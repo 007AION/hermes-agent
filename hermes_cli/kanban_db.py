@@ -4765,6 +4765,18 @@ def complete_task(
         "running", "ready", "blocked",
     )
 
+    # Capture worker_pid before the UPDATE clears it — needed by
+    # _cleanup_workspace for dir-workspace ownership gating
+    # (#AION-RL2-CORE-01 runtime RED at 60bf37bdb2).
+    _captured_pid_row = conn.execute(
+        "SELECT worker_pid FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    captured_worker_pid: int | None = (
+        int(_captured_pid_row["worker_pid"])
+        if _captured_pid_row and _captured_pid_row["worker_pid"] is not None
+        else None
+    )
+
     with write_txn(conn):
         if expected_run_id is None:
             # Read prior status for audit event.
@@ -4910,7 +4922,7 @@ def complete_task(
     # Recompute ready status for dependents (separate txn so children see done).
     recompute_ready(conn)
     # Clean up the scratch workspace and any stale tmux session for the worker.
-    _cleanup_workspace(conn, task_id)
+    _cleanup_workspace(conn, task_id, captured_worker_pid=captured_worker_pid)
     _done_task = get_task(conn, task_id)
     _fire_kanban_lifecycle_hook(
         "kanban_task_completed",
@@ -5206,7 +5218,10 @@ def _is_managed_scratch_path(p: Path) -> bool:
     return is_managed
 
 
-def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
+def _cleanup_workspace(
+    conn: sqlite3.Connection, task_id: str,
+    *, captured_worker_pid: int | None = None,
+) -> None:
     """Remove a task's scratch workspace dir and kill its stale tmux session.
 
     Called from :func:`complete_task` after the DB transaction commits.
@@ -5231,9 +5246,48 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
         # Close process groups whose cwd is inside the workspace (all kinds).
         # Must run BEFORE rmtree for scratch workspaces so process cwd links
         # are still resolvable. Best-effort — swallowed on any error.
+        #
+        # For shared-dir (workspace_kind=dir) workspaces, cwd containment
+        # alone is insufficient — unrelated processes (YAML LSPs, other task
+        # workers) may share the same directory.  Discover the task's owned
+        # process tree from the most recent spawn event PID and pass it as
+        # owned_pids so only the task's own child/grandchild processes are
+        # signalled, while unrelated shared-dir processes are preserved
+        # (#AION-RL2-CORE-01 runtime RED at merged head 60bf37bdb2).
         if path:
             try:
-                close_workspace_processes(Path(path), dry_run=False)
+                owned: set[int] | None = None
+                if kind == "dir":
+                    # Primary: query spawn events (immutable, survives
+                    # complete_task's UPDATE that clears worker_pid).
+                    spawn_row = conn.execute(
+                        "SELECT json_extract(payload, '$.pid') as pid"
+                        " FROM task_events"
+                        " WHERE task_id = ? AND kind = 'spawned'"
+                        " ORDER BY id DESC LIMIT 1",
+                        (task_id,),
+                    ).fetchone()
+                    spawn_pid: int | None = None
+                    if spawn_row and spawn_row["pid"] is not None:
+                        spawn_pid = int(spawn_row["pid"])
+                    elif captured_worker_pid is not None:
+                        spawn_pid = captured_worker_pid
+                    elif captured_worker_pid is None:
+                        # Fall back to tasks.worker_pid (for callers that
+                        # bypass complete_task and don't pass capture).
+                        worker_row = conn.execute(
+                            "SELECT worker_pid FROM tasks WHERE id = ?",
+                            (task_id,),
+                        ).fetchone()
+                        if worker_row and worker_row["worker_pid"]:
+                            spawn_pid = int(worker_row["worker_pid"])
+                    if spawn_pid is not None:
+                        owned = _discover_descendant_pids(spawn_pid)
+                        if not owned:
+                            owned = set()
+                    else:
+                        owned = set()
+                close_workspace_processes(Path(path), dry_run=False, owned_pids=owned)
             except Exception:
                 pass
 
@@ -10189,14 +10243,82 @@ def _revalidate_identity(pid: int, captured: dict) -> bool:
     )
 
 
+def _discover_descendant_pids(root_pid: int) -> set[int]:
+    """Return the set of PIDs that are descendants of *root_pid*.
+
+    Walks ``/proc`` once and traces the ppid chain of every PID back to
+    *root_pid*.  Returns an empty set when *root_pid* is not alive or has
+    no descendants.
+
+    ``root_pid`` itself is always included when it is alive.
+    """
+    import os as _os
+
+    owned: set[int] = set()
+
+    # Quick check: is root alive?
+    try:
+        _os.kill(root_pid, 0)
+    except OSError:
+        return owned
+    owned.add(root_pid)
+
+    # Build a PID → ppid map from /proc in one pass.
+    pid_ppid: dict[int, int] = {}
+    for entry in _os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        if pid == root_pid:
+            continue
+        try:
+            stat_data = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        except (OSError, FileNotFoundError):
+            continue
+        # stat: "pid (comm) state ppid ..."
+        close_paren = stat_data.rfind(")")
+        if close_paren == -1:
+            continue
+        fields = stat_data[close_paren + 2:].split()
+        if len(fields) < 1:
+            continue
+        try:
+            ppid = int(fields[1])  # field index 1 after "pid (comm) " = ppid
+        except (ValueError, IndexError):
+            continue
+        pid_ppid[pid] = ppid
+
+    # Walk each PID's ancestry — if root_pid is an ancestor, include it.
+    for pid, ppid in pid_ppid.items():
+        cursor = ppid
+        visited: set[int] = set()
+        while cursor not in (0, 1, root_pid) and cursor not in visited:
+            visited.add(cursor)
+            cursor = pid_ppid.get(cursor, 1)
+        if cursor == root_pid:
+            owned.add(pid)
+
+    return owned
+
+
 def close_workspace_processes(
     workspace_path: Path, *, dry_run: bool = False,
+    owned_pids: set[int] | None = None,
 ) -> dict:
-    """Close process groups whose cwd is inside ``workspace_path``.
+    """Close processes whose cwd is inside ``workspace_path``.
 
-    Only signals process groups whose working directory resolves inside the
+    Only signals processes whose working directory resolves inside the
     exact workspace — never broad-kill, never touches processes outside the
     workspace, never touches gateway/self/external cwd.
+
+    When *owned_pids* is provided (non-None), cwd containment alone is NOT
+    sufficient: a process must also be in *owned_pids* (or be a descendant of
+    any PID in it) to be eligible for signalling.  This gates shared-directory
+    (``workspace_kind=dir``) cleanup so unrelated processes (YAML LSPs, other
+    task workers) sharing the same directory are never signalled.  For
+    ``scratch`` and ``worktree`` workspaces, *owned_pids* should remain None
+    — those workspaces are exclusive to one task and cwd containment is
+    sufficient.
 
     Every signal is gated on an immediate identity re-read via
     ``/proc/<pid>/stat`` (starttime + cwd + pgid).  If the identity has
@@ -10207,6 +10329,12 @@ def close_workspace_processes(
     Args:
         workspace_path: Absolute path to the workspace directory.
         dry_run: When True, report what WOULD be signalled without killing.
+        owned_pids: Optional set of PIDs that are eligible for signalling.
+            When None, cwd containment is the sole eligibility test
+            (suitable for scratch/worktree).  When a non-empty set, only
+            processes whose PID is in this set (or whose ancestor PID is
+            in this set) may be signalled even when their cwd is inside
+            the workspace (suitable for shared-dir workspaces).
 
     Returns a dict with cleanup evidence:
         - ``workspace``: str — resolved workspace path
@@ -10215,6 +10343,8 @@ def close_workspace_processes(
         - ``skipped_outside``: int — processes outside workspace (negative canary)
         - ``skipped_self``: int — current process / process group (self-preservation)
         - ``skipped_identity_mismatch``: int — identity re-read mismatch (TOCTOU guard)
+        - ``skipped_unowned``: int — processes inside workspace but not in *owned_pids*
+          (shared-dir containment gate; always 0 when *owned_pids* is None)
         - ``dry_run``: bool — True if dry-run mode
         - ``pids``: list of (pgid, pid, cwd) tuples for signalled groups
     """
@@ -10229,6 +10359,7 @@ def close_workspace_processes(
         "skipped_outside": 0,
         "skipped_self": 0,
         "skipped_identity_mismatch": 0,
+        "skipped_unowned": 0,
         "dry_run": dry_run,
         "pids": [],
     }
@@ -10269,6 +10400,16 @@ def close_workspace_processes(
             # Never signal the completing caller itself.
             if pid == my_pid:
                 result["skipped_self"] += 1
+                continue
+
+            # Shared-dir ownership gate: when owned_pids is provided, cwd
+            # containment alone is not sufficient — the PID must be in the
+            # owned set (which already includes all descendants of the
+            # task's worker PID).  This prevents signalling unrelated
+            # processes (YAML LSPs, other task workers) that happen to
+            # share the same directory (#AION-RL2-CORE-01 runtime RED).
+            if owned_pids is not None and pid not in owned_pids:
+                result["skipped_unowned"] += 1
                 continue
 
             # Signal only by PID with individual identity revalidation —

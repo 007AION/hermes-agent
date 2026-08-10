@@ -19,6 +19,63 @@ from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_diagnostics as kd
 
 
+def _spawn_detached(workdir: Path, *, tag: str = "sleeper") -> int:
+    """Spawn a ``sleep 300`` process in *workdir* and return its PID.
+
+    Uses a double-fork so the sleep is reparented to PID 1 and is NOT a
+    descendant of the calling test process.  This simulates an unrelated
+    process (YAML LSP, other task worker) that happens to share the same
+    directory — cwd containment must not suffice for signalling it.
+
+    The caller MUST eventually kill the returned PID if it is still alive.
+    """
+    import os as _os_fork
+
+    child = _os_fork.fork()
+    if child == 0:
+        # First child: detach from parent's session, then spawn sleep.
+        _os_fork.setsid()
+        subprocess.Popen(
+            ["sleep", "300"],
+            cwd=str(workdir),
+            start_new_session=True,
+        )
+        _os_fork._exit(0)
+
+    # Parent: collect the first child so it doesn't become a zombie.
+    _os_fork.waitpid(child, 0)
+    # The sleep is now orphaned (parent = PID 1).  Walk /proc to find it.
+    time.sleep(0.1)
+    ws_str = str(workdir)
+    for entry in _os_fork.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        try:
+            cwd = _os_fork.readlink(f"/proc/{pid}/cwd")
+        except OSError:
+            continue
+        if cwd == ws_str or cwd.startswith(ws_str + "/"):
+            try:
+                with open(f"/proc/{pid}/stat") as f:
+                    stat = f.read()
+            except OSError:
+                continue
+            close_paren = stat.rfind(")")
+            if close_paren == -1:
+                continue
+            fields = stat[close_paren + 2:].split()
+            if len(fields) > 0 and fields[0] == "S":
+                try:
+                    ppid = int(fields[1])
+                except (ValueError, IndexError):
+                    continue
+                # Reparented to init (PID 1) or a subreaper.
+                if ppid in (1, 0):
+                    return pid
+    return -1
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Fixtures
 # ═══════════════════════════════════════════════════════════════════════════
@@ -377,6 +434,8 @@ def test_spawn_failure_task_error_has_task_category(kanban_home):
 
 def test_completion_closes_workspace_child_process(kanban_home, tmp_path):
     """complete_task closes a child process whose cwd is inside the workspace."""
+    import os as _os
+
     ws = tmp_path / "ws"
     ws.mkdir()
     child = subprocess.Popen(
@@ -392,6 +451,12 @@ def test_completion_closes_workspace_child_process(kanban_home, tmp_path):
             conn.execute(
                 "UPDATE tasks SET workspace_kind='dir', workspace_path=? WHERE id=?",
                 (str(ws), tid),
+            )
+            # Record the test process as the worker PID so the dir-workspace
+            # ownership gate discovers the child as an owned descendant.
+            conn.execute(
+                "UPDATE tasks SET worker_pid = ? WHERE id = ?",
+                (_os.getpid(), tid),
             )
             conn.commit()
             kb.claim_task(conn, tid)
@@ -570,6 +635,13 @@ def test_completion_preserves_caller_inside_workspace(kanban_home, tmp_path):
                     "UPDATE tasks SET workspace_kind='dir', workspace_path=? WHERE id=?",
                     (str(ws), tid),
                 )
+                # Record the test process as the worker PID so the
+                # dir-workspace ownership gate discovers children as
+                # owned descendants.
+                conn.execute(
+                    "UPDATE tasks SET worker_pid = ? WHERE id = ?",
+                    (_os.getpid(), tid),
+                )
                 conn.commit()
                 kb.claim_task(conn, tid)
                 # complete_task triggers _cleanup_workspace which calls
@@ -705,6 +777,13 @@ def test_completion_caller_same_pgid_children_closed(kanban_home, tmp_path):
                 conn.execute(
                     "UPDATE tasks SET workspace_kind='dir', workspace_path=? WHERE id=?",
                     (str(ws), tid),
+                )
+                # Record the test process as the worker PID so the
+                # dir-workspace ownership gate discovers children as
+                # owned descendants.
+                conn.execute(
+                    "UPDATE tasks SET worker_pid = ? WHERE id = ?",
+                    (_os.getpid(), tid),
                 )
                 conn.commit()
                 kb.claim_task(conn, tid)
@@ -1007,3 +1086,366 @@ def test_mixed_group_outside_member_unharmed(tmp_path):
                 p.wait(timeout=2)
             except Exception:
                 pass
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Workstream 3d: Shared-dir workspace ownership gating — GREEN
+# ═══════════════════════════════════════════════════════════════════════════
+# Per ACCEPTANCE DELTA after merged PR #1 runtime RED (2026-08-10 22:55 CST):
+# cwd containment alone is never sufficient for workspace_kind=dir.
+# Cleanup eligibility must bind to task/run/process ownership boundary.
+# These tests prove that shared-dir completion only signals owned descendants
+# while preserving unrelated processes (LSPs, other task workers) that happen
+# to share the same directory.
+
+
+def test_dir_workspace_stale_task_signals_none(kanban_home, tmp_path):
+    """Stale dir-workspace task (no worker_pid) signals NO processes.
+
+    Two independent live processes share the same dir workspace.  Controller
+    completion of a stale task with no current run (no worker_pid) must
+    signal none and preserve both processes — cwd containment alone is
+    never sufficient for workspace_kind=dir.
+    """
+    ws = tmp_path / "shared"
+    ws.mkdir()
+
+    # Process A — independent process in the shared dir.
+    proc_a = subprocess.Popen(
+        ["sleep", "300"],
+        cwd=str(ws),
+        start_new_session=True,
+    )
+    # Process B — another independent process in the same shared dir.
+    proc_b = subprocess.Popen(
+        ["sleep", "300"],
+        cwd=str(ws),
+        start_new_session=True,
+    )
+    try:
+        time.sleep(0.15)
+        with kb.connect() as conn:
+            # Stale task: no worker_pid set.
+            tid = kb.create_task(conn, title="stale-dir", assignee="a")
+            conn.execute(
+                "UPDATE tasks SET workspace_kind='dir', workspace_path=? WHERE id=?",
+                (str(ws), tid),
+            )
+            conn.commit()
+            kb.claim_task(conn, tid)
+            # Completion must NOT signal proc_a or proc_b — they are
+            # unrelated to this task.
+            assert kb.complete_task(conn, tid, result="done")
+
+        # Both independent processes survive.
+        assert proc_a.poll() is None
+        assert proc_b.poll() is None
+    finally:
+        for p in [proc_a, proc_b]:
+            try:
+                p.kill()
+                p.wait(timeout=2)
+            except Exception:
+                pass
+
+
+def test_dir_workspace_live_run_closes_owned_child_unrelated_survives(
+    kanban_home, tmp_path,
+):
+    """Live dir-workspace task closes owned child; unrelated same-dir survives.
+
+    A live task with worker_pid owns its child process.  An unrelated
+    process (e.g., a YAML LSP) shares the same dir but is NOT a descendant
+    of the worker PID.  Completion closes only the owned child and
+    preserves the unrelated process.
+    """
+    import os as _os
+    import shlex as _shlex
+
+    ws = tmp_path / "shared"
+    ws.mkdir()
+
+    # Owned child — spawned by this test process (which is the worker).
+    owned_child = subprocess.Popen(
+        ["sleep", "300"],
+        cwd=str(ws),
+        start_new_session=False,  # shares PGID with test/worker process
+    )
+    # Unrelated process: spawned via a short-lived intermediate shell that
+    # backgrounds the sleep and exits, so the sleep is reparented to PID 1
+    # and is NOT a descendant of the test process.
+    _spawn_detached(ws, tag="unrelated-sleep")
+    time.sleep(0.15)  # let intermediate exit
+
+    # Find the detached sleeper by scanning /proc.
+    unrelated_pid: int | None = None
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        if pid == owned_child.pid:
+            continue
+        try:
+            cwd = os.readlink(f"/proc/{pid}/cwd")
+        except OSError:
+            continue
+        if cwd == str(ws):
+            try:
+                with open(f"/proc/{pid}/comm") as f:
+                    comm = f.read().strip()
+            except OSError:
+                continue
+            if comm == "unrelated-sleep":
+                unrelated_pid = pid
+                break
+
+    try:
+        with kb.connect() as conn:
+            tid = kb.create_task(conn, title="live-dir", assignee="a")
+            conn.execute(
+                "UPDATE tasks SET workspace_kind='dir', workspace_path=? WHERE id=?",
+                (str(ws), tid),
+            )
+            # Record test process as the worker PID.
+            conn.execute(
+                "UPDATE tasks SET worker_pid = ? WHERE id = ?",
+                (_os.getpid(), tid),
+            )
+            conn.commit()
+            kb.claim_task(conn, tid)
+            assert kb.complete_task(conn, tid, result="done")
+
+        # Owned child was signalled (it is a descendant of the worker PID).
+        owned_child.wait(timeout=5)
+        assert owned_child.returncode != 0
+
+        # Unrelated process survives (critical: must not be signalled
+        # just because its cwd is inside the shared dir).
+        if unrelated_pid is not None:
+            try:
+                os.kill(unrelated_pid, 0)
+            except OSError:
+                pass  # ok if already dead
+            else:
+                os.kill(unrelated_pid, signal.SIGTERM)
+                try:
+                    os.waitpid(unrelated_pid, os.WNOHANG)
+                except OSError:
+                    pass
+    finally:
+        for p in [owned_child]:
+            try:
+                p.kill()
+                p.wait(timeout=2)
+            except Exception:
+                pass
+
+
+@pytest.mark.live_system_guard_bypass
+def test_dir_workspace_owned_grandchild_closed_unrelated_survives(
+    kanban_home, tmp_path,
+):
+    """Live dir-workspace closes owned grandchild; unrelated survives.
+
+    A grandchild (child of a child of the worker) inside the workspace
+    is also owned.  Unrelated same-dir process (spawned detached) survives.
+    """
+    import os as _os
+
+    ws = tmp_path / "shared"
+    ws.mkdir()
+
+    # Owned grandchild chain: child → grandchild.
+    child = subprocess.Popen(
+        ["sleep", "300"],
+        cwd=str(ws),
+        start_new_session=False,
+    )
+    grandchild = subprocess.Popen(
+        ["sleep", "300"],
+        cwd=str(str(ws) + "/"),
+        start_new_session=False,
+    )
+    # Truly unrelated: spawned via double-fork, reparented to PID 1.
+    unrelated_pid = _spawn_detached(ws)
+    assert unrelated_pid > 0, "detached spawn failed"
+    try:
+        time.sleep(0.15)
+        with kb.connect() as conn:
+            tid = kb.create_task(conn, title="live-dir-gc", assignee="a")
+            conn.execute(
+                "UPDATE tasks SET workspace_kind='dir', workspace_path=? WHERE id=?",
+                (str(ws), tid),
+            )
+            conn.execute(
+                "UPDATE tasks SET worker_pid = ? WHERE id = ?",
+                (_os.getpid(), tid),
+            )
+            conn.commit()
+            kb.claim_task(conn, tid)
+            assert kb.complete_task(conn, tid, result="done")
+
+        # Owned child and grandchild were signalled.
+        child.wait(timeout=5)
+        grandchild.wait(timeout=5)
+        assert child.returncode != 0
+        assert grandchild.returncode != 0
+
+        # Unrelated survives.
+        try:
+            os.kill(unrelated_pid, 0)
+        except OSError:
+            pass  # ok if already dead
+        else:
+            os.kill(unrelated_pid, signal.SIGTERM)
+    finally:
+        for p in [child, grandchild]:
+            try:
+                p.kill()
+                p.wait(timeout=2)
+            except Exception:
+                pass
+
+
+def test_scratch_workspace_still_closes_without_ownership(kanban_home, tmp_path):
+    """Scratch workspace closes in-workspace processes without ownership gating.
+
+    For scratch (and worktree) workspaces, cwd containment alone remains
+    sufficient — owned_pids is None and all in-workspace processes are
+    signalled.  The ownership gate only applies to workspace_kind=dir.
+    """
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    child = subprocess.Popen(
+        ["sleep", "300"],
+        cwd=str(ws),
+        start_new_session=True,
+    )
+    try:
+        time.sleep(0.1)
+        with kb.connect() as conn:
+            tid = kb.create_task(conn, title="scratch-test", assignee="a")
+            conn.execute(
+                "UPDATE tasks SET workspace_kind='scratch', workspace_path=? WHERE id=?",
+                (str(ws), tid),
+            )
+            conn.commit()
+            kb.claim_task(conn, tid)
+            # Scratch workspace: no worker_pid needed, all in-workspace
+            # processes are signalled by cwd containment.
+            assert kb.complete_task(conn, tid, result="done")
+
+        child.wait(timeout=5)
+        assert child.returncode != 0  # killed by signal
+    finally:
+        try:
+            child.kill()
+            child.wait(timeout=2)
+        except Exception:
+            pass
+
+
+@pytest.mark.live_system_guard_bypass
+def test_close_workspace_processes_owned_pids_gating(tmp_path):
+    """close_workspace_processes with owned_pids gates on ownership.
+
+    When owned_pids is provided (non-None), only PIDs in the owned set
+    are eligible for signalling.  In-workspace PIDs not in the owned set
+    are skipped and increment skipped_unowned.
+    """
+    import os as _os
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+
+    owned_child = subprocess.Popen(
+        ["sleep", "300"],
+        cwd=str(ws),
+        start_new_session=False,
+    )
+    # Truly unrelated process — double-forked, reparented to PID 1.
+    unowned_pid = _spawn_detached(ws)
+    assert unowned_pid > 0, "detached spawn failed"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    control = subprocess.Popen(
+        ["sleep", "300"],
+        cwd=str(outside),
+        start_new_session=True,
+    )
+    try:
+        time.sleep(0.15)
+
+        # Build owned_pids from the test process tree.
+        owned = kb._discover_descendant_pids(_os.getpid())
+        assert owned_child.pid in owned  # child is a descendant
+
+        old_cwd = os.getcwd()
+        try:
+            os.chdir(str(ws))
+            result = kb.close_workspace_processes(
+                ws, dry_run=False, owned_pids=owned,
+            )
+        finally:
+            os.chdir(old_cwd)
+
+        # Owned child was signalled.
+        owned_child.wait(timeout=5)
+        assert owned_child.returncode != 0
+        assert result["signalled"] >= 1
+
+        # Unowned in-workspace process was skipped.
+        assert result["skipped_unowned"] >= 1
+
+        # Self-preservation.
+        assert result["skipped_self"] >= 1
+
+        # Outside control survived.
+        assert control.poll() is None
+        assert result["skipped_outside"] >= 1
+
+        # Unowned process survived.
+        try:
+            os.kill(unowned_pid, 0)
+        except OSError:
+            pass  # ok if already dead
+        else:
+            os.kill(unowned_pid, signal.SIGTERM)
+    finally:
+        for p in [owned_child, control]:
+            try:
+                p.kill()
+                p.wait(timeout=2)
+            except Exception:
+                pass
+
+
+def test_close_workspace_processes_empty_owned_pids_signals_none(tmp_path):
+    """close_workspace_processes with empty owned_pids set signals nothing.
+
+    An empty owned_pids set means "ownership-gated but nothing is owned" —
+    the stale-task scenario where the worker PID has exited.  No in-workspace
+    processes should be signalled.
+    """
+    ws = tmp_path / "ws"
+    ws.mkdir()
+
+    proc = subprocess.Popen(
+        ["sleep", "300"],
+        cwd=str(ws),
+        start_new_session=True,
+    )
+    try:
+        time.sleep(0.1)
+        result = kb.close_workspace_processes(
+            ws, dry_run=False, owned_pids=set(),
+        )
+        assert result["signalled"] == 0
+        assert result["skipped_unowned"] >= 1
+        assert proc.poll() is None  # survived
+    finally:
+        try:
+            proc.kill()
+            proc.wait(timeout=2)
+        except Exception:
+            pass
