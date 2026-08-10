@@ -850,11 +850,10 @@ def test_identity_mismatch_skips_signal_same_pgid(tmp_path):
 
 
 def test_identity_mismatch_skips_signal_diff_pgid(tmp_path):
-    """killpg is skipped when identity re-read fails for a different-PGID group.
+    """PID signal is skipped when identity re-read fails for a different-PGID process.
 
     Same as above but for processes in a different process group
-    (start_new_session=True).  The group leader identity must match
-    before killpg is called.
+    (start_new_session=True).  Identity must match before PID is signalled.
     """
     ws = tmp_path / "ws"
     ws.mkdir()
@@ -925,8 +924,8 @@ def test_mixed_pgids_only_signal_eligible(tmp_path):
 
         # Caller survived.
         assert result["skipped_self"] >= 1
-        # Both in-workspace children were signalled (same-PGID by PID,
-        # diff-PGID by killpg).
+        # Both in-workspace children were signalled by PID
+        # (same-PGID and diff-PGID both use PID-scoped os.kill).
         assert result["signalled"] >= 2
         # Outside process was skipped.
         assert result["skipped_outside"] >= 1
@@ -943,6 +942,66 @@ def test_mixed_pgids_only_signal_eligible(tmp_path):
         assert control.poll() is None
     finally:
         for p in [same_pgid_child, diff_pgid_child, control]:
+            try:
+                p.kill()
+                p.wait(timeout=2)
+            except Exception:
+                pass
+
+
+def test_mixed_group_outside_member_unharmed(tmp_path):
+    """Mixed-CWD process group: inside member closes, outside member survives.
+
+    Per bafuxunan audit (t_bb18e80b at head 2378ac3142): the previous
+    code used killpg for non-current process groups, which broadcasts
+    SIGTERM to every group member — including those whose CWD is outside
+    the workspace.  This regression proves that when a process group
+    contains both in-workspace and outside-workspace members, only the
+    in-workspace member is signalled.  Never broad/group signal on
+    mixed or uncertain membership.
+    """
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+
+    # Create a shared process group by not calling start_new_session.
+    # Both children inherit the parent's PGID, forming a mixed group.
+    # The "inside" child has cwd=ws, the "outside" child has cwd=outside.
+    inside = subprocess.Popen(
+        ["sleep", "300"],
+        cwd=str(ws),
+        start_new_session=False,
+    )
+    outside_child = subprocess.Popen(
+        ["sleep", "300"],
+        cwd=str(outside),
+        start_new_session=False,
+    )
+    try:
+        time.sleep(0.15)
+
+        old_cwd = os.getcwd()
+        try:
+            os.chdir(str(ws))
+            result = kb.close_workspace_processes(ws, dry_run=False)
+        finally:
+            os.chdir(old_cwd)
+
+        # In-workspace member was signalled.
+        inside.wait(timeout=5)
+        assert inside.returncode != 0
+
+        # Outside-shared-PGID member survived (critical negative control).
+        # The audit reproduced a killpg hit here — we must prove it never
+        # happens after the repair.
+        assert outside_child.poll() is None
+
+        # Evidence of selective signalling.
+        assert result["signalled"] >= 1
+        assert result["skipped_self"] >= 1
+    finally:
+        for p in [inside, outside_child]:
             try:
                 p.kill()
                 p.wait(timeout=2)

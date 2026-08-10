@@ -10237,20 +10237,16 @@ def close_workspace_processes(
         return result
 
     # Never signal the completing caller itself — a completion inside
-    # the workspace must not kill the completing caller.  Children that
-    # share the caller's process group are signalled individually by PID
-    # (never killpg(current_pgid)) so eligible descendants are closed
-    # while the caller and its ancestors survive (#AION-RL2-CORE-01 repair).
+    # the workspace must not kill the completing caller.  All eligible
+    # children are signalled individually by PID with TOCTOU identity
+    # revalidation.  killpg is never used because a process group can
+    # contain members with different CWDs — signalling the entire group
+    # risks hitting outside-workspace processes (#AION-RL2-CORE-01).
     my_pid = _os.getpid()
-    try:
-        my_pgid = _os.getpgid(0)
-    except OSError:
-        my_pgid = None
 
     # Walk /proc to find processes whose cwd is inside the workspace.
     wp_str = str(wp)
-    signalled_pgids: set[int] = set()
-    signalled_pids: set[int] = set()  # track PID-scope signals for same-PGID children
+    signalled_pids: set[int] = set()  # track PID-scope signals for dedup
 
     for entry in _os.listdir("/proc"):
         if not entry.isdigit():
@@ -10275,77 +10271,40 @@ def close_workspace_processes(
                 result["skipped_self"] += 1
                 continue
 
-            same_pgid = my_pgid is not None and pgid == my_pgid
-
-            if same_pgid:
-                # Children sharing the caller's PGID: signal by PID only.
-                # Never call killpg(current_pgid) — that would kill the caller.
-                # Dedup so we don't double-signal the same PID from multiple
-                # /proc entries.
-                if pid in signalled_pids:
+            # Signal only by PID with individual identity revalidation —
+            # never killpg.  killpg broadcasts to every member of the
+            # process group, which can hit outside-workspace processes
+            # when a group has mixed CWDs (#AION-RL2-CORE-01 repair,
+            # bafuxunan audit t_bb18e80b at head 2378ac3142).
+            if pid in signalled_pids:
+                continue
+            if dry_run:
+                identity = _read_process_identity(pid)
+                if identity is None:
                     continue
-                if dry_run:
-                    # Capture identity even in dry run for audit evidence.
-                    identity = _read_process_identity(pid)
-                    if identity is None:
-                        continue
-                    result["would_signal"] += 1
-                    result["pids"].append((pgid, pid, cwd_str))
-                    signalled_pids.add(pid)
-                else:
-                    # Capture identity BEFORE any signal.
-                    identity = _read_process_identity(pid)
-                    if identity is None:
-                        continue
-                    # Re-validate identity immediately before signal.
-                    # If PID was recycled, cwd changed, or pgid moved —
-                    # never signal.  This is a best-effort TOCTOU guard.
-                    if not _revalidate_identity(pid, identity):
-                        result["skipped_identity_mismatch"] += 1
-                        continue
-                    try:
-                        _os.kill(pid, _signal.SIGTERM)
-                        signalled_pids.add(pid)
-                        result["signalled"] += 1
-                        result["pids"].append((pgid, pid, cwd_str))
-                    except OSError:
-                        # Process already gone — count it as cleaned.
-                        signalled_pids.add(pid)
-                        result["signalled"] += 1
+                result["would_signal"] += 1
+                result["pids"].append((pgid, pid, cwd_str))
+                signalled_pids.add(pid)
             else:
-                # Different process group: safe to use killpg.
-                if pgid in signalled_pgids:
+                # Capture identity BEFORE any signal.
+                identity = _read_process_identity(pid)
+                if identity is None:
                     continue
-                if dry_run:
-                    # Capture identity of group leader for audit evidence.
-                    identity = _read_process_identity(pid)
-                    if identity is None:
-                        continue
-                    result["would_signal"] += 1
+                # Re-validate identity immediately before signal.
+                # If PID was recycled, cwd changed, or pgid moved —
+                # never signal.  This is a best-effort TOCTOU guard.
+                if not _revalidate_identity(pid, identity):
+                    result["skipped_identity_mismatch"] += 1
+                    continue
+                try:
+                    _os.kill(pid, _signal.SIGTERM)
+                    signalled_pids.add(pid)
+                    result["signalled"] += 1
                     result["pids"].append((pgid, pid, cwd_str))
-                    signalled_pgids.add(pgid)
-                else:
-                    # Capture identity BEFORE any signal.
-                    identity = _read_process_identity(pid)
-                    if identity is None:
-                        continue
-                    # Re-validate identity immediately before signal.
-                    # If the group leader's PID was recycled, cwd changed,
-                    # or pgid moved — never signal.  This protects against
-                    # signalling a recycled PGID that now belongs to an
-                    # unrelated protected/outside process.
-                    if not _revalidate_identity(pid, identity):
-                        result["skipped_identity_mismatch"] += 1
-                        continue
-                    try:
-                        _os.killpg(pgid, _signal.SIGTERM)
-                        signalled_pgids.add(pgid)
-                        result["signalled"] += 1
-                        result["pids"].append((pgid, pid, cwd_str))
-                    except OSError:
-                        # Process group already gone — count it as cleaned.
-                        signalled_pgids.add(pgid)
-                        result["signalled"] += 1
+                except OSError:
+                    # Process already gone — count it as cleaned.
+                    signalled_pids.add(pid)
+                    result["signalled"] += 1
         else:
             result["skipped_outside"] += 1
 
