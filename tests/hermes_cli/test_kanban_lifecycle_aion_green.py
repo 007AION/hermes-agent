@@ -445,6 +445,10 @@ def test_completion_closes_workspace_child_process(kanban_home, tmp_path):
     )
     try:
         time.sleep(0.1)
+        # Capture the test process's identity for the spawn event.
+        worker_identity = kb._read_process_identity(_os.getpid())
+        assert worker_identity is not None
+
         with kb.connect() as conn:
             tid = kb.create_task(conn, title="proc-test", assignee="a")
             # Set workspace to the dir where child runs.
@@ -452,11 +456,13 @@ def test_completion_closes_workspace_child_process(kanban_home, tmp_path):
                 "UPDATE tasks SET workspace_kind='dir', workspace_path=? WHERE id=?",
                 (str(ws), tid),
             )
-            # Record the test process as the worker PID so the dir-workspace
-            # ownership gate discovers the child as an owned descendant.
-            conn.execute(
-                "UPDATE tasks SET worker_pid = ? WHERE id = ?",
-                (_os.getpid(), tid),
+            # Insert a spawn event with the test process's PID + starttime
+            # so the dir-workspace ownership gate can discover owned
+            # descendants (#AION-RL2-CORE-04 R3: spawn event starttime
+            # required for dir-workspace ownership).
+            kb._append_event(
+                conn, tid, "spawned",
+                {"pid": _os.getpid(), "starttime": worker_identity["starttime"]},
             )
             conn.commit()
             kb.claim_task(conn, tid)
@@ -638,9 +644,12 @@ def test_completion_preserves_caller_inside_workspace(kanban_home, tmp_path):
                 # Record the test process as the worker PID so the
                 # dir-workspace ownership gate discovers children as
                 # owned descendants.
-                conn.execute(
-                    "UPDATE tasks SET worker_pid = ? WHERE id = ?",
-                    (_os.getpid(), tid),
+                # Insert a spawn event with PID + starttime for the
+                # ownership gate (#AION-RL2-CORE-04 R3).
+                kb._append_event(
+                    conn, tid, "spawned",
+                    {"pid": _os.getpid(),
+                     "starttime": kb._read_process_identity(_os.getpid())["starttime"]},
                 )
                 conn.commit()
                 kb.claim_task(conn, tid)
@@ -781,9 +790,12 @@ def test_completion_caller_same_pgid_children_closed(kanban_home, tmp_path):
                 # Record the test process as the worker PID so the
                 # dir-workspace ownership gate discovers children as
                 # owned descendants.
-                conn.execute(
-                    "UPDATE tasks SET worker_pid = ? WHERE id = ?",
-                    (_os.getpid(), tid),
+                # Insert a spawn event with PID + starttime for the
+                # ownership gate (#AION-RL2-CORE-04 R3).
+                kb._append_event(
+                    conn, tid, "spawned",
+                    {"pid": _os.getpid(),
+                     "starttime": kb._read_process_identity(_os.getpid())["starttime"]},
                 )
                 conn.commit()
                 kb.claim_task(conn, tid)
@@ -1206,10 +1218,11 @@ def test_dir_workspace_live_run_closes_owned_child_unrelated_survives(
                 "UPDATE tasks SET workspace_kind='dir', workspace_path=? WHERE id=?",
                 (str(ws), tid),
             )
-            # Record test process as the worker PID.
-            conn.execute(
-                "UPDATE tasks SET worker_pid = ? WHERE id = ?",
-                (_os.getpid(), tid),
+            # Insert spawn event with PID + starttime for ownership gate.
+            kb._append_event(
+                conn, tid, "spawned",
+                {"pid": _os.getpid(),
+                 "starttime": kb._read_process_identity(_os.getpid())["starttime"]},
             )
             conn.commit()
             kb.claim_task(conn, tid)
@@ -1277,9 +1290,11 @@ def test_dir_workspace_owned_grandchild_closed_unrelated_survives(
                 "UPDATE tasks SET workspace_kind='dir', workspace_path=? WHERE id=?",
                 (str(ws), tid),
             )
-            conn.execute(
-                "UPDATE tasks SET worker_pid = ? WHERE id = ?",
-                (_os.getpid(), tid),
+            # Insert spawn event with PID + starttime for ownership gate.
+            kb._append_event(
+                conn, tid, "spawned",
+                {"pid": _os.getpid(),
+                 "starttime": kb._read_process_identity(_os.getpid())["starttime"]},
             )
             conn.commit()
             kb.claim_task(conn, tid)
@@ -1305,6 +1320,269 @@ def test_dir_workspace_owned_grandchild_closed_unrelated_survives(
                 p.wait(timeout=2)
             except Exception:
                 pass
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Workstream 3e: PID ownership bound to starttime identity — GREEN
+# ═══════════════════════════════════════════════════════════════════════════
+# Per bafuxunan audit t_86c15b21 (finding historical_spawn_pid_reuse_false_
+# ownership_root): _discover_descendant_pids must validate that the root
+# PID's starttime matches the originally-recorded spawn starttime, so a
+# recycled PID belonging to an unrelated process is never treated as owned.
+# These tests prove the negative (mismatched starttime → rejected), the
+# positive (matching starttime → accepted), and the fail-closed case
+# (no starttime provided → empty set per R3 acceptance).
+
+
+def test_discover_descendant_pids_rejects_wrong_starttime():
+    """_discover_descendant_pids returns empty set when starttime mismatches.
+
+    The root PID exists (os.kill passes) but its /proc starttime doesn't
+    match expected_starttime — this is a recycled PID.  The function must
+    return an empty owned set as if the original process had exited.
+    (#AION-RL2-CORE-04, bafuxunan audit t_86c15b21)
+    """
+    import os as _os
+
+    my_pid = _os.getpid()
+    # Read the current process's ACTUAL starttime.
+    identity = kb._read_process_identity(my_pid)
+    assert identity is not None, "must be able to read own process identity"
+
+    # Pass a deliberately wrong starttime (guaranteed different: +1000).
+    wrong_starttime = identity["starttime"] + 1000
+    result = kb._discover_descendant_pids(
+        my_pid, expected_starttime=wrong_starttime,
+    )
+    # The PID is alive but its starttime doesn't match — treated as
+    # recycled, so no descendants should be returned.
+    assert result == set(), (
+        f"should return empty set for mismatched starttime, got {result!r}"
+    )
+
+
+def test_discover_descendant_pids_accepts_correct_starttime():
+    """_discover_descendant_pids returns owned descendants when starttime matches.
+
+    The root PID's /proc starttime equals expected_starttime — this IS the
+    original spawned process. The function must include the root PID and all
+    its descendant PIDs in the returned set.
+    (#AION-RL2-CORE-04, bafuxunan audit t_86c15b21)
+    """
+    import os as _os
+
+    my_pid = _os.getpid()
+    identity = kb._read_process_identity(my_pid)
+    assert identity is not None, "must be able to read own process identity"
+
+    correct_starttime = identity["starttime"]
+    result = kb._discover_descendant_pids(
+        my_pid, expected_starttime=correct_starttime,
+    )
+    # Our own PID must be in the owned set.
+    assert my_pid in result, (
+        f"own PID {my_pid} must be in owned set, got {result!r}"
+    )
+
+
+def test_discover_descendant_pids_none_starttime_is_rejected():
+    """_discover_descendant_pids returns empty set when expected_starttime is None.
+
+    Without identity proof (no recorded starttime), the function has no way
+    to distinguish the original spawned process from a recycled PID belonging
+    to an unrelated process.  Must fail closed per R3 acceptance: return
+    empty set (#AION-RL2-CORE-04, bafuxunan audit t_86c15b21).
+    """
+    import os as _os
+
+    my_pid = _os.getpid()
+    result = kb._discover_descendant_pids(my_pid)
+    # Without expected_starttime, no identity proof — must return empty set.
+    assert result == set(), (
+        f"should return empty set when starttime is None, got {result!r}"
+    )
+
+
+def test_completion_rejects_stale_spawn_pid_recycled_identity(
+    kanban_home, tmp_path,
+):
+    """Integration: unrelated same-dir process survives when spawn PID is recycled.
+
+    An auditor-created unrelated process shares the same dir workspace.  The
+    task's spawn event records the unrelated process's PID but with a WRONG
+    starttime — simulating a stale spawn event where the original worker
+    exited and the PID was recycled by an auditor process.
+
+    complete_task must NOT signal the unrelated process because the starttime
+    check in _discover_descendant_pids rejects the recycled PID as unowned.
+    (#AION-RL2-CORE-04, bafuxunan audit t_86c15b21)
+    """
+    import os as _os
+
+    ws = tmp_path / "shared"
+    ws.mkdir()
+
+    # Spawn an auditor-created unrelated process in the shared dir.
+    unrelated = subprocess.Popen(
+        ["sleep", "300"],
+        cwd=str(ws),
+        start_new_session=True,
+    )
+    try:
+        time.sleep(0.1)
+
+        # Read the unrelated process's ACTUAL identity.
+        unrelated_identity = kb._read_process_identity(unrelated.pid)
+        assert unrelated_identity is not None
+
+        # Compute a deliberately WRONG starttime.
+        wrong_starttime = unrelated_identity["starttime"] + 999
+
+        with kb.connect() as conn:
+            tid = kb.create_task(conn, title="recycled-pid-test", assignee="a")
+            # Set workspace to dir.
+            conn.execute(
+                "UPDATE tasks SET workspace_kind='dir', workspace_path=? WHERE id=?",
+                (str(ws), tid),
+            )
+            # Insert a spawn event that records the unrelated process's PID
+            # but with a WRONG starttime — simulating a stale spawn record
+            # where the original worker exited and its PID was recycled by
+            # the auditor's unrelated process.
+            kb._append_event(
+                conn, tid, "spawned",
+                {"pid": unrelated.pid, "starttime": wrong_starttime},
+            )
+            conn.commit()
+            kb.claim_task(conn, tid)
+            assert kb.complete_task(conn, tid, result="done")
+
+        # The unrelated process MUST survive — its PID matched the spawn
+        # event's PID, but the starttime didn't match, so _cleanup_workspace
+        # treated the PID as recycled and returned empty owned_pids.
+        assert unrelated.poll() is None, (
+            "unrelated process was signalled despite starttime mismatch"
+        )
+    finally:
+        try:
+            unrelated.kill()
+            unrelated.wait(timeout=2)
+        except Exception:
+            pass
+
+
+def test_completion_closes_owned_child_with_correct_starttime(
+    kanban_home, tmp_path,
+):
+    """Integration: owned child is closed when spawn starttime matches.
+
+    The positive counterpart: when the spawn event has the CORRECT starttime,
+    the owned child inside the workspace must still be signalled.
+    (#AION-RL2-CORE-04)
+    """
+    import os as _os
+
+    ws = tmp_path / "shared"
+    ws.mkdir()
+
+    # Spawn an owned child (descendant of the test process).
+    owned = subprocess.Popen(
+        ["sleep", "300"],
+        cwd=str(ws),
+        start_new_session=False,
+    )
+    try:
+        time.sleep(0.1)
+
+        # Read the test process's actual starttime (the "worker").
+        worker_identity = kb._read_process_identity(_os.getpid())
+        assert worker_identity is not None
+
+        with kb.connect() as conn:
+            tid = kb.create_task(conn, title="correct-starttime", assignee="a")
+            conn.execute(
+                "UPDATE tasks SET workspace_kind='dir', workspace_path=? WHERE id=?",
+                (str(ws), tid),
+            )
+            # Insert a spawn event with the CORRECT worker PID + starttime.
+            kb._append_event(
+                conn, tid, "spawned",
+                {
+                    "pid": _os.getpid(),
+                    "starttime": worker_identity["starttime"],
+                },
+            )
+            conn.commit()
+            kb.claim_task(conn, tid)
+            assert kb.complete_task(conn, tid, result="done")
+
+        # Owned child must have been signalled.
+        owned.wait(timeout=5)
+        assert owned.returncode != 0, (
+            "owned child was not signalled despite correct starttime"
+        )
+    finally:
+        for p in [owned]:
+            try:
+                p.kill()
+                p.wait(timeout=2)
+            except Exception:
+                pass
+
+
+def test_completion_legacy_spawn_event_without_starttime_survivor(
+    kanban_home, tmp_path,
+):
+    """Integration: legacy spawn event (PID only, no starttime) → no ownership.
+
+    A spawn event recorded before the starttime fix carries only a PID, no
+    starttime.  An unrelated same-dir process that happens to share that PID
+    (PID recycling) must survive cleanup — the missing starttime means no
+    identity proof, and cleanup must fail closed with owned=set() and no
+    signals (#AION-RL2-CORE-04, bafuxunan audit t_86c15b21, R3 acceptance).
+    """
+    import os as _os
+
+    ws = tmp_path / "shared"
+    ws.mkdir()
+
+    # Spawn an unrelated same-dir process.
+    unrelated = subprocess.Popen(
+        ["sleep", "300"],
+        cwd=str(ws),
+        start_new_session=True,
+    )
+    try:
+        time.sleep(0.1)
+
+        with kb.connect() as conn:
+            tid = kb.create_task(conn, title="legacy-no-starttime", assignee="a")
+            conn.execute(
+                "UPDATE tasks SET workspace_kind='dir', workspace_path=? WHERE id=?",
+                (str(ws), tid),
+            )
+            # Legacy spawn event: PID only, NO starttime key.
+            kb._append_event(
+                conn, tid, "spawned",
+                {"pid": unrelated.pid},
+            )
+            conn.commit()
+            kb.claim_task(conn, tid)
+            assert kb.complete_task(conn, tid, result="done")
+
+        # The unrelated process MUST survive — the spawn event lacks
+        # starttime, so _cleanup_workspace had no identity proof and
+        # set owned=set(), producing zero signals.
+        assert unrelated.poll() is None, (
+            "unrelated process was signalled despite missing starttime "
+            "in legacy spawn event"
+        )
+    finally:
+        try:
+            unrelated.kill()
+            unrelated.wait(timeout=2)
+        except Exception:
+            pass
 
 
 def test_scratch_workspace_still_closes_without_ownership(kanban_home, tmp_path):
@@ -1376,8 +1654,13 @@ def test_close_workspace_processes_owned_pids_gating(tmp_path):
     try:
         time.sleep(0.15)
 
-        # Build owned_pids from the test process tree.
-        owned = kb._discover_descendant_pids(_os.getpid())
+        # Build owned_pids from the test process tree with identity proof.
+        worker_identity = kb._read_process_identity(_os.getpid())
+        assert worker_identity is not None
+        owned = kb._discover_descendant_pids(
+            _os.getpid(),
+            expected_starttime=worker_identity["starttime"],
+        )
         assert owned_child.pid in owned  # child is a descendant
 
         old_cwd = os.getcwd()
