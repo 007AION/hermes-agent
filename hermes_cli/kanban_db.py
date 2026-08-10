@@ -5213,6 +5213,10 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
     Best-effort — any error is swallowed so cleanup never blocks task completion.
     Only ``scratch`` workspaces are removed; ``worktree`` and ``dir`` workspaces
     are intentionally preserved.
+
+    Before removing the workspace, close any process groups whose cwd is inside
+    the workspace (all workspace kinds: scratch, dir, worktree). This prevents
+    orphaned child/grandchild processes from outliving the task #AION-RL2-CORE-01.
     """
     try:
         row = conn.execute(
@@ -5223,6 +5227,16 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
             return
         kind: Optional[str] = row["workspace_kind"]
         path: Optional[str] = row["workspace_path"]
+
+        # Close process groups whose cwd is inside the workspace (all kinds).
+        # Must run BEFORE rmtree for scratch workspaces so process cwd links
+        # are still resolvable. Best-effort — swallowed on any error.
+        if path:
+            try:
+                close_workspace_processes(Path(path), dry_run=False)
+            except Exception:
+                pass
+
         if kind != "scratch" or not path:
             # This task's own workspace isn't a removable scratch dir, but its
             # completion may still unblock a deferred parent scratch cleanup
@@ -6712,12 +6726,14 @@ class DispatchResult:
     stale: list[str] = field(default_factory=list)
     """Task ids reclaimed because no progress (heartbeat) was seen
     within ``dispatch_stale_timeout_seconds``."""
-    respawn_guarded: list[tuple[str, str]] = field(default_factory=list)
-    """Tasks skipped by the respawn guard, as ``(task_id, reason)`` pairs.
+    respawn_guarded: list[tuple[str, str, int]] = field(default_factory=list)
+    """Tasks skipped by the respawn guard, as ``(task_id, reason, next_retry_at)`` triples.
 
     Reasons: ``"blocker_auth"`` (quota/auth error — also auto-blocked),
     ``"recent_success"`` (completed run within guard window),
-    ``"active_pr"`` (GitHub PR URL in a recent comment)."""
+    ``"active_pr"`` (GitHub PR URL in a recent comment).
+    ``next_retry_at`` is a Unix epoch when the guard is expected to clear;
+    0 means unknown (needs human intervention)."""
     rate_limited: list[str] = field(default_factory=list)
     """Task ids whose workers bailed on a provider rate-limit / quota wall
     (EX_TEMPFAIL sentinel exit) and were released back to ``ready`` WITHOUT
@@ -7899,8 +7915,9 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
 _clear_spawn_failures = _clear_failure_counter
 
 
-def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
-    """Return a guard reason if ``task_id`` should NOT be re-spawned, else None.
+def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[tuple[str, int]]:
+    """Return ``(guard_reason, next_retry_at)`` if ``task_id`` should NOT be
+    re-spawned, else None.
 
     Called per ready task in ``dispatch_once`` before any claim attempt.
     Returning a reason defers the spawn this tick; the task stays in
@@ -7984,7 +8001,7 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
             return None
         ended_at = latest_run["ended_at"]
         if ended_at is not None and (now - int(ended_at)) < rl_cooldown:
-            return "rate_limit_cooldown"
+            return ("rate_limit_cooldown", int(ended_at) + rl_cooldown)
         # Cooldown elapsed — allow the respawn. Return early so the
         # blocker_auth check below doesn't catch the rate-limit text we
         # stamped on the task; this path intentionally retries forever
@@ -7995,7 +8012,7 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     # 2. Quota / auth blocker: retrying immediately will not help.
     err = row["last_failure_error"]
     if err and _RESPAWN_BLOCKER_RE.search(err):
-        return "blocker_auth"
+        return ("blocker_auth", 0)  # unknown — needs human intervention
 
     # 3. Completed run within guard window — proof of recent success.
     #    Exception: an explicit re-queue AFTER that success (an operator
@@ -8020,16 +8037,17 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
             (task_id, completed_at),
         ).fetchone()
         if not requeued_after:
-            return "recent_success"
+            return ("recent_success", completed_at + _RESPAWN_GUARD_SUCCESS_WINDOW)
 
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
     for c in conn.execute(
-        "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
+        "SELECT body, created_at FROM task_comments WHERE task_id = ? AND created_at >= ?",
         (task_id, pr_cutoff),
     ).fetchall():
         if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
-            return "active_pr"
+            comment_created = int(c["created_at"] or 0)
+            return ("active_pr", comment_created + _RESPAWN_GUARD_PR_WINDOW)
 
     return None
 
@@ -8394,18 +8412,39 @@ def _dispatch_once_locked(
         # still trips the auto-block circuit breaker after failure_limit
         # consecutive failures, so a persistent auth error eventually
         # blocks via the normal path rather than on first occurrence.
-        guard_reason = check_respawn_guard(conn, row["id"])
-        if guard_reason is not None:
-            result.respawn_guarded.append((row["id"], guard_reason))
+        guard_result = check_respawn_guard(conn, row["id"])
+        if guard_result is not None:
+            guard_reason, next_retry_at = guard_result
+            result.respawn_guarded.append((row["id"], guard_reason, next_retry_at))
             # Emit an event so operators can see why the task was
             # skipped when reading `hermes kanban tail` — without
             # this the task appears stuck in ready with no diagnosis.
+            # Dedup: skip emission if the most recent event is already a
+            # respawn_guarded for the same reason (prevents per-minute
+            # event churn across dispatcher ticks — #AION-RL2-CORE-01).
             if not dry_run:
-                with write_txn(conn):
-                    _append_event(
-                        conn, row["id"], "respawn_guarded",
-                        {"reason": guard_reason},
-                    )
+                _should_emit = True
+                _last_event = conn.execute(
+                    "SELECT kind, payload FROM task_events "
+                    "WHERE task_id = ? ORDER BY created_at DESC LIMIT 1",
+                    (row["id"],),
+                ).fetchone()
+                if _last_event and _last_event["kind"] == "respawn_guarded":
+                    try:
+                        _prev_payload = json.loads(_last_event["payload"] or "{}")
+                        if _prev_payload.get("reason") == guard_reason:
+                            _should_emit = False
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                if _should_emit:
+                    with write_txn(conn):
+                        _append_event(
+                            conn, row["id"], "respawn_guarded",
+                            {
+                                "reason": guard_reason,
+                                "next_retry_at": next_retry_at,
+                            },
+                        )
             continue
         if dry_run:
             result.spawned.append((row["id"], row_assignee, ""))

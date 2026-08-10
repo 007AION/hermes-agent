@@ -1012,7 +1012,8 @@ def test_respawn_guard_defers_rate_limited_within_cooldown(
 
         # Inside cooldown → defer with the rate-limit-specific reason.
         monkeypatch.setattr(_kb.time, "time", lambda: now + 100)
-        assert kb.check_respawn_guard(conn, tid) == "rate_limit_cooldown"
+        guard = kb.check_respawn_guard(conn, tid)
+        assert guard is not None and guard[0] == "rate_limit_cooldown"
 
         # Past cooldown → allowed (None), NOT trapped by blocker_auth even
         # though last_failure_error contains "rate-limited".
@@ -1826,7 +1827,7 @@ def test_respawn_guard_blocker_auth_on_quota_error(kanban_home):
             ("API quota exceeded: rate limit hit", t),
         )
         reason = kb.check_respawn_guard(conn, t)
-    assert reason == "blocker_auth"
+    assert reason is not None and reason[0] == "blocker_auth"
 
 
 def test_respawn_guard_blocker_auth_on_auth_error(kanban_home):
@@ -1838,7 +1839,7 @@ def test_respawn_guard_blocker_auth_on_auth_error(kanban_home):
             ("403 Forbidden: unauthorized to access resource", t),
         )
         reason = kb.check_respawn_guard(conn, t)
-    assert reason == "blocker_auth"
+    assert reason is not None and reason[0] == "blocker_auth"
 
 
 def test_respawn_guard_blocker_auth_on_authentication_error(kanban_home):
@@ -1850,7 +1851,7 @@ def test_respawn_guard_blocker_auth_on_authentication_error(kanban_home):
             ("Authentication failed: invalid credentials", t),
         )
         reason = kb.check_respawn_guard(conn, t)
-    assert reason == "blocker_auth"
+    assert reason is not None and reason[0] == "blocker_auth"
 
 
 def test_respawn_guard_blocker_auth_on_authorization_error(kanban_home):
@@ -1862,7 +1863,7 @@ def test_respawn_guard_blocker_auth_on_authorization_error(kanban_home):
             ("authorization denied for scope repo", t),
         )
         reason = kb.check_respawn_guard(conn, t)
-    assert reason == "blocker_auth"
+    assert reason is not None and reason[0] == "blocker_auth"
 
 
 def test_respawn_guard_recent_success(kanban_home):
@@ -1876,7 +1877,7 @@ def test_respawn_guard_recent_success(kanban_home):
             (t, now - 120, now - 60),
         )
         reason = kb.check_respawn_guard(conn, t)
-    assert reason == "recent_success"
+    assert reason is not None and reason[0] == "recent_success"
 
 
 def test_respawn_guard_recent_success_bypassed_by_requeue(kanban_home):
@@ -1893,7 +1894,8 @@ def test_respawn_guard_recent_success_bypassed_by_requeue(kanban_home):
             (t, now - 120, now - 60),
         )
         # Baseline: a recent completion defers the respawn.
-        assert kb.check_respawn_guard(conn, t) == "recent_success"
+        guard = kb.check_respawn_guard(conn, t)
+        assert guard is not None and guard[0] == "recent_success"
         # Operator drags done -> ready: a 'status' event after completion.
         conn.execute(
             "INSERT INTO task_events (task_id, kind, created_at) "
@@ -1926,7 +1928,7 @@ def test_respawn_guard_active_pr_in_comment(kanban_home):
             "PR created: https://github.com/totemx-AI/subsidysmart/pull/42",
         )
         reason = kb.check_respawn_guard(conn, t)
-    assert reason == "active_pr"
+    assert reason is not None and reason[0] == "active_pr"
 
 
 def test_respawn_guard_old_pr_comment_not_guarded(kanban_home):
@@ -1977,8 +1979,9 @@ def test_dispatch_respawn_guard_defers_auth_error_without_auto_block(
         f"got auto_blocked={res.auto_blocked!r}"
     )
     # It IS recorded as respawn_guarded with the reason.
-    assert (t, "blocker_auth") in res.respawn_guarded, (
-        f"expected (task_id, 'blocker_auth') in respawn_guarded; "
+    guarded_reasons = {task_id: reason for task_id, reason, _ in res.respawn_guarded}
+    assert guarded_reasons.get(t) == "blocker_auth", (
+        f"expected '{t}' with 'blocker_auth' in respawn_guarded; "
         f"got {res.respawn_guarded!r}"
     )
     # And it's NOT spawned this tick.
@@ -2008,7 +2011,8 @@ def test_dispatch_respawn_guard_skips_recent_success(
         )
         res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
 
-    assert (t, "recent_success") in res.respawn_guarded
+    guarded_reasons = {task_id: reason for task_id, reason, _ in res.respawn_guarded}
+    assert guarded_reasons.get(t) == "recent_success"
     assert t not in spawned_ids
     assert t not in res.auto_blocked
     with kb.connect() as conn:
@@ -2032,7 +2036,8 @@ def test_dispatch_respawn_guard_skips_active_pr(
         )
         res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
 
-    assert (t, "active_pr") in res.respawn_guarded
+    guarded_reasons = {task_id: reason for task_id, reason, _ in res.respawn_guarded}
+    assert guarded_reasons.get(t) == "active_pr"
     assert t not in spawned_ids
     assert t not in res.auto_blocked
     with kb.connect() as conn:
@@ -2051,7 +2056,8 @@ def test_dispatch_respawn_guard_dry_run_no_auto_block(
         )
         res = kb.dispatch_once(conn, dry_run=True)
 
-    assert (t, "blocker_auth") in res.respawn_guarded
+    guarded_reasons = {task_id: reason for task_id, reason, _ in res.respawn_guarded}
+    assert guarded_reasons.get(t) == "blocker_auth"
     assert t not in res.auto_blocked
     with kb.connect() as conn:
         assert kb.get_task(conn, t).status == "ready"  # dry_run: no writes
@@ -2096,6 +2102,70 @@ def test_dispatch_respawn_guard_emits_event_for_skipped_task(
     # Event.payload is already parsed as a dict by list_events.
     assert isinstance(guarded_evt.payload, dict)
     assert guarded_evt.payload.get("reason") == "recent_success"
+    assert isinstance(guarded_evt.payload.get("next_retry_at"), int)
+    assert guarded_evt.payload["next_retry_at"] > 0  # computed from completed_at + window
+
+
+def test_dispatch_respawn_guard_dedup_events(
+    kanban_home, all_assignees_spawnable
+):
+    """Second dispatcher tick with same guard reason does NOT emit a duplicate event."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="dedup-check", assignee="alice")
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, outcome, started_at, ended_at) "
+            "VALUES (?, 'done', 'completed', ?, ?)",
+            (t, now - 300, now - 60),
+        )
+        # First tick — emits event.
+        kb.dispatch_once(conn, spawn_fn=lambda task, ws: None)
+        events_1 = kb.list_events(conn, t)
+        guarded_count_1 = sum(1 for e in events_1 if e.kind == "respawn_guarded")
+        assert guarded_count_1 == 1
+
+        # Second tick — same guard, should NOT emit a duplicate event.
+        kb.dispatch_once(conn, spawn_fn=lambda task, ws: None)
+        events_2 = kb.list_events(conn, t)
+        guarded_count_2 = sum(1 for e in events_2 if e.kind == "respawn_guarded")
+        assert guarded_count_2 == 1  # still just one
+
+
+def test_dispatch_respawn_guard_dedup_emits_on_reason_change(
+    kanban_home, all_assignees_spawnable
+):
+    """A different guard reason (after the first one clears) emits a new event."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="reason-change", assignee="alice")
+        now = int(time.time())
+
+        # Guard 1: recent_success
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, outcome, started_at, ended_at) "
+            "VALUES (?, 'done', 'completed', ?, ?)",
+            (t, now - 300, now - 60),
+        )
+        kb.dispatch_once(conn, spawn_fn=lambda task, ws: None)
+        events_1 = kb.list_events(conn, t)
+        guarded_1 = [e for e in events_1 if e.kind == "respawn_guarded"]
+        assert len(guarded_1) == 1
+        assert guarded_1[0].payload.get("reason") == "recent_success"
+
+        # Simulate reason change: add a PR comment → active_pr guard fires.
+        # But recent_success fires first, so we need a different setup.
+        # Instead: clear the completed run and add a blocker_auth error.
+        conn.execute("DELETE FROM task_runs WHERE task_id = ?", (t,))
+        kb.add_comment(
+            conn, t, "worker",
+            "Opened https://github.com/totemx-AI/subsidysmart/pull/999",
+        )
+        kb.dispatch_once(conn, spawn_fn=lambda task, ws: None)
+        events_2 = kb.list_events(conn, t)
+        guarded_2 = [e for e in events_2 if e.kind == "respawn_guarded"]
+        # Now we should have 2 events: one for recent_success, one for active_pr
+        reasons = [e.payload.get("reason") for e in guarded_2]
+        assert "recent_success" in reasons
+        assert "active_pr" in reasons
 
 
 # ---------------------------------------------------------------------------

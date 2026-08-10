@@ -364,3 +364,169 @@ def test_spawn_failure_task_error_has_task_category(kanban_home):
         gave_up = [e for e in events if e.kind == "gave_up"]
         assert len(gave_up) == 1
         assert gave_up[0].payload.get("failure_category") == "task"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Workstream 3b: Completion-triggered workspace process closure — INTEGRATION
+# ═══════════════════════════════════════════════════════════════════════════
+# These tests prove that complete_task → _cleanup_workspace → close_workspace_processes
+# closes child/grandchild processes inside the workspace while preserving outside
+# processes and the current process itself (#AION-RL2-CORE-01 repair).
+
+
+def test_completion_closes_workspace_child_process(kanban_home, tmp_path):
+    """complete_task closes a child process whose cwd is inside the workspace."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    child = subprocess.Popen(
+        ["sleep", "300"],
+        cwd=str(ws),
+        start_new_session=True,
+    )
+    try:
+        time.sleep(0.1)
+        with kb.connect() as conn:
+            tid = kb.create_task(conn, title="proc-test", assignee="a")
+            # Set workspace to the dir where child runs.
+            conn.execute(
+                "UPDATE tasks SET workspace_kind='dir', workspace_path=? WHERE id=?",
+                (str(ws), tid),
+            )
+            conn.commit()
+            kb.claim_task(conn, tid)
+            assert kb.complete_task(conn, tid, result="done")
+
+        # Child should be killed by workspace process closure.
+        child.wait(timeout=5)
+        assert child.returncode != 0  # killed by signal
+    finally:
+        try:
+            child.kill()
+            child.wait(timeout=2)
+        except Exception:
+            pass
+
+
+def test_completion_preserves_outside_process(kanban_home, tmp_path):
+    """complete_task preserves a process whose cwd is outside the workspace."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    control = subprocess.Popen(
+        ["sleep", "300"],
+        cwd=str(outside),
+        start_new_session=True,
+    )
+    try:
+        time.sleep(0.1)
+        with kb.connect() as conn:
+            tid = kb.create_task(conn, title="outside-test", assignee="a")
+            conn.execute(
+                "UPDATE tasks SET workspace_kind='dir', workspace_path=? WHERE id=?",
+                (str(ws), tid),
+            )
+            conn.commit()
+            kb.claim_task(conn, tid)
+            assert kb.complete_task(conn, tid, result="done")
+
+        # Outside process must survive.
+        assert control.poll() is None
+    finally:
+        try:
+            control.kill()
+            control.wait(timeout=2)
+        except Exception:
+            pass
+
+
+def test_completion_preserves_self_process(kanban_home, tmp_path):
+    """complete_task never signals the current process (self-preservation)."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    import os as _os
+    my_pid = _os.getpid()
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="self-test", assignee="a")
+        conn.execute(
+            "UPDATE tasks SET workspace_kind='dir', workspace_path=? WHERE id=?",
+            (str(tmp_path), tid),  # workspace covers our own cwd
+        )
+        conn.commit()
+        kb.claim_task(conn, tid)
+        # Must not kill ourselves.
+        assert kb.complete_task(conn, tid, result="done")
+    # We're still alive.
+    assert _os.getpid() == my_pid
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Workstream 2b: Blocked-parent wake mismatch + stale obligation diagnostics
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def test_blocked_parent_wake_mismatch_finding(kanban_home):
+    """A child in todo/blocked with all parents done fires blocked_parent_wake_mismatch."""
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="done-parent", assignee="a")
+        kb.claim_task(conn, parent)
+        kb.complete_task(conn, parent, result="ok")
+        # recompute_ready has already promoted the child. Force it back to
+        # blocked so the mismatch diagnostic fires (simulates a recompute
+        # bug or missed promotion).
+        child = kb.create_task(
+            conn, title="orphaned-child", assignee="a", parents=[parent],
+        )
+        # The child was promoted to ready by recompute_ready. Force it back.
+        conn.execute(
+            "UPDATE tasks SET status = 'blocked', block_kind = 'dependency' "
+            "WHERE id = ?", (child,),
+        )
+        conn.commit()
+        diag = kd.compute_board_diagnostics(conn)
+    wake = [f for f in diag["findings"] if f["kind"] == "blocked_parent_wake_mismatch"]
+    assert len(wake) >= 1
+    assert wake[0]["data"]["task_id"] == child
+
+
+def test_stale_scheduled_finding(kanban_home):
+    """A scheduled task older than threshold fires stale_scheduled."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="parked-task", assignee="a")
+        kb.claim_task(conn, tid)
+        kb.schedule_task(conn, tid, reason="waiting")
+        one_week_ago = int(time.time()) - 7 * 24 * 3600
+        conn.execute(
+            "UPDATE tasks SET created_at = ? WHERE id = ?",
+            (one_week_ago, tid),
+        )
+        conn.execute(
+            "UPDATE task_events SET created_at = ? WHERE task_id = ?",
+            (one_week_ago, tid),
+        )
+        conn.commit()
+        diag = kd.compute_board_diagnostics(conn)
+    stale = [f for f in diag["findings"] if f["kind"] == "stale_scheduled"]
+    assert len(stale) >= 1
+    assert stale[0]["data"]["task_id"] == tid
+
+
+def test_stale_review_finding(kanban_home):
+    """A review task older than threshold fires stale_review."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="review-parked", assignee="a")
+        kb.claim_task(conn, tid)
+        kb.complete_task(conn, tid, result="worker done")
+        conn.execute(
+            "UPDATE tasks SET status = 'review' WHERE id = ?", (tid,),
+        )
+        one_week_ago = int(time.time()) - 7 * 24 * 3600
+        conn.execute(
+            "UPDATE tasks SET created_at = ? WHERE id = ?",
+            (one_week_ago, tid),
+        )
+        conn.commit()
+        diag = kd.compute_board_diagnostics(conn)
+    stale = [f for f in diag["findings"] if f["kind"] == "stale_review"]
+    assert len(stale) >= 1
+    assert stale[0]["data"]["task_id"] == tid
