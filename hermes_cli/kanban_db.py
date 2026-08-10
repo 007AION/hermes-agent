@@ -10143,7 +10143,7 @@ def _read_process_identity(pid: int) -> dict | None:
     import os as _os
 
     try:
-        stat_data = Path(f"/proc/{pid}/stat").read_text()
+        stat_data = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
     except (OSError, FileNotFoundError):
         return None
 
