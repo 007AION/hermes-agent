@@ -10126,6 +10126,69 @@ def _classify_failure(error: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _read_process_identity(pid: int) -> dict | None:
+    """Capture process identity from /proc for TOCTOU revalidation.
+
+    Reads ``/proc/<pid>/stat`` starttime (field 22; 0-indexed field 21),
+    current cwd, and PGID.  Returns ``None`` when the process has exited or
+    /proc is unreadable.
+
+    The starttime + PID pair is a reliable identity anchor: Linux reuses
+    PIDs but starttime is monotonic per-boot, so a PID-recycled process
+    can never match the captured identity of a prior occupant.
+
+    Returns:
+        ``{"starttime": int, "cwd": str, "pgid": int}`` or ``None``.
+    """
+    import os as _os
+
+    try:
+        stat_data = Path(f"/proc/{pid}/stat").read_text()
+    except (OSError, FileNotFoundError):
+        return None
+
+    # stat format: "pid (comm) state ppid pgrp ..."
+    # comm may contain spaces and parentheses; split at the last ')'
+    close_paren = stat_data.rfind(")")
+    if close_paren == -1:
+        return None
+    fields = stat_data[close_paren + 2:].split()
+    # After "pid (comm) ": field index 0=state, 19=starttime (21st field
+    # in the full stat line minus pid+comm = index 19 in the post-paren split).
+    if len(fields) < 20:
+        return None
+    try:
+        starttime = int(fields[19])
+    except (ValueError, IndexError):
+        return None
+
+    try:
+        cwd = Path(f"/proc/{pid}/cwd").resolve()
+        pgid = _os.getpgid(pid)
+    except (OSError, RuntimeError):
+        return None
+
+    return {"starttime": starttime, "cwd": str(cwd), "pgid": pgid}
+
+
+def _revalidate_identity(pid: int, captured: dict) -> bool:
+    """Return True if *pid* still matches the captured identity.
+
+    Re-reads /proc identity and compares starttime, cwd, and pgid.  A
+    mismatch means the PID was recycled, the process changed working
+    directory, or it moved process groups — in all cases the captured
+    identity is stale and the signal must be withheld.
+    """
+    current = _read_process_identity(pid)
+    if current is None:
+        return False  # process exited — no signal needed
+    return (
+        current["starttime"] == captured["starttime"]
+        and current["cwd"] == captured["cwd"]
+        and current["pgid"] == captured["pgid"]
+    )
+
+
 def close_workspace_processes(
     workspace_path: Path, *, dry_run: bool = False,
 ) -> dict:
@@ -10134,6 +10197,12 @@ def close_workspace_processes(
     Only signals process groups whose working directory resolves inside the
     exact workspace — never broad-kill, never touches processes outside the
     workspace, never touches gateway/self/external cwd.
+
+    Every signal is gated on an immediate identity re-read via
+    ``/proc/<pid>/stat`` (starttime + cwd + pgid).  If the identity has
+    changed since discovery (PID reuse, cwd change, pgid change), the signal
+    is withheld and the mismatch is recorded.  This prevents TOCTOU attacks
+    where a PID is recycled between discovery and signal delivery.
 
     Args:
         workspace_path: Absolute path to the workspace directory.
@@ -10145,6 +10214,7 @@ def close_workspace_processes(
         - ``would_signal``: int — count that WOULD be signalled (dry_run only)
         - ``skipped_outside``: int — processes outside workspace (negative canary)
         - ``skipped_self``: int — current process / process group (self-preservation)
+        - ``skipped_identity_mismatch``: int — identity re-read mismatch (TOCTOU guard)
         - ``dry_run``: bool — True if dry-run mode
         - ``pids``: list of (pgid, pid, cwd) tuples for signalled groups
     """
@@ -10158,6 +10228,7 @@ def close_workspace_processes(
         "would_signal": 0,
         "skipped_outside": 0,
         "skipped_self": 0,
+        "skipped_identity_mismatch": 0,
         "dry_run": dry_run,
         "pids": [],
     }
@@ -10209,14 +10280,29 @@ def close_workspace_processes(
             if same_pgid:
                 # Children sharing the caller's PGID: signal by PID only.
                 # Never call killpg(current_pgid) — that would kill the caller.
-                # Dedup so we don't double-signal the same PID from multiple /proc entries.
+                # Dedup so we don't double-signal the same PID from multiple
+                # /proc entries.
                 if pid in signalled_pids:
                     continue
                 if dry_run:
+                    # Capture identity even in dry run for audit evidence.
+                    identity = _read_process_identity(pid)
+                    if identity is None:
+                        continue
                     result["would_signal"] += 1
                     result["pids"].append((pgid, pid, cwd_str))
                     signalled_pids.add(pid)
                 else:
+                    # Capture identity BEFORE any signal.
+                    identity = _read_process_identity(pid)
+                    if identity is None:
+                        continue
+                    # Re-validate identity immediately before signal.
+                    # If PID was recycled, cwd changed, or pgid moved —
+                    # never signal.  This is a best-effort TOCTOU guard.
+                    if not _revalidate_identity(pid, identity):
+                        result["skipped_identity_mismatch"] += 1
+                        continue
                     try:
                         _os.kill(pid, _signal.SIGTERM)
                         signalled_pids.add(pid)
@@ -10231,10 +10317,26 @@ def close_workspace_processes(
                 if pgid in signalled_pgids:
                     continue
                 if dry_run:
+                    # Capture identity of group leader for audit evidence.
+                    identity = _read_process_identity(pid)
+                    if identity is None:
+                        continue
                     result["would_signal"] += 1
                     result["pids"].append((pgid, pid, cwd_str))
                     signalled_pgids.add(pgid)
                 else:
+                    # Capture identity BEFORE any signal.
+                    identity = _read_process_identity(pid)
+                    if identity is None:
+                        continue
+                    # Re-validate identity immediately before signal.
+                    # If the group leader's PID was recycled, cwd changed,
+                    # or pgid moved — never signal.  This protects against
+                    # signalling a recycled PGID that now belongs to an
+                    # unrelated protected/outside process.
+                    if not _revalidate_identity(pid, identity):
+                        result["skipped_identity_mismatch"] += 1
+                        continue
                     try:
                         _os.killpg(pgid, _signal.SIGTERM)
                         signalled_pgids.add(pgid)

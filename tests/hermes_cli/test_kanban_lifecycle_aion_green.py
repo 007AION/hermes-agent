@@ -11,6 +11,7 @@ import signal
 import subprocess
 import time
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -802,3 +803,148 @@ def test_stale_review_finding(kanban_home):
     stale = [f for f in diag["findings"] if f["kind"] == "stale_review"]
     assert len(stale) >= 1
     assert stale[0]["data"]["task_id"] == tid
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Workstream 3c: Process identity TOCTOU protection — GREEN
+# ═══════════════════════════════════════════════════════════════════════════
+# Per bafuxunan audit (t_926703bb at head 8d67916a): capture /proc/<pid>/stat
+# starttime and re-read identity + cwd containment + PGID immediately before
+# every signal.  Never signal on mismatch.  Mixed groups must not broad-signal
+# protected/outside members.
+
+
+def test_identity_mismatch_skips_signal_same_pgid(tmp_path):
+    """PID-scope signal is skipped when identity re-read fails.
+
+    When _revalidate_identity returns False for a same-PGID child
+    (simulating PID reuse, cwd change, or pgid change), the signal
+    is withheld and skipped_identity_mismatch is incremented.  The
+    child survives.
+    """
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    child = subprocess.Popen(
+        ["sleep", "300"],
+        cwd=str(ws),
+        start_new_session=False,  # same PGID as caller
+    )
+    try:
+        time.sleep(0.1)
+        # Monkeypatch _revalidate_identity to always return False —
+        # simulates identity mismatch after capture.
+        with patch(
+            "hermes_cli.kanban_db._revalidate_identity", return_value=False,
+        ):
+            result = kb.close_workspace_processes(ws)
+        # Identity mismatch counter incremented.
+        assert result["skipped_identity_mismatch"] >= 1
+        # Child was NOT signalled — it is still alive.
+        assert child.poll() is None
+    finally:
+        try:
+            child.kill()
+            child.wait(timeout=2)
+        except Exception:
+            pass
+
+
+def test_identity_mismatch_skips_signal_diff_pgid(tmp_path):
+    """killpg is skipped when identity re-read fails for a different-PGID group.
+
+    Same as above but for processes in a different process group
+    (start_new_session=True).  The group leader identity must match
+    before killpg is called.
+    """
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    child = subprocess.Popen(
+        ["sleep", "300"],
+        cwd=str(ws),
+        start_new_session=True,  # different PGID
+    )
+    try:
+        time.sleep(0.1)
+        with patch(
+            "hermes_cli.kanban_db._revalidate_identity", return_value=False,
+        ):
+            result = kb.close_workspace_processes(ws)
+        assert result["skipped_identity_mismatch"] >= 1
+        # Child was NOT signalled.
+        assert child.poll() is None
+    finally:
+        try:
+            child.kill()
+            child.wait(timeout=2)
+        except Exception:
+            pass
+
+
+def test_mixed_pgids_only_signal_eligible(tmp_path):
+    """Mixed PGIDs: same-PGID children signalled by PID; outside/unmatched skip.
+
+    When some children share the caller's PGID and others are in different
+    groups, only eligible in-workspace processes are signalled.  Outside
+    processes survive.  This proves mixed groups do not broad-signal
+    protected members.
+    """
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    import os as _os
+
+    # Same-PGID child (eligible — in workspace, not caller).
+    same_pgid_child = subprocess.Popen(
+        ["sleep", "300"],
+        cwd=str(ws),
+        start_new_session=False,
+    )
+    # Different-PGID child (eligible — in workspace, separate group).
+    diff_pgid_child = subprocess.Popen(
+        ["sleep", "300"],
+        cwd=str(ws),
+        start_new_session=True,
+    )
+    # Outside negative control (in its own session).
+    control = subprocess.Popen(
+        ["sleep", "300"],
+        cwd=str(outside),
+        start_new_session=True,
+    )
+    try:
+        time.sleep(0.15)
+
+        # Change cwd into workspace so same-PGID children are detected.
+        old_cwd = os.getcwd()
+        try:
+            os.chdir(str(ws))
+            result = kb.close_workspace_processes(ws)
+        finally:
+            os.chdir(old_cwd)
+
+        # Caller survived.
+        assert result["skipped_self"] >= 1
+        # Both in-workspace children were signalled (same-PGID by PID,
+        # diff-PGID by killpg).
+        assert result["signalled"] >= 2
+        # Outside process was skipped.
+        assert result["skipped_outside"] >= 1
+        # No identity mismatches — all real identities match.
+        assert result["skipped_identity_mismatch"] == 0
+
+        # In-workspace children are dead.
+        same_pgid_child.wait(timeout=5)
+        diff_pgid_child.wait(timeout=5)
+        assert same_pgid_child.returncode != 0
+        assert diff_pgid_child.returncode != 0
+
+        # Outside control survived.
+        assert control.poll() is None
+    finally:
+        for p in [same_pgid_child, diff_pgid_child, control]:
+            try:
+                p.kill()
+                p.wait(timeout=2)
+            except Exception:
+                pass
