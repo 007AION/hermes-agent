@@ -460,6 +460,143 @@ def test_completion_preserves_self_process(kanban_home, tmp_path):
     assert _os.getpid() == my_pid
 
 
+def test_close_workspace_processes_preserves_caller_inside_workspace(tmp_path):
+    """close_workspace_processes skips caller PID/PGID when caller CWD is inside workspace.
+
+    Per bafuxunan audit (t_4d4f44ac): the previous self-preservation test
+    was insufficient because the caller's CWD was outside the workspace.
+    This test proves that when the caller IS inside the workspace,
+    close_workspace_processes() still does not signal it.
+    """
+    ws = tmp_path / "ws"
+    ws.mkdir()
+
+    # Spawn a child+grandchild inside the workspace (separate process groups).
+    child = subprocess.Popen(
+        ["sleep", "300"],
+        cwd=str(ws),
+        start_new_session=True,
+    )
+    grandchild = subprocess.Popen(
+        ["sleep", "300"],
+        cwd=str(str(ws) + "/"),
+        start_new_session=True,
+    )
+    # Outside negative control.
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    control = subprocess.Popen(
+        ["sleep", "300"],
+        cwd=str(outside),
+        start_new_session=True,
+    )
+    try:
+        time.sleep(0.15)
+
+        # Change caller CWD INTO the workspace — this is the critical difference
+        # from the previous test_completion_preserves_self_process.
+        old_cwd = os.getcwd()
+        try:
+            os.chdir(str(ws))
+            result = kb.close_workspace_processes(ws, dry_run=False)
+        finally:
+            os.chdir(old_cwd)
+
+        # Caller survived — we are still here.
+        assert result["skipped_self"] >= 1
+
+        # Children inside workspace were signalled.
+        assert result["signalled"] >= 2
+
+        # Child and grandchild are dead.
+        child.wait(timeout=5)
+        grandchild.wait(timeout=5)
+        assert child.returncode != 0
+        assert grandchild.returncode != 0
+
+        # Outside control survived.
+        assert control.poll() is None
+    finally:
+        for p in [child, grandchild, control]:
+            try:
+                p.kill()
+                p.wait(timeout=2)
+            except Exception:
+                pass
+
+
+def test_completion_preserves_caller_inside_workspace(kanban_home, tmp_path):
+    """complete_task with caller CWD inside workspace closes children, preserves caller.
+
+    Per bafuxunan audit (t_4d4f44ac): the complete_task path must also survive
+    when the caller's CWD is inside the exact workspace, closing child+grandchild
+    while preserving the caller and outside negative controls.
+    """
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    import os as _os
+    my_pid = _os.getpid()
+
+    # Spawn child+grandchild inside workspace.
+    child = subprocess.Popen(
+        ["sleep", "300"],
+        cwd=str(ws),
+        start_new_session=True,
+    )
+    grandchild = subprocess.Popen(
+        ["sleep", "300"],
+        cwd=str(str(ws) + "/"),
+        start_new_session=True,
+    )
+    # Outside negative control.
+    control = subprocess.Popen(
+        ["sleep", "300"],
+        cwd=str(outside),
+        start_new_session=True,
+    )
+    try:
+        time.sleep(0.15)
+
+        # Change caller CWD INTO the workspace.
+        old_cwd = os.getcwd()
+        try:
+            os.chdir(str(ws))
+            with kb.connect() as conn:
+                tid = kb.create_task(conn, title="caller-in-ws", assignee="a")
+                conn.execute(
+                    "UPDATE tasks SET workspace_kind='dir', workspace_path=? WHERE id=?",
+                    (str(ws), tid),
+                )
+                conn.commit()
+                kb.claim_task(conn, tid)
+                # complete_task triggers _cleanup_workspace which calls
+                # close_workspace_processes — caller is inside the workspace
+                # so self-preservation must work.
+                assert kb.complete_task(conn, tid, result="done")
+            # Caller survived completion.
+            assert _os.getpid() == my_pid
+        finally:
+            os.chdir(old_cwd)
+
+        # Children were killed.
+        child.wait(timeout=5)
+        grandchild.wait(timeout=5)
+        assert child.returncode != 0
+        assert grandchild.returncode != 0
+
+        # Outside control survived.
+        assert control.poll() is None
+    finally:
+        for p in [child, grandchild, control]:
+            try:
+                p.kill()
+                p.wait(timeout=2)
+            except Exception:
+                pass
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Workstream 2b: Blocked-parent wake mismatch + stale obligation diagnostics
 # ═══════════════════════════════════════════════════════════════════════════

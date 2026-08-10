@@ -10144,6 +10144,7 @@ def close_workspace_processes(
         - ``signalled``: int — count of process groups signalled (0 in dry_run)
         - ``would_signal``: int — count that WOULD be signalled (dry_run only)
         - ``skipped_outside``: int — processes outside workspace (negative canary)
+        - ``skipped_self``: int — current process / process group (self-preservation)
         - ``dry_run``: bool — True if dry-run mode
         - ``pids``: list of (pgid, pid, cwd) tuples for signalled groups
     """
@@ -10156,12 +10157,22 @@ def close_workspace_processes(
         "signalled": 0,
         "would_signal": 0,
         "skipped_outside": 0,
+        "skipped_self": 0,
         "dry_run": dry_run,
         "pids": [],
     }
 
     if not wp.is_dir():
         return result
+
+    # Skip the current process and its process group so we never
+    # signal ourselves — a completion inside the workspace must not
+    # kill the completing caller (#AION-RL2-CORE-01 repair).
+    my_pid = _os.getpid()
+    try:
+        my_pgid = _os.getpgid(0)
+    except OSError:
+        my_pgid = None
 
     # Walk /proc to find processes whose cwd is inside the workspace.
     wp_str = str(wp)
@@ -10184,6 +10195,13 @@ def close_workspace_processes(
                 pgid = _os.getpgid(pid)
             except OSError:
                 continue
+
+            # Never signal the current process or its process group —
+            # this prevents the completing caller from killing itself.
+            if pid == my_pid or (my_pgid is not None and pgid == my_pgid):
+                result["skipped_self"] += 1
+                continue
+
             if pgid in signalled_pgids:
                 continue
 
