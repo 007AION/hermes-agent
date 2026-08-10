@@ -4756,8 +4756,26 @@ def complete_task(
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
+    # --- Controller/manual completion (AION-RL2-CORE-01) ---
+    # expected_run_id=None: controller terminalization of any non-terminal
+    # status (triage, todo, scheduled, review, running, ready, blocked).
+    # Records prior_status in completed event payload for auditability.
+    _CONTROLLER_TERMINAL_STATUSES = (
+        "triage", "todo", "scheduled", "review",
+        "running", "ready", "blocked",
+    )
+
     with write_txn(conn):
         if expected_run_id is None:
+            # Read prior status for audit event.
+            prior = conn.execute(
+                "SELECT status FROM tasks WHERE id = ?", (task_id,),
+            ).fetchone()
+            if prior is None:
+                return False
+            prior_status = prior["status"]
+            if prior_status not in _CONTROLLER_TERMINAL_STATUSES:
+                return False
             cur = conn.execute(
                 """
                 UPDATE tasks
@@ -4770,11 +4788,15 @@ def complete_task(
                        block_kind   = NULL,
                        block_recurrences = 0
                  WHERE id = ?
-                   AND status IN ('running', 'ready', 'blocked')
+                   AND status = ?
                 """,
-                (result, now, task_id),
+                (result, now, task_id, prior_status),
             )
         else:
+            # Worker-bound completion: strict CAS gate — only running +
+            # matching run_id. Non-running statuses (triage, todo,
+            # scheduled, review) never match because they have no
+            # current_run_id.
             cur = conn.execute(
                 """
                 UPDATE tasks
@@ -4835,6 +4857,11 @@ def complete_task(
         }
         if verified_cards:
             completed_payload["verified_cards"] = verified_cards
+        # Record prior_status when controller completed a non-running task
+        # (AION-RL2-CORE-01). Worker-completed tasks have no prior_status
+        # because they were already running.
+        if expected_run_id is None and prior_status not in ("running", "ready", "blocked"):
+            completed_payload["prior_status"] = prior_status
         # Carry artifact paths in the event payload so the gateway
         # notifier can upload them as native attachments alongside the
         # completion message. Workers pass these via
@@ -7815,12 +7842,17 @@ def _record_spawn_failure(
     *,
     failure_limit: int = None,
 ) -> bool:
+    # Classify the failure so platform-resource errors (EAGAIN, ENOMEM,
+    # ENOSPC) are visibly distinct from task-own errors in run/event
+    # evidence (AION-RL2-CORE-01).
+    category = _classify_failure(error)
     return _record_task_failure(
         conn, task_id, error,
         outcome="spawn_failed",
         failure_limit=failure_limit,
         release_claim=True,
         end_run=True,
+        event_payload_extra={"failure_category": category},
     )
 
 
@@ -10013,3 +10045,124 @@ def latest_summaries(
         ids,
     ).fetchall()
     return {r["task_id"]: r["summary"] for r in rows}
+
+
+# ---------------------------------------------------------------------------
+# Failure classification (AION-RL2-CORE-01)
+# ---------------------------------------------------------------------------
+
+
+def _classify_failure(error: str) -> str:
+    """Classify a failure error message as 'platform_resource' or 'task'.
+
+    Platform-resource failures are shared-infra problems the task does not
+    own: subprocess-spawn EAGAIN/ENOMEM (pid exhaustion, cgroup limits),
+    temporary fs errors, etc. These are recorded with ``failure_category``
+    in event evidence so operators can distinguish "the task is broken"
+    from "the host is overloaded" without opening logs.
+
+    Returns 'platform_resource' when the error matches known platform-level
+    signals; 'task' for everything else.
+    """
+    lower = error.lower()
+    # EAGAIN / Errno 11 — classic "resource temporarily unavailable"
+    # from fork/exec when the pid cgroup is at its limit.
+    if "errno 11" in lower or "eagain" in lower:
+        return "platform_resource"
+    if "resource temporarily unavailable" in lower:
+        return "platform_resource"
+    # ENOMEM / Errno 12 — out of memory during fork.
+    if "errno 12" in lower or "enomem" in lower:
+        return "platform_resource"
+    if "cannot allocate memory" in lower:
+        return "platform_resource"
+    # ENOSPC / Errno 28 — no space left on device (disk full on temp).
+    if "errno 28" in lower or "enospc" in lower:
+        return "platform_resource"
+    return "task"
+
+
+# ---------------------------------------------------------------------------
+# Workspace process cleanup (AION-RL2-CORE-01)
+# ---------------------------------------------------------------------------
+
+
+def close_workspace_processes(
+    workspace_path: Path, *, dry_run: bool = False,
+) -> dict:
+    """Close process groups whose cwd is inside ``workspace_path``.
+
+    Only signals process groups whose working directory resolves inside the
+    exact workspace — never broad-kill, never touches processes outside the
+    workspace, never touches gateway/self/external cwd.
+
+    Args:
+        workspace_path: Absolute path to the workspace directory.
+        dry_run: When True, report what WOULD be signalled without killing.
+
+    Returns a dict with cleanup evidence:
+        - ``workspace``: str — resolved workspace path
+        - ``signalled``: int — count of process groups signalled (0 in dry_run)
+        - ``would_signal``: int — count that WOULD be signalled (dry_run only)
+        - ``skipped_outside``: int — processes outside workspace (negative canary)
+        - ``dry_run``: bool — True if dry-run mode
+        - ``pids``: list of (pgid, pid, cwd) tuples for signalled groups
+    """
+    import os as _os
+    import signal as _signal
+
+    wp = Path(workspace_path).resolve()
+    result: dict = {
+        "workspace": str(wp),
+        "signalled": 0,
+        "would_signal": 0,
+        "skipped_outside": 0,
+        "dry_run": dry_run,
+        "pids": [],
+    }
+
+    if not wp.is_dir():
+        return result
+
+    # Walk /proc to find processes whose cwd is inside the workspace.
+    wp_str = str(wp)
+    signalled_pgids: set[int] = set()
+
+    for entry in _os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        try:
+            cwd_link = Path(f"/proc/{pid}/cwd")
+            cwd = cwd_link.resolve()
+        except (OSError, RuntimeError):
+            continue
+
+        cwd_str = str(cwd)
+        # Exact workspace check: cwd must be equal to wp or a descendant.
+        if cwd_str == wp_str or cwd_str.startswith(wp_str + "/"):
+            try:
+                pgid = _os.getpgid(pid)
+            except OSError:
+                continue
+            if pgid in signalled_pgids:
+                continue
+
+            if dry_run:
+                result["would_signal"] += 1
+                result["pids"].append((pgid, pid, cwd_str))
+                signalled_pgids.add(pgid)
+            else:
+                try:
+                    _os.killpg(pgid, _signal.SIGTERM)
+                    signalled_pgids.add(pgid)
+                    result["signalled"] += 1
+                    result["pids"].append((pgid, pid, cwd_str))
+                except OSError:
+                    # Process group already gone — count it as cleaned.
+                    signalled_pgids.add(pgid)
+                    result["signalled"] += 1
+        else:
+            result["skipped_outside"] += 1
+
+    return result

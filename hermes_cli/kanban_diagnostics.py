@@ -1131,3 +1131,241 @@ def compute_task_diagnostics(
         )
     )
     return out
+
+
+# ---------------------------------------------------------------------------
+# Board-level diagnostics (AION-RL2-CORE-01)
+# ---------------------------------------------------------------------------
+#
+# Unlike compute_task_diagnostics (per-task rules), these run against
+# the entire board to surface cross-task health signals: queue emptiness
+# vs obligation emptiness, stale triage, blocked-parent wake mismatches.
+#
+# They are designed to be called from the dashboard /board endpoint,
+# `hermes kanban diagnostics --board`, and gateway notifiers that
+# surface "the board looks idle but isn't" to operators.
+
+
+# Non-terminal statuses that represent open obligations — tasks the
+# board is still responsible for.
+_NONTERMINAL_STATUSES: tuple[str, ...] = (
+    "triage", "todo", "scheduled", "ready", "running", "blocked", "review",
+)
+
+# Statuses that are legitimately executable by the dispatcher.
+_EXECUTABLE_STATUSES: tuple[str, ...] = ("ready",)
+
+# Default staleness thresholds.
+DEFAULT_STALE_TRIAGE_HOURS = 4   # triage tasks sitting >4h
+DEFAULT_STALE_TODO_HOURS = 24    # todo tasks sitting >24h with all parents done
+DEFAULT_STALE_SCHEDULED_HOURS = 24  # scheduled tasks sitting >24h
+DEFAULT_STALE_REVIEW_HOURS = 48  # review tasks sitting >48h
+
+
+def compute_board_diagnostics(
+    conn,
+    *,
+    now: Optional[int] = None,
+    config: Optional[dict] = None,
+) -> dict:
+    """Compute board-level health diagnostics.
+
+    Returns a dict with:
+    - ``status_counts``: {status: count} for every non-archived status.
+    - ``executable_now``: count of tasks the dispatcher can claim (ready).
+    - ``open_obligations``: count of tasks in any non-terminal status.
+    - ``findings``: list of finding dicts with kind/severity/title/detail/data.
+
+    Callers include the dashboard board view, ``hermes kanban diagnostics``,
+    and gateway notifiers.
+    """
+    now_ts = int(now if now is not None else time.time())
+    cfg = config or {}
+
+    stale_triage_hours = float(
+        cfg.get("stale_triage_hours", DEFAULT_STALE_TRIAGE_HOURS)
+    )
+    stale_todo_hours = float(
+        cfg.get("stale_todo_hours", DEFAULT_STALE_TODO_HOURS)
+    )
+    stale_scheduled_hours = float(
+        cfg.get("stale_scheduled_hours", DEFAULT_STALE_SCHEDULED_HOURS)
+    )
+    stale_review_hours = float(
+        cfg.get("stale_review_hours", DEFAULT_STALE_REVIEW_HOURS)
+    )
+
+    # ── status counts ─────────────────────────────────────────────────────
+    status_rows = conn.execute(
+        "SELECT status, COUNT(*) AS cnt FROM tasks "
+        "WHERE status != 'archived' GROUP BY status"
+    ).fetchall()
+    status_counts: dict[str, int] = {}
+    for row in status_rows:
+        status_counts[row["status"]] = row["cnt"]
+
+    # ── executable_now / open_obligations ──────────────────────────────────
+    executable_now = sum(
+        status_counts.get(s, 0) for s in _EXECUTABLE_STATUSES
+    )
+    open_obligations = sum(
+        status_counts.get(s, 0) for s in _NONTERMINAL_STATUSES
+    )
+
+    findings: list[dict] = []
+
+    # ── Finding: executable_now=0 while open_obligations>0 ───────────────
+    if executable_now == 0 and open_obligations > 0:
+        nonterminal_states = {
+            s: status_counts.get(s, 0)
+            for s in _NONTERMINAL_STATUSES
+            if status_counts.get(s, 0) > 0
+        }
+        detail_parts = [
+            f"{open_obligations} open obligation(s) across "
+            f"{len(nonterminal_states)} non-terminal status(es):"
+        ]
+        for st, cnt in nonterminal_states.items():
+            detail_parts.append(f"  {st}: {cnt}")
+        detail_parts.append(
+            "The dispatcher has nothing executable, but obligations remain "
+            "unresolved. Check triage for un-triaged work, todo for tasks "
+            "waiting on parents or stuck specification, scheduled for "
+            "time-parked tasks, review for tasks awaiting reviewer pickup, "
+            "and blocked for tasks waiting on human input."
+        )
+        findings.append({
+            "kind": "executable_zero_open_obligations",
+            "severity": "error",
+            "title": (
+                f"0 executable tasks, {open_obligations} open obligation(s) — "
+                f"board is not idle"
+            ),
+            "detail": "\n".join(detail_parts),
+            "data": {
+                "executable_now": executable_now,
+                "open_obligations": open_obligations,
+                "nonterminal_states": nonterminal_states,
+                "open_statuses": sorted(nonterminal_states.keys()),
+            },
+        })
+
+    # ── Finding: stale triage tasks ──────────────────────────────────────
+    triage_rows = conn.execute(
+        "SELECT id, title, created_at FROM tasks "
+        "WHERE status = 'triage' AND created_at IS NOT NULL"
+    ).fetchall()
+    for row in triage_rows:
+        age_hours = (now_ts - row["created_at"]) / 3600.0
+        if age_hours >= stale_triage_hours:
+            findings.append({
+                "kind": "stale_triage",
+                "severity": "warning",
+                "title": (
+                    f"Triage task {row['id']} has been un-triaged for "
+                    f"{int(age_hours)}h"
+                ),
+                "detail": (
+                    f"Task '{row['title']}' has been in triage for "
+                    f"{int(age_hours)}h without being specified. Use "
+                    f"'hermes kanban specify {row['id']}' to promote it."
+                ),
+                "data": {
+                    "task_id": row["id"],
+                    "age_hours": round(age_hours, 1),
+                },
+            })
+
+    # ── Finding: stale scheduled tasks ───────────────────────────────────
+    scheduled_rows = conn.execute(
+        "SELECT id, title, created_at FROM tasks "
+        "WHERE status = 'scheduled' AND created_at IS NOT NULL"
+    ).fetchall()
+    for row in scheduled_rows:
+        age_hours = (now_ts - row["created_at"]) / 3600.0
+        if age_hours >= stale_scheduled_hours:
+            findings.append({
+                "kind": "stale_scheduled",
+                "severity": "warning",
+                "title": (
+                    f"Scheduled task {row['id']} has been parked for "
+                    f"{int(age_hours)}h"
+                ),
+                "detail": (
+                    f"Task '{row['title']}' has been scheduled for "
+                    f"{int(age_hours)}h. Use 'hermes kanban unblock "
+                    f"{row['id']}' to move it back to ready/todo."
+                ),
+                "data": {
+                    "task_id": row["id"],
+                    "age_hours": round(age_hours, 1),
+                },
+            })
+
+    # ── Finding: stale review tasks ──────────────────────────────────────
+    review_rows = conn.execute(
+        "SELECT id, title, created_at FROM tasks "
+        "WHERE status = 'review' AND created_at IS NOT NULL"
+    ).fetchall()
+    for row in review_rows:
+        age_hours = (now_ts - row["created_at"]) / 3600.0
+        if age_hours >= stale_review_hours:
+            findings.append({
+                "kind": "stale_review",
+                "severity": "warning",
+                "title": (
+                    f"Review task {row['id']} has been in review for "
+                    f"{int(age_hours)}h"
+                ),
+                "detail": (
+                    f"Task '{row['title']}' has been awaiting review for "
+                    f"{int(age_hours)}h."
+                ),
+                "data": {
+                    "task_id": row["id"],
+                    "age_hours": round(age_hours, 1),
+                },
+            })
+
+    # ── Finding: blocked-parent wake mismatches ──────────────────────────
+    # Children in todo/blocked whose parents are all done should have been
+    # promoted by recompute_ready. If they weren't, something is wrong.
+    wake_rows = conn.execute(
+        """
+        SELECT c.id AS child_id, c.title AS child_title, c.status AS child_status,
+               COUNT(l.parent_id) AS parent_count
+        FROM tasks c
+        JOIN task_links l ON l.child_id = c.id
+        LEFT JOIN tasks p ON p.id = l.parent_id AND p.status = 'done'
+        WHERE c.status IN ('todo', 'blocked')
+        GROUP BY c.id
+        HAVING COUNT(l.parent_id) = COUNT(p.id)
+        """
+    ).fetchall()
+    for row in wake_rows:
+        findings.append({
+            "kind": "blocked_parent_wake_mismatch",
+            "severity": "warning",
+            "title": (
+                f"Task {row['child_id']} ({row['child_status']}) has "
+                f"{row['parent_count']} done parent(s) — should be ready"
+            ),
+            "detail": (
+                f"'{row['child_title']}' is {row['child_status']} but all "
+                f"{row['parent_count']} parents are done. "
+                f"recompute_ready should have promoted it. Run "
+                f"'hermes kanban recompute' to fix."
+            ),
+            "data": {
+                "task_id": row["child_id"],
+                "child_status": row["child_status"],
+                "done_parent_count": row["parent_count"],
+            },
+        })
+
+    return {
+        "status_counts": status_counts,
+        "executable_now": executable_now,
+        "open_obligations": open_obligations,
+        "findings": findings,
+    }
