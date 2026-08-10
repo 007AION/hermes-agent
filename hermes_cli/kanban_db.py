@@ -4756,8 +4756,26 @@ def complete_task(
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
+    # --- Controller/manual completion (AION-RL2-CORE-01) ---
+    # expected_run_id=None: controller terminalization of any non-terminal
+    # status (triage, todo, scheduled, review, running, ready, blocked).
+    # Records prior_status in completed event payload for auditability.
+    _CONTROLLER_TERMINAL_STATUSES = (
+        "triage", "todo", "scheduled", "review",
+        "running", "ready", "blocked",
+    )
+
     with write_txn(conn):
         if expected_run_id is None:
+            # Read prior status for audit event.
+            prior = conn.execute(
+                "SELECT status FROM tasks WHERE id = ?", (task_id,),
+            ).fetchone()
+            if prior is None:
+                return False
+            prior_status = prior["status"]
+            if prior_status not in _CONTROLLER_TERMINAL_STATUSES:
+                return False
             cur = conn.execute(
                 """
                 UPDATE tasks
@@ -4770,11 +4788,15 @@ def complete_task(
                        block_kind   = NULL,
                        block_recurrences = 0
                  WHERE id = ?
-                   AND status IN ('running', 'ready', 'blocked')
+                   AND status = ?
                 """,
-                (result, now, task_id),
+                (result, now, task_id, prior_status),
             )
         else:
+            # Worker-bound completion: strict CAS gate — only running +
+            # matching run_id. Non-running statuses (triage, todo,
+            # scheduled, review) never match because they have no
+            # current_run_id.
             cur = conn.execute(
                 """
                 UPDATE tasks
@@ -4835,6 +4857,11 @@ def complete_task(
         }
         if verified_cards:
             completed_payload["verified_cards"] = verified_cards
+        # Record prior_status when controller completed a non-running task
+        # (AION-RL2-CORE-01). Worker-completed tasks have no prior_status
+        # because they were already running.
+        if expected_run_id is None and prior_status not in ("running", "ready", "blocked"):
+            completed_payload["prior_status"] = prior_status
         # Carry artifact paths in the event payload so the gateway
         # notifier can upload them as native attachments alongside the
         # completion message. Workers pass these via
@@ -5186,6 +5213,10 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
     Best-effort — any error is swallowed so cleanup never blocks task completion.
     Only ``scratch`` workspaces are removed; ``worktree`` and ``dir`` workspaces
     are intentionally preserved.
+
+    Before removing the workspace, close any process groups whose cwd is inside
+    the workspace (all workspace kinds: scratch, dir, worktree). This prevents
+    orphaned child/grandchild processes from outliving the task #AION-RL2-CORE-01.
     """
     try:
         row = conn.execute(
@@ -5196,6 +5227,16 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
             return
         kind: Optional[str] = row["workspace_kind"]
         path: Optional[str] = row["workspace_path"]
+
+        # Close process groups whose cwd is inside the workspace (all kinds).
+        # Must run BEFORE rmtree for scratch workspaces so process cwd links
+        # are still resolvable. Best-effort — swallowed on any error.
+        if path:
+            try:
+                close_workspace_processes(Path(path), dry_run=False)
+            except Exception:
+                pass
+
         if kind != "scratch" or not path:
             # This task's own workspace isn't a removable scratch dir, but its
             # completion may still unblock a deferred parent scratch cleanup
@@ -6685,12 +6726,14 @@ class DispatchResult:
     stale: list[str] = field(default_factory=list)
     """Task ids reclaimed because no progress (heartbeat) was seen
     within ``dispatch_stale_timeout_seconds``."""
-    respawn_guarded: list[tuple[str, str]] = field(default_factory=list)
-    """Tasks skipped by the respawn guard, as ``(task_id, reason)`` pairs.
+    respawn_guarded: list[tuple[str, str, int]] = field(default_factory=list)
+    """Tasks skipped by the respawn guard, as ``(task_id, reason, next_retry_at)`` triples.
 
     Reasons: ``"blocker_auth"`` (quota/auth error — also auto-blocked),
     ``"recent_success"`` (completed run within guard window),
-    ``"active_pr"`` (GitHub PR URL in a recent comment)."""
+    ``"active_pr"`` (GitHub PR URL in a recent comment).
+    ``next_retry_at`` is a Unix epoch when the guard is expected to clear;
+    0 means unknown (needs human intervention)."""
     rate_limited: list[str] = field(default_factory=list)
     """Task ids whose workers bailed on a provider rate-limit / quota wall
     (EX_TEMPFAIL sentinel exit) and were released back to ``ready`` WITHOUT
@@ -7815,12 +7858,17 @@ def _record_spawn_failure(
     *,
     failure_limit: int = None,
 ) -> bool:
+    # Classify the failure so platform-resource errors (EAGAIN, ENOMEM,
+    # ENOSPC) are visibly distinct from task-own errors in run/event
+    # evidence (AION-RL2-CORE-01).
+    category = _classify_failure(error)
     return _record_task_failure(
         conn, task_id, error,
         outcome="spawn_failed",
         failure_limit=failure_limit,
         release_claim=True,
         end_run=True,
+        event_payload_extra={"failure_category": category},
     )
 
 
@@ -7867,8 +7915,9 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
 _clear_spawn_failures = _clear_failure_counter
 
 
-def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
-    """Return a guard reason if ``task_id`` should NOT be re-spawned, else None.
+def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[tuple[str, int]]:
+    """Return ``(guard_reason, next_retry_at)`` if ``task_id`` should NOT be
+    re-spawned, else None.
 
     Called per ready task in ``dispatch_once`` before any claim attempt.
     Returning a reason defers the spawn this tick; the task stays in
@@ -7952,7 +8001,7 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
             return None
         ended_at = latest_run["ended_at"]
         if ended_at is not None and (now - int(ended_at)) < rl_cooldown:
-            return "rate_limit_cooldown"
+            return ("rate_limit_cooldown", int(ended_at) + rl_cooldown)
         # Cooldown elapsed — allow the respawn. Return early so the
         # blocker_auth check below doesn't catch the rate-limit text we
         # stamped on the task; this path intentionally retries forever
@@ -7963,7 +8012,7 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     # 2. Quota / auth blocker: retrying immediately will not help.
     err = row["last_failure_error"]
     if err and _RESPAWN_BLOCKER_RE.search(err):
-        return "blocker_auth"
+        return ("blocker_auth", 0)  # unknown — needs human intervention
 
     # 3. Completed run within guard window — proof of recent success.
     #    Exception: an explicit re-queue AFTER that success (an operator
@@ -7988,16 +8037,17 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
             (task_id, completed_at),
         ).fetchone()
         if not requeued_after:
-            return "recent_success"
+            return ("recent_success", completed_at + _RESPAWN_GUARD_SUCCESS_WINDOW)
 
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
     for c in conn.execute(
-        "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
+        "SELECT body, created_at FROM task_comments WHERE task_id = ? AND created_at >= ?",
         (task_id, pr_cutoff),
     ).fetchall():
         if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
-            return "active_pr"
+            comment_created = int(c["created_at"] or 0)
+            return ("active_pr", comment_created + _RESPAWN_GUARD_PR_WINDOW)
 
     return None
 
@@ -8362,18 +8412,39 @@ def _dispatch_once_locked(
         # still trips the auto-block circuit breaker after failure_limit
         # consecutive failures, so a persistent auth error eventually
         # blocks via the normal path rather than on first occurrence.
-        guard_reason = check_respawn_guard(conn, row["id"])
-        if guard_reason is not None:
-            result.respawn_guarded.append((row["id"], guard_reason))
+        guard_result = check_respawn_guard(conn, row["id"])
+        if guard_result is not None:
+            guard_reason, next_retry_at = guard_result
+            result.respawn_guarded.append((row["id"], guard_reason, next_retry_at))
             # Emit an event so operators can see why the task was
             # skipped when reading `hermes kanban tail` — without
             # this the task appears stuck in ready with no diagnosis.
+            # Dedup: skip emission if the most recent event is already a
+            # respawn_guarded for the same reason (prevents per-minute
+            # event churn across dispatcher ticks — #AION-RL2-CORE-01).
             if not dry_run:
-                with write_txn(conn):
-                    _append_event(
-                        conn, row["id"], "respawn_guarded",
-                        {"reason": guard_reason},
-                    )
+                _should_emit = True
+                _last_event = conn.execute(
+                    "SELECT kind, payload FROM task_events "
+                    "WHERE task_id = ? ORDER BY created_at DESC LIMIT 1",
+                    (row["id"],),
+                ).fetchone()
+                if _last_event and _last_event["kind"] == "respawn_guarded":
+                    try:
+                        _prev_payload = json.loads(_last_event["payload"] or "{}")
+                        if _prev_payload.get("reason") == guard_reason:
+                            _should_emit = False
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                if _should_emit:
+                    with write_txn(conn):
+                        _append_event(
+                            conn, row["id"], "respawn_guarded",
+                            {
+                                "reason": guard_reason,
+                                "next_retry_at": next_retry_at,
+                            },
+                        )
             continue
         if dry_run:
             result.spawned.append((row["id"], row_assignee, ""))
@@ -10013,3 +10084,228 @@ def latest_summaries(
         ids,
     ).fetchall()
     return {r["task_id"]: r["summary"] for r in rows}
+
+
+# ---------------------------------------------------------------------------
+# Failure classification (AION-RL2-CORE-01)
+# ---------------------------------------------------------------------------
+
+
+def _classify_failure(error: str) -> str:
+    """Classify a failure error message as 'platform_resource' or 'task'.
+
+    Platform-resource failures are shared-infra problems the task does not
+    own: subprocess-spawn EAGAIN/ENOMEM (pid exhaustion, cgroup limits),
+    temporary fs errors, etc. These are recorded with ``failure_category``
+    in event evidence so operators can distinguish "the task is broken"
+    from "the host is overloaded" without opening logs.
+
+    Returns 'platform_resource' when the error matches known platform-level
+    signals; 'task' for everything else.
+    """
+    lower = error.lower()
+    # EAGAIN / Errno 11 — classic "resource temporarily unavailable"
+    # from fork/exec when the pid cgroup is at its limit.
+    if "errno 11" in lower or "eagain" in lower:
+        return "platform_resource"
+    if "resource temporarily unavailable" in lower:
+        return "platform_resource"
+    # ENOMEM / Errno 12 — out of memory during fork.
+    if "errno 12" in lower or "enomem" in lower:
+        return "platform_resource"
+    if "cannot allocate memory" in lower:
+        return "platform_resource"
+    # ENOSPC / Errno 28 — no space left on device (disk full on temp).
+    if "errno 28" in lower or "enospc" in lower:
+        return "platform_resource"
+    return "task"
+
+
+# ---------------------------------------------------------------------------
+# Workspace process cleanup (AION-RL2-CORE-01)
+# ---------------------------------------------------------------------------
+
+
+def _read_process_identity(pid: int) -> dict | None:
+    """Capture process identity from /proc for TOCTOU revalidation.
+
+    Reads ``/proc/<pid>/stat`` starttime (field 22; 0-indexed field 21),
+    current cwd, and PGID.  Returns ``None`` when the process has exited or
+    /proc is unreadable.
+
+    The starttime + PID pair is a reliable identity anchor: Linux reuses
+    PIDs but starttime is monotonic per-boot, so a PID-recycled process
+    can never match the captured identity of a prior occupant.
+
+    Returns:
+        ``{"starttime": int, "cwd": str, "pgid": int}`` or ``None``.
+    """
+    import os as _os
+
+    try:
+        stat_data = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except (OSError, FileNotFoundError):
+        return None
+
+    # stat format: "pid (comm) state ppid pgrp ..."
+    # comm may contain spaces and parentheses; split at the last ')'
+    close_paren = stat_data.rfind(")")
+    if close_paren == -1:
+        return None
+    fields = stat_data[close_paren + 2:].split()
+    # After "pid (comm) ": field index 0=state, 19=starttime (21st field
+    # in the full stat line minus pid+comm = index 19 in the post-paren split).
+    if len(fields) < 20:
+        return None
+    try:
+        starttime = int(fields[19])
+    except (ValueError, IndexError):
+        return None
+
+    try:
+        cwd = Path(f"/proc/{pid}/cwd").resolve()
+        pgid = _os.getpgid(pid)
+    except (OSError, RuntimeError):
+        return None
+
+    return {"starttime": starttime, "cwd": str(cwd), "pgid": pgid}
+
+
+def _revalidate_identity(pid: int, captured: dict) -> bool:
+    """Return True if *pid* still matches the captured identity.
+
+    Re-reads /proc identity and compares starttime, cwd, and pgid.  A
+    mismatch means the PID was recycled, the process changed working
+    directory, or it moved process groups — in all cases the captured
+    identity is stale and the signal must be withheld.
+    """
+    current = _read_process_identity(pid)
+    if current is None:
+        return False  # process exited — no signal needed
+    return (
+        current["starttime"] == captured["starttime"]
+        and current["cwd"] == captured["cwd"]
+        and current["pgid"] == captured["pgid"]
+    )
+
+
+def close_workspace_processes(
+    workspace_path: Path, *, dry_run: bool = False,
+) -> dict:
+    """Close process groups whose cwd is inside ``workspace_path``.
+
+    Only signals process groups whose working directory resolves inside the
+    exact workspace — never broad-kill, never touches processes outside the
+    workspace, never touches gateway/self/external cwd.
+
+    Every signal is gated on an immediate identity re-read via
+    ``/proc/<pid>/stat`` (starttime + cwd + pgid).  If the identity has
+    changed since discovery (PID reuse, cwd change, pgid change), the signal
+    is withheld and the mismatch is recorded.  This prevents TOCTOU attacks
+    where a PID is recycled between discovery and signal delivery.
+
+    Args:
+        workspace_path: Absolute path to the workspace directory.
+        dry_run: When True, report what WOULD be signalled without killing.
+
+    Returns a dict with cleanup evidence:
+        - ``workspace``: str — resolved workspace path
+        - ``signalled``: int — count of process groups signalled (0 in dry_run)
+        - ``would_signal``: int — count that WOULD be signalled (dry_run only)
+        - ``skipped_outside``: int — processes outside workspace (negative canary)
+        - ``skipped_self``: int — current process / process group (self-preservation)
+        - ``skipped_identity_mismatch``: int — identity re-read mismatch (TOCTOU guard)
+        - ``dry_run``: bool — True if dry-run mode
+        - ``pids``: list of (pgid, pid, cwd) tuples for signalled groups
+    """
+    import os as _os
+    import signal as _signal
+
+    wp = Path(workspace_path).resolve()
+    result: dict = {
+        "workspace": str(wp),
+        "signalled": 0,
+        "would_signal": 0,
+        "skipped_outside": 0,
+        "skipped_self": 0,
+        "skipped_identity_mismatch": 0,
+        "dry_run": dry_run,
+        "pids": [],
+    }
+
+    if not wp.is_dir():
+        return result
+
+    # Never signal the completing caller itself — a completion inside
+    # the workspace must not kill the completing caller.  All eligible
+    # children are signalled individually by PID with TOCTOU identity
+    # revalidation.  killpg is never used because a process group can
+    # contain members with different CWDs — signalling the entire group
+    # risks hitting outside-workspace processes (#AION-RL2-CORE-01).
+    my_pid = _os.getpid()
+
+    # Walk /proc to find processes whose cwd is inside the workspace.
+    wp_str = str(wp)
+    signalled_pids: set[int] = set()  # track PID-scope signals for dedup
+
+    for entry in _os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        try:
+            cwd_link = Path(f"/proc/{pid}/cwd")
+            cwd = cwd_link.resolve()
+        except (OSError, RuntimeError):
+            continue
+
+        cwd_str = str(cwd)
+        # Exact workspace check: cwd must be equal to wp or a descendant.
+        if cwd_str == wp_str or cwd_str.startswith(wp_str + "/"):
+            try:
+                pgid = _os.getpgid(pid)
+            except OSError:
+                continue
+
+            # Never signal the completing caller itself.
+            if pid == my_pid:
+                result["skipped_self"] += 1
+                continue
+
+            # Signal only by PID with individual identity revalidation —
+            # never killpg.  killpg broadcasts to every member of the
+            # process group, which can hit outside-workspace processes
+            # when a group has mixed CWDs (#AION-RL2-CORE-01 repair,
+            # bafuxunan audit t_bb18e80b at head 2378ac3142).
+            if pid in signalled_pids:
+                continue
+            if dry_run:
+                identity = _read_process_identity(pid)
+                if identity is None:
+                    continue
+                result["would_signal"] += 1
+                result["pids"].append((pgid, pid, cwd_str))
+                signalled_pids.add(pid)
+            else:
+                # Capture identity BEFORE any signal.
+                identity = _read_process_identity(pid)
+                if identity is None:
+                    continue
+                # Re-validate identity immediately before signal.
+                # If PID was recycled, cwd changed, or pgid moved —
+                # never signal.  This is a best-effort TOCTOU guard.
+                if not _revalidate_identity(pid, identity):
+                    result["skipped_identity_mismatch"] += 1
+                    continue
+                try:
+                    _os.kill(pid, _signal.SIGTERM)
+                    signalled_pids.add(pid)
+                    result["signalled"] += 1
+                    result["pids"].append((pgid, pid, cwd_str))
+                except OSError:
+                    # Process already gone — count it as cleaned.
+                    signalled_pids.add(pid)
+                    result["signalled"] += 1
+        else:
+            result["skipped_outside"] += 1
+
+    return result
