@@ -597,6 +597,141 @@ def test_completion_preserves_caller_inside_workspace(kanban_home, tmp_path):
                 pass
 
 
+def test_close_workspace_processes_caller_same_pgid_children_closed(tmp_path):
+    """Children sharing the caller's PGID are PID-scoped signalled; caller survives.
+
+    Per bafuxunan audit (t_e0b0681f at head 27a330d4): do not skip the entire
+    current PGID. When children share the caller's PGID (no start_new_session),
+    each eligible child is signalled by PID — never killpg(current_pgid).
+    Caller exits 0, children actually close, outside negative control survives.
+    """
+    ws = tmp_path / "ws"
+    ws.mkdir()
+
+    # Children that SHARE the caller's PGID (no start_new_session).
+    child = subprocess.Popen(
+        ["sleep", "300"],
+        cwd=str(ws),
+        start_new_session=False,
+    )
+    grandchild = subprocess.Popen(
+        ["sleep", "300"],
+        cwd=str(str(ws) + "/"),
+        start_new_session=False,
+    )
+    # Outside negative control — starts its own session.
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    control = subprocess.Popen(
+        ["sleep", "300"],
+        cwd=str(outside),
+        start_new_session=True,
+    )
+    try:
+        time.sleep(0.15)
+
+        # Change caller CWD INTO the workspace.
+        old_cwd = os.getcwd()
+        try:
+            os.chdir(str(ws))
+            result = kb.close_workspace_processes(ws, dry_run=False)
+        finally:
+            os.chdir(old_cwd)
+
+        # Caller survived — we are still here.
+        assert result["skipped_self"] >= 1
+
+        # Children inside workspace were signalled by PID (not via killpg).
+        assert result["signalled"] >= 2
+
+        # Child and grandchild are dead.
+        child.wait(timeout=5)
+        grandchild.wait(timeout=5)
+        assert child.returncode != 0
+        assert grandchild.returncode != 0
+
+        # Outside control survived.
+        assert control.poll() is None
+    finally:
+        for p in [child, grandchild, control]:
+            try:
+                p.kill()
+                p.wait(timeout=2)
+            except Exception:
+                pass
+
+
+def test_completion_caller_same_pgid_children_closed(kanban_home, tmp_path):
+    """complete_task with same-PGID children: PID-scoped signals, caller survives.
+
+    Per bafuxunan audit (t_e0b0681f at head 27a330d4): the complete_task path
+    must close same-PGID children by PID while preserving the caller and outside
+    negative controls.  Children inherit caller PGID (no start_new_session).
+    """
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    import os as _os
+    my_pid = _os.getpid()
+
+    # Spawn children that SHARE the caller's PGID.
+    child = subprocess.Popen(
+        ["sleep", "300"],
+        cwd=str(ws),
+        start_new_session=False,
+    )
+    grandchild = subprocess.Popen(
+        ["sleep", "300"],
+        cwd=str(str(ws) + "/"),
+        start_new_session=False,
+    )
+    # Outside negative control in its own session.
+    control = subprocess.Popen(
+        ["sleep", "300"],
+        cwd=str(outside),
+        start_new_session=True,
+    )
+    try:
+        time.sleep(0.15)
+
+        # Change caller CWD INTO the workspace.
+        old_cwd = os.getcwd()
+        try:
+            os.chdir(str(ws))
+            with kb.connect() as conn:
+                tid = kb.create_task(conn, title="same-pgid-completion", assignee="a")
+                conn.execute(
+                    "UPDATE tasks SET workspace_kind='dir', workspace_path=? WHERE id=?",
+                    (str(ws), tid),
+                )
+                conn.commit()
+                kb.claim_task(conn, tid)
+                # complete_task triggers _cleanup_workspace → close_workspace_processes.
+                # Caller is inside workspace and shares PGID with children.
+                assert kb.complete_task(conn, tid, result="done")
+            # Caller survived completion.
+            assert _os.getpid() == my_pid
+        finally:
+            os.chdir(old_cwd)
+
+        # Children were killed.
+        child.wait(timeout=5)
+        grandchild.wait(timeout=5)
+        assert child.returncode != 0
+        assert grandchild.returncode != 0
+
+        # Outside control survived.
+        assert control.poll() is None
+    finally:
+        for p in [child, grandchild, control]:
+            try:
+                p.kill()
+                p.wait(timeout=2)
+            except Exception:
+                pass
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Workstream 2b: Blocked-parent wake mismatch + stale obligation diagnostics
 # ═══════════════════════════════════════════════════════════════════════════
