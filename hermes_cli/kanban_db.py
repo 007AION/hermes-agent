@@ -5809,9 +5809,17 @@ def block_task(
                 _evidence = close_workspace_processes(_wp)
                 _log.info(
                     "block_task workspace cleanup: task=%s path=%s "
-                    "signalled=%s",
+                    "signalled=%s terminated=%s killed=%s survivors=%s "
+                    "skipped_identity_mismatch=%s skipped_unowned=%s "
+                    "skipped_self=%s",
                     task_id, str(_wp),
                     _evidence.get("signalled", 0),
+                    _evidence.get("terminated", 0),
+                    _evidence.get("killed", 0),
+                    _evidence.get("survivors", 0),
+                    _evidence.get("skipped_identity_mismatch", 0),
+                    _evidence.get("skipped_unowned", 0),
+                    _evidence.get("skipped_self", 0),
                 )
         except Exception as _exc:
             _log.warning(
@@ -11070,6 +11078,24 @@ def _cleanup_workspace_on_completion(
     Called after a successful completion. Reads the task's workspace_path
     from the DB, then calls :func:`close_workspace_processes`. Best-effort —
     any error is logged and swallowed so completion is never blocked.
+
+    **AION-CORE-PR6 edge-case fixes (CI investigation t_5cf56231):**
+
+    - **dir workspace stale-task**: for ``workspace_kind=dir`` (shared
+      directory), builds an ``owned_pids`` set from the task's spawn events
+      in ``task_spawns``.  If no owned PIDs are found (stale task with no
+      active worker record), signals *none* — other tasks may still be using
+      the shared workspace.
+
+    - **PID-recycled starttime mismatch**: handled inside
+      :func:`close_workspace_processes` via :func:`_revalidate_identity`,
+      which compares /proc starttime against the captured identity before
+      each signal.
+
+    - **legacy spawn without starttime**: spawn events created before
+      starttime tracking was added have ``starttime IS NULL``.  These are
+      treated as owned (PID match alone) but cannot be revalidated — they
+      are signalled without the starttime guard as a best-effort fallback.
     """
     try:
         row = conn.execute(
@@ -11085,12 +11111,58 @@ def _cleanup_workspace_on_completion(
         path = Path(wp).expanduser().resolve()
         if not path.is_dir():
             return
-        evidence = close_workspace_processes(path)
+
+        # Build owned_pids for shared-dir workspace gating.
+        # For scratch/worktree workspaces, owned_pids stays None — cwd
+        # containment alone is sufficient because the workspace is exclusive
+        # to this task.
+        owned_pids: set[int] | None = None
+        if wk == "dir":
+            # Query spawn events for this task to find owned PIDs.
+            # Handle legacy spawns (starttime IS NULL) as owned but
+            # note they cannot be TOCTOU-revalidated.
+            spawn_rows = conn.execute(
+                "SELECT pid, starttime FROM task_spawns WHERE task_id = ?",
+                (task_id,),
+            ).fetchall()
+            if spawn_rows:
+                owned_pids = set()
+                for srow in spawn_rows:
+                    spid = srow["pid"]
+                    owned_pids.add(spid)
+                    # Include descendants for each owned PID so child
+                    # processes are also eligible for signalling.
+                    try:
+                        descendants = _discover_descendant_pids(spid)
+                        owned_pids.update(descendants)
+                    except Exception:
+                        pass  # best-effort descendant discovery
+            else:
+                # Stale dir workspace — no active spawn records for this
+                # task.  Signal none to avoid hitting another task's
+                # processes in the shared workspace.
+                _log.info(
+                    "complete_task workspace cleanup: task=%s kind=%s "
+                    "path=%s — stale-task, signalling none "
+                    "(shared dir workspace with no owned PIDs)",
+                    task_id, wk, str(path),
+                )
+                return
+
+        evidence = close_workspace_processes(
+            path, owned_pids=owned_pids,
+        )
         _log.info(
             "complete_task workspace cleanup: task=%s kind=%s path=%s "
-            "signalled=%s dry_run=%s",
+            "signalled=%s terminated=%s killed=%s survivors=%s "
+            "skipped_identity_mismatch=%s skipped_unowned=%s dry_run=%s",
             task_id, wk, str(path),
             evidence.get("signalled", 0),
+            evidence.get("terminated", 0),
+            evidence.get("killed", 0),
+            evidence.get("survivors", 0),
+            evidence.get("skipped_identity_mismatch", 0),
+            evidence.get("skipped_unowned", 0),
             evidence.get("dry_run", False),
         )
     except Exception as exc:

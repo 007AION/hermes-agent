@@ -6112,6 +6112,139 @@ def test_close_workspace_processes_escalates_to_sigkill(tmp_path):
             child.wait()
 
 
+# --- AION-CORE-PR6 CI investigation edge case tests (t_5cf56231) ---
+
+
+def test_close_workspace_processes_owned_pids_gate(tmp_path):
+    """owned_pids gates shared-dir cleanup — unowned PIDs are skipped."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    import subprocess as _sp
+    import time as _time
+
+    child = _sp.Popen(["sleep", "60"], cwd=str(ws))
+    try:
+        _time.sleep(0.2)
+        # Pass owned_pids that does NOT include the child — it should be skipped.
+        result = kb.close_workspace_processes(ws, owned_pids={99999})
+        assert result["skipped_unowned"] >= 1
+        assert result["signalled"] == 0
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait()
+
+
+def test_dir_workspace_stale_task_signals_none(tmp_path):
+    """dir workspace with no owned PIDs should signal none (stale task)."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    import subprocess as _sp
+    import time as _time
+
+    child = _sp.Popen(["sleep", "60"], cwd=str(ws))
+    try:
+        _time.sleep(0.2)
+        result = kb.close_workspace_processes(ws, owned_pids=set())
+        assert result["signalled"] == 0
+        assert result["skipped_unowned"] >= 1
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait()
+
+
+def test_close_workspace_processes_identity_revalidation(tmp_path):
+    """TOCTOU guard: identity re-read protects against PID recycling."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+
+    # Test _read_process_identity returns valid identity for our own PID.
+    identity = kb._read_process_identity(os.getpid())
+    assert identity is not None
+    assert "starttime" in identity
+    assert "cwd" in identity
+    assert "pgid" in identity
+
+    # Test _revalidate_identity returns True for current process.
+    assert kb._revalidate_identity(os.getpid(), identity) is True
+
+    # Test _revalidate_identity returns False for non-existent PID.
+    assert kb._revalidate_identity(99999999, identity) is False
+
+
+def test_close_workspace_processes_legacy_spawn_no_starttime(tmp_path):
+    """Legacy spawn events (no starttime) still allow owned PID matching.
+
+    The owned_pids set is built from spawn records. When starttime is NULL,
+    the PID alone determines ownership. The TOCTOU revalidation inside
+    close_workspace_processes still runs but a legacy-owned PID that
+    passes identity re-read is legitimately signalled.
+    """
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    import subprocess as _sp
+    import time as _time
+
+    child = _sp.Popen(["sleep", "60"], cwd=str(ws))
+    try:
+        _time.sleep(0.2)
+        result = kb.close_workspace_processes(ws, owned_pids={child.pid})
+        assert result["signalled"] >= 1
+        child.wait(timeout=5)
+        assert child.returncode != 0
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait()
+
+
+def test_close_workspace_processes_terminated_killed_survivors(tmp_path):
+    """TERM→KILL ladder reports terminated/killed/survivors correctly."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    import subprocess as _sp
+    import time as _time
+
+    child = _sp.Popen(["sleep", "60"], cwd=str(ws))
+    try:
+        _time.sleep(0.2)
+        result = kb.close_workspace_processes(ws)
+        assert result["signalled"] >= 1
+        assert result["terminated"] >= 1
+        child.wait(timeout=5)
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait()
+
+
+def test_discover_descendant_pids(tmp_path):
+    """_discover_descendant_pids finds child processes recursively."""
+    import subprocess as _sp
+    import time as _time
+
+    parent = _sp.Popen(
+        ["sh", "-c", "sleep 60 & sleep 60"],
+        cwd=str(tmp_path),
+    )
+    try:
+        _time.sleep(0.3)
+        # Read starttime from /proc to satisfy the identity guard.
+        stat_data = Path(f"/proc/{parent.pid}/stat").read_text()
+        close_paren = stat_data.rfind(")")
+        starttime = int(stat_data[close_paren + 2:].split()[19])
+        descendants = kb._discover_descendant_pids(
+            parent.pid, expected_starttime=starttime,
+        )
+        assert len(descendants) >= 1
+        assert all(isinstance(d, int) for d in descendants)
+    finally:
+        if parent.poll() is None:
+            parent.kill()
+            parent.wait()
+
+
 def test_bare_connect_does_not_close_on_context_exit(tmp_path):
     """Document the leak that connect_closing exists to prevent.
 

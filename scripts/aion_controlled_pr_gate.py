@@ -94,6 +94,8 @@ def run_gh(args: list[str], gh_config_dir: str, *, input_text: str | None = None
         ["gh", *args],
         input=input_text,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         env=env,
@@ -113,7 +115,7 @@ def run_gh(args: list[str], gh_config_dir: str, *, input_text: str | None = None
 def gh_text(args: list[str], gh_config_dir: str) -> str:
     env = os.environ.copy()
     env["GH_CONFIG_DIR"] = gh_config_dir
-    cp = subprocess.run(["gh", *args], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, check=False)
+    cp = subprocess.run(["gh", *args], text=True, encoding="utf-8", errors="replace", stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, check=False)
     if cp.returncode != 0:
         die("GH_FAILED", "gh command failed", {"args": args[:4], "stderr": cp.stderr[-800:]})
     return cp.stdout.strip()
@@ -302,7 +304,7 @@ def _real_github_merge_adapter(
         "--subject", subject or f"AION controlled merge PR #{pr_number}",
         "--body", merge_body or "AION controlled role-separated merge.",
     ]
-    cp = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, check=False)
+    cp = subprocess.run(cmd, text=True, encoding="utf-8", errors="replace", stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, check=False)
     if cp.returncode != 0:
         # A missing branch cleanup ref can happen after merge landed.
         post = run_gh(["pr", "view", str(pr_number), "--repo", repo, "--json", "state,mergeCommit,mergedBy,headRefOid"], gh_config_dir)
@@ -397,7 +399,7 @@ def action_merge(args: argparse.Namespace, *, merge_adapter: Callable | None = N
             "--subject", args.subject or f"AION controlled merge PR #{args.pr}",
             "--body", args.merge_body or "AION controlled role-separated merge.",
         ]
-        cp = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, check=False)
+        cp = subprocess.run(cmd, text=True, encoding="utf-8", errors="replace", stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, check=False)
         if cp.returncode != 0:
             # A missing branch cleanup ref can happen after the merge already landed. Read back before failing.
             post = run_gh(["pr", "view", str(args.pr), "--repo", args.repo, "--json", "state,mergeCommit,mergedBy,headRefOid"], args.gh_config_dir)
