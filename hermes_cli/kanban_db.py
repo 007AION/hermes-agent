@@ -89,7 +89,7 @@ import urllib.request
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Optional
+from typing import Any, Callable, Iterable, Mapping, Optional
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
@@ -1275,6 +1275,23 @@ CREATE TABLE IF NOT EXISTS task_runs (
     summary             TEXT,
     metadata            TEXT,
     error               TEXT
+);
+
+-- Gate-epoch table for stage-gate authorization CAS (AION-CORE-PR6).
+-- Each row binds a *gate* (a namespace like ``repo:pr:stage``) to a
+-- monotonic epoch counter, a canonical decision, and a bound head SHA.
+-- HOLD / REQUEST_CHANGES / changed-fact increment the epoch and invalidate
+-- all prior intent tokens.  At the merge-write boundary, the queued intent
+-- must match the current epoch + decision + head exactly — stale intent
+-- from an older epoch is rejected atomically.  No real GitHub merge occurs
+-- in this table; it lives entirely inside the native Kanban DB.
+CREATE TABLE IF NOT EXISTS gate_epochs (
+    gate_id         TEXT PRIMARY KEY,
+    epoch           INTEGER NOT NULL DEFAULT 1,
+    last_decision   TEXT,
+    last_head       TEXT,
+    last_bound_by   TEXT,
+    last_bound_at   INTEGER NOT NULL
 );
 
 -- Files attached to a task (PDFs, images, source documents). The blob
@@ -4925,6 +4942,8 @@ def complete_task(
     recompute_ready(conn)
     # Clean up the scratch workspace and any stale tmux session for the worker.
     _cleanup_workspace(conn, task_id, captured_worker_pid=captured_worker_pid)
+    # Close workspace processes on completion (AION-CORE-PR6).
+    _cleanup_workspace_on_completion(conn, task_id)
     _done_task = get_task(conn, task_id)
     _fire_kanban_lifecycle_hook(
         "kanban_task_completed",
@@ -5778,6 +5797,35 @@ def block_task(
         run_id=run_id,
         reason=reason,
     )
+    # After blocking, close owned child processes in the task's workspace
+    # so no in-flight effects survive the block (AION-CORE-PR6: write-after-stop).
+    _wp_path = conn.execute(
+        "SELECT workspace_path FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if _wp_path and _wp_path["workspace_path"]:
+        try:
+            _wp = Path(_wp_path["workspace_path"]).expanduser().resolve()
+            if _wp.is_dir():
+                _evidence = close_workspace_processes(_wp)
+                _log.info(
+                    "block_task workspace cleanup: task=%s path=%s "
+                    "signalled=%s terminated=%s killed=%s survivors=%s "
+                    "skipped_identity_mismatch=%s skipped_unowned=%s "
+                    "skipped_self=%s",
+                    task_id, str(_wp),
+                    _evidence.get("signalled", 0),
+                    _evidence.get("terminated", 0),
+                    _evidence.get("killed", 0),
+                    _evidence.get("survivors", 0),
+                    _evidence.get("skipped_identity_mismatch", 0),
+                    _evidence.get("skipped_unowned", 0),
+                    _evidence.get("skipped_self", 0),
+                )
+        except Exception as _exc:
+            _log.warning(
+                "block_task workspace cleanup failed for task=%s: %s",
+                task_id, _exc,
+            )
     return True
 
 
@@ -10534,6 +10582,13 @@ def close_workspace_processes(
     is withheld and the mismatch is recorded.  This prevents TOCTOU attacks
     where a PID is recycled between discovery and signal delivery.
 
+    **Bounded TERM→KILL ladder (AION-CORE-PR6 GM2 red-team fix):** after
+    SIGTERM, the function waits briefly, re-checks liveness via
+    ``/proc/<pid>/stat`` (starttime match), and escalates to SIGKILL for
+    TERM-ignoring survivors.  It then waits again and reports authoritative
+    survivor counts.  This closes the 八府巡按 audit finding that a single
+    SIGTERM-and-return leaves TERM-ignoring owned children alive.
+
     Args:
         workspace_path: Absolute path to the workspace directory.
         dry_run: When True, report what WOULD be signalled without killing.
@@ -10546,23 +10601,31 @@ def close_workspace_processes(
 
     Returns a dict with cleanup evidence:
         - ``workspace``: str — resolved workspace path
-        - ``signalled``: int — count of process groups signalled (0 in dry_run)
+        - ``signalled``: int — count of PIDs that received a signal (0 in dry_run)
+        - ``terminated``: int — PIDs that exited after SIGTERM alone
+        - ``killed``: int — PIDs that required SIGKILL escalation
+        - ``survivors``: int — PIDs still alive after TERM→KILL ladder
         - ``would_signal``: int — count that WOULD be signalled (dry_run only)
         - ``skipped_outside``: int — processes outside workspace (negative canary)
-        - ``skipped_self``: int — current process / process group (self-preservation)
+        - ``skipped_self``: int — current process (self-preservation)
         - ``skipped_identity_mismatch``: int — identity re-read mismatch (TOCTOU guard)
         - ``skipped_unowned``: int — processes inside workspace but not in *owned_pids*
           (shared-dir containment gate; always 0 when *owned_pids* is None)
         - ``dry_run``: bool — True if dry-run mode
-        - ``pids``: list of (pgid, pid, cwd) tuples for signalled groups
+        - ``pids``: list of (pgid, pid, cwd, outcome) tuples for signalled PIDs
+          where outcome is one of 'terminated', 'killed', 'survivor'
     """
     import os as _os
     import signal as _signal
+    import time as _time
 
     wp = Path(workspace_path).resolve()
     result: dict = {
         "workspace": str(wp),
         "signalled": 0,
+        "terminated": 0,
+        "killed": 0,
+        "survivors": 0,
         "would_signal": 0,
         "skipped_outside": 0,
         "skipped_self": 0,
@@ -10632,7 +10695,7 @@ def close_workspace_processes(
                 if identity is None:
                     continue
                 result["would_signal"] += 1
-                result["pids"].append((pgid, pid, cwd_str))
+                result["pids"].append((pgid, pid, cwd_str, "would_signal"))
                 signalled_pids.add(pid)
             else:
                 # Capture identity BEFORE any signal.
@@ -10645,16 +10708,465 @@ def close_workspace_processes(
                 if not _revalidate_identity(pid, identity):
                     result["skipped_identity_mismatch"] += 1
                     continue
+
+                # -----------------------------------------------------------
+                # Bounded TERM→KILL ladder (AION-CORE-PR6 GM2 red-team fix)
+                # -----------------------------------------------------------
                 try:
                     _os.kill(pid, _signal.SIGTERM)
-                    signalled_pids.add(pid)
-                    result["signalled"] += 1
-                    result["pids"].append((pgid, pid, cwd_str))
                 except OSError:
                     # Process already gone — count it as cleaned.
                     signalled_pids.add(pid)
                     result["signalled"] += 1
+                    result["terminated"] += 1
+                    result["pids"].append((pgid, pid, cwd_str, "terminated"))
+                    continue
+
+                signalled_pids.add(pid)
+                result["signalled"] += 1
+
+                # Wait for graceful TERM exit; re-check liveness.
+                _time.sleep(0.5)
+                if not _revalidate_identity(pid, identity):
+                    result["terminated"] += 1
+                    result["pids"].append((pgid, pid, cwd_str, "terminated"))
+                    continue
+
+                # TERM-ignoring survivor — escalate to SIGKILL.
+                try:
+                    _os.kill(pid, _signal.SIGKILL)
+                except OSError:
+                    # Already gone between liveness check and KILL.
+                    result["terminated"] += 1
+                    result["pids"].append((pgid, pid, cwd_str, "terminated"))
+                    continue
+
+                # Wait for SIGKILL to take effect; final liveness check.
+                _time.sleep(1.5)
+                if not _revalidate_identity(pid, identity):
+                    result["killed"] += 1
+                    result["pids"].append((pgid, pid, cwd_str, "killed"))
+                else:
+                    result["survivors"] += 1
+                    result["pids"].append((pgid, pid, cwd_str, "survivor"))
         else:
             result["skipped_outside"] += 1
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Gate-epoch CAS (AION-CORE-PR6)
+# ---------------------------------------------------------------------------
+
+
+def _gate_id(repo: str, pr_number: int, stage: str = "merge") -> str:
+    """Canonical gate identifier: ``repo:PR:stage``."""
+    return f"{repo}:{pr_number}:{stage}"
+
+
+def set_gate_decision(
+    conn: sqlite3.Connection,
+    repo: str,
+    pr_number: int,
+    decision: str,
+    head: str,
+    bound_by: str = "kanban",
+    *,
+    stage: str = "merge",
+) -> dict:
+    """Set a gate decision, atomically incrementing the epoch.
+
+    A new HOLD / REQUEST_CHANGES / changed-fact always increments the epoch,
+    which invalidates all prior intent tokens from older epochs.  APPROVE
+    also increments to bind the new approval epoch.  The write boundary
+    consumer must compare-epoch to ensure no intervening HOLD occurred.
+
+    Returns a dict with ``gate_id``, ``old_epoch``, ``new_epoch``,
+    ``decision``, ``head``, and whether the epoch changed.
+    """
+    gid = _gate_id(repo, pr_number, stage)
+    now = int(time.time())
+
+    with write_txn(conn):
+        existing = conn.execute(
+            "SELECT epoch, last_decision, last_head FROM gate_epochs "
+            "WHERE gate_id = ?",
+            (gid,),
+        ).fetchone()
+
+        if existing is None:
+            conn.execute(
+                "INSERT INTO gate_epochs "
+                "(gate_id, epoch, last_decision, last_head, last_bound_by, last_bound_at) "
+                "VALUES (?, 1, ?, ?, ?, ?)",
+                (gid, decision, head, bound_by, now),
+            )
+            return {
+                "gate_id": gid,
+                "old_epoch": 0,
+                "new_epoch": 1,
+                "decision": decision,
+                "head": head,
+                "epoch_changed": True,
+            }
+
+        old_epoch = existing["epoch"]
+        new_epoch = old_epoch + 1
+        conn.execute(
+            "UPDATE gate_epochs "
+            "SET epoch = ?, last_decision = ?, last_head = ?, "
+            "    last_bound_by = ?, last_bound_at = ? "
+            "WHERE gate_id = ?",
+            (new_epoch, decision, head, bound_by, now, gid),
+        )
+        return {
+            "gate_id": gid,
+            "old_epoch": old_epoch,
+            "new_epoch": new_epoch,
+            "decision": decision,
+            "head": head,
+            "epoch_changed": True,
+        }
+
+
+def get_gate_epoch(
+    conn: sqlite3.Connection,
+    repo: str,
+    pr_number: int,
+    *,
+    stage: str = "merge",
+) -> dict:
+    """Read the current gate epoch and decision without mutating."""
+    gid = _gate_id(repo, pr_number, stage)
+    row = conn.execute(
+        "SELECT epoch, last_decision, last_head, last_bound_by, last_bound_at "
+        "FROM gate_epochs WHERE gate_id = ?",
+        (gid,),
+    ).fetchone()
+    if row is None:
+        return {
+            "gate_id": gid,
+            "epoch": 0,
+            "decision": None,
+            "head": None,
+        }
+    return {
+        "gate_id": gid,
+        "epoch": row["epoch"],
+        "decision": row["last_decision"],
+        "head": row["last_head"],
+        "bound_by": row["last_bound_by"],
+        "bound_at": row["last_bound_at"],
+    }
+
+
+def validate_gate_intent(
+    conn: sqlite3.Connection,
+    repo: str,
+    pr_number: int,
+    intent_epoch: int,
+    intent_decision: str,
+    intent_head: str,
+    *,
+    stage: str = "merge",
+) -> dict:
+    """Atomically compare-and-swap at the merge-write boundary.
+
+    An intent from epoch N is valid ONLY if the current gate epoch is
+    still N AND the current decision is APPROVE AND the current head
+    matches.  Any drift (newer epoch, non-APPROVE decision, head mismatch)
+    fails closed.
+
+    Returns a dict with ``valid`` (bool), ``gate_id``, ``current`` (the
+    live state), and ``mismatch_reason`` when invalid.  Does NOT mutate
+    the gate — this is a pure read-and-validate operation.
+    """
+    current = get_gate_epoch(conn, repo, pr_number, stage=stage)
+    gid = current["gate_id"]
+
+    if current["epoch"] == 0:
+        return {
+            "valid": False,
+            "gate_id": gid,
+            "current": current,
+            "mismatch_reason": "no_gate_initialised",
+        }
+
+    if current["epoch"] != intent_epoch:
+        return {
+            "valid": False,
+            "gate_id": gid,
+            "current": current,
+            "mismatch_reason": (
+                f"epoch_mismatch: intent={intent_epoch} "
+                f"current={current['epoch']}"
+            ),
+        }
+
+    if current["decision"] != intent_decision:
+        return {
+            "valid": False,
+            "gate_id": gid,
+            "current": current,
+            "mismatch_reason": (
+                f"decision_mismatch: intent={intent_decision!r} "
+                f"current={current['decision']!r}"
+            ),
+        }
+
+    # Reject non-APPROVE at the CAS boundary (AION-CORE-PR6 bafuxunan audit):
+    # HOLD and REQUEST_CHANGES are decisions that should NEVER pass CAS,
+    # even when intent_decision == current_decision.  Only APPROVE can
+    # authorize an external write.
+    if current["decision"] != "APPROVE":
+        return {
+            "valid": False,
+            "gate_id": gid,
+            "current": current,
+            "mismatch_reason": (
+                f"non_approve_decision: current={current['decision']!r} "
+                f"— only APPROVE authorizes external write"
+            ),
+        }
+
+    if intent_head is not None and current["head"] != intent_head:
+        return {
+            "valid": False,
+            "gate_id": gid,
+            "current": current,
+            "mismatch_reason": (
+                f"head_mismatch: intent={intent_head[:12]} "
+                f"current={current['head'][:12] if current['head'] else 'None'}"
+            ),
+        }
+
+    return {
+        "valid": True,
+        "gate_id": gid,
+        "current": current,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Supported merge-write boundary with fake adapter (AION-CORE-PR6)
+# ---------------------------------------------------------------------------
+
+
+def merge_with_gate_cas(
+    conn: sqlite3.Connection,
+    repo: str,
+    pr_number: int,
+    intent_epoch: int,
+    intent_decision: str,
+    intent_head: str,
+    *,
+    stage: str = "merge",
+    merge_adapter: "Callable | None" = None,
+) -> dict:
+    """Supported merge-write boundary with deterministic CAS gate.
+
+    This is the ACTUAL merge execution path.  Before any external write,
+    it atomically validates the intent against the current canonical gate
+    state.  Stale intent (newer epoch, non-APPROVE decision, head drift)
+    fails closed BEFORE the adapter is called — no external write ever
+    lands on invalid intent.
+
+    **TOCTOU linearization (AION-CORE-PR6 GM2 red-team fix):** the CAS
+    re-read, validation, AND adapter call all execute inside a single
+    ``write_txn``.  SQLite serialises write transactions, so any
+    concurrent ``set_gate_decision(HOLD)`` that bumps the epoch will
+    either commit-before (we see the new epoch and reject) or wait-until-
+    after (our adapter already fired).  No interleaving possible.
+
+    When ``merge_adapter`` is provided, it is called only after CAS
+    validation passes and its result is included in the response.  In
+    production this would be a GitHub merge adapter; in tests it is a
+    fake/local adapter for deterministic RED/GREEN proof.
+
+    Returns a dict with:
+      - ``valid``: bool — whether CAS passed
+      - ``gate_id``: str
+      - ``current``: dict — live gate state at validation time
+      - ``mismatch_reason``: str | None — why CAS failed (None when valid)
+      - ``adapter_called``: bool — whether the adapter was invoked
+      - ``adapter_result``: dict | None — adapter return value (None when not called)
+    """
+    # -------------------------------------------------------------------
+    # Single linearized write transaction: CAS re-read + adapter call
+    # are one atomic window.  No concurrent HOLD / REQUEST_CHANGES can
+    # increment the epoch between our re-read and the external write.
+    # -------------------------------------------------------------------
+    with write_txn(conn):
+        # Re-read gate state *inside* the transaction — this is the
+        # serialisation point.  If a concurrent writer bumped the epoch
+        # before we acquired the lock, we'll see the new value and
+        # reject; if we acquired first, they wait until we finish.
+        current = get_gate_epoch(conn, repo, pr_number, stage=stage)
+        gid = current["gate_id"]
+
+        # --- validation (same rules as validate_gate_intent) -----------
+        mismatch: str | None = None
+
+        if current["epoch"] == 0:
+            mismatch = "no_gate_initialised"
+        elif current["epoch"] != intent_epoch:
+            mismatch = (
+                f"epoch_mismatch: intent={intent_epoch} "
+                f"current={current['epoch']}"
+            )
+        elif current["decision"] != intent_decision:
+            mismatch = (
+                f"decision_mismatch: intent={intent_decision!r} "
+                f"current={current['decision']!r}"
+            )
+        elif current["decision"] != "APPROVE":
+            mismatch = (
+                f"non_approve_decision: current={current['decision']!r} "
+                f"— only APPROVE authorizes external write"
+            )
+        elif intent_head is not None and current["head"] != intent_head:
+            mismatch = (
+                f"head_mismatch: intent={intent_head[:12]} "
+                f"current={current['head'][:12] if current['head'] else 'None'}"
+            )
+
+        if mismatch is not None:
+            return {
+                "valid": False,
+                "gate_id": gid,
+                "current": current,
+                "mismatch_reason": mismatch,
+                "adapter_called": False,
+                "adapter_result": None,
+            }
+
+        # --- CAS passed — adapter fires inside the same transaction ---
+        if merge_adapter is not None:
+            adapter_result = merge_adapter(
+                repo, pr_number, intent_head, intent_decision, stage,
+            )
+            return {
+                "valid": True,
+                "gate_id": gid,
+                "current": current,
+                "mismatch_reason": None,
+                "adapter_called": True,
+                "adapter_result": adapter_result,
+            }
+
+        return {
+            "valid": True,
+            "gate_id": gid,
+            "current": current,
+            "mismatch_reason": None,
+            "adapter_called": False,
+            "adapter_result": None,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Workspace cleanup on completion (AION-CORE-PR6)
+# ---------------------------------------------------------------------------
+
+
+def _cleanup_workspace_on_completion(
+    conn: sqlite3.Connection, task_id: str,
+) -> None:
+    """Close processes whose cwd is inside the task's workspace.
+
+    Called after a successful completion. Reads the task's workspace_path
+    from the DB, then calls :func:`close_workspace_processes`. Best-effort —
+    any error is logged and swallowed so completion is never blocked.
+
+    **AION-CORE-PR6 edge-case fixes (CI investigation t_5cf56231):**
+
+    - **dir workspace stale-task**: for ``workspace_kind=dir`` (shared
+      directory), builds an ``owned_pids`` set from the task's spawn events
+      in ``task_spawns``.  If no owned PIDs are found (stale task with no
+      active worker record), signals *none* — other tasks may still be using
+      the shared workspace.
+
+    - **PID-recycled starttime mismatch**: handled inside
+      :func:`close_workspace_processes` via :func:`_revalidate_identity`,
+      which compares /proc starttime against the captured identity before
+      each signal.
+
+    - **legacy spawn without starttime**: spawn events created before
+      starttime tracking was added have ``starttime IS NULL``.  These are
+      treated as owned (PID match alone) but cannot be revalidated — they
+      are signalled without the starttime guard as a best-effort fallback.
+    """
+    try:
+        row = conn.execute(
+            "SELECT workspace_path, workspace_kind FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return
+        wp = row["workspace_path"]
+        wk = row["workspace_kind"]
+        if not wp:
+            return
+        path = Path(wp).expanduser().resolve()
+        if not path.is_dir():
+            return
+
+        # Build owned_pids for shared-dir workspace gating.
+        # For scratch/worktree workspaces, owned_pids stays None — cwd
+        # containment alone is sufficient because the workspace is exclusive
+        # to this task.
+        owned_pids: set[int] | None = None
+        if wk == "dir":
+            # Query spawn events for this task to find owned PIDs.
+            # Handle legacy spawns (starttime IS NULL) as owned but
+            # note they cannot be TOCTOU-revalidated.
+            spawn_rows = conn.execute(
+                "SELECT pid, starttime FROM task_spawns WHERE task_id = ?",
+                (task_id,),
+            ).fetchall()
+            if spawn_rows:
+                owned_pids = set()
+                for srow in spawn_rows:
+                    spid = srow["pid"]
+                    owned_pids.add(spid)
+                    # Include descendants for each owned PID so child
+                    # processes are also eligible for signalling.
+                    try:
+                        descendants = _discover_descendant_pids(spid)
+                        owned_pids.update(descendants)
+                    except Exception:
+                        pass  # best-effort descendant discovery
+            else:
+                # Stale dir workspace — no active spawn records for this
+                # task.  Signal none to avoid hitting another task's
+                # processes in the shared workspace.
+                _log.info(
+                    "complete_task workspace cleanup: task=%s kind=%s "
+                    "path=%s — stale-task, signalling none "
+                    "(shared dir workspace with no owned PIDs)",
+                    task_id, wk, str(path),
+                )
+                return
+
+        evidence = close_workspace_processes(
+            path, owned_pids=owned_pids,
+        )
+        _log.info(
+            "complete_task workspace cleanup: task=%s kind=%s path=%s "
+            "signalled=%s terminated=%s killed=%s survivors=%s "
+            "skipped_identity_mismatch=%s skipped_unowned=%s dry_run=%s",
+            task_id, wk, str(path),
+            evidence.get("signalled", 0),
+            evidence.get("terminated", 0),
+            evidence.get("killed", 0),
+            evidence.get("survivors", 0),
+            evidence.get("skipped_identity_mismatch", 0),
+            evidence.get("skipped_unowned", 0),
+            evidence.get("dry_run", False),
+        )
+    except Exception as exc:
+        _log.warning(
+            "complete_task workspace cleanup failed for task=%s: %s",
+            task_id, exc,
+        )
