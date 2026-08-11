@@ -10574,6 +10574,13 @@ def close_workspace_processes(
     is withheld and the mismatch is recorded.  This prevents TOCTOU attacks
     where a PID is recycled between discovery and signal delivery.
 
+    **Bounded TERM→KILL ladder (AION-CORE-PR6 GM2 red-team fix):** after
+    SIGTERM, the function waits briefly, re-checks liveness via
+    ``/proc/<pid>/stat`` (starttime match), and escalates to SIGKILL for
+    TERM-ignoring survivors.  It then waits again and reports authoritative
+    survivor counts.  This closes the 八府巡按 audit finding that a single
+    SIGTERM-and-return leaves TERM-ignoring owned children alive.
+
     Args:
         workspace_path: Absolute path to the workspace directory.
         dry_run: When True, report what WOULD be signalled without killing.
@@ -10586,23 +10593,31 @@ def close_workspace_processes(
 
     Returns a dict with cleanup evidence:
         - ``workspace``: str — resolved workspace path
-        - ``signalled``: int — count of process groups signalled (0 in dry_run)
+        - ``signalled``: int — count of PIDs that received a signal (0 in dry_run)
+        - ``terminated``: int — PIDs that exited after SIGTERM alone
+        - ``killed``: int — PIDs that required SIGKILL escalation
+        - ``survivors``: int — PIDs still alive after TERM→KILL ladder
         - ``would_signal``: int — count that WOULD be signalled (dry_run only)
         - ``skipped_outside``: int — processes outside workspace (negative canary)
-        - ``skipped_self``: int — current process / process group (self-preservation)
+        - ``skipped_self``: int — current process (self-preservation)
         - ``skipped_identity_mismatch``: int — identity re-read mismatch (TOCTOU guard)
         - ``skipped_unowned``: int — processes inside workspace but not in *owned_pids*
           (shared-dir containment gate; always 0 when *owned_pids* is None)
         - ``dry_run``: bool — True if dry-run mode
-        - ``pids``: list of (pgid, pid, cwd) tuples for signalled groups
+        - ``pids``: list of (pgid, pid, cwd, outcome) tuples for signalled PIDs
+          where outcome is one of 'terminated', 'killed', 'survivor'
     """
     import os as _os
     import signal as _signal
+    import time as _time
 
     wp = Path(workspace_path).resolve()
     result: dict = {
         "workspace": str(wp),
         "signalled": 0,
+        "terminated": 0,
+        "killed": 0,
+        "survivors": 0,
         "would_signal": 0,
         "skipped_outside": 0,
         "skipped_self": 0,
@@ -10672,7 +10687,7 @@ def close_workspace_processes(
                 if identity is None:
                     continue
                 result["would_signal"] += 1
-                result["pids"].append((pgid, pid, cwd_str))
+                result["pids"].append((pgid, pid, cwd_str, "would_signal"))
                 signalled_pids.add(pid)
             else:
                 # Capture identity BEFORE any signal.
@@ -10685,15 +10700,47 @@ def close_workspace_processes(
                 if not _revalidate_identity(pid, identity):
                     result["skipped_identity_mismatch"] += 1
                     continue
+
+                # -----------------------------------------------------------
+                # Bounded TERM→KILL ladder (AION-CORE-PR6 GM2 red-team fix)
+                # -----------------------------------------------------------
                 try:
                     _os.kill(pid, _signal.SIGTERM)
-                    signalled_pids.add(pid)
-                    result["signalled"] += 1
-                    result["pids"].append((pgid, pid, cwd_str))
                 except OSError:
                     # Process already gone — count it as cleaned.
                     signalled_pids.add(pid)
                     result["signalled"] += 1
+                    result["terminated"] += 1
+                    result["pids"].append((pgid, pid, cwd_str, "terminated"))
+                    continue
+
+                signalled_pids.add(pid)
+                result["signalled"] += 1
+
+                # Wait for graceful TERM exit; re-check liveness.
+                _time.sleep(0.5)
+                if not _revalidate_identity(pid, identity):
+                    result["terminated"] += 1
+                    result["pids"].append((pgid, pid, cwd_str, "terminated"))
+                    continue
+
+                # TERM-ignoring survivor — escalate to SIGKILL.
+                try:
+                    _os.kill(pid, _signal.SIGKILL)
+                except OSError:
+                    # Already gone between liveness check and KILL.
+                    result["terminated"] += 1
+                    result["pids"].append((pgid, pid, cwd_str, "terminated"))
+                    continue
+
+                # Wait for SIGKILL to take effect; final liveness check.
+                _time.sleep(1.5)
+                if not _revalidate_identity(pid, identity):
+                    result["killed"] += 1
+                    result["pids"].append((pgid, pid, cwd_str, "killed"))
+                else:
+                    result["survivors"] += 1
+                    result["pids"].append((pgid, pid, cwd_str, "survivor"))
         else:
             result["skipped_outside"] += 1
 
@@ -10917,6 +10964,13 @@ def merge_with_gate_cas(
     fails closed BEFORE the adapter is called — no external write ever
     lands on invalid intent.
 
+    **TOCTOU linearization (AION-CORE-PR6 GM2 red-team fix):** the CAS
+    re-read, validation, AND adapter call all execute inside a single
+    ``write_txn``.  SQLite serialises write transactions, so any
+    concurrent ``set_gate_decision(HOLD)`` that bumps the epoch will
+    either commit-before (we see the new epoch and reject) or wait-until-
+    after (our adapter already fired).  No interleaving possible.
+
     When ``merge_adapter`` is provided, it is called only after CAS
     validation passes and its result is included in the response.  In
     production this would be a GitHub merge adapter; in tests it is a
@@ -10930,35 +10984,77 @@ def merge_with_gate_cas(
       - ``adapter_called``: bool — whether the adapter was invoked
       - ``adapter_result``: dict | None — adapter return value (None when not called)
     """
-    validation = validate_gate_intent(
-        conn, repo, pr_number,
-        intent_epoch=intent_epoch,
-        intent_decision=intent_decision,
-        intent_head=intent_head,
-        stage=stage,
-    )
+    # -------------------------------------------------------------------
+    # Single linearized write transaction: CAS re-read + adapter call
+    # are one atomic window.  No concurrent HOLD / REQUEST_CHANGES can
+    # increment the epoch between our re-read and the external write.
+    # -------------------------------------------------------------------
+    with write_txn(conn):
+        # Re-read gate state *inside* the transaction — this is the
+        # serialisation point.  If a concurrent writer bumped the epoch
+        # before we acquired the lock, we'll see the new value and
+        # reject; if we acquired first, they wait until we finish.
+        current = get_gate_epoch(conn, repo, pr_number, stage=stage)
+        gid = current["gate_id"]
 
-    result: dict = {
-        "valid": validation["valid"],
-        "gate_id": validation["gate_id"],
-        "current": validation["current"],
-        "mismatch_reason": validation.get("mismatch_reason"),
-        "adapter_called": False,
-        "adapter_result": None,
-    }
+        # --- validation (same rules as validate_gate_intent) -----------
+        mismatch: str | None = None
 
-    if not validation["valid"]:
-        return result
+        if current["epoch"] == 0:
+            mismatch = "no_gate_initialised"
+        elif current["epoch"] != intent_epoch:
+            mismatch = (
+                f"epoch_mismatch: intent={intent_epoch} "
+                f"current={current['epoch']}"
+            )
+        elif current["decision"] != intent_decision:
+            mismatch = (
+                f"decision_mismatch: intent={intent_decision!r} "
+                f"current={current['decision']!r}"
+            )
+        elif current["decision"] != "APPROVE":
+            mismatch = (
+                f"non_approve_decision: current={current['decision']!r} "
+                f"— only APPROVE authorizes external write"
+            )
+        elif intent_head is not None and current["head"] != intent_head:
+            mismatch = (
+                f"head_mismatch: intent={intent_head[:12]} "
+                f"current={current['head'][:12] if current['head'] else 'None'}"
+            )
 
-    # CAS passed — the adapter is the ONLY path to external write.
-    if merge_adapter is not None:
-        adapter_result = merge_adapter(
-            repo, pr_number, intent_head, intent_decision, stage,
-        )
-        result["adapter_called"] = True
-        result["adapter_result"] = adapter_result
+        if mismatch is not None:
+            return {
+                "valid": False,
+                "gate_id": gid,
+                "current": current,
+                "mismatch_reason": mismatch,
+                "adapter_called": False,
+                "adapter_result": None,
+            }
 
-    return result
+        # --- CAS passed — adapter fires inside the same transaction ---
+        if merge_adapter is not None:
+            adapter_result = merge_adapter(
+                repo, pr_number, intent_head, intent_decision, stage,
+            )
+            return {
+                "valid": True,
+                "gate_id": gid,
+                "current": current,
+                "mismatch_reason": None,
+                "adapter_called": True,
+                "adapter_result": adapter_result,
+            }
+
+        return {
+            "valid": True,
+            "gate_id": gid,
+            "current": current,
+            "mismatch_reason": None,
+            "adapter_called": False,
+            "adapter_result": None,
+        }
 
 
 # ---------------------------------------------------------------------------

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import concurrent.futures
+import io
+import json
 import os
 import sqlite3
 import subprocess
@@ -5519,6 +5521,277 @@ def test_merge_with_gate_cas_head_mismatch_rejects_before_adapter(kanban_home):
 
 
 # ---------------------------------------------------------------------------
+# Gate-epoch CAS — wired action_merge integration (AION-CORE-PR6)
+# ---------------------------------------------------------------------------
+# These tests import the real ``action_merge`` from the version-controlled
+# gate script and inject a fake merge adapter, proving that the CAS wired
+# inside action_merge enforces stale-intent rejection and adapter-call
+# semantics BEFORE any external GitHub write.
+
+
+@pytest.fixture
+def _fake_verify(monkeypatch):
+    """Replace ``verify`` with a stub so tests don't need live GitHub access.
+
+    Tests import the gate module, override its ``verify`` to return a dummy
+    evidence dict, and then focus on the CAS wiring inside ``action_merge``.
+    """
+    import scripts.aion_controlled_pr_gate as gate
+
+    def _stub_verify(args, *, require_open, require_approved, require_merger):
+        return {
+            "repo": args.repo,
+            "pr": args.pr,
+            "url": f"https://github.com/{args.repo}/pull/{args.pr}",
+            "title": "test PR",
+            "state": "OPEN",
+            "author": args.author,
+            "reviewer": args.reviewer,
+            "runtime_role": getattr(args, "runtime_role", "") or "agent007",
+            "actor": args.actor,
+            "exact_head": args.head,
+            "merge_state": "CLEAN",
+            "review_decision": "APPROVED",
+            "checks": [],
+            "protected_issues": {},
+            "authorization_envelope": "PRESENT",
+        }
+
+    monkeypatch.setattr(gate, "verify", _stub_verify)
+    return gate
+
+
+def _make_merge_args(
+    gate_module,
+    repo="kiddhu/hermes-agent",
+    pr=42,
+    head="abc123def4567890abcdef1234567890abcdef12",
+    author="007AION",
+    reviewer="GemAION",
+    actor="kiddhu",
+    gate_epoch=1,
+    kanban_db=None,
+    dry_run=True,
+):
+    """Build a minimal argparse.Namespace for action_merge."""
+    import argparse
+    ns = argparse.Namespace()
+    ns.repo = repo
+    ns.pr = pr
+    ns.head = head
+    ns.author = author
+    ns.reviewer = reviewer
+    ns.actor = actor
+    ns.runtime_role = "agent007"
+    ns.base = "main"
+    ns.gh_config_dir = "/nonexistent"
+    ns.dry_run = dry_run
+    ns.method = "squash"
+    ns.subject = ""
+    ns.merge_body = ""
+    ns.gate_epoch = gate_epoch
+    ns.kanban_db = kanban_db
+    # accessor for gate_module's verify stub
+    ns.expect_open = False
+    ns.require_approved = False
+    ns.require_merger = False
+    return ns
+
+
+def test_action_merge_cas_approve_calls_adapter(
+    kanban_home, _fake_verify, monkeypatch,
+):
+    """APPROVE gate → adapter called exactly once in wired action_merge."""
+    gate = _fake_verify
+    import sys as _sys
+
+    db_path = str(kanban_home / "kanban.db")
+    monkeypatch.setitem(
+        _sys.modules, "scripts.aion_controlled_pr_gate", gate,
+    )
+
+    with kb.connect() as conn:
+        kb.set_gate_decision(
+            conn, "kiddhu/hermes-agent", 42, "APPROVE",
+            "abc123def4567890abcdef1234567890abcdef12",
+        )
+
+    adapter_calls = []
+    def fake_adapter(repo, pr, head, decision, stage):
+        adapter_calls.append(1)
+        return {"merged": True, "repo": repo, "pr": pr}
+
+    args = _make_merge_args(gate, gate_epoch=1, kanban_db=db_path)
+
+    # action_merge calls die() on failure; on success (with injected adapter)
+    # it prints JSON and returns.
+    import io
+    saved_stdout = _sys.stdout
+    try:
+        _sys.stdout = io.StringIO()
+        gate.action_merge(args, merge_adapter=fake_adapter)
+        output = _sys.stdout.getvalue()
+    finally:
+        _sys.stdout = saved_stdout
+
+    result = json.loads(output)
+    assert result["ok"] is True
+    assert result["adapter_injected"] is True
+    assert result["gate_cas"]["adapter_called"] is True
+    assert len(adapter_calls) == 1
+
+
+def test_action_merge_cas_stale_intent_rejects_before_adapter(
+    kanban_home, _fake_verify, monkeypatch,
+):
+    """HOLD increments epoch → stale intent from epoch 1 fails closed."""
+    gate = _fake_verify
+    import sys as _sys
+    monkeypatch.setitem(
+        _sys.modules, "scripts.aion_controlled_pr_gate", gate,
+    )
+
+    db_path = str(kanban_home / "kanban.db")
+
+    with kb.connect() as conn:
+        kb.set_gate_decision(
+            conn, "kiddhu/hermes-agent", 42, "APPROVE",
+            "abc123def4567890abcdef1234567890abcdef12",
+        )
+        # HOLD bumps to epoch 2
+        kb.set_gate_decision(
+            conn, "kiddhu/hermes-agent", 42, "HOLD",
+            "abc123def4567890abcdef1234567890abcdef12",
+        )
+
+    adapter_calls = []
+    def fake_adapter(repo, pr, head, decision, stage):
+        adapter_calls.append(1)
+        return {"merged": True}
+
+    args = _make_merge_args(gate, gate_epoch=1, kanban_db=db_path)
+
+    with pytest.raises(SystemExit) as exc:
+        import io
+        saved_stdout = _sys.stdout
+        _sys.stdout = io.StringIO()
+        try:
+            gate.action_merge(args, merge_adapter=fake_adapter)
+        finally:
+            _sys.stdout = saved_stdout
+
+    assert exc.value.code == 2  # die() raises SystemExit(2)
+    assert len(adapter_calls) == 0  # adapter NEVER called
+
+
+def test_action_merge_cas_non_approve_rejects_before_adapter(
+    kanban_home, _fake_verify, monkeypatch,
+):
+    """REQUEST_CHANGES gate → adapter never called (bafuxunan finding)."""
+    gate = _fake_verify
+    import sys as _sys
+    monkeypatch.setitem(
+        _sys.modules, "scripts.aion_controlled_pr_gate", gate,
+    )
+
+    db_path = str(kanban_home / "kanban.db")
+
+    with kb.connect() as conn:
+        kb.set_gate_decision(
+            conn, "kiddhu/hermes-agent", 42, "REQUEST_CHANGES",
+            "abc123def4567890abcdef1234567890abcdef12",
+        )
+
+    adapter_calls = []
+    def fake_adapter(repo, pr, head, decision, stage):
+        adapter_calls.append(1)
+        return {"merged": True}
+
+    args = _make_merge_args(gate, gate_epoch=1, kanban_db=db_path)
+
+    with pytest.raises(SystemExit) as exc:
+        import io
+        saved_stdout = _sys.stdout
+        _sys.stdout = io.StringIO()
+        try:
+            gate.action_merge(args, merge_adapter=fake_adapter)
+        finally:
+            _sys.stdout = saved_stdout
+
+    assert exc.value.code == 2
+    assert len(adapter_calls) == 0
+
+
+def test_action_merge_cas_head_mismatch_rejects_before_adapter(
+    kanban_home, _fake_verify, monkeypatch,
+):
+    """Wrong head SHA fails closed before adapter — CAS enforces exact head."""
+    gate = _fake_verify
+    import sys as _sys
+    monkeypatch.setitem(
+        _sys.modules, "scripts.aion_controlled_pr_gate", gate,
+    )
+
+    db_path = str(kanban_home / "kanban.db")
+
+    with kb.connect() as conn:
+        kb.set_gate_decision(
+            conn, "kiddhu/hermes-agent", 42, "APPROVE",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+
+    adapter_calls = []
+    def fake_adapter(repo, pr, head, decision, stage):
+        adapter_calls.append(1)
+        return {"merged": True}
+
+    # Intent carries a different head than the gate
+    args = _make_merge_args(
+        gate, gate_epoch=1, kanban_db=db_path,
+        head="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        import io
+        saved_stdout = _sys.stdout
+        _sys.stdout = io.StringIO()
+        try:
+            gate.action_merge(args, merge_adapter=fake_adapter)
+        finally:
+            _sys.stdout = saved_stdout
+
+    assert exc.value.code == 2
+    assert len(adapter_calls) == 0
+
+
+def test_action_merge_cas_missing_gate_epoch_skips_cas(
+    kanban_home, _fake_verify, monkeypatch,
+):
+    """No --gate-epoch arg → CAS is skipped, backward-compat no-op."""
+    gate = _fake_verify
+    import sys as _sys
+    monkeypatch.setitem(
+        _sys.modules, "scripts.aion_controlled_pr_gate", gate,
+    )
+
+    args = _make_merge_args(gate, gate_epoch=None, kanban_db=None)
+
+    import io
+    saved_stdout = _sys.stdout
+    try:
+        _sys.stdout = io.StringIO()
+        gate.action_merge(args, merge_adapter=None)
+        output = _sys.stdout.getvalue()
+    finally:
+        _sys.stdout = saved_stdout
+
+    result = json.loads(output)
+    assert result["ok"] is True
+    # No gate_cas evidence when gate_epoch is None
+    assert "gate_cas" not in result
+
+
+# ---------------------------------------------------------------------------
 # Block-task effect reconciliation (AION-CORE-PR6)
 # ---------------------------------------------------------------------------
 
@@ -5634,7 +5907,7 @@ def test_close_workspace_processes_skips_self(tmp_path):
     import os as _os
     my_pid = _os.getpid()
     result = kb.close_workspace_processes(ws)
-    signalled_pids = {pid for _, pid, _ in result.get("pids", [])}
+    signalled_pids = {pid for _, pid, _, _ in result.get("pids", [])}
     assert my_pid not in signalled_pids
 
 
@@ -5687,6 +5960,142 @@ def test_classify_failure_task():
     assert kb._classify_failure("ImportError: no module named foo") == "task"
     assert kb._classify_failure("SyntaxError: invalid syntax") == "task"
     assert kb._classify_failure("") == "task"
+
+
+# ---------------------------------------------------------------------------
+# TOCTOU linearization barrier test (AION-CORE-PR6 GM2 red-team fix)
+# ---------------------------------------------------------------------------
+
+
+def test_merge_with_gate_cas_toctou_barrier(kanban_home):
+    """Two-connection race: HOLD cannot interleave between CAS and adapter.
+
+    Conn1 holds a manual write_txn (simulating merge_with_gate_cas internals)
+    while Conn2 attempts set_gate_decision(HOLD) from a thread.  Because
+    SQLite serialises write transactions, Conn2 MUST block until Conn1
+    releases — proving the adapter fires inside the same serialisation
+    window as the CAS re-read, with zero interleaving window.
+    """
+    import threading
+    import time as _time
+
+    db_path = str(kanban_home / "kanban.db")
+
+    with kb.connect() as conn:
+        kb.set_gate_decision(
+            conn, "kiddhu/hermes-agent", 99, "APPROVE",
+            "cccccccccccccccccccccccccccccccccccccccc",
+        )
+
+    # Separate connections for the race.  Use connect() for proper init.
+    conn1_ctx = kb.connect(db_path=Path(db_path))
+    conn1 = conn1_ctx.__enter__()
+    conn2_ctx = kb.connect(db_path=Path(db_path))
+    conn2 = conn2_ctx.__enter__()
+
+    hold_result_holder: list = []
+    barrier = threading.Barrier(2, timeout=5)
+
+    def hold_racer():
+        barrier.wait()
+        # conn2 will block here until conn1 releases its write_txn.
+        r = kb.set_gate_decision(
+            conn2, "kiddhu/hermes-agent", 99, "HOLD",
+            "cccccccccccccccccccccccccccccccccccccccc",
+        )
+        hold_result_holder.append(r)
+
+    adapter_calls = []
+
+    def fake_adapter(repo, pr, head, decision, stage):
+        adapter_calls.append(1)
+        return {"adapter": "called"}
+
+    # Acquire write lock on conn1 *before* the racer thread starts trying.
+    with kb.write_txn(conn1):
+        # conn1 holds the write lock.  Now start the racer.
+        t = threading.Thread(target=hold_racer, daemon=True)
+        t.start()
+        barrier.wait()
+        _time.sleep(0.3)  # Ensure conn2 is blocked waiting for the write lock.
+
+        # Re-read gate inside the transaction (as merge_with_gate_cas does).
+        g = kb.get_gate_epoch(conn1, "kiddhu/hermes-agent", 99)
+        assert g["epoch"] == 1
+        assert g["decision"] == "APPROVE"
+
+        # Fire adapter inside the same write_txn.
+        fake_adapter("kiddhu/hermes-agent", 99,
+                     "cccccccccccccccccccccccccccccccccccccccc",
+                     "APPROVE", "merge")
+        # write_txn exits here — conn2 can now acquire the lock.
+
+    t.join(timeout=5)
+
+    # Adapter was called exactly once (inside the serialised window).
+    assert len(adapter_calls) == 1
+
+    # HOLD racer committed after conn1 released.
+    assert len(hold_result_holder) == 1
+    assert hold_result_holder[0]["epoch_changed"] is True
+    assert hold_result_holder[0]["new_epoch"] == 2
+    assert hold_result_holder[0]["decision"] == "HOLD"
+
+    conn1.close()
+    conn2.close()
+
+
+# ---------------------------------------------------------------------------
+# TERM-ignoring child test (AION-CORE-PR6 GM2 red-team fix)
+# ---------------------------------------------------------------------------
+
+
+def test_close_workspace_processes_escalates_to_sigkill(tmp_path):
+    """TERM-ignoring child receives SIGKILL after SIGTERM fails.
+
+    Spawns a Python child that explicitly catches and ignores SIGTERM
+    (via signal.signal(SIGTERM, SIG_IGN)), then calls
+    close_workspace_processes.  The TERM→KILL ladder MUST escalate
+    to SIGKILL, and the child MUST be dead before the function returns.
+    """
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    import subprocess as _sp
+    import time as _time
+
+    # Child script: ignore SIGTERM, then sleep 60s.
+    child_script = (
+        "import signal, time\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "time.sleep(60)\n"
+    )
+
+    child = _sp.Popen(
+        [sys.executable, "-c", child_script],
+        cwd=str(ws),
+        preexec_fn=os.setpgrp,
+    )
+    try:
+        _time.sleep(0.4)
+        assert child.poll() is None, "child should be alive before cleanup"
+
+        result = kb.close_workspace_processes(ws)
+
+        # Child must be dead — TERM→KILL ladder guarantees this.
+        child.wait(timeout=5)
+
+        # Evidence: TERM-ignoring child required SIGKILL.
+        assert result["killed"] >= 1, (
+            f"Expected >=1 killed by SIGKILL, got {result}"
+        )
+        assert result["signalled"] >= 1
+        assert result["survivors"] == 0, (
+            f"Child survived TERM→KILL ladder: {result}"
+        )
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait()
 
 
 def test_bare_connect_does_not_close_on_context_exit(tmp_path):
