@@ -10,6 +10,7 @@ import sys
 import time
 import types
 import unittest.mock
+import urllib.request
 from pathlib import Path
 
 import pytest
@@ -1704,6 +1705,26 @@ def test_has_spawnable_ready_true_when_real_profile_present(kanban_home, monkeyp
         assert kb.has_spawnable_ready(conn) is True
 
 
+def test_has_spawnable_ready_false_when_only_ready_task_has_live_pr_owner(
+    kanban_home, monkeypatch
+):
+    """Dispatchability excludes a ready task guarded by a distinct live owner."""
+    from hermes_cli import profiles
+
+    pr_url = "https://github.com/totemx-AI/subsidysmart/pull/42"
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
+    monkeypatch.setattr(
+        kb, "_resolve_github_pr_state", lambda _url: "OPEN", raising=False
+    )
+    with kb.connect() as conn:
+        current = kb.create_task(conn, title="ready-continuation", assignee="alice")
+        owner = kb.create_task(conn, title="active-owner", assignee="bob")
+        kb.add_comment(conn, current, "alice", f"Continue {pr_url}")
+        kb.add_comment(conn, owner, "bob", f"Working {pr_url}")
+        kb.claim_task(conn, owner)
+        assert kb.has_spawnable_ready(conn) is False
+
+
 def test_has_spawnable_ready_false_on_empty_queue(kanban_home):
     """Empty queue is the trivial false case — no ready tasks at all."""
     with kb.connect() as conn:
@@ -1919,31 +1940,148 @@ def test_respawn_guard_stale_success_not_guarded(kanban_home):
     assert reason is None
 
 
-def test_respawn_guard_active_pr_in_comment(kanban_home):
-    """A GitHub PR URL in a recent comment triggers active_pr."""
+def test_respawn_guard_pr_comment_alone_allows_same_task_continuation(kanban_home):
+    """A PR URL is evidence, not ownership; the same ready task may continue it."""
     with kb.connect() as conn:
-        t = kb.create_task(conn, title="has-pr", assignee="alice")
+        t = kb.create_task(conn, title="same-pr-continuation", assignee="alice")
         kb.add_comment(
-            conn, t, "worker",
-            "PR created: https://github.com/totemx-AI/subsidysmart/pull/42",
-        )
-        reason = kb.check_respawn_guard(conn, t)
-    assert reason is not None and reason[0] == "active_pr"
-
-
-def test_respawn_guard_old_pr_comment_not_guarded(kanban_home):
-    """A GitHub PR URL in a comment older than the PR window does not block."""
-    with kb.connect() as conn:
-        t = kb.create_task(conn, title="old-pr", assignee="alice")
-        old_ts = int(time.time()) - kb._RESPAWN_GUARD_PR_WINDOW - 60
-        conn.execute(
-            "INSERT INTO task_comments (task_id, author, body, created_at) "
-            "VALUES (?, 'worker', "
-            "'PR: https://github.com/totemx-AI/subsidysmart/pull/10', ?)",
-            (t, old_ts),
+            conn, t, "alice",
+            "Continue https://github.com/totemx-AI/subsidysmart/pull/42",
         )
         reason = kb.check_respawn_guard(conn, t)
     assert reason is None
+
+
+def test_respawn_guard_open_pr_with_distinct_live_owner_blocks(
+    kanban_home, monkeypatch
+):
+    """Only a distinct live run bound to the same OPEN PR blocks duplicate work."""
+    pr_url = "https://github.com/totemx-AI/subsidysmart/pull/42"
+    monkeypatch.setattr(
+        kb, "_resolve_github_pr_state", lambda _url: "OPEN", raising=False
+    )
+    with kb.connect() as conn:
+        current = kb.create_task(conn, title="continue-pr", assignee="alice")
+        owner = kb.create_task(conn, title="active-owner", assignee="bob")
+        kb.add_comment(conn, current, "alice", f"Continue {pr_url}")
+        kb.add_comment(conn, owner, "bob", f"Working {pr_url}")
+        kb.claim_task(conn, owner)
+        reason = kb.check_respawn_guard(conn, current)
+    assert reason is not None and reason[0] == "active_pr"
+
+
+def test_respawn_guard_merged_pr_invalidates_distinct_owner_guard(
+    kanban_home, monkeypatch
+):
+    """GitHub MERGED is authoritative and immediately invalidates active_pr."""
+    pr_url = "https://github.com/totemx-AI/subsidysmart/pull/42"
+    monkeypatch.setattr(
+        kb, "_resolve_github_pr_state", lambda _url: "MERGED", raising=False
+    )
+    with kb.connect() as conn:
+        current = kb.create_task(conn, title="merged-pr", assignee="alice")
+        owner = kb.create_task(conn, title="stale-owner", assignee="bob")
+        kb.add_comment(conn, current, "alice", f"Readback {pr_url}")
+        kb.add_comment(conn, owner, "bob", f"Historical {pr_url}")
+        kb.claim_task(conn, owner)
+        reason = kb.check_respawn_guard(conn, current)
+    assert reason is None
+
+
+def test_respawn_guard_closed_pr_invalidates_distinct_owner_guard(
+    kanban_home, monkeypatch
+):
+    """GitHub CLOSED is authoritative and immediately invalidates active_pr."""
+    pr_url = "https://github.com/totemx-AI/subsidysmart/pull/42"
+    monkeypatch.setattr(
+        kb, "_resolve_github_pr_state", lambda _url: "CLOSED", raising=False
+    )
+    with kb.connect() as conn:
+        current = kb.create_task(conn, title="closed-pr", assignee="alice")
+        owner = kb.create_task(conn, title="stale-owner", assignee="bob")
+        kb.add_comment(conn, current, "alice", f"Readback {pr_url}")
+        kb.add_comment(conn, owner, "bob", f"Historical {pr_url}")
+        kb.claim_task(conn, owner)
+        reason = kb.check_respawn_guard(conn, current)
+    assert reason is None
+
+
+def test_respawn_guard_unknown_pr_state_has_one_hour_ceiling(
+    kanban_home, monkeypatch
+):
+    """Unknown GitHub state gets a bounded retry, never the historical 24h TTL."""
+    now = 6_000_000
+    pr_url = "https://github.com/totemx-AI/subsidysmart/pull/42"
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    monkeypatch.setattr(
+        kb, "_resolve_github_pr_state", lambda _url: None, raising=False
+    )
+    with kb.connect() as conn:
+        current = kb.create_task(conn, title="unknown-pr", assignee="alice")
+        owner = kb.create_task(conn, title="live-owner", assignee="bob")
+        kb.add_comment(conn, current, "alice", f"Continue {pr_url}")
+        kb.add_comment(conn, owner, "bob", f"Working {pr_url}")
+        kb.claim_task(conn, owner)
+        reason = kb.check_respawn_guard(conn, current)
+    assert reason is not None and reason[0] == "active_pr_state_unknown"
+    assert now < reason[1] <= now + 3600
+
+
+def test_respawn_guard_unknown_pr_state_surfaces_hard_blocker_after_one_hour(
+    kanban_home, monkeypatch
+):
+    """An unresolved live-state lookup never rolls into another silent TTL."""
+    now = 6_000_000
+    pr_url = "https://github.com/totemx-AI/subsidysmart/pull/42"
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    monkeypatch.setattr(
+        kb, "_resolve_github_pr_state", lambda _url: None, raising=False
+    )
+    with kb.connect() as conn:
+        current = kb.create_task(conn, title="unknown-pr", assignee="alice")
+        owner = kb.create_task(conn, title="old-live-owner", assignee="bob")
+        kb.add_comment(conn, current, "alice", f"Continue {pr_url}")
+        kb.add_comment(conn, owner, "bob", f"Working {pr_url}")
+        kb.claim_task(conn, owner)
+        conn.execute(
+            "UPDATE task_runs SET started_at = ? "
+            "WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?)",
+            (now - 3601, owner),
+        )
+        reason = kb.check_respawn_guard(conn, current)
+    assert reason == ("active_pr_state_unknown_hard_blocker", 0)
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        (b'{"state":"open","merged_at":null}', "OPEN"),
+        (b'{"state":"closed","merged_at":null}', "CLOSED"),
+        (b'{"state":"closed","merged_at":"2026-08-11T00:00:00Z"}', "MERGED"),
+    ],
+)
+def test_resolve_github_pr_state_uses_live_api_payload(
+    monkeypatch, payload, expected
+):
+    """GitHub live payload, not comment text, determines canonical PR state."""
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return payload
+
+    getattr(kb, "_GITHUB_PR_STATE_CACHE").clear()
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *_args, **_kwargs: _Response())
+    assert (
+        getattr(kb, "_resolve_github_pr_state")(
+            "https://github.com/totemx-AI/subsidysmart/pull/42"
+        )
+        == expected
+    )
 
 
 def test_dispatch_respawn_guard_defers_auth_error_without_auto_block(
@@ -2019,10 +2157,10 @@ def test_dispatch_respawn_guard_skips_recent_success(
         assert kb.get_task(conn, t).status == "ready"  # not blocked, just skipped
 
 
-def test_dispatch_respawn_guard_skips_active_pr(
+def test_dispatch_respawn_guard_allows_same_task_pr_continuation(
     kanban_home, all_assignees_spawnable
 ):
-    """dispatch_once skips (but does not block) a task with an active PR comment."""
+    """dispatch_once must not mistake the task's own PR comment for duplicate work."""
     spawned_ids = []
 
     def fake_spawn(task, workspace):
@@ -2031,17 +2169,14 @@ def test_dispatch_respawn_guard_skips_active_pr(
     with kb.connect() as conn:
         t = kb.create_task(conn, title="has-pr", assignee="alice")
         kb.add_comment(
-            conn, t, "worker",
+            conn, t, "alice",
             "Opened https://github.com/totemx-AI/subsidysmart/pull/99",
         )
         res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
 
-    guarded_reasons = {task_id: reason for task_id, reason, _ in res.respawn_guarded}
-    assert guarded_reasons.get(t) == "active_pr"
-    assert t not in spawned_ids
+    assert t in spawned_ids
+    assert not res.respawn_guarded
     assert t not in res.auto_blocked
-    with kb.connect() as conn:
-        assert kb.get_task(conn, t).status == "ready"
 
 
 def test_dispatch_respawn_guard_dry_run_no_auto_block(
@@ -2151,21 +2286,20 @@ def test_dispatch_respawn_guard_dedup_emits_on_reason_change(
         assert len(guarded_1) == 1
         assert guarded_1[0].payload.get("reason") == "recent_success"
 
-        # Simulate reason change: add a PR comment → active_pr guard fires.
-        # But recent_success fires first, so we need a different setup.
-        # Instead: clear the completed run and add a blocker_auth error.
+        # Simulate reason change: clear the completed run and add a real
+        # blocker_auth error. A PR comment alone is deliberately not a guard.
         conn.execute("DELETE FROM task_runs WHERE task_id = ?", (t,))
-        kb.add_comment(
-            conn, t, "worker",
-            "Opened https://github.com/totemx-AI/subsidysmart/pull/999",
+        conn.execute(
+            "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
+            ("403 Forbidden: authorization denied", t),
         )
         kb.dispatch_once(conn, spawn_fn=lambda task, ws: None)
         events_2 = kb.list_events(conn, t)
         guarded_2 = [e for e in events_2 if e.kind == "respawn_guarded"]
-        # Now we should have 2 events: one for recent_success, one for active_pr
+        # Now we should have two events with distinct guard reasons.
         reasons = [e.payload.get("reason") for e in guarded_2]
         assert "recent_success" in reasons
-        assert "active_pr" in reasons
+        assert "blocker_auth" in reasons
 
 
 # ---------------------------------------------------------------------------

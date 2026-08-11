@@ -226,6 +226,26 @@ def test_board_diagnostics_executable_now(kanban_home):
     assert diag["open_obligations"] == 4  # ready(2) + triage(1) + todo(1)
 
 
+def test_board_diagnostics_excludes_guarded_ready_from_executable_now(
+    kanban_home, monkeypatch
+):
+    """executable_now is dispatchable READY, not the raw READY count."""
+    pr_url = "https://github.com/totemx-AI/subsidysmart/pull/42"
+    monkeypatch.setattr(kb, "_resolve_github_pr_state", lambda _url: "OPEN", raising=False)
+    with kb.connect() as conn:
+        current = kb.create_task(conn, title="ready-continuation", assignee="alice")
+        owner = kb.create_task(conn, title="active-owner", assignee="bob")
+        kb.add_comment(conn, current, "alice", f"Continue {pr_url}")
+        kb.add_comment(conn, owner, "bob", f"Working {pr_url}")
+        kb.claim_task(conn, owner)
+        diag = kd.compute_board_diagnostics(conn)
+    assert diag["status_counts"]["ready"] == 1
+    assert diag["executable_now"] == 0
+    assert diag["guarded_ready"] == [
+        {"task_id": current, "reason": "active_pr"}
+    ]
+
+
 def test_board_diagnostics_executable_zero_open_nonzero(kanban_home):
     """When executable_now=0 but open_obligations>0, emit a hard finding."""
     with kb.connect() as conn:

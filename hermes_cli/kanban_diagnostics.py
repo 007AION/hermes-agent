@@ -1172,7 +1172,8 @@ def compute_board_diagnostics(
 
     Returns a dict with:
     - ``status_counts``: {status: count} for every non-archived status.
-    - ``executable_now``: count of tasks the dispatcher can claim (ready).
+    - ``executable_now``: count of ready tasks the dispatcher can claim now.
+    - ``guarded_ready``: ready tasks excluded by a respawn guard.
     - ``open_obligations``: count of tasks in any non-terminal status.
     - ``findings``: list of finding dicts with kind/severity/title/detail/data.
 
@@ -1205,9 +1206,23 @@ def compute_board_diagnostics(
         status_counts[row["status"]] = row["cnt"]
 
     # ── executable_now / open_obligations ──────────────────────────────────
-    executable_now = sum(
-        status_counts.get(s, 0) for s in _EXECUTABLE_STATUSES
-    )
+    from . import kanban_db as _kb
+
+    executable_now = 0
+    guarded_ready: list[dict[str, Any]] = []
+    ready_rows = conn.execute(
+        "SELECT id FROM tasks WHERE status = 'ready' "
+        "AND assignee IS NOT NULL AND claim_lock IS NULL "
+        "ORDER BY priority DESC, created_at, id"
+    ).fetchall()
+    for ready_row in ready_rows:
+        guard = _kb.check_respawn_guard(conn, ready_row["id"])
+        if guard is None:
+            executable_now += 1
+        else:
+            guarded_ready.append(
+                {"task_id": ready_row["id"], "reason": guard[0]}
+            )
     open_obligations = sum(
         status_counts.get(s, 0) for s in _NONTERMINAL_STATUSES
     )
@@ -1366,6 +1381,7 @@ def compute_board_diagnostics(
     return {
         "status_counts": status_counts,
         "executable_now": executable_now,
+        "guarded_ready": guarded_ready,
         "open_obligations": open_obligations,
         "findings": findings,
     }

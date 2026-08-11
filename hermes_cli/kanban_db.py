@@ -84,6 +84,8 @@ import sys
 import threading
 import logging
 import time
+import urllib.error
+import urllib.request
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -6730,14 +6732,23 @@ _RESPAWN_GUARD_SUCCESS_WINDOW = 3600  # 1 hour
 # for operators who want a tighter/looser probe cadence.
 DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 300  # 5 minutes
 
-# Within this window a GitHub PR URL in a comment blocks re-spawn.
-_RESPAWN_GUARD_PR_WINDOW = 86400  # 24 hours
+# Internal control-plane recovery may never silently wait longer than one hour.
+AION_INTERNAL_RECOVERY_MAX_WAIT = 3600
 
-# Pattern matching a GitHub PR URL in task comments.
+# Pattern matching a canonical GitHub PR URL in task bodies/comments. A URL is
+# evidence for a binding candidate only; it is never sufficient ownership by
+# itself. See ``_find_distinct_active_pr_owner``.
 _RESPAWN_GUARD_PR_URL_RE = re.compile(
-    r"https?://github\.com/[^/\s]+/[^/\s]+/pull/\d+",
+    r"https?://github\.com/"
+    r"(?P<owner>[A-Za-z0-9_.-]+)/(?P<repo>[A-Za-z0-9_.-]+)/pull/"
+    r"(?P<number>\d+)",
     re.IGNORECASE,
 )
+
+_GITHUB_PR_STATE_CACHE_SECONDS = 60
+_GITHUB_PR_STATE_TIMEOUT_SECONDS = 3.0
+_GITHUB_PR_STATE_CACHE: dict[str, tuple[Optional[str], int]] = {}
+_GITHUB_PR_STATE_CACHE_LOCK = threading.Lock()
 
 
 @dataclass
@@ -7981,6 +7992,135 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
 _clear_spawn_failures = _clear_failure_counter
 
 
+def _canonical_github_pr_urls(text: Optional[str]) -> set[str]:
+    """Return normalized GitHub PR URLs found in *text*.
+
+    Normalization makes repository/owner case irrelevant while retaining the
+    exact PR number. The result is only a binding candidate; callers must also
+    prove live run ownership before treating it as duplicate work.
+    """
+    if not text:
+        return set()
+    urls: set[str] = set()
+    for match in _RESPAWN_GUARD_PR_URL_RE.finditer(text):
+        urls.add(
+            "https://github.com/"
+            f"{match.group('owner').lower()}/{match.group('repo').lower()}"
+            f"/pull/{int(match.group('number'))}"
+        )
+    return urls
+
+
+def _task_canonical_pr_bindings(conn: sqlite3.Connection, task_id: str) -> set[str]:
+    """Read the task-local PR binding candidates from body and comments."""
+    urls: set[str] = set()
+    row = conn.execute("SELECT body FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if row is not None:
+        urls.update(_canonical_github_pr_urls(row["body"]))
+    for comment in conn.execute(
+        "SELECT body FROM task_comments WHERE task_id = ? ORDER BY created_at, id",
+        (task_id,),
+    ).fetchall():
+        urls.update(_canonical_github_pr_urls(comment["body"]))
+    return urls
+
+
+def _find_distinct_active_pr_owner(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> Optional[tuple[str, str, int]]:
+    """Find another live run bound to one of ``task_id``'s PRs.
+
+    A comment URL on the current task is never ownership. Duplicate-work
+    protection applies only when a *different* task has a non-terminal run,
+    holds a claim, and binds the same canonical PR URL.
+    """
+    current_bindings = _task_canonical_pr_bindings(conn, task_id)
+    if not current_bindings:
+        return None
+
+    active_rows = conn.execute(
+        "SELECT t.id, r.started_at FROM tasks AS t "
+        "JOIN task_runs AS r ON r.id = t.current_run_id "
+        "WHERE t.id != ? AND t.status = 'running' "
+        "AND t.claim_lock IS NOT NULL "
+        "AND r.status = 'running' AND r.ended_at IS NULL "
+        "ORDER BY r.started_at, t.id",
+        (task_id,),
+    ).fetchall()
+    for active in active_rows:
+        overlap = current_bindings.intersection(
+            _task_canonical_pr_bindings(conn, active["id"])
+        )
+        if overlap:
+            return (
+                sorted(overlap)[0],
+                str(active["id"]),
+                int(active["started_at"] or 0),
+            )
+    return None
+
+
+def _resolve_github_pr_state(pr_url: str) -> Optional[str]:
+    """Resolve ``OPEN``/``MERGED``/``CLOSED`` from GitHub live state.
+
+    The resolver is intentionally read-only and unauthenticated. Public PRs
+    resolve directly; private/rate-limited/unreachable PRs return ``None`` and
+    enter the bounded one-hour path in :func:`check_respawn_guard`. Results are
+    cached briefly so dispatcher and diagnostics checks do not hammer GitHub.
+    """
+    canonical = next(iter(_canonical_github_pr_urls(pr_url)), None)
+    if canonical is None:
+        return None
+    now = int(time.time())
+    with _GITHUB_PR_STATE_CACHE_LOCK:
+        cached = _GITHUB_PR_STATE_CACHE.get(canonical)
+        if cached is not None and cached[1] > now:
+            return cached[0]
+
+    match = _RESPAWN_GUARD_PR_URL_RE.fullmatch(canonical)
+    if match is None:
+        return None
+    api_url = (
+        "https://api.github.com/repos/"
+        f"{match.group('owner')}/{match.group('repo')}/pulls/{match.group('number')}"
+    )
+    request = urllib.request.Request(
+        api_url,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "hermes-kanban-active-pr-guard",
+        },
+    )
+    state: Optional[str] = None
+    try:
+        with urllib.request.urlopen(
+            request, timeout=_GITHUB_PR_STATE_TIMEOUT_SECONDS
+        ) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        if payload.get("merged_at"):
+            state = "MERGED"
+        else:
+            raw_state = str(payload.get("state") or "").upper()
+            if raw_state in {"OPEN", "CLOSED"}:
+                state = raw_state
+    except (
+        OSError,
+        TimeoutError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        urllib.error.URLError,
+    ):
+        state = None
+
+    with _GITHUB_PR_STATE_CACHE_LOCK:
+        _GITHUB_PR_STATE_CACHE[canonical] = (
+            state,
+            now + _GITHUB_PR_STATE_CACHE_SECONDS,
+        )
+    return state
+
+
 def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[tuple[str, int]]:
     """Return ``(guard_reason, next_retry_at)`` if ``task_id`` should NOT be
     re-spawned, else None.
@@ -8021,9 +8161,16 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[tupl
         arrives AFTER that completion — that's a deliberate re-run request.
 
     ``"active_pr"``
-        A GitHub PR URL appears in a recent task comment (within
-        ``_RESPAWN_GUARD_PR_WINDOW`` seconds).  A prior worker already
-        opened a PR; re-spawning risks a duplicate PR on the same task.
+        A different task has a live claimed run bound to the same canonical
+        GitHub PR, and GitHub reports that PR OPEN. The current task's own PR
+        URL never blocks same-task continuation. MERGED/CLOSED invalidates
+        this guard immediately.
+
+    ``"active_pr_state_unknown"``
+        A distinct live owner exists but GitHub live state is temporarily
+        unavailable. Retry is bounded by ``AION_INTERNAL_RECOVERY_MAX_WAIT``;
+        after that the reason becomes ``active_pr_state_unknown_hard_blocker``
+        instead of silently waiting on a long TTL.
 
     Stale / dead claim locks are NOT a guard reason — they are handled
     by ``release_stale_claims`` and ``detect_crashed_workers`` which
@@ -8105,15 +8252,24 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[tupl
         if not requeued_after:
             return ("recent_success", completed_at + _RESPAWN_GUARD_SUCCESS_WINDOW)
 
-    # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
-    pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
-    for c in conn.execute(
-        "SELECT body, created_at FROM task_comments WHERE task_id = ? AND created_at >= ?",
-        (task_id, pr_cutoff),
-    ).fetchall():
-        if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
-            comment_created = int(c["created_at"] or 0)
-            return ("active_pr", comment_created + _RESPAWN_GUARD_PR_WINDOW)
+    # 4. Canonical PR binding + live state + distinct task/run ownership.
+    #    The current task's own OPEN PR is a same-task continuation, not
+    #    duplicate work. MERGED/CLOSED always invalidates stale ownership.
+    #    GitHub-unavailable state gets a bounded one-hour retry and then an
+    #    explicit hard-blocker reason — never the historical 24-hour URL TTL.
+    active_owner = _find_distinct_active_pr_owner(conn, task_id)
+    if active_owner is not None:
+        pr_url, _owner_task_id, owner_started_at = active_owner
+        live_state = _resolve_github_pr_state(pr_url)
+        if live_state in {"MERGED", "CLOSED"}:
+            return None
+        if live_state == "OPEN":
+            return ("active_pr", now + 60)
+        recovery_started_at = owner_started_at if owner_started_at > 0 else now
+        recovery_deadline = recovery_started_at + AION_INTERNAL_RECOVERY_MAX_WAIT
+        if now < recovery_deadline:
+            return ("active_pr_state_unknown", recovery_deadline)
+        return ("active_pr_state_unknown_hard_blocker", 0)
 
     return None
 
@@ -8133,9 +8289,9 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     the warning still fires in degraded environments.
     """
     rows = conn.execute(
-        "SELECT DISTINCT assignee FROM tasks "
+        "SELECT id, assignee FROM tasks "
         "WHERE status = 'ready' AND assignee IS NOT NULL "
-        "    AND claim_lock IS NULL"
+        "    AND claim_lock IS NULL ORDER BY priority DESC, created_at, id"
     ).fetchall()
     if not rows:
         return False
@@ -8143,9 +8299,12 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
         from hermes_cli.profiles import profile_exists  # local import: avoids cycle
     except Exception:
         # Can't introspect — assume spawnable, preserve legacy behavior.
-        return True
+        return any(check_respawn_guard(conn, row["id"]) is None for row in rows)
     for row in rows:
-        if profile_exists(row["assignee"]):
+        if (
+            profile_exists(row["assignee"])
+            and check_respawn_guard(conn, row["id"]) is None
+        ):
             return True
     return False
 
