@@ -40,6 +40,7 @@ import json
 import logging
 import os
 import re
+import sqlite3
 from dataclasses import dataclass
 from typing import Optional
 
@@ -268,6 +269,19 @@ def _normalize_assignee_choice(
     return chosen
 
 
+def _task_has_block_loop_event(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Return True if the task has a ``block_loop_detected`` event."""
+    events = kb.list_events(conn, task_id)
+    return any(e.kind == "block_loop_detected" for e in events)
+
+
+def _task_has_prior_runs(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Return True if the task has at least one closed (non-active) run,
+    indicating prior execution / implementation ownership."""
+    runs = kb.list_runs(conn, task_id, include_active=False)
+    return len(runs) > 0
+
+
 def decompose_task(
     task_id: str,
     *,
@@ -289,6 +303,19 @@ def decompose_task(
         return DecomposeOutcome(
             task_id, False, f"task is not in triage (status={task.status!r})"
         )
+
+    # Gate: a task that landed in triage via block_loop_detected AND has
+    # prior execution runs is an already-implemented canonical task
+    # waiting for review/audit — it must NOT be decomposed, reassigned,
+    # or given reverse-parent children. The original assignee and task
+    # identity must survive the triage→next transition intact.
+    with kb.connect_closing() as conn:
+        if _task_has_block_loop_event(conn, task_id) and _task_has_prior_runs(conn, task_id):
+            return DecomposeOutcome(
+                task_id, False,
+                "skipped: block-loop triage with prior execution — "
+                "review/audit handoff preserved, no decomposition",
+            )
 
     cfg = _load_config()
     orchestrator = _resolve_orchestrator_profile(cfg)

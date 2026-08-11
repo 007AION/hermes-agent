@@ -75,6 +75,39 @@ def _patch_list_profiles(names: list[str]):
     ]
 
 
+def _running_task(conn, title="t"):
+    """Create a task and drive it to ``running`` so block_task can act."""
+    tid = kb.create_task(conn, title=title, assignee="worker")
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
+    claimed = kb.claim_task(conn, tid, claimer="worker")
+    assert claimed is not None
+    return tid
+
+
+def _make_running_again(conn, tid):
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
+    assert kb.claim_task(conn, tid, claimer="worker") is not None
+
+
+def _add_prior_run(conn, tid, outcome="done", summary="prior execution"):
+    """Insert a closed run so the task appears to have prior execution."""
+    import time
+    now = int(time.time())
+    rid = conn.execute(
+        "INSERT INTO task_runs (task_id, profile, status, outcome, summary, started_at, ended_at) "
+        "VALUES (?, ?, 'done', ?, ?, ?, ?)",
+        (tid, "worker", outcome, summary, now - 60, now - 30),
+    ).lastrowid
+    return rid
+
+
+# ---------------------------------------------------------------------------
+# Existing decompose tests
+# ---------------------------------------------------------------------------
+
+
 def test_decompose_with_fanout_creates_children(kanban_home):
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="ship a feature", triage=True)
@@ -349,3 +382,332 @@ def test_decompose_no_aux_client_configured(kanban_home):
     assert outcome.ok is False
     # call_llm's no-provider RuntimeError surfaces via the LLM-error branch.
     assert "LLM error" in outcome.reason
+
+
+# ---------------------------------------------------------------------------
+# RED tests — block-loop triage → auto-decompose collision
+# ---------------------------------------------------------------------------
+
+
+def test_decompose_skips_block_loop_triage_with_prior_runs(kanban_home):
+    """RED: A task that landed in triage via block_loop_detected AND has
+    prior execution runs must NOT be decomposed — the decomposer must
+    skip it and return ok=False with a block-loop eligibility reason.
+
+    This reproduces the exact t_0df failure: a repeated review-required
+    block on an already-implemented task was routed to triage, and the
+    auto-decomposer reassigned the canonical task and created reverse-
+    parent children."""
+    with kb.connect() as conn:
+        # Simulate a task that was already executed (has prior runs)
+        tid = kb.create_task(conn, title="fix auth bug", assignee="agent007", triage=True)
+        _add_prior_run(conn, tid, outcome="done", summary="implemented the fix")
+
+        # Simulate block_loop_detected: the task was blocked with
+        # review-required, unblocked, and re-blocked for the same reason,
+        # triggering the loop breaker → triage
+        kb._append_event(conn, tid, "block_loop_detected", {
+            "reason": "review-required: PR #862 ready for review",
+            "kind": "needs_input",
+            "recurrences": 2,
+            "limit": 2,
+        })
+
+    patches = _patch_list_profiles(["orchestrator", "agent007", "gmaion"])
+    for p in patches:
+        p.start()
+    try:
+        outcome = decomp.decompose_task(tid, author="auto-decomposer")
+    finally:
+        for p in patches:
+            p.stop()
+
+    # RED: the decomposer must reject this task
+    assert outcome.ok is False, f"expected skip, got ok=True: {outcome.reason}"
+    assert "block-loop" in outcome.reason.lower() or "prior execution" in outcome.reason.lower()
+    assert outcome.child_ids is None
+    assert outcome.fanout is False
+
+    # Verify the task is untouched: still in triage, original assignee
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+    assert task.status == "triage"
+    assert task.assignee == "agent007"
+
+
+def test_decompose_block_loop_no_children_created(kanban_home):
+    """RED: A block-loop triage task must produce ZERO child tasks."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="deploy config", assignee="agent007", triage=True)
+        _add_prior_run(conn, tid, outcome="blocked",
+                       summary="review-required: config change needs approval")
+        kb._append_event(conn, tid, "block_loop_detected", {
+            "reason": "review-required: config change needs approval",
+            "kind": "needs_input",
+            "recurrences": 2,
+            "limit": 2,
+        })
+
+    patches = _patch_list_profiles(["orchestrator", "agent007", "gm2"])
+    for p in patches:
+        p.start()
+    try:
+        outcome = decomp.decompose_task(tid, author="auto-decomposer")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok is False
+    assert outcome.child_ids is None
+
+    # Hard check: no new tasks were created in the DB
+    with kb.connect() as conn:
+        all_tasks = kb.list_tasks(conn)
+        # Only the original task should exist (no children spawned)
+        assert len(all_tasks) == 1
+        assert all_tasks[0].id == tid
+
+
+def test_decompose_block_loop_no_reverse_parent_links(kanban_home):
+    """RED: A block-loop triage task must not acquire reverse parent links
+    from decomposition children."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="audit report", assignee="agent007", triage=True)
+        _add_prior_run(conn, tid, outcome="done",
+                       summary="audit-complete: report generated")
+        kb._append_event(conn, tid, "block_loop_detected", {
+            "reason": "review-required: awaiting audit sign-off",
+            "kind": "needs_input",
+            "recurrences": 2,
+            "limit": 2,
+        })
+
+    patches = _patch_list_profiles(["orchestrator", "agent007", "auditor"])
+    for p in patches:
+        p.start()
+    try:
+        outcome = decomp.decompose_task(tid, author="auto-decomposer")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok is False
+
+    # Verify: the task has no parent links (no children became parents of root)
+    with kb.connect() as conn:
+        links = conn.execute(
+            "SELECT * FROM task_links WHERE child_id = ?", (tid,)
+        ).fetchall()
+        assert len(links) == 0, f"expected zero parent links, got {len(links)}"
+
+
+# ---------------------------------------------------------------------------
+# GREEN tests — owner preservation, idempotency, control case
+# ---------------------------------------------------------------------------
+
+
+def test_block_loop_skip_preserves_assignee_exactly(kanban_home):
+    """GREEN: A block-loop skipped task preserves its original assignee exactly,
+    with no reassignment to orchestrator or any other profile."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="security patch", assignee="agent007", triage=True)
+        _add_prior_run(conn, tid, outcome="done", summary="patch applied")
+        kb._append_event(conn, tid, "block_loop_detected", {
+            "reason": "review-required: needs security review",
+            "kind": "needs_input",
+            "recurrences": 2,
+            "limit": 2,
+        })
+
+    patches = _patch_list_profiles(["orchestrator", "agent007", "gm2"])
+    for p in patches:
+        p.start()
+    try:
+        outcome = decomp.decompose_task(tid, author="auto-decomposer")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok is False
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+    assert task.assignee == "agent007"
+    assert task.status == "triage"
+    # Also verify no claim or other mutation leaked
+    assert task.claim_lock is None
+    assert task.claim_expires is None
+
+
+def test_block_loop_skip_is_idempotent(kanban_home):
+    """GREEN: Calling decompose_task twice on the same block-loop task
+    returns the same skip outcome both times — no state change."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="hotfix", assignee="agent007", triage=True)
+        _add_prior_run(conn, tid, outcome="done", summary="hotfix deployed")
+        kb._append_event(conn, tid, "block_loop_detected", {
+            "reason": "review-required: verify hotfix",
+            "kind": "needs_input",
+            "recurrences": 2,
+            "limit": 2,
+        })
+
+    patches = _patch_list_profiles(["orchestrator", "agent007", "gm2"])
+    for p in patches:
+        p.start()
+    try:
+        outcome1 = decomp.decompose_task(tid, author="auto-decomposer")
+        outcome2 = decomp.decompose_task(tid, author="auto-decomposer")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome1.ok is False
+    assert outcome2.ok is False
+    assert "block-loop" in outcome1.reason.lower() or "prior execution" in outcome1.reason.lower()
+    assert "block-loop" in outcome2.reason.lower() or "prior execution" in outcome2.reason.lower()
+
+    # Task still intact after both calls
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+    assert task.status == "triage"
+    assert task.assignee == "agent007"
+    # Still exactly one task in the system
+    with kb.connect() as conn:
+        all_tasks = kb.list_tasks(conn)
+        assert len(all_tasks) == 1
+
+
+def test_fresh_triage_intake_still_decomposes_normally(kanban_home):
+    """GREEN: A genuinely new triage intake with NO block_loop_detected event
+    and NO prior runs must still decompose normally — the guard must NOT
+    block normal triage→decomposition flow."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="build notification system", triage=True)
+        # No prior runs, no block_loop_detected event
+
+    llm_payload = jsonlib.dumps({
+        "fanout": True,
+        "rationale": "normal triage intake",
+        "tasks": [
+            {"title": "design API", "body": "spec the endpoints", "assignee": "architect", "parents": []},
+            {"title": "implement", "body": "code the server", "assignee": "engineer", "parents": [0]},
+        ],
+    })
+
+    patches = _patch_list_profiles(["orchestrator", "architect", "engineer"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(llm_payload), _patch_extra_body():
+            outcome = decomp.decompose_task(tid, author="auto-decomposer")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok, f"fresh triage should decompose normally: {outcome.reason}"
+    assert outcome.fanout is True
+    assert outcome.child_ids and len(outcome.child_ids) == 2
+
+    with kb.connect() as conn:
+        root = kb.get_task(conn, tid)
+        children = [kb.get_task(conn, cid) for cid in outcome.child_ids]
+    assert root.status == "todo"
+    assert all(c is not None for c in children)
+
+
+def test_fresh_triage_with_no_block_loop_but_prior_runs_decomposes(kanban_home):
+    """GREEN: A task in triage with prior runs but NO block_loop_detected
+    event should still decompose — the guard is conjunctive (both required).
+    This covers the case of a task that was manually moved to triage after
+    prior execution but never went through the block-loop path."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="refactor cache layer", assignee="agent007", triage=True)
+        _add_prior_run(conn, tid, outcome="done", summary="previous iteration")
+        # No block_loop_detected event — just a prior run
+
+    llm_payload = jsonlib.dumps({
+        "fanout": False,
+        "rationale": "single cleanup",
+        "title": "refactor cache layer v2",
+        "body": "Do the refactor again.",
+    })
+
+    patches = _patch_list_profiles(["orchestrator", "agent007", "engineer"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(llm_payload), _patch_extra_body():
+            outcome = decomp.decompose_task(tid, author="auto-decomposer")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok, (
+        f"prior runs alone without block_loop_detected should still decompose: {outcome.reason}"
+    )
+
+
+def test_block_loop_without_prior_runs_still_decomposes(kanban_home):
+    """GREEN: A task with a block_loop_detected event but NO prior runs
+    should still decompose — it's a new task that just happened to hit
+    the block-loop breaker (e.g., missing credential, repeated capability
+    block for a task that was never executed)."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="need new API key", triage=True)
+        # No prior runs — this task was never executed
+        kb._append_event(conn, tid, "block_loop_detected", {
+            "reason": "capability: no API key configured",
+            "kind": "capability",
+            "recurrences": 2,
+            "limit": 2,
+        })
+
+    llm_payload = jsonlib.dumps({
+        "fanout": False,
+        "rationale": "single task",
+        "title": "provision API key",
+        "body": "Create a new API key for the service.",
+    })
+
+    patches = _patch_list_profiles(["orchestrator", "admin"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(llm_payload), _patch_extra_body():
+            outcome = decomp.decompose_task(tid, author="auto-decomposer")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok, (
+        f"block_loop_detected without prior runs should still decompose: {outcome.reason}"
+    )
+
+
+def test_block_loop_skip_reason_is_descriptive(kanban_home):
+    """GREEN: The skip reason must be descriptive enough for the gateway log
+    and dashboard to surface why decomposition was skipped."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="migrate DB", assignee="agent007", triage=True)
+        _add_prior_run(conn, tid, outcome="done", summary="migration completed")
+        kb._append_event(conn, tid, "block_loop_detected", {
+            "reason": "review-required: DB migration PR #900 ready",
+            "kind": "needs_input",
+            "recurrences": 2,
+            "limit": 2,
+        })
+
+    patches = _patch_list_profiles(["orchestrator", "agent007"])
+    for p in patches:
+        p.start()
+    try:
+        outcome = decomp.decompose_task(tid, author="auto-decomposer")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok is False
+    assert "skipped" in outcome.reason.lower()
+    assert "block-loop" in outcome.reason.lower()
+    assert "prior execution" in outcome.reason.lower()
+    assert "review" in outcome.reason.lower() or "audit" in outcome.reason.lower()
