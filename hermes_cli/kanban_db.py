@@ -89,7 +89,7 @@ import urllib.request
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Optional
+from typing import Any, Callable, Iterable, Mapping, Optional
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
@@ -1275,6 +1275,23 @@ CREATE TABLE IF NOT EXISTS task_runs (
     summary             TEXT,
     metadata            TEXT,
     error               TEXT
+);
+
+-- Gate-epoch table for stage-gate authorization CAS (AION-CORE-PR6).
+-- Each row binds a *gate* (a namespace like ``repo:pr:stage``) to a
+-- monotonic epoch counter, a canonical decision, and a bound head SHA.
+-- HOLD / REQUEST_CHANGES / changed-fact increment the epoch and invalidate
+-- all prior intent tokens.  At the merge-write boundary, the queued intent
+-- must match the current epoch + decision + head exactly — stale intent
+-- from an older epoch is rejected atomically.  No real GitHub merge occurs
+-- in this table; it lives entirely inside the native Kanban DB.
+CREATE TABLE IF NOT EXISTS gate_epochs (
+    gate_id         TEXT PRIMARY KEY,
+    epoch           INTEGER NOT NULL DEFAULT 1,
+    last_decision   TEXT,
+    last_head       TEXT,
+    last_bound_by   TEXT,
+    last_bound_at   INTEGER NOT NULL
 );
 
 -- Files attached to a task (PDFs, images, source documents). The blob
@@ -4925,6 +4942,8 @@ def complete_task(
     recompute_ready(conn)
     # Clean up the scratch workspace and any stale tmux session for the worker.
     _cleanup_workspace(conn, task_id, captured_worker_pid=captured_worker_pid)
+    # Close workspace processes on completion (AION-CORE-PR6).
+    _cleanup_workspace_on_completion(conn, task_id)
     _done_task = get_task(conn, task_id)
     _fire_kanban_lifecycle_hook(
         "kanban_task_completed",
@@ -5778,6 +5797,27 @@ def block_task(
         run_id=run_id,
         reason=reason,
     )
+    # After blocking, close owned child processes in the task's workspace
+    # so no in-flight effects survive the block (AION-CORE-PR6: write-after-stop).
+    _wp_path = conn.execute(
+        "SELECT workspace_path FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if _wp_path and _wp_path["workspace_path"]:
+        try:
+            _wp = Path(_wp_path["workspace_path"]).expanduser().resolve()
+            if _wp.is_dir():
+                _evidence = close_workspace_processes(_wp)
+                _log.info(
+                    "block_task workspace cleanup: task=%s path=%s "
+                    "signalled=%s",
+                    task_id, str(_wp),
+                    _evidence.get("signalled", 0),
+                )
+        except Exception as _exc:
+            _log.warning(
+                "block_task workspace cleanup failed for task=%s: %s",
+                task_id, _exc,
+            )
     return True
 
 
@@ -10658,3 +10698,307 @@ def close_workspace_processes(
             result["skipped_outside"] += 1
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Gate-epoch CAS (AION-CORE-PR6)
+# ---------------------------------------------------------------------------
+
+
+def _gate_id(repo: str, pr_number: int, stage: str = "merge") -> str:
+    """Canonical gate identifier: ``repo:PR:stage``."""
+    return f"{repo}:{pr_number}:{stage}"
+
+
+def set_gate_decision(
+    conn: sqlite3.Connection,
+    repo: str,
+    pr_number: int,
+    decision: str,
+    head: str,
+    bound_by: str = "kanban",
+    *,
+    stage: str = "merge",
+) -> dict:
+    """Set a gate decision, atomically incrementing the epoch.
+
+    A new HOLD / REQUEST_CHANGES / changed-fact always increments the epoch,
+    which invalidates all prior intent tokens from older epochs.  APPROVE
+    also increments to bind the new approval epoch.  The write boundary
+    consumer must compare-epoch to ensure no intervening HOLD occurred.
+
+    Returns a dict with ``gate_id``, ``old_epoch``, ``new_epoch``,
+    ``decision``, ``head``, and whether the epoch changed.
+    """
+    gid = _gate_id(repo, pr_number, stage)
+    now = int(time.time())
+
+    with write_txn(conn):
+        existing = conn.execute(
+            "SELECT epoch, last_decision, last_head FROM gate_epochs "
+            "WHERE gate_id = ?",
+            (gid,),
+        ).fetchone()
+
+        if existing is None:
+            conn.execute(
+                "INSERT INTO gate_epochs "
+                "(gate_id, epoch, last_decision, last_head, last_bound_by, last_bound_at) "
+                "VALUES (?, 1, ?, ?, ?, ?)",
+                (gid, decision, head, bound_by, now),
+            )
+            return {
+                "gate_id": gid,
+                "old_epoch": 0,
+                "new_epoch": 1,
+                "decision": decision,
+                "head": head,
+                "epoch_changed": True,
+            }
+
+        old_epoch = existing["epoch"]
+        new_epoch = old_epoch + 1
+        conn.execute(
+            "UPDATE gate_epochs "
+            "SET epoch = ?, last_decision = ?, last_head = ?, "
+            "    last_bound_by = ?, last_bound_at = ? "
+            "WHERE gate_id = ?",
+            (new_epoch, decision, head, bound_by, now, gid),
+        )
+        return {
+            "gate_id": gid,
+            "old_epoch": old_epoch,
+            "new_epoch": new_epoch,
+            "decision": decision,
+            "head": head,
+            "epoch_changed": True,
+        }
+
+
+def get_gate_epoch(
+    conn: sqlite3.Connection,
+    repo: str,
+    pr_number: int,
+    *,
+    stage: str = "merge",
+) -> dict:
+    """Read the current gate epoch and decision without mutating."""
+    gid = _gate_id(repo, pr_number, stage)
+    row = conn.execute(
+        "SELECT epoch, last_decision, last_head, last_bound_by, last_bound_at "
+        "FROM gate_epochs WHERE gate_id = ?",
+        (gid,),
+    ).fetchone()
+    if row is None:
+        return {
+            "gate_id": gid,
+            "epoch": 0,
+            "decision": None,
+            "head": None,
+        }
+    return {
+        "gate_id": gid,
+        "epoch": row["epoch"],
+        "decision": row["last_decision"],
+        "head": row["last_head"],
+        "bound_by": row["last_bound_by"],
+        "bound_at": row["last_bound_at"],
+    }
+
+
+def validate_gate_intent(
+    conn: sqlite3.Connection,
+    repo: str,
+    pr_number: int,
+    intent_epoch: int,
+    intent_decision: str,
+    intent_head: str,
+    *,
+    stage: str = "merge",
+) -> dict:
+    """Atomically compare-and-swap at the merge-write boundary.
+
+    An intent from epoch N is valid ONLY if the current gate epoch is
+    still N AND the current decision is APPROVE AND the current head
+    matches.  Any drift (newer epoch, non-APPROVE decision, head mismatch)
+    fails closed.
+
+    Returns a dict with ``valid`` (bool), ``gate_id``, ``current`` (the
+    live state), and ``mismatch_reason`` when invalid.  Does NOT mutate
+    the gate — this is a pure read-and-validate operation.
+    """
+    current = get_gate_epoch(conn, repo, pr_number, stage=stage)
+    gid = current["gate_id"]
+
+    if current["epoch"] == 0:
+        return {
+            "valid": False,
+            "gate_id": gid,
+            "current": current,
+            "mismatch_reason": "no_gate_initialised",
+        }
+
+    if current["epoch"] != intent_epoch:
+        return {
+            "valid": False,
+            "gate_id": gid,
+            "current": current,
+            "mismatch_reason": (
+                f"epoch_mismatch: intent={intent_epoch} "
+                f"current={current['epoch']}"
+            ),
+        }
+
+    if current["decision"] != intent_decision:
+        return {
+            "valid": False,
+            "gate_id": gid,
+            "current": current,
+            "mismatch_reason": (
+                f"decision_mismatch: intent={intent_decision!r} "
+                f"current={current['decision']!r}"
+            ),
+        }
+
+    # Reject non-APPROVE at the CAS boundary (AION-CORE-PR6 bafuxunan audit):
+    # HOLD and REQUEST_CHANGES are decisions that should NEVER pass CAS,
+    # even when intent_decision == current_decision.  Only APPROVE can
+    # authorize an external write.
+    if current["decision"] != "APPROVE":
+        return {
+            "valid": False,
+            "gate_id": gid,
+            "current": current,
+            "mismatch_reason": (
+                f"non_approve_decision: current={current['decision']!r} "
+                f"— only APPROVE authorizes external write"
+            ),
+        }
+
+    if intent_head is not None and current["head"] != intent_head:
+        return {
+            "valid": False,
+            "gate_id": gid,
+            "current": current,
+            "mismatch_reason": (
+                f"head_mismatch: intent={intent_head[:12]} "
+                f"current={current['head'][:12] if current['head'] else 'None'}"
+            ),
+        }
+
+    return {
+        "valid": True,
+        "gate_id": gid,
+        "current": current,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Supported merge-write boundary with fake adapter (AION-CORE-PR6)
+# ---------------------------------------------------------------------------
+
+
+def merge_with_gate_cas(
+    conn: sqlite3.Connection,
+    repo: str,
+    pr_number: int,
+    intent_epoch: int,
+    intent_decision: str,
+    intent_head: str,
+    *,
+    stage: str = "merge",
+    merge_adapter: "Callable | None" = None,
+) -> dict:
+    """Supported merge-write boundary with deterministic CAS gate.
+
+    This is the ACTUAL merge execution path.  Before any external write,
+    it atomically validates the intent against the current canonical gate
+    state.  Stale intent (newer epoch, non-APPROVE decision, head drift)
+    fails closed BEFORE the adapter is called — no external write ever
+    lands on invalid intent.
+
+    When ``merge_adapter`` is provided, it is called only after CAS
+    validation passes and its result is included in the response.  In
+    production this would be a GitHub merge adapter; in tests it is a
+    fake/local adapter for deterministic RED/GREEN proof.
+
+    Returns a dict with:
+      - ``valid``: bool — whether CAS passed
+      - ``gate_id``: str
+      - ``current``: dict — live gate state at validation time
+      - ``mismatch_reason``: str | None — why CAS failed (None when valid)
+      - ``adapter_called``: bool — whether the adapter was invoked
+      - ``adapter_result``: dict | None — adapter return value (None when not called)
+    """
+    validation = validate_gate_intent(
+        conn, repo, pr_number,
+        intent_epoch=intent_epoch,
+        intent_decision=intent_decision,
+        intent_head=intent_head,
+        stage=stage,
+    )
+
+    result: dict = {
+        "valid": validation["valid"],
+        "gate_id": validation["gate_id"],
+        "current": validation["current"],
+        "mismatch_reason": validation.get("mismatch_reason"),
+        "adapter_called": False,
+        "adapter_result": None,
+    }
+
+    if not validation["valid"]:
+        return result
+
+    # CAS passed — the adapter is the ONLY path to external write.
+    if merge_adapter is not None:
+        adapter_result = merge_adapter(
+            repo, pr_number, intent_head, intent_decision, stage,
+        )
+        result["adapter_called"] = True
+        result["adapter_result"] = adapter_result
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Workspace cleanup on completion (AION-CORE-PR6)
+# ---------------------------------------------------------------------------
+
+
+def _cleanup_workspace_on_completion(
+    conn: sqlite3.Connection, task_id: str,
+) -> None:
+    """Close processes whose cwd is inside the task's workspace.
+
+    Called after a successful completion. Reads the task's workspace_path
+    from the DB, then calls :func:`close_workspace_processes`. Best-effort —
+    any error is logged and swallowed so completion is never blocked.
+    """
+    try:
+        row = conn.execute(
+            "SELECT workspace_path, workspace_kind FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return
+        wp = row["workspace_path"]
+        wk = row["workspace_kind"]
+        if not wp:
+            return
+        path = Path(wp).expanduser().resolve()
+        if not path.is_dir():
+            return
+        evidence = close_workspace_processes(path)
+        _log.info(
+            "complete_task workspace cleanup: task=%s kind=%s path=%s "
+            "signalled=%s dry_run=%s",
+            task_id, wk, str(path),
+            evidence.get("signalled", 0),
+            evidence.get("dry_run", False),
+        )
+    except Exception as exc:
+        _log.warning(
+            "complete_task workspace cleanup failed for task=%s: %s",
+            task_id, exc,
+        )
