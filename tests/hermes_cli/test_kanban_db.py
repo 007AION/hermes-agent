@@ -5987,11 +5987,25 @@ def test_merge_with_gate_cas_toctou_barrier(kanban_home):
             "cccccccccccccccccccccccccccccccccccccccc",
         )
 
-    # Separate connections for the race.  Use connect() for proper init.
+    # Separate connections for the race.
+    # conn1 stays on the main thread; conn2 will be used in the racer thread.
+    # Must use check_same_thread=False for cross-thread SQLite access.
+    import sqlite3 as _sqlite3
     conn1_ctx = kb.connect(db_path=Path(db_path))
     conn1 = conn1_ctx.__enter__()
-    conn2_ctx = kb.connect(db_path=Path(db_path))
-    conn2 = conn2_ctx.__enter__()
+    conn2 = _sqlite3.connect(db_path, check_same_thread=False)
+    conn2.row_factory = _sqlite3.Row
+    # Mirror the schema init that connect() would do — gate_epochs table.
+    conn2.execute(
+        "CREATE TABLE IF NOT EXISTS gate_epochs ("
+        "  gate_id TEXT PRIMARY KEY,"
+        "  epoch INTEGER NOT NULL DEFAULT 0,"
+        "  last_decision TEXT NOT NULL DEFAULT 'HOLD',"
+        "  last_head TEXT,"
+        "  last_bound_by TEXT NOT NULL DEFAULT 'kanban',"
+        "  last_bound_at INTEGER NOT NULL DEFAULT 0"
+        ")"
+    )
 
     hold_result_holder: list = []
     barrier = threading.Barrier(2, timeout=5)
