@@ -297,6 +297,100 @@ def test_release_fenced_workers_surviving_predecessor_stays_fenced(
         assert kb.claim_task(conn, t) is None  # still not claimable
 
 
+def test_release_fenced_workers_descendant_survivor_keeps_fenced(
+    kanban_home, monkeypatch, tmp_path,
+):
+    """Root PID exits during the fence but an eligible in-workspace descendant
+    survives (``close_workspace_processes`` reports ``survivors > 0``) — the
+    task must stay ``fenced`` and non-claimable until the complete lineage is
+    gone, never released on root-PID disappearance alone.
+
+    Regression for the bafuxunan exact-head audit finding: the R10 code
+    discarded ``close_workspace_processes().survivors`` and released to ready
+    as soon as the root PID disappeared, redispatching into a workspace that a
+    surviving descendant could still mutate.
+    """
+    import hermes_cli.kanban_db as _kb
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    state = {"root_fenced": False}
+
+    def _ident(pid):
+        if state["root_fenced"]:
+            return None  # root exited during the fence
+        return {"starttime": 999001, "cwd": str(workspace), "pgid": 1}
+
+    def _close(workspace_arg, **kwargs):
+        state["root_fenced"] = True  # root died; descendant below survived
+        return {
+            "workspace": str(workspace),
+            "signalled": 2,
+            "terminated": 1,
+            "killed": 0,
+            "survivors": 1,  # an eligible descendant is still alive
+        }
+
+    monkeypatch.setattr(_kb, "_read_process_identity", _ident)
+    monkeypatch.setattr(_kb, "close_workspace_processes", _close)
+
+    with kb.connect() as conn:
+        t = _make_fenced(conn, pid=424250, starttime=999001,
+                         workspace_path=str(workspace))
+        released = kb.release_fenced_workers(conn)
+        assert released == []
+        assert kb.get_task(conn, t).status == "fenced"
+        assert kb.claim_task(conn, t) is None  # still not claimable
+        # Deferred specifically for the surviving descendant, not a root-only
+        # reason, so operators can see the fence was held for lineage reasons.
+        deferred = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? "
+            "AND kind = 'fence_deferred' ORDER BY created_at DESC LIMIT 1",
+            (t,),
+        ).fetchone()
+        assert deferred is not None
+        assert json.loads(deferred["payload"])["reason"] == "descendant_survived"
+
+
+def test_release_fenced_workers_descendant_clean_exit_releases(
+    kanban_home, monkeypatch, tmp_path,
+):
+    """When the fence reports zero survivors AND the root PID is gone, the task
+    is released — the complete eligible lineage is quiescent."""
+    import hermes_cli.kanban_db as _kb
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    state = {"root_fenced": False}
+
+    def _ident(pid):
+        if state["root_fenced"]:
+            return None
+        return {"starttime": 999002, "cwd": str(workspace), "pgid": 1}
+
+    def _close(workspace_arg, **kwargs):
+        state["root_fenced"] = True
+        return {
+            "workspace": str(workspace),
+            "signalled": 2,
+            "terminated": 2,
+            "killed": 0,
+            "survivors": 0,
+        }
+
+    monkeypatch.setattr(_kb, "_read_process_identity", _ident)
+    monkeypatch.setattr(_kb, "close_workspace_processes", _close)
+
+    with kb.connect() as conn:
+        t = _make_fenced(conn, pid=424251, starttime=999002,
+                         workspace_path=str(workspace))
+        released = kb.release_fenced_workers(conn)
+        assert t in released
+        assert kb.get_task(conn, t).status == "ready"
+
+
 def test_release_fenced_workers_shared_dir_gates_on_owned_pids(
     kanban_home, monkeypatch, tmp_path,
 ):
@@ -413,3 +507,65 @@ def test_dispatch_reconciles_fenced_before_spawning(
         assert live not in spawns
         # The live-predecessor task remains fenced, not claimable.
         assert kb.get_task(conn, live).status == "fenced"
+
+
+# ---------------------------------------------------------------------------
+# Hermetic probe isolation (Native Kanban env pins)
+# ---------------------------------------------------------------------------
+
+def test_isolated_kanban_env_keeps_inherited_live_board_untouched(
+    kanban_home, monkeypatch, tmp_path,
+):
+    """A standalone RED/audit probe that inherits the dispatcher's live
+    ``HERMES_KANBAN_DB`` / board / workspaces pins must not write synthetic
+    cards into the real board.
+
+    Regression for the AION-RL2-CORE-01-R10 pollution incident: two standalone
+    probes inherited the dispatched worker's live ``HERMES_KANBAN_DB`` and
+    wrote synthetic fixture residue (t_d4dffd9c / t_75d7b60e) into the live
+    aion-factory board. ``isolated_kanban_env`` must rebind every pin so
+    ``connect()`` resolves to an isolated temp DB, leaving the live board
+    byte-identical.
+    """
+    import hermes_cli.kanban_db as _kb
+
+    # Simulate the live board a dispatched worker's env points at.
+    live_home = tmp_path / "live-factory"
+    live_home.mkdir()
+    live_db = live_home / "kanban.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(live_db))
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "aion-factory")
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(live_home))
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACES_ROOT", str(live_home / "workspaces"))
+    monkeypatch.setenv("HERMES_KANBAN_ATTACHMENTS_ROOT", str(live_home / "attachments"))
+
+    # Seed the live board with a known task so any residue is detectable.
+    with _kb.connect() as live_conn:
+        seed = _kb.create_task(live_conn, title="real-factory-task", assignee="a")
+        live_ids_before = [
+            r["id"] for r in live_conn.execute(
+                "SELECT id FROM tasks ORDER BY id"
+            ).fetchall()
+        ]
+
+    iso = tmp_path / "isolated-probe"
+    iso.mkdir()
+    with _kb.isolated_kanban_env(iso):
+        with _kb.connect() as probe_conn:
+            created = _kb.create_task(probe_conn, title="probe fixture")
+
+    # The live board is untouched (no synthetic residue); the probe task
+    # landed in the isolated DB under the temp root, not the live board.
+    with _kb.connect() as live_conn:
+        live_ids_after = [
+            r["id"] for r in live_conn.execute(
+                "SELECT id FROM tasks ORDER BY id"
+            ).fetchall()
+        ]
+    assert live_ids_after == live_ids_before
+    assert seed in live_ids_after
+    assert created not in live_ids_after
+
+    # After the context manager exits, the inherited live pins are restored.
+    assert os.environ.get("HERMES_KANBAN_DB") == str(live_db)
+    assert os.environ.get("HERMES_KANBAN_BOARD") == "aion-factory"

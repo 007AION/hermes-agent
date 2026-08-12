@@ -416,6 +416,86 @@ def kanban_home() -> Path:
     return get_default_hermes_root()
 
 
+# Native Kanban path pins the dispatcher injects into every worker's
+# environment (and that a developer shell may also carry). These must be
+# rebound (not merely cleared) for hermetic isolation so ``connect()`` resolves
+# to an isolated DB under the caller's temp root.
+_KANBAN_ENV_PINS: tuple[str, ...] = (
+    "HERMES_KANBAN_DB",
+    "HERMES_KANBAN_HOME",
+    "HERMES_KANBAN_WORKSPACES_ROOT",
+    "HERMES_KANBAN_ATTACHMENTS_ROOT",
+    "HERMES_KANBAN_LOGS_ROOT",
+)
+
+# Worker-identity / board-slug pins that must be *unset* (not rebound) so a
+# probe cannot inherit the dispatched worker's active board or claim identity.
+_KANBAN_ENV_UNSET: tuple[str, ...] = (
+    "HERMES_KANBAN_BOARD",
+    "HERMES_KANBAN_TASK",
+    "HERMES_KANBAN_WORKSPACE",
+    "HERMES_KANBAN_RUN_ID",
+    "HERMES_KANBAN_CLAIM_LOCK",
+    "HERMES_KANBAN_DISPATCH_IN_GATEWAY",
+    "HERMES_TENANT",
+)
+
+
+@contextlib.contextmanager
+def isolated_kanban_env(tmp_root: Path):
+    """Rebind every Native Kanban path/board pin to an isolated temp location.
+
+    The dispatcher injects ``HERMES_KANBAN_DB`` / ``HERMES_KANBAN_BOARD`` /
+    workspaces/logs pins into every worker's environment. A standalone
+    RED/audit probe that inherits those and then calls :func:`connect` will
+    silently write synthetic cards into the **real** board — the exact
+    pollution behind AION-RL2-CORE-01-R10 (synthetic fixture residue
+    t_d4dffd9c / t_75d7b60e written to the live aion-factory board). Wrap any
+    standalone probe or test that performs synthetic DB operations in this
+    context manager so ``connect()`` resolves to an isolated DB under
+    ``tmp_root``.
+
+    Example::
+
+        from hermes_cli import kanban_db
+        with kanban_db.isolated_kanban_env(tmp_path):
+            with kanban_db.connect() as conn:
+                kanban_db.create_task(conn, title="probe fixture")
+
+    Yields nothing and restores the original environment on exit. Clearing
+    the pins (rather than only overriding ``HERMES_KANBAN_DB``) is load-bearing:
+    ``kanban_db_path`` honours ``HERMES_KANBAN_DB`` first, but workspaces /
+    attachments / logs roots and the active-board slug each read their own
+    pin, so all of them must be redirected for a probe to be fully hermetic.
+    """
+    root = Path(tmp_root).resolve()
+    overrides = {
+        "HERMES_KANBAN_DB": str(root / "kanban.db"),
+        "HERMES_KANBAN_HOME": str(root),
+        "HERMES_KANBAN_WORKSPACES_ROOT": str(root / "workspaces"),
+        "HERMES_KANBAN_ATTACHMENTS_ROOT": str(root / "attachments"),
+        "HERMES_KANBAN_LOGS_ROOT": str(root / "logs"),
+    }
+    saved = {k: os.environ.get(k) for k in _KANBAN_ENV_PINS}
+    saved_unset = {k: os.environ.get(k) for k in _KANBAN_ENV_UNSET}
+    try:
+        os.environ.update(overrides)
+        for k in _KANBAN_ENV_UNSET:
+            os.environ.pop(k, None)
+        yield
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        for k, v in saved_unset.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
 def boards_root() -> Path:
     """Return ``<root>/kanban/boards`` — the parent of non-default board dirs.
 
@@ -7960,8 +8040,9 @@ def release_fenced_workers(
          signal by PID alone; release only if the PID is observed gone.
       5. identity matches and alive → fence the exact worker + in-workspace
          descendants via ``close_workspace_processes`` (cwd-containment, owned-PID
-         gate for shared-dir), then release when verified gone, else stay
-         ``fenced`` and retry next tick.
+         gate for shared-dir), then release only when the predecessor PID is gone
+         AND the fence reported zero survivors, else stay ``fenced`` and retry
+         next tick.
 
     Returns the list of task ids released to ``ready``. This is the single
     dispatcher-side gate; it uses only the existing task/run/event surface.
@@ -8009,6 +8090,7 @@ def release_fenced_workers(
         workspace_path = row["workspace_path"]
         workspace_kind = row["workspace_kind"] or "scratch"
         workspace = Path(workspace_path).resolve() if workspace_path else None
+        survivors = 0
         if workspace is not None and workspace.is_dir():
             # cwd-containment fence with descendant coverage. For shared-dir
             # workspaces, gate on the worker's owned PID lineage so unrelated
@@ -8016,17 +8098,25 @@ def release_fenced_workers(
             owned = None
             if workspace_kind == "dir":
                 owned = _discover_descendant_pids(pid, expected_starttime=starttime)
-            close_workspace_processes(workspace, owned_pids=owned)
+            cleanup = close_workspace_processes(workspace, owned_pids=owned)
+            # Honor cleanup survivors. The root PID alone is NOT sufficient
+            # proof the workspace is quiescent: a TERM/KILL-resistant (or
+            # reparented) in-workspace descendant can outlive the root. Only
+            # release when the fence reports zero survivors; otherwise keep the
+            # task fenced (non-claimable) and retry next tick.
+            # (AION-RL2-CORE-01-R10 PR#7 repair — bafuxunan exact-head audit
+            # found survivors were being discarded.)
+            if isinstance(cleanup, dict):
+                survivors = int(cleanup.get("survivors", 0) or 0)
         else:
             _fence_worker_by_identity(pid, starttime, signal_fn=signal_fn)
 
-        if _read_process_identity(pid) is None:
+        if _read_process_identity(pid) is None and survivors == 0:
             _release_fenced(conn, tid, reason="predecessor_fenced")
             released.append(tid)
         else:
-            _defer_fence(
-                conn, tid, pid, starttime, reason="predecessor_survived",
-            )
+            reason = "descendant_survived" if survivors else "predecessor_survived"
+            _defer_fence(conn, tid, pid, starttime, reason=reason)
 
     return released
 
