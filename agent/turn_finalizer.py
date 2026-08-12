@@ -151,6 +151,14 @@ def finalize_turn(
         # We route through ``_record_task_failure(outcome="timed_out")``
         # rather than ``kanban_block`` so this counts toward the dispatcher's
         # consecutive-failure circuit breaker (#29747 gap 2).
+        #
+        # ``fence_worker=True`` parks the task in ``fenced`` (non-dispatchable)
+        # with the predecessor PID+starttime retained instead of releasing the
+        # claim while this worker is still alive — the claim-release-before-
+        # process-exit race from AION-RL2-CORE-01-R10 (t_e690dcc1/t_50c0b14c).
+        # The dispatcher's ``release_fenced_workers`` verifies this process has
+        # exited (or fences it identity-safely) before the task becomes
+        # retry-eligible.
         _kanban_task = os.environ.get("HERMES_KANBAN_TASK")
         if _kanban_task:
             try:
@@ -167,7 +175,7 @@ def finalize_turn(
                             "iterations"
                         ),
                         outcome="timed_out",
-                        release_claim=True,
+                        fence_worker=True,
                         end_run=True,
                         event_payload_extra={
                             "budget_used": api_call_count,
