@@ -1257,6 +1257,12 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- its root across ticks is still caught (AION-RL2-CORE-01-R10 PR#7 repair,
     -- bafuxunan exact-head audit t_c09288bc).
     fence_lineage        TEXT,
+    -- Terminal disposition for a fenced task once its predecessor lineage is
+    -- quiescent: NULL/'ready' → release back to ``ready`` (retry-eligible);
+    -- 'blocked' → terminalize to ``blocked`` (the breaker already gave up, so
+    -- the work must NOT be retried). Set only by the fence_worker breaker-trip
+    -- path in ``_record_task_failure``. (AION-RL2-CORE-01-R10 PR#8 repair.)
+    fence_disposition    TEXT,
     -- Short excerpt of the most recent failure's error text.
     last_failure_error   TEXT,
     max_runtime_seconds  INTEGER,
@@ -2446,6 +2452,13 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         # Persisted eligible survivor lineage for the fenced reconciler.
         _add_column_if_missing(
             conn, "tasks", "fence_lineage", "fence_lineage TEXT"
+        )
+    if "fence_disposition" not in cols:
+        # Terminal disposition for a fenced task once its lineage is quiescent.
+        # NULL (legacy rows) = release-to-ready; 'blocked' = terminalize without
+        # retry (AION-RL2-CORE-01-R10 PR#8 repair).
+        _add_column_if_missing(
+            conn, "tasks", "fence_disposition", "fence_disposition TEXT"
         )
     if "last_failure_error" not in cols:
         added = _add_column_if_missing(
@@ -6948,7 +6961,8 @@ class DispatchResult:
     fenced_released: list[str] = field(default_factory=list)
     """Task ids released from ``fenced`` back to ``ready`` after the
     dispatcher verified the predecessor worker exited (or fenced it
-    identity-safely). (AION-RL2-CORE-01-R10)"""
+    identity-safely). Breaker-tripped fenced tasks that terminalize to
+    ``blocked`` (no retry) are NOT included here. (AION-RL2-CORE-01-R10)"""
     respawn_guarded: list[tuple[str, str, int]] = field(default_factory=list)
     """Tasks skipped by the respawn guard, as ``(task_id, reason, next_retry_at)`` triples.
 
@@ -7984,20 +7998,34 @@ def _fence_worker_by_identity(
     return info
 
 
-def _release_fenced(conn: sqlite3.Connection, task_id: str, *, reason: str) -> None:
-    """Transition a fenced task back to ``ready`` and emit fence evidence."""
+def _release_fenced(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: str,
+    target: str = "ready",
+) -> None:
+    """Transition a fenced task to ``target`` (``ready`` or ``blocked``) and
+    emit fence evidence.
+
+    ``target`` is ``ready`` for a normal self-fenced worker (retry-eligible) or
+    ``blocked`` for a breaker-tripped self-fence (terminal ``gave_up``, no
+    retry). (AION-RL2-CORE-01-R10 PR#8 repair.)
+    """
     with write_txn(conn):
         cur = conn.execute(
-            "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+            "UPDATE tasks SET status = ?, claim_lock = NULL, "
             "claim_expires = NULL, worker_pid = NULL, worker_starttime = NULL, "
-            "fence_lineage = NULL, last_heartbeat_at = NULL "
+            "fence_lineage = NULL, fence_disposition = NULL, "
+            "last_heartbeat_at = NULL "
             "WHERE id = ? AND status = 'fenced'",
-            (task_id,),
+            (target, task_id),
         )
         if cur.rowcount != 1:
             return
         _append_event(
-            conn, task_id, "fence_released", {"reason": reason},
+            conn, task_id, "fence_released",
+            {"reason": reason, "target": target},
         )
 
 
@@ -8163,6 +8191,12 @@ def release_fenced_workers(
     still mutate the workspace — the claim-release-before-process-exit race in
     AION-RL2-CORE-01-R10 (canonical incident t_e690dcc1 / t_50c0b14c).
 
+    Terminal disposition is carried by ``fence_disposition``: a normal
+    self-fence releases to ``ready`` (retry-eligible) once its lineage is
+    quiescent; a breaker-tripped self-fence terminalizes to ``blocked``
+    (``gave_up``, no retry) instead — the work is not retried.
+    (AION-RL2-CORE-01-R10 PR#8 repair, t_6918bd42 runs 1964/1984.)
+
     Per task, in order:
       1. ``worker_pid IS NULL`` → nothing to fence → release.
       2. ``/proc`` identity unreadable → predecessor exited → release ONLY after
@@ -8186,7 +8220,7 @@ def release_fenced_workers(
     released: list[str] = []
     rows = conn.execute(
         "SELECT id, worker_pid, worker_starttime, workspace_kind, workspace_path, "
-        "fence_lineage FROM tasks WHERE status = 'fenced'"
+        "fence_lineage, fence_disposition FROM tasks WHERE status = 'fenced'"
     ).fetchall()
     for row in rows:
         tid = row["id"]
@@ -8194,10 +8228,15 @@ def release_fenced_workers(
         starttime = row["worker_starttime"]
         workspace_kind = row["workspace_kind"] or "scratch"
         workspace = Path(row["workspace_path"]).resolve() if row["workspace_path"] else None
+        # A breaker-tripped self-fence must terminalize to ``blocked`` (no
+        # retry) once its lineage is quiescent; a normal self-fence releases
+        # back to ``ready`` (retry-eligible). (AION-RL2-CORE-01-R10 PR#8.)
+        target = "blocked" if row["fence_disposition"] == "blocked" else "ready"
 
         if not raw_pid:
-            _release_fenced(conn, tid, reason="no_predecessor")
-            released.append(tid)
+            _release_fenced(conn, tid, reason="no_predecessor", target=target)
+            if target == "ready":
+                released.append(tid)
             continue
 
         pid = int(raw_pid)
@@ -8210,8 +8249,9 @@ def release_fenced_workers(
         if ident is None or (starttime is not None and ident["starttime"] != int(starttime)):
             if _lineage_quiescent(conn, tid, lineage, workspace, workspace_kind):
                 reason = "predecessor_pid_recycled" if ident is not None else "predecessor_exited"
-                _release_fenced(conn, tid, reason=reason)
-                released.append(tid)
+                _release_fenced(conn, tid, reason=reason, target=target)
+                if target == "ready":
+                    released.append(tid)
             else:
                 _defer_fence(conn, tid, pid, starttime, reason="descendant_survived")
             continue
@@ -8221,8 +8261,9 @@ def release_fenced_workers(
             # and even then only after the eligible lineage is quiescent.
             if not _pid_alive(pid):
                 if _lineage_quiescent(conn, tid, lineage, workspace, workspace_kind):
-                    _release_fenced(conn, tid, reason="predecessor_exited")
-                    released.append(tid)
+                    _release_fenced(conn, tid, reason="predecessor_exited", target=target)
+                    if target == "ready":
+                        released.append(tid)
                 else:
                     _defer_fence(conn, tid, pid, starttime, reason="descendant_survived")
             else:
@@ -8258,8 +8299,9 @@ def release_fenced_workers(
             _persist_fence_lineage(conn, tid, [])
 
         if _read_process_identity(pid) is None and survivors == 0:
-            _release_fenced(conn, tid, reason="predecessor_fenced")
-            released.append(tid)
+            _release_fenced(conn, tid, reason="predecessor_fenced", target=target)
+            if target == "ready":
+                released.append(tid)
         else:
             reason = "descendant_survived" if survivors else "predecessor_survived"
             _defer_fence(conn, tid, pid, starttime, reason=reason)
@@ -8315,6 +8357,16 @@ def _record_task_failure(
       predecessor (PID+starttime) before the task becomes retry-eligible.
       (AION-RL2-CORE-01-R10, canonical incident t_e690dcc1 / t_50c0b14c.)
 
+      When the breaker trips on this path, the predecessor identity is STILL
+      retained — the task is parked ``fenced`` with ``fence_disposition =
+      'blocked'`` (not blocked-with-dropped-identity, which would let the
+      live predecessor keep mutating and a later unblock spawn a duplicate).
+      The reconciler then fences the exact worker and terminalizes to
+      ``blocked`` (no retry) once the lineage is quiescent. If no predecessor
+      identity was ever recorded, the breaker trip degrades straight to a
+      terminal ``blocked``. (AION-RL2-CORE-01-R10 PR#8 repair, t_6918bd42
+      runs 1964/1984.)
+
     ``event_payload_extra`` merges into the ``gave_up`` event payload
     when the breaker trips, so callers can include outcome-specific
     context (e.g. pid on crash, elapsed on timeout).
@@ -8361,6 +8413,7 @@ def _record_task_failure(
 
         if force_trip or failures >= effective_limit:
             # Trip the breaker.
+            fence_identity = None
             if release_claim:
                 # Spawn path: still running, also clear claim state.
                 conn.execute(
@@ -8371,18 +8424,50 @@ def _record_task_failure(
                     (failures, error[:500], task_id),
                 )
             elif fence_worker:
-                # Self-fence path tripping the breaker: block and drop the
-                # predecessor identity. Blocked is non-dispatchable, so no
-                # duplicate can spawn; the predecessor exits on its own and is
-                # gone by the time a human unblocks the task.
-                conn.execute(
-                    "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
-                    "claim_expires = NULL, worker_pid = NULL, "
-                    "worker_starttime = NULL, "
-                    "consecutive_failures = ?, last_failure_error = ? "
-                    "WHERE id = ? AND status IN ('running', 'ready', 'fenced')",
-                    (failures, error[:500], task_id),
-                )
+                # Self-fence path tripping the breaker: park in ``fenced``
+                # (non-dispatchable) and RETAIN the predecessor identity (PID +
+                # starttime) so the dispatcher can fence the exact still-alive
+                # worker before any retry. Never block-and-drop the identity —
+                # that lets a live predecessor keep mutating the workspace and a
+                # later unblock spawn a duplicate beside it. Mark the terminal
+                # disposition ``blocked`` so, once the lineage is quiescent, the
+                # reconciler terminalizes the task WITHOUT retrying the work.
+                # (AION-RL2-CORE-01-R10 PR#8 repair, t_6918bd42 runs 1964/1984.)
+                wrow = conn.execute(
+                    "SELECT worker_pid FROM tasks WHERE id = ?", (task_id,),
+                ).fetchone()
+                worker_pid = wrow["worker_pid"] if wrow else None
+                fence_starttime = None
+                if worker_pid:
+                    ident = _read_process_identity(int(worker_pid))
+                    if ident is not None:
+                        fence_starttime = ident["starttime"]
+                if worker_pid is None:
+                    # No predecessor identity to fence (PID never recorded).
+                    # The breaker has already given up → terminal block, no retry.
+                    conn.execute(
+                        "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
+                        "claim_expires = NULL, worker_pid = NULL, "
+                        "worker_starttime = NULL, fence_disposition = NULL, "
+                        "consecutive_failures = ?, last_failure_error = ? "
+                        "WHERE id = ? AND status IN ('running', 'ready', 'fenced')",
+                        (failures, error[:500], task_id),
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE tasks SET status = 'fenced', claim_lock = NULL, "
+                        "claim_expires = NULL, worker_pid = ?, "
+                        "worker_starttime = ?, fence_disposition = 'blocked', "
+                        "consecutive_failures = ?, last_failure_error = ? "
+                        "WHERE id = ? AND status IN ('running', 'ready', 'fenced')",
+                        (
+                            int(worker_pid), fence_starttime,
+                            failures, error[:500], task_id,
+                        ),
+                    )
+                    fence_identity = {"pid": int(worker_pid)}
+                    if fence_starttime is not None:
+                        fence_identity["starttime"] = fence_starttime
             else:
                 # Timeout/crash path: task is already at ``ready``
                 # with claim cleared; just flip to blocked + update
@@ -8419,6 +8504,14 @@ def _record_task_failure(
             _append_event(
                 conn, task_id, "gave_up", payload, run_id=run_id,
             )
+            if fence_worker and fence_identity:
+                # Emit fence evidence with the exact predecessor identity so
+                # operators see the terminal fence in `hermes kanban tail`.
+                fence_payload = {"error": error[:500], "failures": failures}
+                fence_payload.update(fence_identity)
+                _append_event(
+                    conn, task_id, "fenced", fence_payload, run_id=run_id,
+                )
             blocked = True
         else:
             # Below threshold.

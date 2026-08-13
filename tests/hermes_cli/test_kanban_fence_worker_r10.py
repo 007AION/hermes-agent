@@ -111,14 +111,23 @@ def test_fence_worker_records_fenced_not_claimable_while_predecessor_alive(
         assert payload["starttime"] == 111222
 
 
-def test_fence_worker_trips_breaker_blocks_and_clears_identity(
+def test_fence_worker_trips_breaker_fences_and_retains_identity(
     kanban_home, monkeypatch,
 ):
-    """When the breaker trips on a self-fence, the task is blocked (non-dispatchable)
-    and the stale predecessor identity is dropped."""
+    """When the breaker trips on a self-fence, the task is parked in ``fenced``
+    (non-dispatchable) with the live predecessor identity RETAINED — never
+    blocked-with-dropped-identity, which would let a still-alive worker keep
+    mutating the workspace and a later unblock spawn a duplicate beside it.
+
+    (AION-RL2-CORE-01-R10 PR#8 repair — canonical t_e690dcc1 / t_6918bd42 runs
+    1964/1984: the breaker branch dropped worker_pid/starttime while the exact
+    predecessor PID was still alive.)"""
     import hermes_cli.kanban_db as _kb
 
-    monkeypatch.setattr(_kb, "_read_process_identity", lambda _pid: None)
+    monkeypatch.setattr(
+        _kb, "_read_process_identity",
+        lambda _pid: {"starttime": 111333, "cwd": "/w", "pgid": 1},
+    )
     with kb.connect() as conn:
         t = _claim_with_worker(conn, pid=424243)
 
@@ -133,12 +142,18 @@ def test_fence_worker_trips_breaker_blocks_and_clears_identity(
         assert blocked is True
 
         task = kb.get_task(conn, t)
-        assert task.status == "blocked"
+        assert task.status == "fenced"          # non-dispatchable, not blocked
         row = conn.execute(
-            "SELECT worker_pid, worker_starttime FROM tasks WHERE id = ?", (t,),
+            "SELECT worker_pid, worker_starttime, claim_lock FROM tasks WHERE id = ?",
+            (t,),
         ).fetchone()
-        assert row["worker_pid"] is None
-        assert row["worker_starttime"] is None
+        assert row["worker_pid"] == 424243       # predecessor identity retained
+        assert row["worker_starttime"] == 111333  # starttime captured for fencing
+        assert row["claim_lock"] is None
+
+        # A second worker must NOT be claimable while the predecessor lives.
+        assert kb.claim_task(conn, t) is None
+
 
 
 def test_fence_worker_with_no_predecessor_pid_degrades_to_ready(
@@ -567,6 +582,198 @@ def test_release_fenced_workers_shared_dir_gates_on_owned_pids(
     # owned_pids passed (worker + descendant), never None for a shared dir.
     assert "owned_pids" in owned_seen
     assert owned_seen["owned_pids"] == {424249, 424250}
+
+
+# ---------------------------------------------------------------------------
+# Breaker-trip terminal disposition (AION-RL2-CORE-01-R10 PR#8 repair)
+# ---------------------------------------------------------------------------
+
+def test_fence_worker_breaker_trip_no_predecessor_blocks_terminal(kanban_home):
+    """No predecessor identity + breaker trip → terminal ``blocked`` (gave_up),
+    never a retry-eligible ``ready``."""
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="x", assignee="a")
+        host = _kb._claimer_id().split(":", 1)[0]
+        kb.claim_task(conn, t, claimer=f"{host}:worker")
+        # worker_pid left NULL.
+
+        blocked = _kb._record_task_failure(
+            conn, t, error="boom", outcome="timed_out",
+            fence_worker=True, end_run=True, failure_limit=1,
+        )
+        assert blocked is True
+        assert kb.get_task(conn, t).status == "blocked"
+
+
+def test_fence_worker_breaker_trip_terminalizes_blocked_after_quiescence(
+    kanban_home, monkeypatch, tmp_path,
+):
+    """After the breaker-tripped predecessor lineage is quiescent, the task
+    terminalizes to ``blocked`` (gave_up) — NOT ``ready`` — so the dispatcher
+    does NOT retry the work. Deterministic terminal disposition without retry."""
+    import hermes_cli.kanban_db as _kb
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    monkeypatch.setattr(
+        _kb, "_read_process_identity",
+        lambda _pid: {"starttime": 777001, "cwd": str(workspace), "pgid": 1},
+    )
+    with kb.connect() as conn:
+        t = _claim_with_worker(conn, pid=424301)
+        conn.execute(
+            "UPDATE tasks SET workspace_kind='scratch', workspace_path=? WHERE id = ?",
+            (str(workspace), t),
+        )
+        conn.commit()
+        _kb._record_task_failure(
+            conn, t, error="boom", outcome="timed_out",
+            fence_worker=True, end_run=True, failure_limit=1,
+        )
+        assert kb.get_task(conn, t).status == "fenced"
+
+    # Predecessor gone + zero survivors → deterministic terminalization.
+    monkeypatch.setattr(_kb, "_read_process_identity", lambda _pid: None)
+    monkeypatch.setattr(
+        _kb, "close_workspace_processes",
+        lambda *a, **k: {"workspace": str(workspace), "survivors": 0, "pids": []},
+    )
+    with kb.connect() as conn:
+        released = kb.release_fenced_workers(conn)
+        assert t not in released          # not released back to ready
+        assert kb.get_task(conn, t).status == "blocked"   # terminal, no retry
+        assert kb.claim_task(conn, t) is None
+        ev = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? "
+            "AND kind = 'fence_released' ORDER BY created_at DESC LIMIT 1",
+            (t,),
+        ).fetchone()
+        assert ev is not None
+        assert json.loads(ev["payload"]).get("target") == "blocked"
+
+
+def test_fence_worker_breaker_trip_pid_recycled_terminalizes_blocked_without_signal(
+    kanban_home, monkeypatch,
+):
+    """A recycled (starttime-mismatch) predecessor must never be signalled, and a
+    breaker-tripped fenced task still terminalizes to ``blocked`` (fail closed)."""
+    import hermes_cli.kanban_db as _kb
+
+    state = {"phase": "record"}
+    fence_calls = []
+
+    def _ident(pid):
+        if state["phase"] == "record":
+            return {"starttime": 111, "cwd": "/w", "pgid": 1}
+        return {"starttime": 999999, "cwd": "/elsewhere", "pgid": 1}
+
+    monkeypatch.setattr(_kb, "_read_process_identity", _ident)
+    monkeypatch.setattr(_kb, "_fence_worker_by_identity",
+                        lambda *a, **k: fence_calls.append(("direct", a, k)))
+    monkeypatch.setattr(_kb, "close_workspace_processes",
+                        lambda *a, **k: fence_calls.append(("close", a, k)))
+
+    with kb.connect() as conn:
+        t = _claim_with_worker(conn, pid=424320)
+        _kb._record_task_failure(
+            conn, t, error="boom", outcome="timed_out",
+            fence_worker=True, end_run=True, failure_limit=1,
+        )
+        assert kb.get_task(conn, t).status == "fenced"
+
+    state["phase"] = "release"
+    with kb.connect() as conn:
+        released = kb.release_fenced_workers(conn)
+        assert t not in released
+        assert kb.get_task(conn, t).status == "blocked"
+        assert fence_calls == []  # never signalled the recycled PID
+
+
+def test_fence_worker_breaker_trip_descendant_survivor_keeps_fenced_then_blocked(
+    kanban_home, monkeypatch, tmp_path,
+):
+    """Multi-tick: a breaker-tripped fenced task whose root exits while an owned
+    descendant survives must stay ``fenced`` (non-dispatchable, not released,
+    not terminalized) across >=2 dispatcher ticks; only the final zero-survivor
+    terminalizes to ``blocked`` without retrying work."""
+    import hermes_cli.kanban_db as _kb
+
+    shared = tmp_path / "shared"
+    shared.mkdir()
+
+    root_pid = 424310
+    root_starttime = 777310
+    desc_pid = 900310
+    desc_starttime = 777311
+
+    state = {"root_alive": True, "desc_alive": True, "owned_seen": None}
+
+    def _ident(pid):
+        if pid == root_pid:
+            if state["root_alive"]:
+                return {"starttime": root_starttime, "cwd": str(shared), "pgid": 1}
+            return None
+        if pid == desc_pid:
+            if state["desc_alive"]:
+                return {"starttime": desc_starttime, "cwd": str(shared), "pgid": 1}
+            return None
+        return None
+
+    def _close(workspace_arg, **kwargs):
+        state["owned_seen"] = kwargs.get("owned_pids")
+        state["root_alive"] = False
+        return {
+            "workspace": str(shared),
+            "signalled": 2, "terminated": 1, "killed": 0,
+            "survivors": 1,
+            "pids": [(1, desc_pid, str(shared), "survivor")],
+        }
+
+    monkeypatch.setattr(_kb, "_read_process_identity", _ident)
+    monkeypatch.setattr(_kb, "_discover_descendant_pids",
+                        lambda pid, **k: {root_pid, desc_pid})
+    monkeypatch.setattr(_kb, "close_workspace_processes", _close)
+
+    with kb.connect() as conn:
+        t = _claim_with_worker(conn, pid=root_pid)
+        conn.execute(
+            "UPDATE tasks SET workspace_kind='dir', workspace_path=? WHERE id = ?",
+            (str(shared), t),
+        )
+        conn.commit()
+        _kb._record_task_failure(
+            conn, t, error="boom", outcome="timed_out",
+            fence_worker=True, end_run=True, failure_limit=1,
+        )
+        assert kb.get_task(conn, t).status == "fenced"
+
+    # Tick 1: root alive + identity match → fence discovers descendant survivor.
+    with kb.connect() as conn:
+        released = kb.release_fenced_workers(conn)
+        assert released == []
+        assert kb.get_task(conn, t).status == "fenced"
+        assert state["root_alive"] is False
+        # Shared-dir fence is gated on the worker's owned PID lineage.
+        assert state["owned_seen"] is not None
+        assert state["owned_seen"] == {root_pid, desc_pid}
+
+    # Tick 2: root gone, persisted descendant alive → still fenced (not released,
+    # not terminalized) — persists across a second dispatcher tick.
+    with kb.connect() as conn:
+        released = kb.release_fenced_workers(conn)
+        assert released == []
+        assert kb.get_task(conn, t).status == "fenced"
+        assert kb.claim_task(conn, t) is None
+
+    # Tick 3: descendant finally exits → final zero-survivor → terminal blocked.
+    state["desc_alive"] = False
+    with kb.connect() as conn:
+        released = kb.release_fenced_workers(conn)
+        assert t not in released
+        assert kb.get_task(conn, t).status == "blocked"
 
 
 # ---------------------------------------------------------------------------
