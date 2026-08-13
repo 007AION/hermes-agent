@@ -101,7 +101,7 @@ _log = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
+VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "fenced", "done", "archived"}
 VALID_INITIAL_STATUSES = {"running", "blocked"}
 
 # Typed block reasons. Distinguishes the two fundamentally different things a
@@ -414,6 +414,86 @@ def kanban_home() -> Path:
         return Path(override).expanduser()
     from hermes_constants import get_default_hermes_root
     return get_default_hermes_root()
+
+
+# Native Kanban path pins the dispatcher injects into every worker's
+# environment (and that a developer shell may also carry). These must be
+# rebound (not merely cleared) for hermetic isolation so ``connect()`` resolves
+# to an isolated DB under the caller's temp root.
+_KANBAN_ENV_PINS: tuple[str, ...] = (
+    "HERMES_KANBAN_DB",
+    "HERMES_KANBAN_HOME",
+    "HERMES_KANBAN_WORKSPACES_ROOT",
+    "HERMES_KANBAN_ATTACHMENTS_ROOT",
+    "HERMES_KANBAN_LOGS_ROOT",
+)
+
+# Worker-identity / board-slug pins that must be *unset* (not rebound) so a
+# probe cannot inherit the dispatched worker's active board or claim identity.
+_KANBAN_ENV_UNSET: tuple[str, ...] = (
+    "HERMES_KANBAN_BOARD",
+    "HERMES_KANBAN_TASK",
+    "HERMES_KANBAN_WORKSPACE",
+    "HERMES_KANBAN_RUN_ID",
+    "HERMES_KANBAN_CLAIM_LOCK",
+    "HERMES_KANBAN_DISPATCH_IN_GATEWAY",
+    "HERMES_TENANT",
+)
+
+
+@contextlib.contextmanager
+def isolated_kanban_env(tmp_root: Path):
+    """Rebind every Native Kanban path/board pin to an isolated temp location.
+
+    The dispatcher injects ``HERMES_KANBAN_DB`` / ``HERMES_KANBAN_BOARD`` /
+    workspaces/logs pins into every worker's environment. A standalone
+    RED/audit probe that inherits those and then calls :func:`connect` will
+    silently write synthetic cards into the **real** board — the exact
+    pollution behind AION-RL2-CORE-01-R10 (synthetic fixture residue
+    t_d4dffd9c / t_75d7b60e written to the live aion-factory board). Wrap any
+    standalone probe or test that performs synthetic DB operations in this
+    context manager so ``connect()`` resolves to an isolated DB under
+    ``tmp_root``.
+
+    Example::
+
+        from hermes_cli import kanban_db
+        with kanban_db.isolated_kanban_env(tmp_path):
+            with kanban_db.connect() as conn:
+                kanban_db.create_task(conn, title="probe fixture")
+
+    Yields nothing and restores the original environment on exit. Clearing
+    the pins (rather than only overriding ``HERMES_KANBAN_DB``) is load-bearing:
+    ``kanban_db_path`` honours ``HERMES_KANBAN_DB`` first, but workspaces /
+    attachments / logs roots and the active-board slug each read their own
+    pin, so all of them must be redirected for a probe to be fully hermetic.
+    """
+    root = Path(tmp_root).resolve()
+    overrides = {
+        "HERMES_KANBAN_DB": str(root / "kanban.db"),
+        "HERMES_KANBAN_HOME": str(root),
+        "HERMES_KANBAN_WORKSPACES_ROOT": str(root / "workspaces"),
+        "HERMES_KANBAN_ATTACHMENTS_ROOT": str(root / "attachments"),
+        "HERMES_KANBAN_LOGS_ROOT": str(root / "logs"),
+    }
+    saved = {k: os.environ.get(k) for k in _KANBAN_ENV_PINS}
+    saved_unset = {k: os.environ.get(k) for k in _KANBAN_ENV_UNSET}
+    try:
+        os.environ.update(overrides)
+        for k in _KANBAN_ENV_UNSET:
+            os.environ.pop(k, None)
+        yield
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        for k, v in saved_unset.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
 
 def boards_root() -> Path:
@@ -1164,6 +1244,19 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- exceeds DEFAULT_FAILURE_LIMIT consecutive non-successes.
     consecutive_failures INTEGER NOT NULL DEFAULT 0,
     worker_pid           INTEGER,
+    -- Process starttime captured at spawn (from /proc/<pid>/stat field 22).
+    -- Retained across a worker's self-fence (iteration-limit / self-recorded
+    -- failure) so the dispatcher can prove the exact predecessor PID was not
+    -- recycled before fencing or releasing it back to ``ready``.
+    -- (AION-RL2-CORE-01-R10, canonical incident t_e690dcc1.)
+    worker_starttime     INTEGER,
+    -- Persisted eligible survivor lineage for a fenced task: a JSON list of
+    -- {"pid": int, "starttime": int|null} for owned/exact-workspace descendant
+    -- processes that survived a prior fence attempt. The reconciler refuses to
+    -- release a fenced task until this set is empty, so a survivor that outlives
+    -- its root across ticks is still caught (AION-RL2-CORE-01-R10 PR#7 repair,
+    -- bafuxunan exact-head audit t_c09288bc).
+    fence_lineage        TEXT,
     -- Short excerpt of the most recent failure's error text.
     last_failure_error   TEXT,
     max_runtime_seconds  INTEGER,
@@ -2342,6 +2435,18 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             )
     if "worker_pid" not in cols:
         _add_column_if_missing(conn, "tasks", "worker_pid", "worker_pid INTEGER")
+    if "worker_starttime" not in cols:
+        # Predecessor starttime identity for self-fenced workers (R10).
+        # NULL on legacy rows = no identity proof; the fence reconciler then
+        # fails closed (never signals by PID without a starttime identity).
+        _add_column_if_missing(
+            conn, "tasks", "worker_starttime", "worker_starttime INTEGER"
+        )
+    if "fence_lineage" not in cols:
+        # Persisted eligible survivor lineage for the fenced reconciler.
+        _add_column_if_missing(
+            conn, "tasks", "fence_lineage", "fence_lineage TEXT"
+        )
     if "last_failure_error" not in cols:
         added = _add_column_if_missing(
             conn, "tasks", "last_failure_error", "last_failure_error TEXT"
@@ -6840,6 +6945,10 @@ class DispatchResult:
     stale: list[str] = field(default_factory=list)
     """Task ids reclaimed because no progress (heartbeat) was seen
     within ``dispatch_stale_timeout_seconds``."""
+    fenced_released: list[str] = field(default_factory=list)
+    """Task ids released from ``fenced`` back to ``ready`` after the
+    dispatcher verified the predecessor worker exited (or fenced it
+    identity-safely). (AION-RL2-CORE-01-R10)"""
     respawn_guarded: list[tuple[str, str, int]] = field(default_factory=list)
     """Tasks skipped by the respawn guard, as ``(task_id, reason, next_retry_at)`` triples.
 
@@ -7799,6 +7908,365 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     return crashed
 
 
+def _fence_worker_by_identity(
+    pid: int,
+    starttime: int,
+    *,
+    signal_fn=None,
+) -> dict:
+    """Identity-safe TERM→KILL of the exact predecessor worker PID.
+
+    Only used as the fallback when the fenced task has no resolvable
+    workspace directory (so ``close_workspace_processes`` cannot gate on cwd
+    containment). Every signal is gated on a starttime revalidation via
+    ``/proc/<pid>/stat`` so a PID recycled between discovery and signal is
+    never touched. Returns machine-readable evidence of what happened.
+    """
+    import signal as _signal
+    import time as _time
+
+    info: dict = {
+        "pid": pid,
+        "starttime": starttime,
+        "termination_attempted": False,
+        "terminated": False,
+        "sigkill": False,
+        "identity_mismatch": False,
+    }
+    kill = signal_fn if signal_fn is not None else (
+        os.kill if hasattr(os, "kill") else None
+    )
+    if kill is None:
+        return info
+
+    # Never signal ourselves (self-preservation — the dispatcher must not
+    # kill its own process even if a corrupt row pointed at it).
+    if pid == os.getpid():
+        return info
+
+    ident = _read_process_identity(pid)
+    if ident is None:
+        info["terminated"] = True
+        return info
+    if ident["starttime"] != starttime:
+        info["identity_mismatch"] = True
+        return info
+
+    info["termination_attempted"] = True
+    try:
+        kill(pid, _signal.SIGTERM)
+    except (ProcessLookupError, OSError):
+        info["terminated"] = True
+        return info
+
+    # Bounded TERM wait with per-iteration identity revalidation.
+    for _ in range(10):
+        if not _revalidate_identity(pid, ident):
+            info["terminated"] = True
+            return info
+        _time.sleep(0.5)
+
+    # TERM-ignoring survivor → escalate to KILL.
+    if _revalidate_identity(pid, ident):
+        try:
+            _sigkill = getattr(_signal, "SIGKILL", _signal.SIGTERM)
+            kill(pid, _sigkill)
+            info["sigkill"] = True
+        except (ProcessLookupError, OSError):
+            info["terminated"] = True
+            return info
+        _time.sleep(1.5)
+        if not _revalidate_identity(pid, ident):
+            info["terminated"] = True
+            return info
+
+    info["terminated"] = not _revalidate_identity(pid, ident)
+    return info
+
+
+def _release_fenced(conn: sqlite3.Connection, task_id: str, *, reason: str) -> None:
+    """Transition a fenced task back to ``ready`` and emit fence evidence."""
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+            "claim_expires = NULL, worker_pid = NULL, worker_starttime = NULL, "
+            "fence_lineage = NULL, last_heartbeat_at = NULL "
+            "WHERE id = ? AND status = 'fenced'",
+            (task_id,),
+        )
+        if cur.rowcount != 1:
+            return
+        _append_event(
+            conn, task_id, "fence_released", {"reason": reason},
+        )
+
+
+def _defer_fence(
+    conn: sqlite3.Connection,
+    task_id: str,
+    pid: int,
+    starttime: Optional[int],
+    *,
+    reason: str,
+) -> None:
+    """Keep a fenced task fenced this tick; emit a deduped ``fence_deferred`` event."""
+    with write_txn(conn):
+        last = conn.execute(
+            "SELECT kind, payload FROM task_events "
+            "WHERE task_id = ? ORDER BY created_at DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if last and last["kind"] == "fence_deferred":
+            try:
+                prev = json.loads(last["payload"] or "{}")
+                if prev.get("reason") == reason:
+                    return
+            except (json.JSONDecodeError, TypeError):
+                pass
+        payload = {"reason": reason, "pid": pid}
+        if starttime is not None:
+            payload["starttime"] = starttime
+        _append_event(conn, task_id, "fence_deferred", payload)
+
+
+def _encode_fence_lineage(lineage: list[dict]) -> Optional[str]:
+    """Encode a survivor-lineage list for persistence (empty → None)."""
+    if not lineage:
+        return None
+    return json.dumps(lineage, ensure_ascii=False)
+
+
+def _decode_fence_lineage(raw: Optional[str]) -> list[dict]:
+    """Decode a persisted survivor-lineage blob; corruption → empty list."""
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return []
+    out: list[dict] = []
+    for item in parsed or []:
+        if not isinstance(item, dict):
+            continue
+        pid = item.get("pid")
+        if not isinstance(pid, int):
+            continue
+        st = item.get("starttime")
+        out.append({"pid": pid, "starttime": st if isinstance(st, int) else None})
+    return out
+
+
+def _survivor_lineage_from_cleanup(cleanup: dict) -> list[dict]:
+    """Extract surviving PIDs (with starttime identity) from cleanup evidence.
+
+    ``close_workspace_processes`` reports each signalled PID as
+    ``(pgid, pid, cwd, outcome)`` in ``cleanup["pids"]``; entries whose outcome
+    is ``"survivor"`` are still alive and must be tracked across ticks.
+    """
+    out: list[dict] = []
+    seen: set[int] = set()
+    for entry in cleanup.get("pids", []) or []:
+        try:
+            pid, outcome = entry[1], entry[3]
+        except (IndexError, TypeError):
+            continue
+        if outcome != "survivor" or pid in seen:
+            continue
+        ident = _read_process_identity(pid)
+        out.append({"pid": pid, "starttime": (ident or {}).get("starttime")})
+        seen.add(pid)
+    return out
+
+
+def _live_lineage(lineage: list[dict]) -> list[dict]:
+    """Return the subset of *lineage* still alive with a matching identity.
+
+    Fail-closed on missing identity proof: a persisted entry with no starttime
+    and a live PID is treated as a live survivor (we cannot prove it exited, so
+    the task stays fenced). A starttime mismatch means the PID was recycled — the
+    original survivor is gone.
+    """
+    live: list[dict] = []
+    for entry in lineage:
+        pid = entry["pid"]
+        starttime = entry.get("starttime")
+        ident = _read_process_identity(pid)
+        if ident is None:
+            continue  # exited → gone
+        if starttime is None:
+            live.append(entry)  # no identity proof → fail closed
+            continue
+        if ident["starttime"] == starttime:
+            live.append(entry)
+        # else: PID recycled → original survivor gone.
+    return live
+
+
+def _persist_fence_lineage(
+    conn: sqlite3.Connection, task_id: str, lineage: list[dict],
+) -> None:
+    """Persist the current survivor lineage onto the fenced task row."""
+    with write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET fence_lineage = ? WHERE id = ?",
+            (_encode_fence_lineage(lineage), task_id),
+        )
+
+
+def _lineage_quiescent(
+    conn: sqlite3.Connection,
+    task_id: str,
+    lineage: list[dict],
+    workspace: Optional[Path],
+    workspace_kind: str,
+) -> bool:
+    """True when no eligible survivor remains, re-deriving and persisting the
+    live survivor set as a side effect.
+
+    The root predecessor PID is already gone/recycled/unknown by the time this
+    runs, so it cannot be used to rediscover owned lineage. Survivors are the
+    union of:
+
+      * persisted lineage still alive with a matching identity (the ``dir`` /
+        shared-dir owned-lineage case), and
+      * for exclusive workspaces (scratch/worktree), any process still bound to
+        the exact workspace by cwd — a reparented orphan keeps its cwd, so cwd
+        containment reliably catches it even after the root exits.
+
+    Returns False (and persists the survivors) when anything remains so the
+    task stays fenced and is rechecked next tick.
+    """
+    survivors: dict[int, dict] = {s["pid"]: s for s in _live_lineage(lineage)}
+
+    if workspace_kind != "dir" and workspace is not None and workspace.is_dir():
+        cleanup = close_workspace_processes(workspace, owned_pids=None)
+        if isinstance(cleanup, dict):
+            for entry in _survivor_lineage_from_cleanup(cleanup):
+                survivors.setdefault(entry["pid"], entry)
+
+    _persist_fence_lineage(conn, task_id, list(survivors.values()))
+    return not survivors
+
+
+def release_fenced_workers(
+    conn: sqlite3.Connection,
+    *,
+    signal_fn=None,
+) -> list[str]:
+    """Reconcile ``fenced`` tasks: release to ``ready`` only after the exact
+    predecessor worker (PID + starttime) is verified gone or fenced identity-safely,
+    AND no eligible exact-workspace or owned-lineage descendant survives.
+
+    A ``fenced`` task was parked by ``_record_task_failure(fence_worker=True)``
+    when a still-alive worker recorded its own non-success (iteration-budget
+    exhaustion). The task must never be dispatchable while that predecessor can
+    still mutate the workspace — the claim-release-before-process-exit race in
+    AION-RL2-CORE-01-R10 (canonical incident t_e690dcc1 / t_50c0b14c).
+
+    Per task, in order:
+      1. ``worker_pid IS NULL`` → nothing to fence → release.
+      2. ``/proc`` identity unreadable → predecessor exited → release ONLY after
+         the eligible lineage (persisted survivors +, for exclusive workspaces, a
+         cwd-containment re-scan) is quiescent.
+      3. recorded starttime mismatch → PID recycled, predecessor gone → release
+         ONLY after the eligible lineage is quiescent (never signal the recycled
+         occupant).
+      4. starttime unknown (NULL) → no identity proof → fail closed: do NOT
+         signal by PID alone; release only if the PID is observed gone AND the
+         eligible lineage is quiescent.
+      5. identity matches and alive → fence the exact worker + in-workspace
+         descendants via ``close_workspace_processes`` (cwd-containment, owned-PID
+         gate for shared-dir), persist any survivors, then release only when the
+         predecessor PID is gone AND the fence reported zero survivors, else stay
+         ``fenced`` and retry next tick.
+
+    Returns the list of task ids released to ``ready``. This is the single
+    dispatcher-side gate; it uses only the existing task/run/event surface.
+    """
+    released: list[str] = []
+    rows = conn.execute(
+        "SELECT id, worker_pid, worker_starttime, workspace_kind, workspace_path, "
+        "fence_lineage FROM tasks WHERE status = 'fenced'"
+    ).fetchall()
+    for row in rows:
+        tid = row["id"]
+        raw_pid = row["worker_pid"]
+        starttime = row["worker_starttime"]
+        workspace_kind = row["workspace_kind"] or "scratch"
+        workspace = Path(row["workspace_path"]).resolve() if row["workspace_path"] else None
+
+        if not raw_pid:
+            _release_fenced(conn, tid, reason="no_predecessor")
+            released.append(tid)
+            continue
+
+        pid = int(raw_pid)
+        lineage = _decode_fence_lineage(row["fence_lineage"])
+        ident = _read_process_identity(pid)
+
+        # Root predecessor exited, or its PID was recycled. The root no longer
+        # blocks release, but eligible lineage may still survive — never release
+        # on root disappearance alone (bafuxunan exact-head audit t_c09288bc).
+        if ident is None or (starttime is not None and ident["starttime"] != int(starttime)):
+            if _lineage_quiescent(conn, tid, lineage, workspace, workspace_kind):
+                reason = "predecessor_pid_recycled" if ident is not None else "predecessor_exited"
+                _release_fenced(conn, tid, reason=reason)
+                released.append(tid)
+            else:
+                _defer_fence(conn, tid, pid, starttime, reason="descendant_survived")
+            continue
+
+        if starttime is None:
+            # No identity proof → fail closed. Release only on observed exit,
+            # and even then only after the eligible lineage is quiescent.
+            if not _pid_alive(pid):
+                if _lineage_quiescent(conn, tid, lineage, workspace, workspace_kind):
+                    _release_fenced(conn, tid, reason="predecessor_exited")
+                    released.append(tid)
+                else:
+                    _defer_fence(conn, tid, pid, starttime, reason="descendant_survived")
+            else:
+                _defer_fence(
+                    conn, tid, pid, starttime, reason="identity_unknown",
+                )
+            continue
+
+        # Identity matches and the predecessor is alive → fence it identity-safely.
+        survivors = 0
+        if workspace is not None and workspace.is_dir():
+            # cwd-containment fence with descendant coverage. For shared-dir
+            # workspaces, gate on the worker's owned PID lineage so unrelated
+            # processes sharing the directory are never signalled.
+            owned = None
+            if workspace_kind == "dir":
+                owned = _discover_descendant_pids(pid, expected_starttime=starttime)
+            cleanup = close_workspace_processes(workspace, owned_pids=owned)
+            # Honor cleanup survivors. The root PID alone is NOT sufficient
+            # proof the workspace is quiescent: a TERM/KILL-resistant (or
+            # reparented) in-workspace descendant can outlive the root. Only
+            # release when the fence reports zero survivors; otherwise keep the
+            # task fenced (non-claimable), persist the survivors, and retry next
+            # tick. (AION-RL2-CORE-01-R10 PR#7 repair — bafuxunan exact-head
+            # audit found survivors were being discarded.)
+            if isinstance(cleanup, dict):
+                survivors = int(cleanup.get("survivors", 0) or 0)
+                _persist_fence_lineage(
+                    conn, tid, _survivor_lineage_from_cleanup(cleanup),
+                )
+        else:
+            _fence_worker_by_identity(pid, starttime, signal_fn=signal_fn)
+            _persist_fence_lineage(conn, tid, [])
+
+        if _read_process_identity(pid) is None and survivors == 0:
+            _release_fenced(conn, tid, reason="predecessor_fenced")
+            released.append(tid)
+        else:
+            reason = "descendant_survived" if survivors else "predecessor_survived"
+            _defer_fence(conn, tid, pid, starttime, reason=reason)
+
+    return released
+
+
 def _record_task_failure(
     conn: sqlite3.Connection,
     task_id: str,
@@ -7809,6 +8277,7 @@ def _record_task_failure(
     force_trip: bool = False,
     release_claim: bool = False,
     end_run: bool = False,
+    fence_worker: bool = False,
     event_payload_extra: Optional[dict] = None,
 ) -> bool:
     """Record a non-success outcome (spawn_failed / crashed / timed_out)
@@ -7834,6 +8303,17 @@ def _record_task_failure(
       run with the appropriate outcome. This just increments the
       counter; if the breaker trips, the task is re-transitioned
       ``ready → blocked`` and a ``gave_up`` event is emitted.
+
+    * ``fence_worker=True`` (with ``end_run=True``) — worker self-fence
+      path. The caller is a worker that is STILL ALIVE but is recording its
+      own non-success (e.g. iteration-budget exhaustion from
+      ``agent/turn_finalizer.py``). Instead of releasing the claim to
+      ``ready`` (which would let the dispatcher spawn a duplicate beside the
+      still-alive predecessor), the task is parked in ``fenced`` with
+      ``worker_pid`` retained and ``worker_starttime`` captured so the
+      dispatcher's ``release_fenced_workers`` can fence the exact
+      predecessor (PID+starttime) before the task becomes retry-eligible.
+      (AION-RL2-CORE-01-R10, canonical incident t_e690dcc1 / t_50c0b14c.)
 
     ``event_payload_extra`` merges into the ``gave_up`` event payload
     when the breaker trips, so callers can include outcome-specific
@@ -7890,6 +8370,19 @@ def _record_task_failure(
                     "WHERE id = ? AND status IN ('running', 'ready')",
                     (failures, error[:500], task_id),
                 )
+            elif fence_worker:
+                # Self-fence path tripping the breaker: block and drop the
+                # predecessor identity. Blocked is non-dispatchable, so no
+                # duplicate can spawn; the predecessor exits on its own and is
+                # gone by the time a human unblocks the task.
+                conn.execute(
+                    "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
+                    "claim_expires = NULL, worker_pid = NULL, "
+                    "worker_starttime = NULL, "
+                    "consecutive_failures = ?, last_failure_error = ? "
+                    "WHERE id = ? AND status IN ('running', 'ready', 'fenced')",
+                    (failures, error[:500], task_id),
+                )
             else:
                 # Timeout/crash path: task is already at ``ready``
                 # with claim cleared; just flip to blocked + update
@@ -7929,6 +8422,7 @@ def _record_task_failure(
             blocked = True
         else:
             # Below threshold.
+            fence_identity = None
             if release_claim:
                 # Spawn path: transition running → ready + clear claim.
                 conn.execute(
@@ -7938,6 +8432,47 @@ def _record_task_failure(
                     "WHERE id = ? AND status = 'running'",
                     (failures, error[:500], task_id),
                 )
+            elif fence_worker:
+                # Self-fence path: park in ``fenced`` (non-dispatchable) and
+                # retain the predecessor identity (PID + starttime) so the
+                # dispatcher can fence it before the task becomes retry-eligible.
+                wrow = conn.execute(
+                    "SELECT worker_pid FROM tasks WHERE id = ?", (task_id,),
+                ).fetchone()
+                worker_pid = wrow["worker_pid"] if wrow else None
+                fence_starttime = None
+                if worker_pid:
+                    ident = _read_process_identity(int(worker_pid))
+                    if ident is not None:
+                        fence_starttime = ident["starttime"]
+                if worker_pid is None:
+                    # No predecessor identity to fence (e.g. PID never recorded).
+                    # Degrade to the release path — there is no live worker to
+                    # duplicate.
+                    conn.execute(
+                        "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                        "claim_expires = NULL, worker_pid = NULL, "
+                        "worker_starttime = NULL, "
+                        "consecutive_failures = ?, last_failure_error = ? "
+                        "WHERE id = ? AND status = 'running'",
+                        (failures, error[:500], task_id),
+                    )
+                    fence_identity = None
+                else:
+                    conn.execute(
+                        "UPDATE tasks SET status = 'fenced', claim_lock = NULL, "
+                        "claim_expires = NULL, worker_pid = ?, "
+                        "worker_starttime = ?, "
+                        "consecutive_failures = ?, last_failure_error = ? "
+                        "WHERE id = ? AND status = 'running'",
+                        (
+                            int(worker_pid), fence_starttime,
+                            failures, error[:500], task_id,
+                        ),
+                    )
+                    fence_identity = {"pid": int(worker_pid)}
+                    if fence_starttime is not None:
+                        fence_identity["starttime"] = fence_starttime
             else:
                 # Timeout/crash path: task is already at ``ready`` via
                 # its own UPDATE. Just bookkeep the counter + last error.
@@ -7959,6 +8494,15 @@ def _record_task_failure(
                     {"error": error[:500], "failures": failures},
                     run_id=run_id,
                 )
+                if fence_worker and fence_identity:
+                    # Emit the fence evidence with the exact predecessor
+                    # identity so operators can see the fence in `hermes kanban
+                    # tail` without opening the drawer.
+                    fence_payload = {"error": error[:500], "failures": failures}
+                    fence_payload.update(fence_identity)
+                    _append_event(
+                        conn, task_id, "fenced", fence_payload, run_id=run_id,
+                    )
             # Timeout/crash path's caller already emitted its own event.
     return blocked
 
@@ -8520,6 +9064,10 @@ def _dispatch_once_locked(
     )
     if _crash_rate_limited:
         result.rate_limited.extend(_crash_rate_limited)
+    # Reconcile self-fenced workers (iteration-budget exhaustion, etc.) before
+    # enforcing max-runtime / promoting / spawning: a task whose predecessor
+    # is still alive must stay non-dispatchable (AION-RL2-CORE-01-R10).
+    result.fenced_released = release_fenced_workers(conn)
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
 
