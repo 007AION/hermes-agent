@@ -391,6 +391,152 @@ def test_release_fenced_workers_descendant_clean_exit_releases(
         assert kb.get_task(conn, t).status == "ready"
 
 
+def test_release_fenced_workers_multitick_descendant_survivor_not_released_on_root_exit(
+    kanban_home, monkeypatch, tmp_path,
+):
+    """Multi-tick regression: after tick 1 records ``descendant_survived`` and
+    the root PID exits, tick 2 must NOT release solely on root disappearance —
+    the persisted eligible descendant must be rechecked and, while still alive,
+    keep the task fenced/non-claimable. Only when the descendant also exits does
+    the task release through final zero-survivor.
+
+    Regression for the bafuxunan exact-head audit (t_c09288bc) finding: the R10
+    repair handled the single-tick survivor but released on the next tick's
+    missing-root identity without rediscovering/persisting the still-live
+    descendant.
+    """
+    import hermes_cli.kanban_db as _kb
+
+    shared = tmp_path / "shared"
+    shared.mkdir()
+
+    root_pid = 424260
+    root_starttime = 999020
+    desc_pid = 900020
+    desc_starttime = 999021
+
+    state = {"root_alive": True, "desc_alive": True, "cleanup_ran": 0}
+
+    def _ident(pid):
+        if pid == root_pid:
+            if state["root_alive"]:
+                return {"starttime": root_starttime, "cwd": str(shared), "pgid": 1}
+            return None
+        if pid == desc_pid:
+            if state["desc_alive"]:
+                return {"starttime": desc_starttime, "cwd": str(shared), "pgid": 1}
+            return None
+        return None
+
+    def _close(workspace_arg, **kwargs):
+        state["cleanup_ran"] += 1
+        # Root dies inside the fence; the owned descendant survives.
+        state["root_alive"] = False
+        return {
+            "workspace": str(shared),
+            "signalled": 2,
+            "terminated": 1,
+            "killed": 0,
+            "survivors": 1,
+            "pids": [(1, desc_pid, str(shared), "survivor")],
+        }
+
+    monkeypatch.setattr(_kb, "_read_process_identity", _ident)
+    monkeypatch.setattr(
+        _kb, "_discover_descendant_pids",
+        lambda pid, **k: {root_pid, desc_pid},
+    )
+    monkeypatch.setattr(_kb, "close_workspace_processes", _close)
+
+    with kb.connect() as conn:
+        t = _make_fenced(conn, pid=root_pid, starttime=root_starttime,
+                         workspace_kind="dir", workspace_path=str(shared))
+
+        # Tick 1: root alive + identity match → fence discovers descendant survivor.
+        released = kb.release_fenced_workers(conn)
+        assert released == []
+        assert kb.get_task(conn, t).status == "fenced"
+        assert state["cleanup_ran"] == 1
+        assert state["root_alive"] is False  # root died inside the fence
+
+        # Tick 2: root PID gone, but the persisted descendant is still alive —
+        # must NOT release.
+        released = kb.release_fenced_workers(conn)
+        assert released == []
+        assert kb.get_task(conn, t).status == "fenced"
+        assert kb.claim_task(conn, t) is None  # non-claimable
+
+        # Tick 3: descendant finally exits → final zero-survivor release.
+        state["desc_alive"] = False
+        released = kb.release_fenced_workers(conn)
+        assert t in released
+        assert kb.get_task(conn, t).status == "ready"
+
+
+def test_release_fenced_workers_root_gone_before_first_tick_orphan_keeps_fenced(
+    kanban_home, monkeypatch, tmp_path,
+):
+    """If the root PID is already gone on the first reconciler tick, an orphaned
+    descendant still bound to an exclusive (scratch) workspace must be
+    rediscovered by cwd containment and keep the task fenced until it exits.
+    """
+    import hermes_cli.kanban_db as _kb
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    root_pid = 424261
+    root_starttime = 999030
+    orphan_pid = 900030
+    orphan_starttime = 999031
+
+    state = {"orphan_alive": True}
+
+    def _ident(pid):
+        if pid == root_pid:
+            return None  # root already exited
+        if pid == orphan_pid:
+            if state["orphan_alive"]:
+                return {"starttime": orphan_starttime, "cwd": str(workspace), "pgid": 1}
+            return None
+        return None
+
+    def _close(workspace_arg, **kwargs):
+        if state["orphan_alive"]:
+            return {
+                "workspace": str(workspace),
+                "signalled": 1,
+                "terminated": 0,
+                "killed": 0,
+                "survivors": 1,
+                "pids": [(1, orphan_pid, str(workspace), "survivor")],
+            }
+        return {
+            "workspace": str(workspace),
+            "signalled": 0,
+            "terminated": 0,
+            "killed": 0,
+            "survivors": 0,
+            "pids": [],
+        }
+
+    monkeypatch.setattr(_kb, "_read_process_identity", _ident)
+    monkeypatch.setattr(_kb, "close_workspace_processes", _close)
+
+    with kb.connect() as conn:
+        t = _make_fenced(conn, pid=root_pid, starttime=root_starttime,
+                         workspace_kind="scratch", workspace_path=str(workspace))
+
+        released = kb.release_fenced_workers(conn)
+        assert released == []
+        assert kb.get_task(conn, t).status == "fenced"
+
+        state["orphan_alive"] = False
+        released = kb.release_fenced_workers(conn)
+        assert t in released
+        assert kb.get_task(conn, t).status == "ready"
+
+
 def test_release_fenced_workers_shared_dir_gates_on_owned_pids(
     kanban_home, monkeypatch, tmp_path,
 ):

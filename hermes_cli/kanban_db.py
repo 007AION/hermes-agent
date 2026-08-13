@@ -1250,6 +1250,13 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- recycled before fencing or releasing it back to ``ready``.
     -- (AION-RL2-CORE-01-R10, canonical incident t_e690dcc1.)
     worker_starttime     INTEGER,
+    -- Persisted eligible survivor lineage for a fenced task: a JSON list of
+    -- {"pid": int, "starttime": int|null} for owned/exact-workspace descendant
+    -- processes that survived a prior fence attempt. The reconciler refuses to
+    -- release a fenced task until this set is empty, so a survivor that outlives
+    -- its root across ticks is still caught (AION-RL2-CORE-01-R10 PR#7 repair,
+    -- bafuxunan exact-head audit t_c09288bc).
+    fence_lineage        TEXT,
     -- Short excerpt of the most recent failure's error text.
     last_failure_error   TEXT,
     max_runtime_seconds  INTEGER,
@@ -2434,6 +2441,11 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         # fails closed (never signals by PID without a starttime identity).
         _add_column_if_missing(
             conn, "tasks", "worker_starttime", "worker_starttime INTEGER"
+        )
+    if "fence_lineage" not in cols:
+        # Persisted eligible survivor lineage for the fenced reconciler.
+        _add_column_if_missing(
+            conn, "tasks", "fence_lineage", "fence_lineage TEXT"
         )
     if "last_failure_error" not in cols:
         added = _add_column_if_missing(
@@ -7978,7 +7990,7 @@ def _release_fenced(conn: sqlite3.Connection, task_id: str, *, reason: str) -> N
         cur = conn.execute(
             "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
             "claim_expires = NULL, worker_pid = NULL, worker_starttime = NULL, "
-            "last_heartbeat_at = NULL "
+            "fence_lineage = NULL, last_heartbeat_at = NULL "
             "WHERE id = ? AND status = 'fenced'",
             (task_id,),
         )
@@ -8017,13 +8029,133 @@ def _defer_fence(
         _append_event(conn, task_id, "fence_deferred", payload)
 
 
+def _encode_fence_lineage(lineage: list[dict]) -> Optional[str]:
+    """Encode a survivor-lineage list for persistence (empty → None)."""
+    if not lineage:
+        return None
+    return json.dumps(lineage, ensure_ascii=False)
+
+
+def _decode_fence_lineage(raw: Optional[str]) -> list[dict]:
+    """Decode a persisted survivor-lineage blob; corruption → empty list."""
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return []
+    out: list[dict] = []
+    for item in parsed or []:
+        if not isinstance(item, dict):
+            continue
+        pid = item.get("pid")
+        if not isinstance(pid, int):
+            continue
+        st = item.get("starttime")
+        out.append({"pid": pid, "starttime": st if isinstance(st, int) else None})
+    return out
+
+
+def _survivor_lineage_from_cleanup(cleanup: dict) -> list[dict]:
+    """Extract surviving PIDs (with starttime identity) from cleanup evidence.
+
+    ``close_workspace_processes`` reports each signalled PID as
+    ``(pgid, pid, cwd, outcome)`` in ``cleanup["pids"]``; entries whose outcome
+    is ``"survivor"`` are still alive and must be tracked across ticks.
+    """
+    out: list[dict] = []
+    seen: set[int] = set()
+    for entry in cleanup.get("pids", []) or []:
+        try:
+            pid, outcome = entry[1], entry[3]
+        except (IndexError, TypeError):
+            continue
+        if outcome != "survivor" or pid in seen:
+            continue
+        ident = _read_process_identity(pid)
+        out.append({"pid": pid, "starttime": (ident or {}).get("starttime")})
+        seen.add(pid)
+    return out
+
+
+def _live_lineage(lineage: list[dict]) -> list[dict]:
+    """Return the subset of *lineage* still alive with a matching identity.
+
+    Fail-closed on missing identity proof: a persisted entry with no starttime
+    and a live PID is treated as a live survivor (we cannot prove it exited, so
+    the task stays fenced). A starttime mismatch means the PID was recycled — the
+    original survivor is gone.
+    """
+    live: list[dict] = []
+    for entry in lineage:
+        pid = entry["pid"]
+        starttime = entry.get("starttime")
+        ident = _read_process_identity(pid)
+        if ident is None:
+            continue  # exited → gone
+        if starttime is None:
+            live.append(entry)  # no identity proof → fail closed
+            continue
+        if ident["starttime"] == starttime:
+            live.append(entry)
+        # else: PID recycled → original survivor gone.
+    return live
+
+
+def _persist_fence_lineage(
+    conn: sqlite3.Connection, task_id: str, lineage: list[dict],
+) -> None:
+    """Persist the current survivor lineage onto the fenced task row."""
+    with write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET fence_lineage = ? WHERE id = ?",
+            (_encode_fence_lineage(lineage), task_id),
+        )
+
+
+def _lineage_quiescent(
+    conn: sqlite3.Connection,
+    task_id: str,
+    lineage: list[dict],
+    workspace: Optional[Path],
+    workspace_kind: str,
+) -> bool:
+    """True when no eligible survivor remains, re-deriving and persisting the
+    live survivor set as a side effect.
+
+    The root predecessor PID is already gone/recycled/unknown by the time this
+    runs, so it cannot be used to rediscover owned lineage. Survivors are the
+    union of:
+
+      * persisted lineage still alive with a matching identity (the ``dir`` /
+        shared-dir owned-lineage case), and
+      * for exclusive workspaces (scratch/worktree), any process still bound to
+        the exact workspace by cwd — a reparented orphan keeps its cwd, so cwd
+        containment reliably catches it even after the root exits.
+
+    Returns False (and persists the survivors) when anything remains so the
+    task stays fenced and is rechecked next tick.
+    """
+    survivors: dict[int, dict] = {s["pid"]: s for s in _live_lineage(lineage)}
+
+    if workspace_kind != "dir" and workspace is not None and workspace.is_dir():
+        cleanup = close_workspace_processes(workspace, owned_pids=None)
+        if isinstance(cleanup, dict):
+            for entry in _survivor_lineage_from_cleanup(cleanup):
+                survivors.setdefault(entry["pid"], entry)
+
+    _persist_fence_lineage(conn, task_id, list(survivors.values()))
+    return not survivors
+
+
 def release_fenced_workers(
     conn: sqlite3.Connection,
     *,
     signal_fn=None,
 ) -> list[str]:
     """Reconcile ``fenced`` tasks: release to ``ready`` only after the exact
-    predecessor worker (PID + starttime) is verified gone or fenced identity-safely.
+    predecessor worker (PID + starttime) is verified gone or fenced identity-safely,
+    AND no eligible exact-workspace or owned-lineage descendant survives.
 
     A ``fenced`` task was parked by ``_record_task_failure(fence_worker=True)``
     when a still-alive worker recorded its own non-success (iteration-budget
@@ -8033,29 +8165,35 @@ def release_fenced_workers(
 
     Per task, in order:
       1. ``worker_pid IS NULL`` → nothing to fence → release.
-      2. ``/proc`` identity unreadable → predecessor exited → release.
+      2. ``/proc`` identity unreadable → predecessor exited → release ONLY after
+         the eligible lineage (persisted survivors +, for exclusive workspaces, a
+         cwd-containment re-scan) is quiescent.
       3. recorded starttime mismatch → PID recycled, predecessor gone → release
-         (never signal the recycled occupant).
+         ONLY after the eligible lineage is quiescent (never signal the recycled
+         occupant).
       4. starttime unknown (NULL) → no identity proof → fail closed: do NOT
-         signal by PID alone; release only if the PID is observed gone.
+         signal by PID alone; release only if the PID is observed gone AND the
+         eligible lineage is quiescent.
       5. identity matches and alive → fence the exact worker + in-workspace
          descendants via ``close_workspace_processes`` (cwd-containment, owned-PID
-         gate for shared-dir), then release only when the predecessor PID is gone
-         AND the fence reported zero survivors, else stay ``fenced`` and retry
-         next tick.
+         gate for shared-dir), persist any survivors, then release only when the
+         predecessor PID is gone AND the fence reported zero survivors, else stay
+         ``fenced`` and retry next tick.
 
     Returns the list of task ids released to ``ready``. This is the single
     dispatcher-side gate; it uses only the existing task/run/event surface.
     """
     released: list[str] = []
     rows = conn.execute(
-        "SELECT id, worker_pid, worker_starttime, workspace_kind, workspace_path "
-        "FROM tasks WHERE status = 'fenced'"
+        "SELECT id, worker_pid, worker_starttime, workspace_kind, workspace_path, "
+        "fence_lineage FROM tasks WHERE status = 'fenced'"
     ).fetchall()
     for row in rows:
         tid = row["id"]
         raw_pid = row["worker_pid"]
         starttime = row["worker_starttime"]
+        workspace_kind = row["workspace_kind"] or "scratch"
+        workspace = Path(row["workspace_path"]).resolve() if row["workspace_path"] else None
 
         if not raw_pid:
             _release_fenced(conn, tid, reason="no_predecessor")
@@ -8063,23 +8201,30 @@ def release_fenced_workers(
             continue
 
         pid = int(raw_pid)
+        lineage = _decode_fence_lineage(row["fence_lineage"])
         ident = _read_process_identity(pid)
-        if ident is None:
-            _release_fenced(conn, tid, reason="predecessor_exited")
-            released.append(tid)
-            continue
 
-        if starttime is not None and ident["starttime"] != int(starttime):
-            # PID recycled — predecessor gone. Never signal the new occupant.
-            _release_fenced(conn, tid, reason="predecessor_pid_recycled")
-            released.append(tid)
+        # Root predecessor exited, or its PID was recycled. The root no longer
+        # blocks release, but eligible lineage may still survive — never release
+        # on root disappearance alone (bafuxunan exact-head audit t_c09288bc).
+        if ident is None or (starttime is not None and ident["starttime"] != int(starttime)):
+            if _lineage_quiescent(conn, tid, lineage, workspace, workspace_kind):
+                reason = "predecessor_pid_recycled" if ident is not None else "predecessor_exited"
+                _release_fenced(conn, tid, reason=reason)
+                released.append(tid)
+            else:
+                _defer_fence(conn, tid, pid, starttime, reason="descendant_survived")
             continue
 
         if starttime is None:
-            # No identity proof → fail closed. Release only on observed exit.
+            # No identity proof → fail closed. Release only on observed exit,
+            # and even then only after the eligible lineage is quiescent.
             if not _pid_alive(pid):
-                _release_fenced(conn, tid, reason="predecessor_exited")
-                released.append(tid)
+                if _lineage_quiescent(conn, tid, lineage, workspace, workspace_kind):
+                    _release_fenced(conn, tid, reason="predecessor_exited")
+                    released.append(tid)
+                else:
+                    _defer_fence(conn, tid, pid, starttime, reason="descendant_survived")
             else:
                 _defer_fence(
                     conn, tid, pid, starttime, reason="identity_unknown",
@@ -8087,9 +8232,6 @@ def release_fenced_workers(
             continue
 
         # Identity matches and the predecessor is alive → fence it identity-safely.
-        workspace_path = row["workspace_path"]
-        workspace_kind = row["workspace_kind"] or "scratch"
-        workspace = Path(workspace_path).resolve() if workspace_path else None
         survivors = 0
         if workspace is not None and workspace.is_dir():
             # cwd-containment fence with descendant coverage. For shared-dir
@@ -8103,13 +8245,17 @@ def release_fenced_workers(
             # proof the workspace is quiescent: a TERM/KILL-resistant (or
             # reparented) in-workspace descendant can outlive the root. Only
             # release when the fence reports zero survivors; otherwise keep the
-            # task fenced (non-claimable) and retry next tick.
-            # (AION-RL2-CORE-01-R10 PR#7 repair — bafuxunan exact-head audit
-            # found survivors were being discarded.)
+            # task fenced (non-claimable), persist the survivors, and retry next
+            # tick. (AION-RL2-CORE-01-R10 PR#7 repair — bafuxunan exact-head
+            # audit found survivors were being discarded.)
             if isinstance(cleanup, dict):
                 survivors = int(cleanup.get("survivors", 0) or 0)
+                _persist_fence_lineage(
+                    conn, tid, _survivor_lineage_from_cleanup(cleanup),
+                )
         else:
             _fence_worker_by_identity(pid, starttime, signal_fn=signal_fn)
+            _persist_fence_lineage(conn, tid, [])
 
         if _read_process_identity(pid) is None and survivors == 0:
             _release_fenced(conn, tid, reason="predecessor_fenced")
