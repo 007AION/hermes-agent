@@ -229,7 +229,7 @@ def test_board_diagnostics_executable_now(kanban_home):
 def test_board_diagnostics_excludes_guarded_ready_from_executable_now(
     kanban_home, monkeypatch
 ):
-    """executable_now is dispatchable READY, not the raw READY count."""
+    """Guarded ready is excluded; the active owner counts as running work."""
     pr_url = "https://github.com/totemx-AI/subsidysmart/pull/42"
     monkeypatch.setattr(kb, "_resolve_github_pr_state", lambda _url: "OPEN", raising=False)
     with kb.connect() as conn:
@@ -240,7 +240,11 @@ def test_board_diagnostics_excludes_guarded_ready_from_executable_now(
         kb.claim_task(conn, owner)
         diag = kd.compute_board_diagnostics(conn)
     assert diag["status_counts"]["ready"] == 1
-    assert diag["executable_now"] == 0
+    # The guarded ready task is NOT executable, but the claimed owner is
+    # active running work, so executable_now is 1 (not 0). (AION-RL2-CORE-01-R12)
+    assert diag["executable_now"] == 1
+    assert diag["executable_components"]["active_running"] == 1
+    assert diag["executable_components"]["dispatchable_ready"] == 0
     assert diag["guarded_ready"] == [
         {"task_id": current, "reason": "active_pr"}
     ]

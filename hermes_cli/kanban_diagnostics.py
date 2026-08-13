@@ -1146,20 +1146,88 @@ def compute_task_diagnostics(
 # surface "the board looks idle but isn't" to operators.
 
 
-# Non-terminal statuses that represent open obligations — tasks the
-# board is still responsible for.
-_NONTERMINAL_STATUSES: tuple[str, ...] = (
-    "triage", "todo", "scheduled", "ready", "running", "blocked", "review",
-)
-
-# Statuses that are legitimately executable by the dispatcher.
-_EXECUTABLE_STATUSES: tuple[str, ...] = ("ready",)
+# Terminal statuses — the ONLY statuses excluded from "open obligations".
+# Done and archived are terminal; every other current status (triage, todo,
+# scheduled, ready, running, blocked, review, fenced) and any future status
+# is fail-closed as an open obligation the board is still responsible for.
+# (AION-RL2-CORE-01-R12: a nonterminal ``fenced`` lifecycle must not vanish
+# from the factory obligation count just because it wasn't in a static list.)
+_TERMINAL_STATUSES: tuple[str, ...] = ("done", "archived")
 
 # Default staleness thresholds.
 DEFAULT_STALE_TRIAGE_HOURS = 4   # triage tasks sitting >4h
 DEFAULT_STALE_TODO_HOURS = 24    # todo tasks sitting >24h with all parents done
 DEFAULT_STALE_SCHEDULED_HOURS = 24  # scheduled tasks sitting >24h
 DEFAULT_STALE_REVIEW_HOURS = 48  # review tasks sitting >48h
+
+
+def _split_running_tasks(conn, now: int) -> dict[str, list[str]]:
+    """Classify ``running`` tasks into active vs safely-reclaimable work.
+
+    Mirrors the installed dispatcher's real reclaim safety semantics
+    (``release_stale_claims`` TTL path plus ``detect_crashed_workers``
+    liveness path) read-only, so board diagnostics never count a fenced
+    wait state as executable and never double-count:
+
+    * ``active`` — the claim is still valid (``claim_expires`` NULL or in
+      the future), OR the claim expired but the worker is host-local, still
+      alive, and has a fresh heartbeat (``release_stale_claims`` *extends*
+      rather than reclaims it). Work is genuinely in flight.
+    * ``reclaimable`` — the dispatcher can safely return the task to
+      ``ready`` this tick without spawning a duplicate beside a surviving
+      worker: the worker PID is absent/dead on this host, the claim is not
+      host-local, or the heartbeat is stale.
+
+    Only the authoritative ``tasks`` row is consulted (never orphaned
+    ``task_runs`` rows), so a task whose canonical status is ``done`` with a
+    stale ``running`` run row is never miscounted as active work.
+
+    Returns ``{"active": [task_id, ...], "reclaimable": [task_id, ...]}``.
+    """
+    from . import kanban_db as _kb
+
+    host_prefix = f"{_kb._claimer_id().split(':', 1)[0]}:"
+    rows = conn.execute(
+        "SELECT id, claim_lock, claim_expires, worker_pid, last_heartbeat_at "
+        "FROM tasks WHERE status = 'running'"
+    ).fetchall()
+    active: list[str] = []
+    reclaimable: list[str] = []
+    for row in rows:
+        lock = row["claim_lock"] or ""
+        pid = row["worker_pid"]
+        expires = row["claim_expires"]
+        host_local = lock.startswith(host_prefix)
+
+        # Crash-detection path: a host-local worker whose PID is already gone
+        # is reclaimed by detect_crashed_workers regardless of claim TTL.
+        if host_local and pid is not None and not _kb._pid_alive(pid):
+            reclaimable.append(row["id"])
+            continue
+
+        # TTL-expiry path (release_stale_claims).
+        if expires is not None and expires < now:
+            hb = row["last_heartbeat_at"]
+            heartbeat_stale = (
+                hb is not None
+                and (now - int(hb)) > _kb.DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS
+            )
+            if (
+                host_local
+                and pid
+                and _kb._pid_alive(pid)
+                and not heartbeat_stale
+            ):
+                # Live host-local worker with a fresh heartbeat → extended.
+                active.append(row["id"])
+            else:
+                reclaimable.append(row["id"])
+            continue
+
+        # Claim still valid (NULL or in the future) → in flight.
+        active.append(row["id"])
+
+    return {"active": active, "reclaimable": reclaimable}
 
 
 def compute_board_diagnostics(
@@ -1172,9 +1240,17 @@ def compute_board_diagnostics(
 
     Returns a dict with:
     - ``status_counts``: {status: count} for every non-archived status.
-    - ``executable_now``: count of ready tasks the dispatcher can claim now.
+    - ``executable_now``: work the dispatcher can act on right now —
+      dispatchable ready plus active and safely-reclaimable running work.
+      Fenced wait states are NOT executable.
     - ``guarded_ready``: ready tasks excluded by a respawn guard.
     - ``open_obligations``: count of tasks in any non-terminal status.
+      Only ``done`` and ``archived`` are terminal; every other current or
+      future status is fail-closed as an open obligation.
+    - ``executable_components``: bounded audit breakdown of ``executable_now``
+      (``dispatchable_ready`` / ``active_running`` / ``reclaimable_running``)
+      plus the excluded buckets (``guarded_ready`` / ``fenced_waiting``) so
+      no component is double-counted.
     - ``findings``: list of finding dicts with kind/severity/title/detail/data.
 
     Callers include the dashboard board view, ``hermes kanban diagnostics``,
@@ -1208,7 +1284,7 @@ def compute_board_diagnostics(
     # ── executable_now / open_obligations ──────────────────────────────────
     from . import kanban_db as _kb
 
-    executable_now = 0
+    dispatchable_ready = 0
     guarded_ready: list[dict[str, Any]] = []
     ready_rows = conn.execute(
         "SELECT id FROM tasks WHERE status = 'ready' "
@@ -1218,13 +1294,30 @@ def compute_board_diagnostics(
     for ready_row in ready_rows:
         guard = _kb.check_respawn_guard(conn, ready_row["id"])
         if guard is None:
-            executable_now += 1
+            dispatchable_ready += 1
         else:
             guarded_ready.append(
                 {"task_id": ready_row["id"], "reason": guard[0]}
             )
+
+    # Running work split into active vs safely-reclaimable (mirrors the
+    # dispatcher's release_stale_claims / detect_crashed_workers semantics).
+    running_split = _split_running_tasks(conn, now_ts)
+    active_running = len(running_split["active"])
+    reclaimable_running = len(running_split["reclaimable"])
+
+    # Fenced tasks are a nonterminal wait state: an open obligation but NOT
+    # executable — the dispatcher must not claim them while the predecessor
+    # lineage may still be alive (AION-RL2-CORE-01-R10/R11).
+    fenced_waiting = int(status_counts.get("fenced", 0))
+
+    executable_now = dispatchable_ready + active_running + reclaimable_running
+
+    # Fail-closed: only done/archived are terminal. Every other status —
+    # current or future — is an open obligation.
     open_obligations = sum(
-        status_counts.get(s, 0) for s in _NONTERMINAL_STATUSES
+        cnt for status, cnt in status_counts.items()
+        if status not in _TERMINAL_STATUSES
     )
 
     findings: list[dict] = []
@@ -1232,9 +1325,8 @@ def compute_board_diagnostics(
     # ── Finding: executable_now=0 while open_obligations>0 ───────────────
     if executable_now == 0 and open_obligations > 0:
         nonterminal_states = {
-            s: status_counts.get(s, 0)
-            for s in _NONTERMINAL_STATUSES
-            if status_counts.get(s, 0) > 0
+            s: cnt for s, cnt in status_counts.items()
+            if s not in _TERMINAL_STATUSES and cnt > 0
         }
         detail_parts = [
             f"{open_obligations} open obligation(s) across "
@@ -1247,7 +1339,8 @@ def compute_board_diagnostics(
             "unresolved. Check triage for un-triaged work, todo for tasks "
             "waiting on parents or stuck specification, scheduled for "
             "time-parked tasks, review for tasks awaiting reviewer pickup, "
-            "and blocked for tasks waiting on human input."
+            "blocked for tasks waiting on human input, and fenced for tasks "
+            "whose predecessor lineage is still being reconciled."
         )
         findings.append({
             "kind": "executable_zero_open_obligations",
@@ -1383,5 +1476,12 @@ def compute_board_diagnostics(
         "executable_now": executable_now,
         "guarded_ready": guarded_ready,
         "open_obligations": open_obligations,
+        "executable_components": {
+            "dispatchable_ready": dispatchable_ready,
+            "active_running": active_running,
+            "reclaimable_running": reclaimable_running,
+            "guarded_ready": len(guarded_ready),
+            "fenced_waiting": fenced_waiting,
+        },
         "findings": findings,
     }
