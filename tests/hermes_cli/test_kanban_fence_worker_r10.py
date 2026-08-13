@@ -922,3 +922,279 @@ def test_isolated_kanban_env_keeps_inherited_live_board_untouched(
     # After the context manager exits, the inherited live pins are restored.
     assert os.environ.get("HERMES_KANBAN_DB") == str(live_db)
     assert os.environ.get("HERMES_KANBAN_BOARD") == "aion-factory"
+
+
+# ---------------------------------------------------------------------------
+# AION-RL2-CORE-01-R11: persist reparented outside-cwd descendant lineage at
+# self-fence time. Canonical run 2041: the reconciler released a breaker-tripped
+# task to ``blocked`` with reason=predecessor_exited while an exact task-owned
+# descendant (PID+starttime) was still alive in the same cgroup with cwd=/tmp.
+# The descendant lineage was never captured while ancestry was provable (the
+# worker had already exited before the first reconciler tick), so the task was
+# falsely released with no fence_deferred(descendant_survived) event and no
+# persisted fence_lineage.
+# ---------------------------------------------------------------------------
+
+def _assert_fence_lineage(conn, task_id, expected):
+    raw = conn.execute(
+        "SELECT fence_lineage FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()[0]
+    assert raw is not None
+    assert json.loads(raw) == expected
+
+
+def _record_breaker_self_fence(conn, t, shared):
+    import hermes_cli.kanban_db as _kb
+    conn.execute(
+        "UPDATE tasks SET workspace_kind='dir', workspace_path=? WHERE id = ?",
+        (str(shared), t),
+    )
+    conn.commit()
+    blocked = _kb._record_task_failure(
+        conn, t, error="boom", outcome="timed_out",
+        fence_worker=True, end_run=True, failure_limit=1,
+    )
+    assert blocked is True
+    assert kb.get_task(conn, t).status == "fenced"
+    return conn
+
+
+def test_fence_worker_breaker_trip_persists_reparented_outside_cwd_descendant_lineage(
+    kanban_home, monkeypatch, tmp_path,
+):
+    """run-2041 RED/GREEN (breaker disposition=blocked): a breaker-tripped
+    self-fence must capture the worker's exact descendant lineage (PID+starttime)
+    BEFORE the worker exits, persist it as ``fence_lineage``, and keep the task
+    fenced/non-claimable until that lineage — including a descendant that escaped
+    the workspace cwd and was reparented — actually exits. Terminal ``blocked``
+    only after lineage quiescence, never on root disappearance alone."""
+    import hermes_cli.kanban_db as _kb
+
+    shared = tmp_path / "shared"
+    shared.mkdir()
+
+    root_pid = 424400
+    root_starttime = 777400
+    desc_pid = 900400
+    desc_starttime = 777401
+
+    state = {"root_alive": True, "desc_alive": True}
+    close_calls = []
+
+    def _ident(pid):
+        if pid == root_pid:
+            if state["root_alive"]:
+                return {"starttime": root_starttime, "cwd": str(shared), "pgid": 1}
+            return None
+        if pid == desc_pid:
+            if state["desc_alive"]:
+                # Reparented + escaped cwd — the exact run-2041 shape.
+                return {"starttime": desc_starttime, "cwd": "/tmp", "pgid": 2}
+            return None
+        return None
+
+    monkeypatch.setattr(_kb, "_read_process_identity", _ident)
+    monkeypatch.setattr(
+        _kb, "_discover_descendant_pids",
+        lambda pid, **k: {root_pid, desc_pid},
+    )
+    # The escaped descendant is WAIT-ONLY lineage: it must never authorize a
+    # workspace signal. For a shared-dir task with the root already gone, the
+    # reconciler only polls the persisted lineage — close_workspace_processes
+    # is never invoked.
+    monkeypatch.setattr(
+        _kb, "close_workspace_processes",
+        lambda *a, **k: close_calls.append((a, k)) or {"survivors": 0, "pids": []},
+    )
+
+    with kb.connect() as conn:
+        t = _claim_with_worker(conn, pid=root_pid)
+        _record_breaker_self_fence(conn, t, shared)
+
+        # The descendant lineage is persisted at self-fence time, while the
+        # worker was still alive and ancestry was provable.
+        _assert_fence_lineage(
+            conn, t, [{"pid": desc_pid, "starttime": desc_starttime}],
+        )
+
+    # Root exits between the self-fence and the first reconciler tick.
+    state["root_alive"] = False
+
+    # Tick 1: root gone + reparented descendant alive → NOT released, NOT
+    # terminalized — held for lineage with reason=descendant_survived.
+    with kb.connect() as conn:
+        released = kb.release_fenced_workers(conn)
+        assert released == []
+        assert kb.get_task(conn, t).status == "fenced"
+        assert kb.claim_task(conn, t) is None
+        deferred = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? "
+            "AND kind = 'fence_deferred' ORDER BY created_at DESC LIMIT 1",
+            (t,),
+        ).fetchone()
+        assert deferred is not None
+        assert json.loads(deferred["payload"])["reason"] == "descendant_survived"
+
+    # Tick 2: descendant still alive → still fenced (multi-tick nonclaimability).
+    with kb.connect() as conn:
+        released = kb.release_fenced_workers(conn)
+        assert released == []
+        assert kb.get_task(conn, t).status == "fenced"
+
+    # Tick 3: descendant finally exits → terminal blocked (no retry).
+    state["desc_alive"] = False
+    with kb.connect() as conn:
+        released = kb.release_fenced_workers(conn)
+        assert t not in released
+        assert kb.get_task(conn, t).status == "blocked"
+
+    # The escaped descendant was never signalled across any tick.
+    assert close_calls == []
+
+
+def test_fence_worker_below_threshold_persists_reparented_outside_cwd_descendant_lineage(
+    kanban_home, monkeypatch, tmp_path,
+):
+    """retry disposition=ready variant: a below-threshold self-fence must persist
+    the escaped-descendant lineage and release to ``ready`` only after lineage
+    quiescence, across multiple reconciler ticks."""
+    import hermes_cli.kanban_db as _kb
+
+    shared = tmp_path / "shared"
+    shared.mkdir()
+
+    root_pid = 424410
+    root_starttime = 777410
+    desc_pid = 900410
+    desc_starttime = 777411
+
+    state = {"root_alive": True, "desc_alive": True}
+    close_calls = []
+
+    def _ident(pid):
+        if pid == root_pid:
+            if state["root_alive"]:
+                return {"starttime": root_starttime, "cwd": str(shared), "pgid": 1}
+            return None
+        if pid == desc_pid:
+            if state["desc_alive"]:
+                return {"starttime": desc_starttime, "cwd": "/tmp", "pgid": 2}
+            return None
+        return None
+
+    monkeypatch.setattr(_kb, "_read_process_identity", _ident)
+    monkeypatch.setattr(
+        _kb, "_discover_descendant_pids",
+        lambda pid, **k: {root_pid, desc_pid},
+    )
+    monkeypatch.setattr(
+        _kb, "close_workspace_processes",
+        lambda *a, **k: close_calls.append((a, k)) or {"survivors": 0, "pids": []},
+    )
+
+    with kb.connect() as conn:
+        t = _claim_with_worker(conn, pid=root_pid)
+        conn.execute(
+            "UPDATE tasks SET workspace_kind='dir', workspace_path=? WHERE id = ?",
+            (str(shared), t),
+        )
+        conn.commit()
+        blocked = _kb._record_task_failure(
+            conn, t, error="boom", outcome="timed_out",
+            fence_worker=True, end_run=True,
+            # No failure_limit → below DEFAULT threshold → retry disposition.
+        )
+        assert blocked is False
+        assert kb.get_task(conn, t).status == "fenced"
+        _assert_fence_lineage(
+            conn, t, [{"pid": desc_pid, "starttime": desc_starttime}],
+        )
+
+    state["root_alive"] = False
+
+    with kb.connect() as conn:
+        released = kb.release_fenced_workers(conn)
+        assert released == []
+        assert kb.get_task(conn, t).status == "fenced"
+        assert kb.claim_task(conn, t) is None
+
+    with kb.connect() as conn:
+        released = kb.release_fenced_workers(conn)
+        assert released == []
+        assert kb.get_task(conn, t).status == "fenced"
+
+    state["desc_alive"] = False
+    with kb.connect() as conn:
+        released = kb.release_fenced_workers(conn)
+        assert t in released
+        assert kb.get_task(conn, t).status == "ready"
+
+    assert close_calls == []
+
+
+def test_fence_worker_reparented_descendant_pid_reuse_releases(
+    kanban_home, monkeypatch, tmp_path,
+):
+    """Negative: a captured descendant whose PID was recycled (starttime mismatch)
+    is dropped from the lineage, so the task releases instead of holding forever on
+    an unrelated occupant."""
+    import hermes_cli.kanban_db as _kb
+
+    shared = tmp_path / "shared"
+    shared.mkdir()
+
+    root_pid = 424420
+    root_starttime = 777420
+    desc_pid = 900420
+    desc_starttime = 777421
+
+    state = {"root_alive": True, "desc_phase": "alive"}
+
+    def _ident(pid):
+        if pid == root_pid:
+            if state["root_alive"]:
+                return {"starttime": root_starttime, "cwd": str(shared), "pgid": 1}
+            return None
+        if pid == desc_pid:
+            if state["desc_phase"] == "alive":
+                return {"starttime": desc_starttime, "cwd": "/tmp", "pgid": 2}
+            if state["desc_phase"] == "recycled":
+                # Same PID, different starttime → recycled by an unrelated process.
+                return {"starttime": 999999, "cwd": "/elsewhere", "pgid": 9}
+            return None
+        return None
+
+    monkeypatch.setattr(_kb, "_read_process_identity", _ident)
+    monkeypatch.setattr(
+        _kb, "_discover_descendant_pids",
+        lambda pid, **k: {root_pid, desc_pid},
+    )
+
+    with kb.connect() as conn:
+        t = _claim_with_worker(conn, pid=root_pid)
+        _record_breaker_self_fence(conn, t, shared)
+        _assert_fence_lineage(
+            conn, t, [{"pid": desc_pid, "starttime": desc_starttime}],
+        )
+
+    # Root gone; the captured PID is now a recycled, unrelated occupant.
+    state["root_alive"] = False
+    state["desc_phase"] = "recycled"
+
+    with kb.connect() as conn:
+        released = kb.release_fenced_workers(conn)
+        assert t not in released
+        assert kb.get_task(conn, t).status == "blocked"  # terminal, no retry
+
+
+def test_snapshot_descendant_lineage_fails_closed_without_identity(monkeypatch):
+    """Negative: with no root starttime identity proof (worker already gone), the
+    snapshot returns an empty lineage — never a best-effort PID-only guess."""
+    import hermes_cli.kanban_db as _kb
+
+    # root_starttime is None → fail closed before any /proc walk.
+    monkeypatch.setattr(
+        _kb, "_discover_descendant_pids",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not walk /proc")),
+    )
+    assert _kb._snapshot_descendant_lineage(12345, None) == []
