@@ -8106,6 +8106,42 @@ def _survivor_lineage_from_cleanup(cleanup: dict) -> list[dict]:
     return out
 
 
+def _snapshot_descendant_lineage(
+    root_pid: int, root_starttime: int | None,
+) -> list[dict]:
+    """Capture the worker's exact descendant lineage (PID+starttime) while the
+    worker is still alive, for durable persistence at self-fence time.
+
+    A worker that records its own non-success (budget exhaustion) is still
+    alive at that instant, so its descendant tree is provably traceable
+    through the ``/proc`` ppid chain. If capture is deferred to the
+    reconciler, the worker has already exited and its children have been
+    reparented (to init or a cgroup subreaper), breaking the ppid chain — a
+    descendant that also escaped the workspace cwd then becomes invisible and
+    the task is falsely released while it still mutates shared state
+    (AION-RL2-CORE-01-R11, canonical run 2041).
+
+    The returned lineage is WAIT-ONLY: the reconciler polls it for liveness
+    via ``_live_lineage``; it is never used to authorize signalling outside
+    the workspace.
+
+    Fails closed on missing root identity proof (``root_starttime is None``)
+    or a recycled root PID, returning an empty list.
+    """
+    if root_starttime is None:
+        return []
+    owned = _discover_descendant_pids(root_pid, expected_starttime=root_starttime)
+    out: list[dict] = []
+    for pid in sorted(owned):
+        if pid == root_pid:
+            continue  # the root is tracked separately via worker_pid/starttime
+        ident = _read_process_identity(pid)
+        if ident is None:
+            continue  # already exited — nothing to track
+        out.append({"pid": pid, "starttime": ident["starttime"]})
+    return out
+
+
 def _live_lineage(lineage: list[dict]) -> list[dict]:
     """Return the subset of *lineage* still alive with a matching identity.
 
@@ -8454,20 +8490,27 @@ def _record_task_failure(
                         (failures, error[:500], task_id),
                     )
                 else:
+                    lineage = _snapshot_descendant_lineage(
+                        int(worker_pid), fence_starttime,
+                    )
                     conn.execute(
                         "UPDATE tasks SET status = 'fenced', claim_lock = NULL, "
                         "claim_expires = NULL, worker_pid = ?, "
                         "worker_starttime = ?, fence_disposition = 'blocked', "
+                        "fence_lineage = ?, "
                         "consecutive_failures = ?, last_failure_error = ? "
                         "WHERE id = ? AND status IN ('running', 'ready', 'fenced')",
                         (
                             int(worker_pid), fence_starttime,
+                            _encode_fence_lineage(lineage),
                             failures, error[:500], task_id,
                         ),
                     )
                     fence_identity = {"pid": int(worker_pid)}
                     if fence_starttime is not None:
                         fence_identity["starttime"] = fence_starttime
+                    if lineage:
+                        fence_identity["descendant_count"] = len(lineage)
             else:
                 # Timeout/crash path: task is already at ``ready``
                 # with claim cleared; just flip to blocked + update
@@ -8552,20 +8595,26 @@ def _record_task_failure(
                     )
                     fence_identity = None
                 else:
+                    lineage = _snapshot_descendant_lineage(
+                        int(worker_pid), fence_starttime,
+                    )
                     conn.execute(
                         "UPDATE tasks SET status = 'fenced', claim_lock = NULL, "
                         "claim_expires = NULL, worker_pid = ?, "
-                        "worker_starttime = ?, "
+                        "worker_starttime = ?, fence_lineage = ?, "
                         "consecutive_failures = ?, last_failure_error = ? "
                         "WHERE id = ? AND status = 'running'",
                         (
                             int(worker_pid), fence_starttime,
+                            _encode_fence_lineage(lineage),
                             failures, error[:500], task_id,
                         ),
                     )
                     fence_identity = {"pid": int(worker_pid)}
                     if fence_starttime is not None:
                         fence_identity["starttime"] = fence_starttime
+                    if lineage:
+                        fence_identity["descendant_count"] = len(lineage)
             else:
                 # Timeout/crash path: task is already at ``ready`` via
                 # its own UPDATE. Just bookkeep the counter + last error.
