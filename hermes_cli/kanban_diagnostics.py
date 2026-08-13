@@ -1161,73 +1161,162 @@ DEFAULT_STALE_SCHEDULED_HOURS = 24  # scheduled tasks sitting >24h
 DEFAULT_STALE_REVIEW_HOURS = 48  # review tasks sitting >48h
 
 
+def _current_run_is_live(conn, task_id: str, current_run_id) -> bool:
+    """Return True when ``current_run_id`` references a still-open run row.
+
+    A ``running`` task whose ``current_run_id`` is NULL — or points at a run
+    row that already ended — is an inconsistent, authority-less state. Fail
+    closed: such a task is neither provably-active nor safely reclaimable.
+    (AION-RL2-CORE-01-R12: authoritative ``current_run_id`` ownership.)
+    """
+    if current_run_id is None:
+        return False
+    try:
+        run_id = int(current_run_id)
+    except (TypeError, ValueError):
+        return False
+    row = conn.execute(
+        "SELECT 1 FROM task_runs WHERE id = ? AND task_id = ? "
+        "AND ended_at IS NULL",
+        (run_id, task_id),
+    ).fetchone()
+    return row is not None
+
+
+def _running_worker_starttime(conn, task_id: str):
+    """Return the recorded /proc starttime identity for the running worker.
+
+    The authoritative identity anchor is the latest ``spawned`` event's
+    ``starttime`` payload (captured at spawn by ``_set_worker_pid``); fall
+    back to ``tasks.worker_starttime`` (set on self-fence). ``None`` means
+    no identity proof exists → fail closed.
+    """
+    row = conn.execute(
+        "SELECT json_extract(payload, '$.starttime') AS starttime "
+        "FROM task_events WHERE task_id = ? AND kind = 'spawned' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if row is not None and row["starttime"] is not None:
+        try:
+            return int(row["starttime"])
+        except (TypeError, ValueError):
+            return None
+    trow = conn.execute(
+        "SELECT worker_starttime FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if trow is not None and trow["worker_starttime"] is not None:
+        try:
+            return int(trow["worker_starttime"])
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
 def _split_running_tasks(conn, now: int) -> dict[str, list[str]]:
-    """Classify ``running`` tasks into active vs safely-reclaimable work.
+    """Classify ``running`` tasks into active vs safely-reclaimable vs deferred.
 
-    Mirrors the installed dispatcher's real reclaim safety semantics
-    (``release_stale_claims`` TTL path plus ``detect_crashed_workers``
-    liveness path) read-only, so board diagnostics never count a fenced
-    wait state as executable and never double-count:
+    Mirrors the installed dispatcher's authoritative reclaim semantics —
+    ``detect_crashed_workers`` (crash path) plus ``release_stale_claims``
+    (TTL path, including its termination-survival deferral) — **read-only**,
+    so board diagnostics never count a fenced wait state or an ambiguous
+    half-dead worker as executable, and never double-count:
 
-    * ``active`` — the claim is still valid (``claim_expires`` NULL or in
-      the future), OR the claim expired but the worker is host-local, still
-      alive, and has a fresh heartbeat (``release_stale_claims`` *extends*
-      rather than reclaims it). Work is genuinely in flight.
-    * ``reclaimable`` — the dispatcher can safely return the task to
-      ``ready`` this tick without spawning a duplicate beside a surviving
-      worker: the worker PID is absent/dead on this host, the claim is not
-      host-local, or the heartbeat is stale.
+    * ``active`` — machine-proven in flight: a host-local worker whose PID
+      is alive AND whose recorded starttime identity matches (same worker,
+      not a recycled PID), or a foreign/unexpired claim, or a claim with no
+      worker PID that has not yet expired.
+    * ``reclaimable`` — machine-proven safe to return to ``ready`` this tick
+      without spawning a duplicate beside a surviving worker:
+        - a host-local worker whose PID is provably dead (crash path), or
+        - a non-host-local claim whose TTL has expired, or
+        - a host-local claim with no worker PID whose TTL has expired.
+    * ``deferred`` — fail-closed, NOT executable now: a host-local worker
+      that is alive but whose claim is expired with a stale heartbeat (the
+      dispatcher would *terminate* it, and that termination may survive →
+      deferral), a PID-recycled impostor, a missing/unreadable identity, or
+      a running row with missing/stale ``current_run_id`` ownership.
 
-    Only the authoritative ``tasks`` row is consulted (never orphaned
-    ``task_runs`` rows), so a task whose canonical status is ``done`` with a
-    stale ``running`` run row is never miscounted as active work.
+    Only the authoritative ``tasks`` row — joined to ``task_runs`` via
+    ``current_run_id`` and to ``task_events`` via the latest ``spawned``
+    identity — is consulted. Orphaned ``task_runs`` rows never count as
+    active work.
 
-    Returns ``{"active": [task_id, ...], "reclaimable": [task_id, ...]}``.
+    Returns ``{"active": [...], "reclaimable": [...], "deferred": [...]}``.
     """
     from . import kanban_db as _kb
 
     host_prefix = f"{_kb._claimer_id().split(':', 1)[0]}:"
     rows = conn.execute(
-        "SELECT id, claim_lock, claim_expires, worker_pid, last_heartbeat_at "
-        "FROM tasks WHERE status = 'running'"
+        "SELECT id, claim_lock, claim_expires, worker_pid, last_heartbeat_at, "
+        "current_run_id FROM tasks WHERE status = 'running'"
     ).fetchall()
+
     active: list[str] = []
     reclaimable: list[str] = []
+    deferred: list[str] = []
     for row in rows:
+        tid = row["id"]
         lock = row["claim_lock"] or ""
         pid = row["worker_pid"]
         expires = row["claim_expires"]
-        host_local = lock.startswith(host_prefix)
+        host_local = bool(lock.startswith(host_prefix))
+
+        # Ownership: a running task must be backed by a live current run.
+        if not _current_run_is_live(conn, tid, row["current_run_id"]):
+            deferred.append(tid)
+            continue
 
         # Crash-detection path: a host-local worker whose PID is already gone
-        # is reclaimed by detect_crashed_workers regardless of claim TTL.
+        # is reclaimed by detect_crashed_workers regardless of claim TTL. A
+        # dead PID slot is unambiguous — no recycled-PID risk — so this is
+        # machine-proven reclaimable.
         if host_local and pid is not None and not _kb._pid_alive(pid):
-            reclaimable.append(row["id"])
+            reclaimable.append(tid)
             continue
 
-        # TTL-expiry path (release_stale_claims).
+        # A host-local worker that is still alive can only be reclaimed after
+        # a termination attempt that may survive. Classify conservatively.
+        if host_local and pid is not None:
+            recorded = _running_worker_starttime(conn, tid)
+            ident = _kb._read_process_identity(int(pid))
+            if ident is None:
+                # Alive by _pid_alive but /proc identity unreadable → ambiguous.
+                deferred.append(tid)
+                continue
+            if recorded is None or int(recorded) != ident["starttime"]:
+                # No identity proof, or the PID was recycled (recorded worker
+                # gone, live PID is an unrelated process). Fail closed.
+                deferred.append(tid)
+                continue
+            # Same worker, genuinely alive. It stays running (extended) unless
+            # the TTL lapsed AND the heartbeat went stale — in which case the
+            # dispatcher terminates it and that termination may survive, so it
+            # is a deferred candidate, not reclaimable and not in flight.
+            if expires is not None and expires < now:
+                hb = row["last_heartbeat_at"]
+                heartbeat_stale = (
+                    hb is not None
+                    and (now - int(hb))
+                    > _kb.DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS
+                )
+                if heartbeat_stale:
+                    deferred.append(tid)
+                    continue
+            active.append(tid)
+            continue
+
+        # No host-local live worker (foreign claim, or a host-local claim with
+        # no PID). Reclaimable only once the claim has expired
+        # (release_stale_claims resets a PID-less/foreign claim then);
+        # otherwise still nominally in flight.
         if expires is not None and expires < now:
-            hb = row["last_heartbeat_at"]
-            heartbeat_stale = (
-                hb is not None
-                and (now - int(hb)) > _kb.DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS
-            )
-            if (
-                host_local
-                and pid
-                and _kb._pid_alive(pid)
-                and not heartbeat_stale
-            ):
-                # Live host-local worker with a fresh heartbeat → extended.
-                active.append(row["id"])
-            else:
-                reclaimable.append(row["id"])
-            continue
+            reclaimable.append(tid)
+        else:
+            active.append(tid)
 
-        # Claim still valid (NULL or in the future) → in flight.
-        active.append(row["id"])
+    return {"active": active, "reclaimable": reclaimable, "deferred": deferred}
 
-    return {"active": active, "reclaimable": reclaimable}
 
 
 def compute_board_diagnostics(
@@ -1249,8 +1338,11 @@ def compute_board_diagnostics(
       future status is fail-closed as an open obligation.
     - ``executable_components``: bounded audit breakdown of ``executable_now``
       (``dispatchable_ready`` / ``active_running`` / ``reclaimable_running``)
-      plus the excluded buckets (``guarded_ready`` / ``fenced_waiting``) so
-      no component is double-counted.
+      plus the excluded buckets (``deferred_running`` / ``guarded_ready`` /
+      ``fenced_waiting``) so no component is double-counted. ``deferred_running``
+      is fail-closed running work that is neither provably in flight nor
+      provably reclaimable this tick (stale-heartbeat termination candidates,
+      PID-recycled/missing-identity workers, missing ``current_run_id``).
     - ``findings``: list of finding dicts with kind/severity/title/detail/data.
 
     Callers include the dashboard board view, ``hermes kanban diagnostics``,
@@ -1300,11 +1392,13 @@ def compute_board_diagnostics(
                 {"task_id": ready_row["id"], "reason": guard[0]}
             )
 
-    # Running work split into active vs safely-reclaimable (mirrors the
-    # dispatcher's release_stale_claims / detect_crashed_workers semantics).
+    # Running work split into active / reclaimable / deferred (mirrors the
+    # dispatcher's release_stale_claims / detect_crashed_workers semantics,
+    # including termination-survival deferral and PID/starttime identity).
     running_split = _split_running_tasks(conn, now_ts)
     active_running = len(running_split["active"])
     reclaimable_running = len(running_split["reclaimable"])
+    deferred_running = len(running_split["deferred"])
 
     # Fenced tasks are a nonterminal wait state: an open obligation but NOT
     # executable — the dispatcher must not claim them while the predecessor
@@ -1355,6 +1449,7 @@ def compute_board_diagnostics(
                 "open_obligations": open_obligations,
                 "nonterminal_states": nonterminal_states,
                 "open_statuses": sorted(nonterminal_states.keys()),
+                "deferred_running": deferred_running,
             },
         })
 
@@ -1480,6 +1575,7 @@ def compute_board_diagnostics(
             "dispatchable_ready": dispatchable_ready,
             "active_running": active_running,
             "reclaimable_running": reclaimable_running,
+            "deferred_running": deferred_running,
             "guarded_ready": len(guarded_ready),
             "fenced_waiting": fenced_waiting,
         },
