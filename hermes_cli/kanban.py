@@ -951,6 +951,27 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_repair.add_argument("--json", action="store_true",
                           help="Emit the repair report as JSON")
 
+    # --- reconcile-terminal-runs ---
+    p_reconcile = sub.add_parser(
+        "reconcile-terminal-runs",
+        help="Repair open run rows for one already-terminal task",
+        description=(
+            "Close any open run rows (ended_at IS NULL) for a single named "
+            "already-terminal task (done/archived) whose current_run_id is "
+            "NULL — the historical-residue shape left by legacy/external "
+            "writes. Refuses non-terminal tasks and tasks that still own a "
+            "live current run (fail closed). Idempotent. Emits a deterministic "
+            "JSON receipt (exact before/after run ids + outcomes) suitable for "
+            "later exact live-row readback. Exits 0 when repaired or already "
+            "clean, 1 when refused."
+        ),
+    )
+    p_reconcile.add_argument("task_id", help="Exact task id to repair")
+    p_reconcile.add_argument(
+        "--json", action="store_true", default=True,
+        help="Emit the repair receipt as JSON (default)",
+    )
+
     kanban_parser.set_defaults(_kanban_parser=kanban_parser)
     return kanban_parser
 
@@ -1085,6 +1106,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "specify":  _cmd_specify,
             "decompose":  _cmd_decompose,
             "gc":       _cmd_gc,
+            "reconcile-terminal-runs": _cmd_reconcile_terminal_runs,
         }
         handler = handlers.get(action)
         if not handler:
@@ -2414,6 +2436,27 @@ def _cmd_archive(args: argparse.Namespace) -> int:
             else:
                 print(f"Archived {tid}")
     return 0 if not failed else 1
+
+
+def _cmd_reconcile_terminal_runs(args: argparse.Namespace) -> int:
+    """Repair open run rows for one already-terminal task; print JSON receipt."""
+    with kb.connect_closing() as conn:
+        receipt = kb.repair_terminal_orphan_runs(conn, args.task_id)
+    print(json.dumps(receipt, sort_keys=True))
+    if receipt.get("refused") is not None:
+        print(
+            f"kanban: reconcile-terminal-runs refused {args.task_id} "
+            f"({receipt['refused']})",
+            file=sys.stderr,
+        )
+        return 1
+    if receipt.get("repaired"):
+        print(
+            f"Reconciled {args.task_id}: closed "
+            f"{receipt['closed_count']} open run(s)",
+            file=sys.stderr,
+        )
+    return 0
 
 
 def _cmd_tail(args: argparse.Namespace) -> int:
