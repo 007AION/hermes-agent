@@ -4120,6 +4120,134 @@ def _close_orphan_open_runs(
     return int(cur.rowcount or 0)
 
 
+# Terminal task statuses for the bounded residue-repair operation. ``blocked``
+# is deliberately excluded: a blocked task may be unblocked and re-run, so its
+# open run is not yet a closed-loop residue.
+_TERMINAL_TASK_STATUSES = ("done", "archived")
+
+
+def repair_terminal_orphan_runs(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    outcome: str = "reclaimed",
+) -> dict:
+    """Repair open run rows for a single already-terminal task, exact-scoped.
+
+    The terminal transitions (``complete_task`` / ``archive_task``) now close
+    orphan open runs at transition time (R15 / R16). Historical residues that
+    were already terminal *before* that reconciliation — e.g. the live board's
+    run 664 (t_8e8e8d62), 2056 (t_c0093dec), 2061 (t_bafab551), all ``done``
+    tasks with ``current_run_id IS NULL`` but a run still ``ended_at IS NULL``
+    — cannot be repaired by a transition that has already happened. This
+    operation closes them on demand, scoped to the exact named task, with the
+    same transaction / CAS / fencing discipline, and without a GC daemon or
+    second control plane.
+
+    Guards (fail closed, in order):
+
+    * unknown task id  → ``{"refused": "unknown_task"}``
+    * non-terminal task (anything but ``done`` / ``archived``) →
+      ``{"refused": "nonterminal_task"}``
+    * terminal task that still owns a live run (``current_run_id`` not NULL) →
+      ``{"refused": "live_current_run"}`` — never close a live worker's run.
+
+    Returns a deterministic, machine-readable receipt suitable for later exact
+    live-row readback::
+
+        {
+            "task_id": str,
+            "task_status": str | None,
+            "refused": None | "unknown_task" | "nonterminal_task" | "live_current_run",
+            "current_run_id": int | None,      # only when refused live_current_run
+            "repaired": bool,                  # True iff ≥1 open run was closed this call
+            "closed_count": int,
+            "before_open_run_ids": [int, ...], # open run ids before (ascending)
+            "closed_run_ids": [int, ...],      # ids actually closed this call (ascending)
+            "after_open_run_ids": [int, ...],  # still-open ids after ([] on success)
+        }
+
+    Idempotent: a second call on an already-repaired task returns
+    ``repaired=False`` with empty before/closed/after lists and ``refused=None``
+    (a no-op), never a duplicate close. (AION-RL2-CORE-01-R16.)
+    """
+    now = int(time.time())
+    receipt: dict = {
+        "task_id": task_id,
+        "task_status": None,
+        "refused": None,
+        "current_run_id": None,
+        "repaired": False,
+        "closed_count": 0,
+        "before_open_run_ids": [],
+        "closed_run_ids": [],
+        "after_open_run_ids": [],
+    }
+
+    with write_txn(conn):
+        trow = conn.execute(
+            "SELECT status, current_run_id FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if trow is None:
+            receipt["refused"] = "unknown_task"
+            return receipt
+
+        status = trow["status"]
+        current_run_id = trow["current_run_id"]
+        receipt["task_status"] = status
+
+        if status not in _TERMINAL_TASK_STATUSES:
+            receipt["refused"] = "nonterminal_task"
+            return receipt
+
+        if current_run_id is not None:
+            receipt["refused"] = "live_current_run"
+            receipt["current_run_id"] = int(current_run_id)
+            return receipt
+
+        # Exact-task scoping only — never a broad scan across the board.
+        open_rows = conn.execute(
+            "SELECT id FROM task_runs WHERE task_id = ? AND ended_at IS NULL "
+            "ORDER BY id",
+            (task_id,),
+        ).fetchall()
+        receipt["before_open_run_ids"] = [int(r["id"]) for r in open_rows]
+
+        closed: list[int] = []
+        for r in open_rows:
+            cur = conn.execute(
+                """
+                UPDATE task_runs
+                   SET status        = ?,
+                       outcome       = ?,
+                       summary       = COALESCE(summary, ?),
+                       ended_at      = ?,
+                       claim_lock    = NULL,
+                       claim_expires = NULL,
+                       worker_pid    = NULL
+                 WHERE id = ?
+                   AND ended_at IS NULL
+                """,
+                (outcome, outcome, "terminal residue repair", now, r["id"]),
+            )
+            # CAS: only rows still open at the moment of the UPDATE are closed.
+            if cur.rowcount == 1:
+                closed.append(int(r["id"]))
+
+        receipt["closed_run_ids"] = closed
+        receipt["closed_count"] = len(closed)
+        receipt["repaired"] = len(closed) > 0
+
+        after_rows = conn.execute(
+            "SELECT id FROM task_runs WHERE task_id = ? AND ended_at IS NULL "
+            "ORDER BY id",
+            (task_id,),
+        ).fetchall()
+        receipt["after_open_run_ids"] = [int(r["id"]) for r in after_rows]
+
+    return receipt
+
+
 # ---------------------------------------------------------------------------
 # Dependency resolution (todo -> ready)
 # ---------------------------------------------------------------------------
@@ -6562,6 +6690,17 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
             conn, task_id,
             outcome="reclaimed", status="reclaimed",
             summary="task archived with run still active",
+        )
+        # Durable terminal reconciliation: close any open run rows for this
+        # task that ``_end_run`` did not close (e.g. a run orphaned by a
+        # legacy / external write whose pointer was already detached). Scoped
+        # to the exact task, so a distinct live worker's run is never touched.
+        # Mirrors ``complete_task`` so the terminal invariant holds for BOTH
+        # terminal transitions. (AION-RL2-CORE-01-R16.)
+        _close_orphan_open_runs(
+            conn, task_id,
+            outcome="reclaimed",
+            summary="invariant recovery on archive",
         )
         _append_event(conn, task_id, "archived", None, run_id=run_id)
     # ``archived`` parents no longer block children, same as ``done``.
