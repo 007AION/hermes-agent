@@ -694,6 +694,33 @@ def _init_shadow_repo(shadow_repo: Path, working_dir: str) -> Optional[str]:
 # CheckpointManager
 # ---------------------------------------------------------------------------
 
+def _checkpoint_workspace_fenced(working_dir: str) -> bool:
+    """True when *working_dir* is a terminal/closed managed workspace.
+
+    Lazy-imports the kanban guard so the heavier ``hermes_cli.kanban_db``
+    module is only loaded when a checkpoint targets a managed workspace. Used
+    by :meth:`CheckpointManager.ensure_checkpoint` to skip snapshots of a
+    closed task workspace (AION-RL2-CORE-01-R19): a stale/null/cross-task
+    session's working directory must not be re-registered or snapshotted once
+    its owning task is terminal or its scratch workspace is closed.
+    """
+    try:
+        from hermes_cli.kanban_db import (
+            terminal_workspace_write_refusal,
+            _kanban_context_active,
+        )
+    except ImportError:
+        return False
+    try:
+        refusal = terminal_workspace_write_refusal(working_dir)
+    except Exception:
+        # The guard itself raised unexpectedly: fail closed only when a
+        # managed-task context is active (we cannot rule out a closed
+        # workspace); ordinary non-managed checkpoints are not overblocked.
+        return _kanban_context_active()
+    return refusal is not None
+
+
 class CheckpointManager:
     """Manages automatic filesystem checkpoints.
 
@@ -763,6 +790,12 @@ class CheckpointManager:
         # Skip root, home, and other overly broad directories
         if abs_dir in {"/", str(Path.home())}:
             logger.debug("Checkpoint skipped: directory too broad (%s)", abs_dir)
+            return False
+
+        # Skip a terminal/closed managed task workspace so a stale/null/
+        # cross-task session cannot re-register or snapshot it (AION-RL2-CORE-01-R19).
+        if _checkpoint_workspace_fenced(abs_dir):
+            logger.debug("Checkpoint skipped: closed terminal task workspace (%s)", abs_dir)
             return False
 
         if abs_dir in self._checkpointed_dirs:

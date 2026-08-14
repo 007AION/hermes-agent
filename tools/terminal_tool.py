@@ -2097,6 +2097,41 @@ def _resolve_command_cwd(
     return get_session_cwd(session_key) or default_cwd
 
 
+def _terminal_workspace_cwd_guard(cwd: Optional[str]) -> Optional[str]:
+    """Refuse terminal execution whose cwd is a closed managed workspace.
+
+    Fences the post-terminal workspace-recreation defect at the terminal
+    boundary (AION-RL2-CORE-01-R19): a stale/null/cross-task session must not
+    run a shell whose working directory is a terminal or closed task's managed
+    scratch workspace, because any relative ``mkdir``/write would recreate the
+    deleted directory. Returns a JSON error string when execution must be
+    refused, else ``None``. The guard is identity-aware: a legitimate worker
+    running in its own active scratch workspace is allowed.
+    """
+    if not cwd:
+        return None
+    try:
+        from hermes_cli.kanban_db import terminal_workspace_write_refusal
+    except ImportError:
+        # Kanban DB module unavailable — not a managed-workspace context.
+        return None
+    refusal = terminal_workspace_write_refusal(cwd)
+    if not refusal:
+        return None
+    return json.dumps({
+        "output": "",
+        "exit_code": -1,
+        "error": refusal.get("message", "terminal task workspace is closed"),
+        "status": "blocked",
+        "refused": True,
+        "reason": refusal.get("reason"),
+        "detail": refusal.get("detail"),
+        "task_id": refusal.get("task_id"),
+        "task_status": refusal.get("task_status"),
+        "workspace": refusal.get("workspace"),
+    }, ensure_ascii=False)
+
+
 def terminal_tool(
     command: str,
     background: bool = False,
@@ -2464,6 +2499,9 @@ def terminal_tool(
                 default_cwd=cwd,
                 session_key=session_key,
             )
+            _cwd_guard = _terminal_workspace_cwd_guard(effective_cwd)
+            if _cwd_guard is not None:
+                return _cwd_guard
             try:
                 if env_type == "local":
                     proc_session = process_registry.spawn_local(
@@ -2724,6 +2762,9 @@ def terminal_tool(
                         default_cwd=cwd,
                         session_key=session_key,
                     )
+                    _cwd_guard = _terminal_workspace_cwd_guard(command_cwd)
+                    if _cwd_guard is not None:
+                        return _cwd_guard
                     execute_kwargs = {
                         "timeout": effective_timeout,
                         "cwd": command_cwd,
