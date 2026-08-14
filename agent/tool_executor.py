@@ -91,8 +91,13 @@ def _budget_for_agent(agent) -> BudgetConfig:
         return DEFAULT_BUDGET
 
 # Maximum number of concurrent worker threads for parallel tool execution.
+# Bounded to 4 as a shared-infra capacity control: a wider fan-out (each
+# worker may spawn terminal/tirith/search subprocesses or provider threads)
+# plus the gateway's own threads can transiently exceed the systemd TasksMax
+# in a single service cgroup and drive pids.events.max denials that surface
+# as [Errno 11] Resource temporarily unavailable at worker/subprocess spawn.
 # Mirrors the constant in ``run_agent`` for tests/imports that look here.
-_MAX_TOOL_WORKERS = 8
+_MAX_TOOL_WORKERS = 4
 # Keep this above the stock auxiliary.web_extract timeout (360s) so the batch
 # guard does not preempt a slow-but-valid summarization attempt.
 _DEFAULT_CONCURRENT_TOOL_TIMEOUT_S = 420.0

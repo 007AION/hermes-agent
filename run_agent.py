@@ -256,7 +256,7 @@ def _is_ephemeral_scaffolding(msg: Any) -> bool:
     )
 
 
-_MAX_TOOL_WORKERS = 8
+_MAX_TOOL_WORKERS = 4  # mirror of agent.tool_executor._MAX_TOOL_WORKERS (shared-infra capacity control)
 
 # Intrinsic marker stamped on a message dict once it has been written to the
 # SQLite session store.  Used by ``_flush_messages_to_session_db`` to decide
