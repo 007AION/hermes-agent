@@ -1569,6 +1569,43 @@ def _mark_verification_stale(
         logger.debug("verification stale marker failed", exc_info=True)
 
 
+def _terminal_workspace_guard_error(resolved_path: str) -> str | None:
+    """Refuse file mutation into a terminal task's closed managed workspace.
+
+    Lazy-imports the kanban guard so the heavier ``hermes_cli.kanban_db``
+    module is only loaded when a write actually targets a kanban-managed
+    workspace path (the common case — ordinary project writes — never loads
+    it). Returns a ``tool_error`` JSON string when the write must be refused,
+    else ``None``.
+    """
+    if not resolved_path:
+        return None
+    try:
+        from hermes_cli.kanban_db import terminal_workspace_write_refusal
+    except ImportError:
+        # Kanban DB module unavailable — not a managed-workspace context, so
+        # there is no managed root to fence. Allow the ordinary write.
+        return None
+    # ``terminal_workspace_write_refusal`` is total (never raises); it already
+    # fails closed on any managed-root ambiguity. Do NOT blanket-catch here —
+    # an unexpected exception must surface as an error, never a silent allow.
+    refusal = terminal_workspace_write_refusal(resolved_path)
+    if not refusal:
+        return None
+    return tool_error(
+        refusal.get("message", "terminal task workspace is closed"),
+        refused=True,
+        reason=refusal.get("reason"),
+        detail=refusal.get("detail"),
+        task_id=refusal.get("task_id"),
+        task_status=refusal.get("task_status"),
+        workspace=refusal.get("workspace"),
+        writer_task=refusal.get("writer_task"),
+        writer_run_id=refusal.get("writer_run_id"),
+        writer_pid=refusal.get("writer_pid"),
+    )
+
+
 def write_file_tool(path: str, content: str, task_id: str = "default",
                     cross_profile: bool = False,
                     session_id: str | None = None) -> str:
@@ -1601,6 +1638,12 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
             _resolved = str(_resolve_path_for_task(path, task_id))
         except Exception:
             _resolved = None
+
+        # Fence writes into a terminal task's closed managed workspace before
+        # the write can recreate the deleted directory (AION-RL2-CORE-01-R19).
+        _terminal_guard = _terminal_workspace_guard_error(_resolved or path)
+        if _terminal_guard is not None:
+            return _terminal_guard
 
         if _resolved is None:
             stale_warning = _check_file_staleness(path, task_id)
@@ -1730,6 +1773,13 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                 _resolved_paths.append(_r)
                 _seen.add(_r)
         _resolved_paths.sort()
+
+        # Fence patches into a terminal task's closed managed workspace before
+        # the patch can recreate the deleted directory (AION-RL2-CORE-01-R19).
+        for _r in _resolved_paths:
+            _terminal_guard = _terminal_workspace_guard_error(_r)
+            if _terminal_guard is not None:
+                return _terminal_guard
 
         # Acquire per-path locks in sorted order via ExitStack.  On single
         # path this degenerates to one lock; on empty list (unresolvable)

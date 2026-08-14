@@ -5703,6 +5703,332 @@ def _is_managed_scratch_path(p: Path) -> bool:
     return is_managed
 
 
+# Task-id pattern for a task's workspace directory name (``t_`` + 8 hex chars).
+_TERMINAL_TASK_ID_RE = re.compile(r"^t_[0-9a-f]{8}$")
+
+# Task statuses whose managed scratch workspace is closed. Native terminality
+# is exactly ``done`` and ``archived`` — the only states under which
+# :func:`_cleanup_workspace` removes (or may remove) a scratch workspace.
+# ``failed`` and ``cancelled`` are NOT terminal: the dispatcher may reclaim and
+# re-run them, so fencing their workspace would break a legitimate retry.
+# (AION-RL2-CORE-01-R19 frozen factory truth contract.)
+_TERMINAL_TASK_STATUSES = frozenset({"done", "archived"})
+
+
+def _process_starttime() -> Optional[int]:
+    """Return this process's starttime (``/proc/<pid>/stat`` field 22), else None.
+
+    The ``comm`` field (field 2) may itself contain spaces or parentheses, so
+    the parser skips everything through the *last* ``)`` and reads the
+    remaining fields — field 22 (starttime) is the 20th of those.
+    """
+    try:
+        with open(f"/proc/{os.getpid()}/stat", "rb") as fh:
+            data = fh.read().decode("ascii", "replace")
+        after = data.rfind(")")
+        fields = data[after + 2:].split()
+        return int(fields[19])
+    except Exception:
+        return None
+
+
+def _kanban_context_active() -> bool:
+    """True when a kanban worker/board context is pinned in the environment.
+
+    The dispatcher injects these pins into every worker's env; a developer or
+    ad-hoc ``hermes kanban`` invocation may also carry them. When a context is
+    active, managed-root discovery ambiguity must fail closed rather than
+    silently allowing a write into a possibly-closed workspace.
+    """
+    return any(
+        os.environ.get(k, "").strip()
+        for k in (
+            "HERMES_KANBAN_DB",
+            "HERMES_KANBAN_HOME",
+            "HERMES_KANBAN_WORKSPACES_ROOT",
+            "HERMES_KANBAN_BOARD",
+            "HERMES_KANBAN_TASK",
+        )
+    )
+
+
+def _managed_scratch_path_info_strict(
+    p: Path,
+) -> tuple[bool, Optional[str], Optional[str]]:
+    """Strict variant of :func:`_managed_scratch_path_info` for the write guard.
+
+    Returns ``(is_managed, board, error)`` where ``error`` is a non-empty
+    message when the managed roots could not be fully enumerated/read (so the
+    managed-ness of *p* cannot be ruled out), else ``None``. The write guard
+    fails closed on ``error`` when a kanban context is active, closing the F7
+    fail-open edge where a swallowed ``kanban_home()``/``iterdir()`` error made
+    a managed path look unmanaged.
+    """
+    try:
+        p_abs = p.resolve(strict=False)
+    except OSError:
+        return False, None, None  # cannot resolve — not a comparable managed path
+
+    roots: list[tuple[Path, Optional[str]]] = []
+    error: Optional[str] = None
+
+    override = os.environ.get("HERMES_KANBAN_WORKSPACES_ROOT", "").strip()
+    if override:
+        try:
+            roots.append((Path(override).expanduser().resolve(strict=False), None))
+        except OSError as exc:
+            error = f"workspaces root override unreadable: {exc}"
+
+    try:
+        home = kanban_home()
+    except OSError as exc:
+        home = None
+        error = error or f"kanban home unreadable: {exc}"
+
+    if home is not None:
+        try:
+            roots.append(
+                ((home / "kanban" / "workspaces").resolve(strict=False), DEFAULT_BOARD)
+            )
+        except OSError as exc:
+            error = error or f"default workspaces root unreadable: {exc}"
+        try:
+            boards_parent = (home / "kanban" / "boards").resolve(strict=False)
+        except OSError as exc:
+            boards_parent = None
+            error = error or f"boards parent unreadable: {exc}"
+        if boards_parent is not None:
+            try:
+                entries = list(boards_parent.iterdir())
+            except FileNotFoundError:
+                entries = []  # no boards yet — not a discovery failure
+            except OSError as exc:
+                entries = []
+                error = error or f"board workspaces enumeration failed: {exc}"
+            for entry in entries:
+                try:
+                    if not entry.is_dir():
+                        continue
+                except OSError:
+                    continue
+                try:
+                    roots.append(
+                        ((entry / "workspaces").resolve(strict=False), entry.name)
+                    )
+                except OSError:
+                    continue
+
+    for root, board in roots:
+        if p_abs == root:
+            continue
+        try:
+            if p_abs.is_relative_to(root):
+                return True, board, None
+        except ValueError:
+            continue
+    return False, None, error
+
+
+def _read_task_identity(board: Optional[str], task_id: str) -> Optional[dict]:
+    """Read a task's status + ownership identity from its board DB (read-only).
+
+    Returns ``None`` when the task row is absent. Raises on any I/O/connection
+    error so the caller can fail closed.
+    """
+    db_path = kanban_db_path(board)
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        row = conn.execute(
+            "SELECT status, workspace_kind, workspace_path, worker_pid, "
+            "worker_starttime, current_run_id FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if not row:
+            return None
+        return {
+            "status": row[0],
+            "workspace_kind": row[1],
+            "workspace_path": row[2],
+            "worker_pid": row[3],
+            "worker_starttime": row[4],
+            "current_run_id": row[5],
+        }
+    finally:
+        conn.close()
+
+
+def terminal_workspace_write_refusal(
+    path,
+    *,
+    writer_task: Optional[str] = None,
+    writer_run_id: Optional[str] = None,
+    writer_pid: Optional[int] = None,
+    writer_starttime: Optional[int] = None,
+    writer_session: Optional[str] = None,
+) -> Optional[dict]:
+    """Return a deterministic refusal when *path* is a managed workspace whose
+    mutation is forbidden, else ``None``.
+
+    Fences the post-terminal / closed-owned-workspace recreation defect
+    (AION-RL2-CORE-01-R19) at the actual mutation boundary. A mutation into a
+    kanban-managed ``workspaces/`` scratch root is refused with a deterministic
+    machine-readable receipt unless the writer is a proven legitimate owner of
+    an *active* task's *extant* scratch workspace:
+
+      * path not under a managed workspaces root          -> ``None`` (allow)
+      * owning task terminal (``done``|``archived``)      -> refusal
+      * owning task unknown / malformed / DB unreadable   -> refusal
+      * writer identity null / cross-task / stale-run /   -> refusal
+        mismatched-PID / recycled-PID
+      * active task whose scratch workspace is closed /    -> refusal
+        missing / points elsewhere
+      * active task, same-task writer, matching run/PID    -> ``None`` (allow)
+        (and starttime where recorded)
+
+    Writer identity defaults to the current process / environment (the
+    dispatcher-injected ``HERMES_KANBAN_TASK`` / ``HERMES_KANBAN_RUN_ID`` pins
+    and ``/proc/<pid>/stat``), and can be overridden for tests. Once the path
+    is a strict descendant of a managed workspaces root, every ambiguity fails
+    closed so a closed workspace is never recreated.
+
+    Read-only inspection (``read_file``/``search_files``) and evidence comments
+    are unaffected; only file/terminal/checkpoint mutation consults this guard.
+    """
+    if writer_task is None:
+        writer_task = os.environ.get("HERMES_KANBAN_TASK", "").strip() or None
+    if writer_run_id is None:
+        writer_run_id = os.environ.get("HERMES_KANBAN_RUN_ID", "").strip() or None
+    if writer_pid is None:
+        writer_pid = os.getpid()
+    if writer_starttime is None:
+        writer_starttime = _process_starttime()
+
+    def _refusal(
+        task_id: Optional[str],
+        status: Optional[str],
+        workspace: str,
+        detail: str,
+    ) -> dict:
+        return {
+            "refused": True,
+            "reason": "terminal_task_workspace",
+            "detail": detail,
+            "task_id": task_id,
+            "task_status": status,
+            "workspace": workspace,
+            "writer_task": writer_task,
+            "writer_run_id": writer_run_id,
+            "writer_pid": writer_pid,
+            "message": (
+                f"Refusing to mutate {task_id or '<unknown>'}: {detail}. The "
+                f"owning task is {status or 'unknown or malformed'} and its "
+                "managed workspace is closed; recreating a terminal or closed "
+                "task workspace is forbidden."
+            ),
+        }
+
+    try:
+        p = Path(path).expanduser()
+        if not p.is_absolute():
+            p = p.resolve()
+    except (OSError, ValueError, TypeError):
+        return None  # cannot form a path — not a managed write
+
+    try:
+        is_managed, board, error = _managed_scratch_path_info_strict(p)
+    except Exception as exc:
+        # discovery raised outright — fail closed only when a kanban context
+        # is active; otherwise treat as non-managed (no overblocking).
+        if _kanban_context_active():
+            return _refusal(None, None, str(p), f"discovery_failed: {exc}")
+        return None
+    if not is_managed:
+        if error and _kanban_context_active():
+            # Discovery/readability failed and a kanban context is active: we
+            # cannot rule out that *p* is managed, so fail closed.
+            return _refusal(None, None, str(p), f"discovery_ambiguous: {error}")
+        return None
+
+    # From here *p* IS a strict descendant of a managed workspaces root: any
+    # ambiguity must refuse (fail closed) so a deleted workspace is not recreated.
+    try:
+        root = workspaces_root(board)
+        root_abs = root.resolve(strict=False)
+        p_abs = p.resolve(strict=False)
+        rel = p_abs.relative_to(root_abs)
+    except Exception:
+        return _refusal(None, None, str(p), "managed_root_unresolvable")
+
+    if not rel.parts:
+        return _refusal(None, None, str(root), "managed_root_itself")
+
+    task_id = rel.parts[0]
+    workspace = str(root / task_id)
+
+    if not _TERMINAL_TASK_ID_RE.match(task_id):
+        return _refusal(task_id, None, workspace, "malformed_task_id")
+
+    try:
+        ident = _read_task_identity(board, task_id)
+    except Exception:
+        # Unreadable DB — fail closed: refuse rather than recreate a
+        # possibly-closed workspace.
+        return _refusal(task_id, None, workspace, "db_unreadable")
+
+    if ident is None:
+        return _refusal(task_id, None, workspace, "unknown_task")
+
+    status = ident["status"]
+    if status in _TERMINAL_TASK_STATUSES:
+        return _refusal(task_id, status, workspace, "terminal_task")
+
+    # Active task — enforce ownership before allowing any mutation.
+    if ident["workspace_kind"] != "scratch":
+        return _refusal(task_id, status, workspace, "not_scratch_workspace")
+
+    # The task row's recorded workspace must match the resolved target, and the
+    # directory must still exist (a deleted/closed scratch workspace must not be
+    # recreated even when the status is still active).
+    db_ws = ident["workspace_path"]
+    if db_ws:
+        try:
+            db_ws_abs = Path(db_ws).expanduser().resolve(strict=False)
+        except OSError:
+            db_ws_abs = None
+        if db_ws_abs != root_abs / task_id:
+            return _refusal(task_id, status, workspace, "workspace_path_mismatch")
+    if not (root / task_id).is_dir():
+        return _refusal(task_id, status, workspace, "workspace_closed")
+
+    if writer_task != task_id:
+        return _refusal(
+            task_id, status, workspace,
+            "identity_null" if writer_task is None else "identity_cross_task",
+        )
+
+    cur_run = ident["current_run_id"]
+    if (
+        cur_run is not None
+        and writer_run_id is not None
+        and str(writer_run_id) != str(cur_run)
+    ):
+        return _refusal(task_id, status, workspace, "identity_stale_run")
+
+    worker_pid = ident["worker_pid"]
+    if worker_pid is not None:
+        if writer_pid != worker_pid:
+            return _refusal(task_id, status, workspace, "identity_pid_mismatch")
+        worker_st = ident["worker_starttime"]
+        if (
+            worker_st is not None
+            and writer_starttime is not None
+            and writer_starttime != worker_st
+        ):
+            return _refusal(task_id, status, workspace, "identity_starttime_mismatch")
+
+    return None
+
+
 def _cleanup_workspace(
     conn: sqlite3.Connection, task_id: str,
     *, captured_worker_pid: int | None = None,
