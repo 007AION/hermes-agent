@@ -161,6 +161,70 @@ def test_explicit_unblock_all_parents_done_goes_ready(isolated_db):
 
 
 # ---------------------------------------------------------------------------
+# GREEN — archived is a legal terminal parent state for explicit unblock
+# (AION-RL2-CORE-01-R13 audit repair: unblock_task must treat done AND
+#  archived parents as terminal, not just done)
+# ---------------------------------------------------------------------------
+
+def test_explicit_unblock_archived_parent_goes_ready(isolated_db):
+    """Explicit unblock with an ``archived`` parent must land immediately
+    ``ready`` — archived is a legal terminal parent state, same as done."""
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="a")
+        kb.archive_task(conn, parent)
+        assert kb.get_task(conn, parent).status == "archived"
+
+        child = kb.create_task(conn, title="gated", assignee="a",
+                               parents=[parent], initial_status="blocked")
+        assert kb.get_task(conn, child).status == "blocked"
+
+        assert kb.unblock_task(conn, child) is True
+        assert kb.get_task(conn, child).status == "ready"
+        # And it is now claimable by the dispatcher.
+        assert kb.claim_task(conn, child) is not None
+
+
+def test_explicit_unblock_mixed_done_and_archived_parents_goes_ready(isolated_db):
+    """All parents terminal (a mix of done and archived) → explicit unblock
+    yields ready, not todo."""
+    with kb.connect() as conn:
+        p_done = kb.create_task(conn, title="p_done", assignee="a")
+        kb.claim_task(conn, p_done)
+        kb.complete_task(conn, p_done, result="done")
+
+        p_arch = kb.create_task(conn, title="p_arch", assignee="a")
+        kb.archive_task(conn, p_arch)
+
+        child = kb.create_task(conn, title="gated", assignee="a",
+                               parents=[p_done, p_arch],
+                               initial_status="blocked")
+        assert kb.get_task(conn, child).status == "blocked"
+
+        assert kb.unblock_task(conn, child) is True
+        assert kb.get_task(conn, child).status == "ready"
+
+
+def test_explicit_unblock_open_and_archived_parents_goes_todo(isolated_db):
+    """Any nonterminal parent keeps the child in ``todo`` on unblock, even
+    when the other parent is already archived."""
+    with kb.connect() as conn:
+        p_open = kb.create_task(conn, title="p_open", assignee="a")
+        p_arch = kb.create_task(conn, title="p_arch", assignee="a")
+        kb.archive_task(conn, p_arch)
+
+        child = kb.create_task(conn, title="gated", assignee="a",
+                               parents=[p_open, p_arch],
+                               initial_status="blocked")
+        assert kb.unblock_task(conn, child) is True
+        assert kb.get_task(conn, child).status == "todo"
+
+        # Completing the open parent then lets recompute promote to ready.
+        kb.claim_task(conn, p_open)
+        kb.complete_task(conn, p_open, result="done")
+        assert kb.get_task(conn, child).status == "ready"
+
+
+# ---------------------------------------------------------------------------
 # GREEN — legacy rows (created event records status=blocked, no blocked event)
 # ---------------------------------------------------------------------------
 

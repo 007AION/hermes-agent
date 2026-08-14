@@ -6142,7 +6142,7 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         undone_parents = conn.execute(
             "SELECT 1 FROM task_links l "
             "JOIN tasks p ON p.id = l.parent_id "
-            "WHERE l.child_id = ? AND p.status != 'done' LIMIT 1",
+            "WHERE l.child_id = ? AND p.status NOT IN ('done', 'archived') LIMIT 1",
             (task_id,),
         ).fetchone()
         new_status = "todo" if undone_parents else "ready"
