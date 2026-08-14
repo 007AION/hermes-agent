@@ -956,7 +956,7 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         "reconcile-terminal-runs",
         help="Repair open run rows for one already-terminal task",
         description=(
-            "Close any open (ended_at IS NULL) run rows for a single named "
+            "Close any open run rows (ended_at IS NULL) for a single named "
             "already-terminal task (done/archived) whose current_run_id is "
             "NULL — the historical-residue shape left by legacy/external "
             "writes. Refuses non-terminal tasks and tasks that still own a "
