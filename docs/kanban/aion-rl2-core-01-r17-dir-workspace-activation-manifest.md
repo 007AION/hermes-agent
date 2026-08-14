@@ -1,12 +1,13 @@
 # AION-RL2-CORE-01-R17 — Dir-Workspace Spawn Identity + Activation Evidence Contract
 
 **directive_id:** `AION-RL2-CORE-01-R17-DIR-WORKSPACE-SPAWN-IDENTITY-AND-ACTIVATION-EVIDENCE-REPAIR`
+**revision:** `R1` (activation-manifest repair — REQUEST_CHANGES finding F1 from audit `t_2ba77c00`)
 **source:** AION-GM2 / 13爷 / Factory Director (`from_gm: gm2`)
 **assigned_agent:** agent007 / 007
 **formal_record:** https://github.com/kiddhu/aion-governance/issues/790
 **audit_target:** bafuxunan (八府巡按) exact-head audit before merge
 
-> 中文摘要：本文件是 R17 修复的审计就绪激活证据契约。它把「活动可编辑导入源」与「已安装覆盖层」分开绑定，列出四个 R15/R16 已验收路径的精确 blob 身份，声明（但不执行）后续角色分离的线上读回协议，包括 pids 资源增量、看板级零跨任务变更证明，以及三个指定残留行的确定性歧义所有权拒绝回执。本任务不执行该线上步骤。
+> 中文摘要：本文件是 R17 修复的审计就绪激活证据契约（修订 R1）。它把「活动可编辑导入源」与「已安装覆盖层」分开绑定，列出四个 R15/R16 已验收路径的精确 blob 身份，**并把 R17 变更文件 `hermes_cli/kanban_db.py` 的修复前/修复后精确 blob 身份、精确 head 绑定链、以及合并后的安装 → 全新进程导入 → 有界角色分离 reload → 重载后健康读回 激活协议一并绑定**，声明（但不执行）后续角色分离的线上读回协议，包括 pids 资源增量、看板级零跨任务变更证明，以及三个指定残留行的确定性歧义所有权拒绝回执。本任务不执行该线上步骤。
 
 ---
 
@@ -25,7 +26,52 @@ The gateway venv's editable finder (`__editable___hermes_agent_*_finder.py`) map
 `hermes_*` / `hermes_cli` package to `/root/hermes-agent-aion-lifecycle`. **The running
 service imports the active source, not the installed overlay.**
 
-## 2. Four accepted R15/R16 path identities (exact blob binding)
+---
+
+## 2. Exact-head binding chain (pre-repair → corrected → merge)
+
+This activation protocol must **never be followed against a stale head**. The
+REQUEST_CHANGES finding F1 (audit `t_2ba77c00`, review 4936774783) was raised against the
+pre-repair head and must be discharged on the corrected head, and every later activation
+step is bound to the corrected head **plus its merge commit and both parents, read live
+immediately before activation**.
+
+| Binding | Value | How bound |
+|---|---|---|
+| **Pre-repair audited PR head** (REQUEST_CHANGES) | `c9ee8ad8ae0a609714c784c6b7205d5d67e43935` | immutable literal — audited by `t_2ba77c00`; verdict `REQUEST_CHANGES` on finding F1 only |
+| Base | `c54bf57d56dc8e23635e1bf18b76e17c62467615` | immutable literal (`fork/main`) |
+| **Corrected exact head** (this REVISION R1) | the single new commit on top of `c9ee8ad8…` that adds this manifest repair | bind-by-live-readback: recorded in this task's handoff, re-read from PR #14 immediately before activation; **must differ from `c9ee8ad8…`** |
+| **Merge commit + both parents** | read live immediately before activation | mandatory readback — merge-commit SHA and its two parent SHAs (the `main` head and the corrected PR head) are recorded at activation time |
+
+**Activation gate.** Immediately before any activation step, the activating role must read
+from the live PR #14: (a) current PR head, (b) merge-commit SHA, (c) merge-commit parent
+SHAs. Activation is **refused** unless the current PR head equals the corrected head, the
+merge commit exists, and both parents are recorded. A mismatch (PR closed/merged against a
+different head, branch drift, or a distinct live worker owning the same obligation) fails
+closed — no stale-head reuse.
+
+---
+
+## 3. R17 `kanban_db.py` exact blob identity (pre/post, both locations)
+
+The only runtime file changed by this PR is `hermes_cli/kanban_db.py`. Its identity is the
+load-bearing proof that the later activation is executing the R17 repair and not the old
+R16 bytes that still contain the broken `task_spawns` query.
+
+| Location | Pre-repair blob (R16 — still contains `task_spawns` query) | Required post-install blob (R17) |
+|---|---|---|
+| Active editable source `/root/hermes-agent-aion-lifecycle/hermes_cli/kanban_db.py` | `af298790ba416292b898af397360cbeffa1d4f8f` | `717f81bf43ec7120ec22f9877ed5e355bdf7478d` |
+| Installed overlay `/usr/local/lib/hermes-agent/hermes_cli/kanban_db.py` | `af298790ba416292b898af397360cbeffa1d4f8f` | `717f81bf43ec7120ec22f9877ed5e355bdf7478d` |
+
+**Required code identity (constant):** `717f81bf43ec7120ec22f9877ed5e355bdf7478d`
+(computed with `git hash-object` on `hermes_cli/kanban_db.py` at the exact head). This blob
+is unchanged by REVISION R1 — only this manifest changed. Pre-repair, **both** locations
+carry `af298790…`; after merge + install, **both** must carry `717f81bf…`. Any location
+that does not match fails closed.
+
+---
+
+## 4. Four accepted R15/R16 path identities (exact blob binding)
 
 These four paths are the accepted R15/R16 (terminal-run reconciliation + archive-orphan
 closure) surface, verified by `git hash-object` on each worktree. The installed overlay
@@ -39,7 +85,13 @@ reported as installed.
 | 3 | `tests/hermes_cli/test_kanban_terminal_run_reconciliation_r15.py` | `34db32a8c565674764ee2d6cc64663b9e4b7c52b` | **MISSING (not installed)** |
 | 4 | `tests/hermes_cli/test_kanban_terminal_run_reconciliation_r16.py` | `3d4e243f6aa1d50deb3ccfc961840e0119c8ceee` | `3d4e243f6aa1d50deb3ccfc961840e0119c8ceee` (present) |
 
-## 3. R17 repair (this PR)
+> Note: row 2 above is the **pre-R17** `kanban_db.py` identity (`af298790…`). The R17
+> post-install identity is `717f81bf…` (Section 3). The four rows above are the accepted
+> R15/R16 surface and must not be conflated with the R17 change.
+
+---
+
+## 5. R17 repair (this PR)
 
 **Root cause.** PR #6 added `_cleanup_workspace_on_completion`, a second completion-time
 process closure whose shared-dir `owned_pids` gate reads a `task_spawns` table that has
@@ -67,9 +119,13 @@ identity_mismatch, no_task, no_workspace, internal_error}`) in addition to loggi
   `task_events` `spawned` identity; deterministic evidence return.
 - `tests/hermes_cli/test_kanban_dir_workspace_spawn_identity_r17.py` — RED→GREEN +
   adversarial coverage.
-- `docs/kanban/aion-rl2-core-01-r17-dir-workspace-activation-manifest.md` — this contract.
+- `docs/kanban/aion-rl2-core-01-r17-dir-workspace-activation-manifest.md` — this contract
+  (REVISION R1 adds the exact-head binding chain, R17 blob identity, and install / import /
+  reload / health protocol).
 
-## 4. RED / GREEN
+---
+
+## 6. RED / GREEN
 
 Command (canonical):
 ```
@@ -95,7 +151,9 @@ Adversarial coverage (acceptance matrix):
 | scratch workspace (no ownership gate) | `success`, in-workspace process signalled |
 | internal error does not block completion | `internal_error`; `complete_task` still returns True |
 
-## 5. Direct resource deltas (pids.current / pids.events.max)
+---
+
+## 7. Direct resource deltas (pids.current / pids.events.max)
 
 **Observed read-only during this task (informational, NOT a definitive delta):**
 - `hermes-gateway-gm2.service` cgroup: `pids.current = 56`, `pids.max = 120`,
@@ -103,10 +161,12 @@ Adversarial coverage (acceptance matrix):
 
 This reading is taken while the R17 isolated test run is in-flight and is **not** the
 required before/after pair. The definitive pre/post `pids.current` + `pids.events.max`
-capture is part of the later role-separated live readback (Section 7) and is **not
+capture is part of the later role-separated live readback (Section 9) and is **not
 executed here**.
 
-## 6. Residue readback (read-only, zero mutation)
+---
+
+## 8. Residue readback (read-only, zero mutation)
 
 The three named residues are unchanged from the R16 audit — confirming this task
 performed **zero committed mutation** on the live board:
@@ -119,10 +179,73 @@ performed **zero committed mutation** on the live board:
 
 All three parent tasks are `done` with `current_run_id NULL`.
 
-## 7. Later role-separated live readback (DEFINED — NOT executed by this task)
+---
+
+## 9. Later role-separated live readback + activation (DEFINED — NOT executed by this task)
 
 The following protocol is specified here for the later role-separated (bafuxunan /
-GemAION) post-merge live readback. **This R17 task does not execute it.**
+GemAION) post-merge activation and live readback. **This R17 task does not execute it.**
+It binds the exact R17 bytes so a false activation PASS against pre-R17 code is impossible.
+
+### 9.1 Install — bind the merged head into both locations (defined, not executed)
+
+1. Confirm the activation gate from Section 2: current PR #14 head == corrected head, merge
+   commit exists, both parents recorded. Refuse on any drift.
+2. Install the merged head's `hermes_cli/kanban_db.py` into **both** locations so each
+   carries the required R17 blob:
+   - active editable source: `/root/hermes-agent-aion-lifecycle/hermes_cli/kanban_db.py`
+   - installed overlay: `/usr/local/lib/hermes-agent/hermes_cli/kanban_db.py`
+3. Verify with `git hash-object` on each file. Expected: **both** equal
+   `717f81bf43ec7120ec22f9877ed5e355bdf7478d`. Any other value (e.g. the old
+   `af298790…`) fails closed — do not proceed to import/reload.
+
+### 9.2 Fresh service-context import — resolve intended active path + exact R17 bytes
+
+In a **fresh** process using the gateway venv (NOT a long-lived interactive shell that may
+have cached an old module), resolve the imported module to its on-disk path and hash the
+resolved bytes:
+
+```
+HERMES_PYTHON=/root/hermes-agent-aion-lifecycle/.venv/bin/python - <<'PY'
+import pathlib
+import hermes_cli.kanban_db as kdb
+print(pathlib.Path(kdb.__file__).resolve())
+PY
+# then bind the resolved path to the required blob:
+git -C /root/hermes-agent-aion-lifecycle hash-object hermes_cli/kanban_db.py
+```
+
+Expected: the resolved path is `/root/hermes-agent-aion-lifecycle/hermes_cli/kanban_db.py`
+(the intended active path) and the hash equals `717f81bf43ec7120ec22f9877ed5e355bdf7478d`.
+**Mismatch (wrong path or wrong bytes) fails closed and rolls back** — the R17 repair is not
+considered installed.
+
+### 9.3 Bounded role-separated reload
+
+One **scoped** reload of the affected service — never a full restart, never a stop, never a
+process kill:
+
+```
+systemctl reload hermes-gateway-gm2.service
+```
+
+This step is **role-separated**: it is performed by the bafuxunan/GemAION audit lane at the
+exact merged head, and is **bounded** to the single named service. 007 never performs it.
+
+### 9.4 Immediate post-reload health + import readback
+
+Immediately after the bounded reload, re-verify before any receipt is accepted:
+
+1. Re-run the fresh-import proof (9.2): resolved path + `git hash-object` must still equal
+   `717f81bf43ec7120ec22f9877ed5e355bdf7478d`.
+2. Read service health: `systemctl is-active hermes-gateway-gm2.service` (expect `active`),
+   and read the cgroup `pids.current` / `pids.events` counters (Section 7) to confirm the
+   reload did not leak processes.
+3. **Mismatch fails closed and rolls back** — revert the installed bytes to the prior blob
+   and re-run the fresh-import proof until the intended state is restored. No refusal /
+   readback receipt may be accepted against bytes that are not `717f81bf…`.
+
+### 9.5 Refusal / residue readback (unchanged from R16, only after 9.1–9.4 pass)
 
 1. **Exact per-target refusal receipt.** For each of `t_8e8e8d62` / `t_c0093dec` /
    `t_bafab551`, invoke the installed `repair_terminal_orphan_runs` / CLI path against the
@@ -144,13 +267,18 @@ GemAION) post-merge live readback. **This R17 task does not execute it.**
 5. **Role separation.** 007 never self-audits; the refusal receipts and readback are
    produced and read back by the bafuxunan/GemAION audit lane at the exact merged head.
 
-## 8. Limits / rollback / stop conditions
+---
+
+## 10. Limits / rollback / stop conditions
 
 - One PR maximum; smallest existing-path change (`kanban_db.py` + focused tests + this
   manifest). No new table, migration, service, queue, scheduler, daemon, or control plane.
 - Rollback: revert this PR; the previous behavior (silent `task_spawns` failure) is the
   only thing removed, and the fail-closed fence is the same one already live in
   `_cleanup_workspace`.
+- **Install/import/reload rollback:** any mismatch in Sections 9.1–9.4 (wrong head, wrong
+  blob, wrong resolved path, post-reload health failure) fails closed — revert the
+  installed bytes to the prior blob (`af298790…`) and re-verify before retrying.
 - Stop conditions (this task): origin/main or the existing-path identity source could not
   be bound safely; repair required a new schema/table/control plane; any live/runtime/DB/
   external mutation became necessary; or the safe PID/starttime fence could not be proven.
