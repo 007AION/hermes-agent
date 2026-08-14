@@ -206,19 +206,24 @@ have cached an old module), resolve the imported module to its on-disk path and 
 resolved bytes:
 
 ```
-HERMES_PYTHON=/root/hermes-agent-aion-lifecycle/.venv/bin/python - <<'PY'
-import pathlib
+HERMES_PYTHON=/root/hermes-agent-aion-lifecycle/.venv/bin/python
+"$HERMES_PYTHON" - <<'PY'
+import hashlib, pathlib
 import hermes_cli.kanban_db as kdb
-print(pathlib.Path(kdb.__file__).resolve())
+resolved = pathlib.Path(kdb.__file__).resolve()
+data = resolved.read_bytes()
+blob_sha1 = hashlib.sha1(b"blob %d%c" % (len(data), 0) + data).hexdigest()
+print("resolved_path:", resolved)
+print("blob_sha1:", blob_sha1)
 PY
-# then bind the resolved path to the required blob:
-git -C /root/hermes-agent-aion-lifecycle hash-object hermes_cli/kanban_db.py
 ```
 
-Expected: the resolved path is `/root/hermes-agent-aion-lifecycle/hermes_cli/kanban_db.py`
-(the intended active path) and the hash equals `717f81bf43ec7120ec22f9877ed5e355bdf7478d`.
-**Mismatch (wrong path or wrong bytes) fails closed and rolls back** — the R17 repair is not
-considered installed.
+Expected: the printed `resolved_path` is `/root/hermes-agent-aion-lifecycle/hermes_cli/kanban_db.py`
+(the intended active path) and the printed `blob_sha1` equals
+`717f81bf43ec7120ec22f9877ed5e355bdf7478d` (git blob SHA-1 of those exact resolved bytes). The
+hash is computed on the resolved `kdb.__file__` bytes in the same fresh process, so a wrong path
+or wrong bytes cannot be silently accepted. **Mismatch (wrong path or wrong bytes) fails closed
+and rolls back** — the R17 repair is not considered installed.
 
 ### 9.3 Bounded role-separated reload
 
