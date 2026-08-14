@@ -289,6 +289,116 @@ def test_active_task_with_closed_workspace_fails_closed(kanban_env):
     )
 
 
+def test_ready_unowned_task_with_matching_writer_task_fails_closed(kanban_env):
+    """F1: a ready/unowned task (null run/PID/starttime) must NOT authorize
+    mutation even when ``writer_task`` matches — the old guard's unconditional
+    allow reached by matching writer_task alone is now a refusal."""
+    with kb.connect() as conn:
+        tid, ws = _make_scratch_task(conn)
+        # no _bind_worker — ownership stays null (ready, unowned)
+
+    _assert_refusal(
+        kb.terminal_workspace_write_refusal(
+            str(ws / "x.py"),
+            writer_task=tid,
+            writer_run_id="replayed-run",
+            writer_pid=os.getpid(),
+            writer_starttime=kb._process_starttime(),
+        ),
+        task_id=tid, status="ready", detail="identity_unowned", workspace=str(ws),
+    )
+    assert not (ws / "x.py").exists()
+
+
+@pytest.mark.parametrize("status", ["todo", "blocked"])
+def test_unowned_task_with_cleared_ownership_fails_closed(kanban_env, status):
+    """F2: todo/blocked tasks with cleared ownership fail closed, not just
+    ready (the auditor probed ready/todo/blocked with cleared ownership)."""
+    with kb.connect() as conn:
+        tid, ws = _make_scratch_task(conn)
+        conn.execute("UPDATE tasks SET status=? WHERE id=?", (status, tid))
+        conn.commit()
+
+    _assert_refusal(
+        kb.terminal_workspace_write_refusal(
+            str(ws / "x.py"),
+            writer_task=tid,
+            writer_run_id="replayed-run",
+            writer_pid=os.getpid(),
+            writer_starttime=kb._process_starttime(),
+        ),
+        task_id=tid, status=status, detail="identity_unowned", workspace=str(ws),
+    )
+
+
+def test_null_run_writer_fails_closed(kanban_env):
+    """F1: a null writer run must not be accepted against a recorded current
+    run (previously only non-null-and-unequal runs were rejected)."""
+    with kb.connect() as conn:
+        tid, ws = _make_scratch_task(conn)
+        _bind_worker(conn, tid, run_id=1, pid=4242, starttime=111)
+
+    _assert_refusal(
+        kb.terminal_workspace_write_refusal(
+            str(ws / "x.py"),
+            writer_task=tid,
+            writer_run_id=None,  # null run against a recorded current run
+            writer_pid=4242,
+            writer_starttime=111,
+        ),
+        task_id=tid, status="ready", detail="identity_null_run", workspace=str(ws),
+    )
+
+
+def test_null_starttime_writer_fails_closed(kanban_env, monkeypatch):
+    """F1: an unreadable/null writer starttime must not be accepted against a
+    recorded starttime (previously only non-null-and-unequal values rejected)."""
+    with kb.connect() as conn:
+        tid, ws = _make_scratch_task(conn)
+        _bind_worker(conn, tid, run_id=1, pid=4242, starttime=111)
+
+    # Simulate an unreadable /proc starttime (non-Linux host).
+    monkeypatch.setattr(kb, "_process_starttime", lambda: None)
+    _assert_refusal(
+        kb.terminal_workspace_write_refusal(
+            str(ws / "x.py"),
+            writer_task=tid,
+            writer_run_id="1",
+            writer_pid=4242,
+            writer_starttime=None,  # null starttime against a recorded value
+        ),
+        task_id=tid, status="ready", detail="identity_null_starttime",
+        workspace=str(ws),
+    )
+
+
+def test_writer_session_parameter_removed(kanban_env):
+    """F1: the unsupported ``writer_session`` parameter was removed — the guard
+    binds run/PID/starttime identity, not an unused session argument."""
+    import inspect
+
+    params = inspect.signature(kb.terminal_workspace_write_refusal).parameters
+    assert "writer_session" not in params
+    assert "writer_run_id" in params
+    assert "writer_starttime" in params
+
+
+@pytest.mark.parametrize("status", ["failed", "cancelled"])
+def test_failed_and_cancelled_reclaimable_with_current_run(kanban_env, monkeypatch, status):
+    """F2: failed/cancelled are reclaimable — a re-dispatched run (fresh
+    run/PID/starttime) may still mutate the extant workspace; terminality alone
+    does not fence it (positive path the old test never exercised)."""
+    with kb.connect() as conn:
+        tid, ws = _make_scratch_task(conn)
+        _bind_worker(conn, tid, run_id=2, pid=os.getpid(),
+                     starttime=kb._process_starttime())
+        conn.execute("UPDATE tasks SET status=? WHERE id=?", (status, tid))
+        conn.commit()
+
+    _bind_env(monkeypatch, tid, run_id="2")
+    assert kb.terminal_workspace_write_refusal(str(ws / "ok.py")) is None
+
+
 def test_replayed_refusal_is_deterministic_and_idempotent(kanban_env):
     with kb.connect() as conn:
         tid, ws = _make_scratch_task(conn)
@@ -471,3 +581,35 @@ def test_checkpoint_manager_skips_terminal_workspace(kanban_env):
 
     mgr = CheckpointManager(enabled=True)
     assert mgr.ensure_checkpoint(str(ws), reason="test") is False
+
+
+def test_checkpoint_guard_exception_fails_closed_when_context_active(kanban_env, monkeypatch):
+    """F3: an unexpected guard exception in an active Kanban context must fail
+    closed (fenced), not authorize the checkpoint mutation."""
+    from tools.checkpoint_manager import _checkpoint_workspace_fenced
+
+    with kb.connect() as conn:
+        tid, ws = _make_scratch_task(conn)
+
+    monkeypatch.setattr(
+        kb, "terminal_workspace_write_refusal",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("guard exploded")),
+    )
+    assert _checkpoint_workspace_fenced(str(ws)) is True
+
+
+def test_checkpoint_guard_exception_allows_when_no_context(tmp_path, monkeypatch):
+    """F3: without a Kanban context, an unexpected guard exception is treated
+    as non-managed (no overblocking of ordinary checkpoints)."""
+    from tools.checkpoint_manager import _checkpoint_workspace_fenced
+
+    for k in ("HERMES_KANBAN_DB", "HERMES_KANBAN_HOME", "HERMES_KANBAN_WORKSPACES_ROOT",
+              "HERMES_KANBAN_BOARD", "HERMES_KANBAN_TASK"):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setattr(
+        kb, "terminal_workspace_write_refusal",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("guard exploded")),
+    )
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    assert _checkpoint_workspace_fenced(str(proj)) is False

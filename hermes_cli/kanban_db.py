@@ -5723,7 +5723,7 @@ def _process_starttime() -> Optional[int]:
     remaining fields — field 22 (starttime) is the 20th of those.
     """
     try:
-        with open(f"/proc/{os.getpid()}/stat", "rb") as fh:
+        with open(f"/proc/{os.getpid()}/stat", "rb") as fh:  # windows-footgun: ok — binary read, no encoding needed
             data = fh.read().decode("ascii", "replace")
         after = data.rfind(")")
         fields = data[after + 2:].split()
@@ -5864,7 +5864,6 @@ def terminal_workspace_write_refusal(
     writer_run_id: Optional[str] = None,
     writer_pid: Optional[int] = None,
     writer_starttime: Optional[int] = None,
-    writer_session: Optional[str] = None,
 ) -> Optional[dict]:
     """Return a deterministic refusal when *path* is a managed workspace whose
     mutation is forbidden, else ``None``.
@@ -5873,23 +5872,28 @@ def terminal_workspace_write_refusal(
     (AION-RL2-CORE-01-R19) at the actual mutation boundary. A mutation into a
     kanban-managed ``workspaces/`` scratch root is refused with a deterministic
     machine-readable receipt unless the writer is a proven legitimate owner of
-    an *active* task's *extant* scratch workspace:
+    a *currently running* task's *extant* scratch workspace:
 
       * path not under a managed workspaces root          -> ``None`` (allow)
       * owning task terminal (``done``|``archived``)      -> refusal
       * owning task unknown / malformed / DB unreadable   -> refusal
-      * writer identity null / cross-task / stale-run /   -> refusal
-        mismatched-PID / recycled-PID
+      * writer identity null / cross-task / unowned /     -> refusal
+        null-run / stale-run / null-starttime / mismatched-PID
+        / recycled-PID
       * active task whose scratch workspace is closed /    -> refusal
         missing / points elsewhere
-      * active task, same-task writer, matching run/PID    -> ``None`` (allow)
-        (and starttime where recorded)
+      * running task, same-task writer, exact non-null    -> ``None`` (allow)
+        run/PID match (and starttime where recorded)
 
     Writer identity defaults to the current process / environment (the
     dispatcher-injected ``HERMES_KANBAN_TASK`` / ``HERMES_KANBAN_RUN_ID`` pins
-    and ``/proc/<pid>/stat``), and can be overridden for tests. Once the path
-    is a strict descendant of a managed workspaces root, every ambiguity fails
-    closed so a closed workspace is never recreated.
+    and ``/proc/<pid>/stat``), and can be overridden for tests. Ownership is a
+    real authorization predicate: the task row must record a non-null current
+    run and worker process, and every recorded identity component (run, PID,
+    starttime) must be exactly matched by the writer. A ready/unowned task with
+    no live run, a null writer run/starttime against a recorded value, or a
+    replayed/stale run/PID/starttime all fail closed, so a closed workspace is
+    never recreated.
 
     Read-only inspection (``read_file``/``search_files``) and evidence comments
     are unaffected; only file/terminal/checkpoint mutation consults this guard.
@@ -6006,25 +6010,39 @@ def terminal_workspace_write_refusal(
             "identity_null" if writer_task is None else "identity_cross_task",
         )
 
+    # Ownership identity is a real authorization predicate. The task row must
+    # record a *currently running* owner: a non-null current run and a bound
+    # worker process. A ready/unowned task (no live run) cannot authorize
+    # mutation even when ``writer_task`` matches.
     cur_run = ident["current_run_id"]
-    if (
-        cur_run is not None
-        and writer_run_id is not None
-        and str(writer_run_id) != str(cur_run)
-    ):
-        return _refusal(task_id, status, workspace, "identity_stale_run")
+    if cur_run is None:
+        return _refusal(task_id, status, workspace, "identity_unowned")
+
+    # The writer's run must be present and exactly match the current run; a
+    # null or stale/replayed run fails closed.
+    if writer_run_id is None or str(writer_run_id) != str(cur_run):
+        return _refusal(
+            task_id, status, workspace,
+            "identity_null_run" if writer_run_id is None else "identity_stale_run",
+        )
 
     worker_pid = ident["worker_pid"]
-    if worker_pid is not None:
-        if writer_pid != worker_pid:
-            return _refusal(task_id, status, workspace, "identity_pid_mismatch")
-        worker_st = ident["worker_starttime"]
-        if (
-            worker_st is not None
-            and writer_starttime is not None
-            and writer_starttime != worker_st
-        ):
-            return _refusal(task_id, status, workspace, "identity_starttime_mismatch")
+    if worker_pid is None:
+        return _refusal(task_id, status, workspace, "identity_unowned")
+    if writer_pid is None or writer_pid != worker_pid:
+        return _refusal(
+            task_id, status, workspace,
+            "identity_null_pid" if writer_pid is None else "identity_pid_mismatch",
+        )
+
+    worker_st = ident["worker_starttime"]
+    if worker_st is not None:
+        if writer_starttime is None or writer_starttime != worker_st:
+            return _refusal(
+                task_id, status, workspace,
+                "identity_null_starttime" if writer_starttime is None
+                else "identity_starttime_mismatch",
+            )
 
     return None
 

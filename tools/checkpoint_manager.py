@@ -705,15 +705,19 @@ def _checkpoint_workspace_fenced(working_dir: str) -> bool:
     its owning task is terminal or its scratch workspace is closed.
     """
     try:
-        from hermes_cli.kanban_db import terminal_workspace_write_refusal
+        from hermes_cli.kanban_db import (
+            terminal_workspace_write_refusal,
+            _kanban_context_active,
+        )
     except ImportError:
         return False
     try:
         refusal = terminal_workspace_write_refusal(working_dir)
     except Exception:
-        # Checkpointing is best-effort; an unexpected guard error must not
-        # break the snapshot path.
-        return False
+        # The guard itself raised unexpectedly: fail closed only when a
+        # managed-task context is active (we cannot rule out a closed
+        # workspace); ordinary non-managed checkpoints are not overblocked.
+        return _kanban_context_active()
     return refusal is not None
 
 
