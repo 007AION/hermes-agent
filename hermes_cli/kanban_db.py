@@ -4080,6 +4080,46 @@ def _synthesize_ended_run(
     return int(cur.lastrowid or 0)
 
 
+def _close_orphan_open_runs(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    outcome: str = "reclaimed",
+    summary: Optional[str] = None,
+) -> int:
+    """Close any open run rows for ``task_id`` that ``_end_run`` did not close.
+
+    A terminal transition (``complete_task``) calls ``_end_run`` first, which
+    closes the run pointed to by ``current_run_id`` and clears that pointer.
+    Any remaining ``task_runs`` row with ``ended_at IS NULL`` for the *same*
+    task is an orphan: its run was left open by a legacy / external write and
+    the pointer was already detached. Closing it here — scoped to the exact
+    task, never touching a distinct live worker's run — makes the terminal
+    invariant (``current_run_id IS NULL`` ⇔ no open run row) durable without a
+    GC daemon, scheduler, or second control plane. (AION-RL2-CORE-01-R15.)
+
+    Returns the number of orphan rows closed (0 when the invariant already
+    held).
+    """
+    now = int(time.time())
+    cur = conn.execute(
+        """
+        UPDATE task_runs
+           SET status        = ?,
+               outcome       = ?,
+               summary       = COALESCE(summary, ?),
+               ended_at      = ?,
+               claim_lock    = NULL,
+               claim_expires = NULL,
+               worker_pid    = NULL
+         WHERE task_id = ?
+           AND ended_at IS NULL
+        """,
+        (outcome, outcome, summary, now, task_id),
+    )
+    return int(cur.rowcount or 0)
+
+
 # ---------------------------------------------------------------------------
 # Dependency resolution (todo -> ready)
 # ---------------------------------------------------------------------------
@@ -5058,6 +5098,16 @@ def complete_task(
             outcome="completed", status="done",
             summary=summary if summary is not None else result,
             metadata=metadata,
+        )
+        # Durable terminal reconciliation: close any open run rows for this
+        # task that ``_end_run`` did not close (e.g. a run orphaned by a
+        # legacy / external write whose pointer was already detached). Scoped
+        # to the exact task, so a distinct live worker's run is never touched.
+        # (AION-RL2-CORE-01-R15.)
+        _close_orphan_open_runs(
+            conn, task_id,
+            outcome="reclaimed",
+            summary="invariant recovery on terminal completion",
         )
         # If complete_task was called on a never-claimed task (ready or
         # blocked → done with no run in flight), synthesize a
