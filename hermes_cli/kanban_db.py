@@ -4084,11 +4084,50 @@ def _synthesize_ended_run(
 # Dependency resolution (todo -> ready)
 # ---------------------------------------------------------------------------
 
-def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Return True when ``task_id`` is sticky-blocked by an explicit
-    worker/operator ``kanban_block`` call (#28712).
+def _created_block_intent(payload: Optional[str]) -> bool:
+    """Interpret a ``created`` event's block intent, failing closed.
 
-    A ``blocked`` status can come from two very different sources:
+    Returns ``True`` when the creation is an explicit block (its ``status``
+    is the string ``"blocked"``) **or** when the evidence is unreadable —
+    malformed JSON, a non-dict payload, an absent payload, or a ``status``
+    value that is present but not a string.  A task whose origin cannot be
+    positively identified as a normal creation must never be auto-promoted.
+
+    Returns ``False`` only for a creation that positively carries no block
+    intent:
+
+    * a readable string ``status`` other than ``"blocked"`` (``ready`` /
+      ``todo`` / ``triage`` / ...), or
+    * a legacy ``created`` event with no ``status`` key at all — the
+      decompose path writes ``{"by": ..., "from_decompose_of": ...}`` for
+      normal ``todo`` children, which are not gates.
+    """
+    if not payload:
+        # No evidence at all — unreadable origin, fail closed.
+        return True
+    try:
+        data = json.loads(payload)
+    except (ValueError, TypeError):
+        # Malformed JSON — unreadable origin, fail closed.
+        return True
+    if not isinstance(data, dict):
+        # Non-dict (list / scalar / null) — unreadable origin, fail closed.
+        return True
+    if "status" not in data:
+        # Legacy decompose-created event: no block intent, not a gate.
+        return False
+    status = data["status"]
+    if isinstance(status, str):
+        return status == "blocked"
+    # ``status`` present but not a string — ambiguous, fail closed.
+    return True
+
+
+def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Return True when ``task_id`` is sticky-blocked by an *explicit*
+    block and must not be auto-promoted or manually promoted.
+
+    A ``blocked`` status can come from several very different sources:
 
     * **Worker- or operator-initiated** — a worker called
       ``kanban_block(reason="review-required: ...")`` (or somebody ran
@@ -4096,30 +4135,67 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
       should stay blocked until an operator unblocks it.  The block tool
       emits a ``"blocked"`` event row in ``task_events``.
 
+    * **Creation-time explicit block** — ``create_task(initial_status=
+      "blocked")`` parks a real external gate (financial/legal/property)
+      directly in ``blocked`` to avoid the running→blocked race.  It
+      records only a ``"created"`` event whose payload ``status`` is
+      ``"blocked"`` — no ``"blocked"`` event.  Both fresh and legacy rows
+      of this shape must stay blocked until an explicit ``unblock_task``
+      (AION-RL2-CORE-01-R13, canonical incident t_e690dcc1).
+
     * **Circuit-breaker** — ``_record_task_failure`` tripped after
       repeated crashes / spawn failures / timeouts.  This emits
       ``"gave_up"``, *not* ``"blocked"``, and is meant to recover
       automatically once the underlying conditions change (e.g. parents
       finish, transient infra error clears).
 
-    The cheapest signal that distinguishes the two is the most recent
-    ``"blocked"`` / ``"unblocked"`` event for the task.  If the most
-    recent one is ``"blocked"`` (or there is a ``"blocked"`` event and
-    no ``"unblocked"`` event has fired since), the task is sticky and
-    ``recompute_ready`` must *not* auto-promote it.
+    Resolution rules (fail closed):
 
-    Returns ``False`` when there is no such event at all (e.g. the task
-    was set to ``status='blocked'`` by the circuit breaker or by direct
-    DB manipulation) — preserves the pre-#28712 auto-recover semantics
-    for that path.
+    1. The most recent ``blocked`` / ``unblocked`` transition is
+       authoritative.  ``unblocked`` wins (not sticky), ``blocked`` wins
+       (sticky).
+    2. ``created`` is immutable origin/fallback evidence: only the *first*
+       ``created`` event carries creation-time intent, and it is consulted
+       only when no ``blocked``/``unblocked`` transition exists.  A later
+       duplicate ``created`` event is ignored, so an adversarial
+       re-inserted ``created {status: blocked}`` cannot re-stick a task
+       after an explicit ``unblocked``.
+    3. When the origin ``created`` evidence is unreadable (malformed /
+       non-dict / non-string ``status``) the task is treated as sticky, so
+       an unidentifiable gate is never silently dispatched.  A positively
+       readable non-blocked origin (normal creation) carries no block
+       intent, which preserves dependency- and circuit-breaker
+       auto-recovery.
     """
-    row = conn.execute(
-        "SELECT kind FROM task_events "
-        "WHERE task_id = ? AND kind IN ('blocked', 'unblocked') "
-        "ORDER BY id DESC LIMIT 1",
+    rows = conn.execute(
+        "SELECT kind, payload FROM task_events "
+        "WHERE task_id = ? AND kind IN ('created', 'blocked', 'unblocked') "
+        "ORDER BY id ASC",
         (task_id,),
-    ).fetchone()
-    return bool(row) and row["kind"] == "blocked"
+    ).fetchall()
+
+    latest_transition: Optional[str] = None  # 'blocked' or 'unblocked'
+    created_intent: Optional[bool] = None    # first created event's intent
+
+    for row in rows:
+        kind = row["kind"]
+        if kind == "created":
+            # Only the first (oldest) created event is the origin; ignore any
+            # later duplicate.
+            if created_intent is None:
+                created_intent = _created_block_intent(row["payload"])
+            continue
+        # kind is 'blocked' or 'unblocked'; the last such event (newest id)
+        # is authoritative.
+        latest_transition = kind
+
+    if latest_transition == "unblocked":
+        return False
+    if latest_transition == "blocked":
+        return True
+    # No explicit block/unblock transition: fall back to creation-time
+    # intent.  A missing/unreadable origin fails closed (sticky).
+    return True if created_intent is None else created_intent
 
 
 def recompute_ready(
@@ -5980,6 +6056,17 @@ def promote_task(
             f"'todo' or 'blocked'"
         )
 
+    # A sticky block (creation-time initial_status='blocked' or a
+    # worker/operator kanban_block) must never be bypassed by manual
+    # promotion — explicit ``unblock_task`` is the only exit.  This holds
+    # for force=True too: force overrides the *parent* gate, not an
+    # explicit human/external gate.  (AION-RL2-CORE-01-R13 audit repair.)
+    if cur_status == "blocked" and _has_sticky_block(conn, task_id):
+        return False, (
+            f"task {task_id} is blocked by an explicit gate; "
+            f"use unblock instead of promote"
+        )
+
     if not force:
         parents = conn.execute(
             "SELECT t.id, t.status FROM tasks t "
@@ -6055,7 +6142,7 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         undone_parents = conn.execute(
             "SELECT 1 FROM task_links l "
             "JOIN tasks p ON p.id = l.parent_id "
-            "WHERE l.child_id = ? AND p.status != 'done' LIMIT 1",
+            "WHERE l.child_id = ? AND p.status NOT IN ('done', 'archived') LIMIT 1",
             (task_id,),
         ).fetchone()
         new_status = "todo" if undone_parents else "ready"
