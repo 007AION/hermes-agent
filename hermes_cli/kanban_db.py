@@ -4125,12 +4125,37 @@ def _close_orphan_open_runs(
 # open run is not yet a closed-loop residue.
 _TERMINAL_TASK_STATUSES = ("done", "archived")
 
+# Canonical, fixed closure outcome for the bounded terminal-residue repair.
+# Deliberately NOT a parameter: a historical residue must be marked
+# ``reclaimed`` (never ``completed`` or any caller-supplied value) so a caller
+# cannot mislabel terminal-residue repair as a real worker completion. The run
+# ``status`` and ``outcome`` are both set to this fixed value.
+# (AION-RL2-CORE-01-R16 audit repair.)
+_TERMINAL_REPAIR_OUTCOME = "reclaimed"
+
+
+def _ambiguous_ownership(claim_lock, claim_expires, worker_pid, now: int) -> bool:
+    """Return True when task/run ownership evidence is ambiguous and must fail
+    closed.
+
+    A non-null ``claim_lock`` or ``worker_pid`` means a worker still holds (or
+    last held) the row, and a ``claim_expires`` strictly in the future means
+    the claim is still unexpired. Any of these leaves the row's live/dead
+    status ambiguous — closing it as terminal residue would risk mislabelling
+    live work. (AION-RL2-CORE-01-R16 audit repair.)
+    """
+    if claim_lock is not None:
+        return True
+    if worker_pid is not None:
+        return True
+    if claim_expires is not None and int(claim_expires) > now:
+        return True
+    return False
+
 
 def repair_terminal_orphan_runs(
     conn: sqlite3.Connection,
     task_id: str,
-    *,
-    outcome: str = "reclaimed",
 ) -> dict:
     """Repair open run rows for a single already-terminal task, exact-scoped.
 
@@ -4151,6 +4176,15 @@ def repair_terminal_orphan_runs(
       ``{"refused": "nonterminal_task"}``
     * terminal task that still owns a live run (``current_run_id`` not NULL) →
       ``{"refused": "live_current_run"}`` — never close a live worker's run.
+    * task row carrying ambiguous ownership evidence (non-null ``claim_lock``
+      or ``worker_pid``, or unexpired ``claim_expires``) →
+      ``{"refused": "ambiguous_live_ownership"}``
+    * any targeted open run row carrying the same ambiguous ownership
+      evidence → ``{"refused": "ambiguous_live_ownership"}``. The refusal is
+      atomic: no row is mutated when any evidence is ambiguous.
+
+    The closure outcome is fixed to ``"reclaimed"`` — there is no caller
+    override, so arbitrary ``outcome="completed"`` injection is impossible.
 
     Returns a deterministic, machine-readable receipt suitable for later exact
     live-row readback::
@@ -4158,18 +4192,28 @@ def repair_terminal_orphan_runs(
         {
             "task_id": str,
             "task_status": str | None,
-            "refused": None | "unknown_task" | "nonterminal_task" | "live_current_run",
+            "refused": None | "unknown_task" | "nonterminal_task"
+                       | "live_current_run" | "ambiguous_live_ownership",
             "current_run_id": int | None,      # only when refused live_current_run
             "repaired": bool,                  # True iff ≥1 open run was closed this call
             "closed_count": int,
             "before_open_run_ids": [int, ...], # open run ids before (ascending)
             "closed_run_ids": [int, ...],      # ids actually closed this call (ascending)
             "after_open_run_ids": [int, ...],  # still-open ids after ([] on success)
+            "rows": [                          # per-row before/after + closure, ascending
+                {
+                    "run_id": int,
+                    "before": {"status": str, "outcome": str | None},
+                    "after":  {"status": str, "outcome": str},
+                    "closure": {"evidence": str, "ended_at": int},
+                },
+                ...
+            ],
         }
 
     Idempotent: a second call on an already-repaired task returns
-    ``repaired=False`` with empty before/closed/after lists and ``refused=None``
-    (a no-op), never a duplicate close. (AION-RL2-CORE-01-R16.)
+    ``repaired=False`` with empty before/closed/after/rows lists and
+    ``refused=None`` (a no-op), never a duplicate close. (AION-RL2-CORE-01-R16.)
     """
     now = int(time.time())
     receipt: dict = {
@@ -4182,11 +4226,14 @@ def repair_terminal_orphan_runs(
         "before_open_run_ids": [],
         "closed_run_ids": [],
         "after_open_run_ids": [],
+        "rows": [],
     }
 
     with write_txn(conn):
         trow = conn.execute(
-            "SELECT status, current_run_id FROM tasks WHERE id = ?", (task_id,),
+            "SELECT status, current_run_id, claim_lock, claim_expires, worker_pid "
+            "FROM tasks WHERE id = ?",
+            (task_id,),
         ).fetchone()
         if trow is None:
             receipt["refused"] = "unknown_task"
@@ -4205,15 +4252,36 @@ def repair_terminal_orphan_runs(
             receipt["current_run_id"] = int(current_run_id)
             return receipt
 
+        # Fail closed on ambiguous *task-level* ownership: a detached pointer
+        # is not enough to prove the row is a safe residue if the task row
+        # still carries a claim lock, worker PID, or unexpired claim.
+        if _ambiguous_ownership(
+            trow["claim_lock"], trow["claim_expires"], trow["worker_pid"], now,
+        ):
+            receipt["refused"] = "ambiguous_live_ownership"
+            return receipt
+
         # Exact-task scoping only — never a broad scan across the board.
         open_rows = conn.execute(
-            "SELECT id FROM task_runs WHERE task_id = ? AND ended_at IS NULL "
+            "SELECT id, status, outcome, claim_lock, claim_expires, worker_pid "
+            "FROM task_runs WHERE task_id = ? AND ended_at IS NULL "
             "ORDER BY id",
             (task_id,),
         ).fetchall()
         receipt["before_open_run_ids"] = [int(r["id"]) for r in open_rows]
 
+        # Fail closed on ambiguous *run-level* ownership, atomically: if any
+        # targeted open run still looks owned, refuse the whole repair without
+        # closing any row (no partial mutation).
+        for r in open_rows:
+            if _ambiguous_ownership(
+                r["claim_lock"], r["claim_expires"], r["worker_pid"], now,
+            ):
+                receipt["refused"] = "ambiguous_live_ownership"
+                return receipt
+
         closed: list[int] = []
+        rows: list[dict] = []
         for r in open_rows:
             cur = conn.execute(
                 """
@@ -4228,15 +4296,39 @@ def repair_terminal_orphan_runs(
                  WHERE id = ?
                    AND ended_at IS NULL
                 """,
-                (outcome, outcome, "terminal residue repair", now, r["id"]),
+                (
+                    _TERMINAL_REPAIR_OUTCOME,
+                    _TERMINAL_REPAIR_OUTCOME,
+                    "terminal residue repair",
+                    now,
+                    r["id"],
+                ),
             )
             # CAS: only rows still open at the moment of the UPDATE are closed.
             if cur.rowcount == 1:
                 closed.append(int(r["id"]))
+                rows.append(
+                    {
+                        "run_id": int(r["id"]),
+                        "before": {
+                            "status": r["status"],
+                            "outcome": r["outcome"],
+                        },
+                        "after": {
+                            "status": _TERMINAL_REPAIR_OUTCOME,
+                            "outcome": _TERMINAL_REPAIR_OUTCOME,
+                        },
+                        "closure": {
+                            "evidence": "terminal residue repair",
+                            "ended_at": now,
+                        },
+                    }
+                )
 
         receipt["closed_run_ids"] = closed
         receipt["closed_count"] = len(closed)
         receipt["repaired"] = len(closed) > 0
+        receipt["rows"] = rows
 
         after_rows = conn.execute(
             "SELECT id FROM task_runs WHERE task_id = ? AND ended_at IS NULL "

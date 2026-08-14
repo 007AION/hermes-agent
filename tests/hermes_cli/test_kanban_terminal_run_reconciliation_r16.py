@@ -85,19 +85,29 @@ def _open_run_ids(conn, task_id):
 
 
 def _claim_then_detach(conn, title, *, assignee="a"):
-    """Create + claim a task, then detach the pointer while the run stays open.
+    """Create + claim a task, then detach the pointer and release ownership
+    while the run stays open.
 
-    Reproduces the invariant leak at the root of the live board's three orphan
-    rows (664 / 2056 / 2061): an owned run is left ``running`` / ``ended_at IS
-    NULL`` while the task's ``current_run_id`` is cleared by an external /
-    legacy write. This is the *historical* entry path — current code pairs
-    every run create with ``current_run_id`` and every close with a pointer
-    clear, so a fresh orphan cannot be produced through the public API alone.
+    Reproduces the *safe* historical residue shape at the root of the live
+    board's three orphan rows (664 / 2056 / 2061): an owned run is left
+    ``running`` / ``ended_at IS NULL`` while the task's ``current_run_id`` is
+    cleared *and its claim/worker ownership evidence is released* by an
+    external / legacy write. This is the shape the terminal-residue repair is
+    allowed to close; a residue that still carries a claim lock, unexpired
+    claim expiry, or worker PID is the *ambiguous* shape the repair must
+    refuse (see the adversarial tests below). (AION-RL2-CORE-01-R16 audit.)
     """
     t = kb.create_task(conn, title=title, assignee=assignee)
     kb.claim_task(conn, t)
     conn.execute(
-        "UPDATE tasks SET current_run_id = NULL WHERE id = ?", (t,),
+        "UPDATE tasks SET current_run_id = NULL, claim_lock = NULL, "
+        "claim_expires = NULL, worker_pid = NULL WHERE id = ?",
+        (t,),
+    )
+    conn.execute(
+        "UPDATE task_runs SET claim_lock = NULL, claim_expires = NULL, "
+        "worker_pid = NULL WHERE task_id = ?",
+        (t,),
     )
     conn.commit()
     return t
@@ -319,3 +329,149 @@ def test_r16_reconcile_cli_receipt(kanban_home):
     assert receipt["closed_count"] == 1
     assert receipt["after_open_run_ids"] == []
     assert open_ids == []
+
+
+# ── RED: fail closed on ambiguous live ownership (AION-RL2-CORE-01-R16 audit) ─
+
+
+def test_r16_repair_refuses_ambiguous_detached_ownership(kanban_home):
+    """RED: a terminal task whose pointer is detached but which still carries
+    non-null claim lock / unexpired claim expiry / worker PID on BOTH task and
+    run must be refused without partial mutation (the auditor's exact shape)."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="detached-but-owned", assignee="a")
+        kb.claim_task(conn, t)  # sets claim_lock + unexpired claim_expires
+        # Adversarial terminal+detached+owned shape: flip status, clear the
+        # pointer, but KEEP claim lock / unexpired expiry and set worker PID.
+        conn.execute(
+            "UPDATE tasks SET status = 'done', current_run_id = NULL, "
+            "worker_pid = 4242 WHERE id = ?",
+            (t,),
+        )
+        conn.execute(
+            "UPDATE task_runs SET worker_pid = 4242 WHERE task_id = ?", (t,),
+        )
+        conn.commit()
+
+        before_task = conn.execute(
+            "SELECT claim_lock, claim_expires, worker_pid, current_run_id "
+            "FROM tasks WHERE id = ?",
+            (t,),
+        ).fetchone()
+        before_run = conn.execute(
+            "SELECT claim_lock, claim_expires, worker_pid, ended_at "
+            "FROM task_runs WHERE task_id = ?",
+            (t,),
+        ).fetchone()
+
+        receipt = kb.repair_terminal_orphan_runs(conn, t)
+
+        after_task = conn.execute(
+            "SELECT claim_lock, claim_expires, worker_pid, current_run_id "
+            "FROM tasks WHERE id = ?",
+            (t,),
+        ).fetchone()
+        after_run = conn.execute(
+            "SELECT claim_lock, claim_expires, worker_pid, ended_at "
+            "FROM task_runs WHERE task_id = ?",
+            (t,),
+        ).fetchone()
+
+    assert receipt["refused"] == "ambiguous_live_ownership"
+    assert receipt["repaired"] is False
+    assert receipt["closed_count"] == 0
+    # No partial mutation: ownership evidence and the open run are untouched.
+    assert after_task["claim_lock"] == before_task["claim_lock"]
+    assert after_task["claim_expires"] == before_task["claim_expires"]
+    assert after_task["worker_pid"] == before_task["worker_pid"]
+    assert after_task["current_run_id"] is None
+    assert after_run["claim_lock"] == before_run["claim_lock"]
+    assert after_run["worker_pid"] == before_run["worker_pid"]
+    assert after_run["ended_at"] is None  # the open run was NOT closed
+
+
+def test_r16_repair_refuses_run_level_ambiguous_ownership(kanban_home):
+    """RED: a clean task row but an open run row that still carries claim lock
+    / worker PID must be refused (run-level fence, not just task-level)."""
+    with kb.connect() as conn:
+        t = _claim_then_detach(conn, "run-level-owned")
+        conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (t,))
+        # Re-introduce ambiguous ownership on the RUN row only.
+        conn.execute(
+            "UPDATE task_runs SET claim_lock = 'host:9', "
+            "claim_expires = 9999999999, worker_pid = 7777 WHERE task_id = ?",
+            (t,),
+        )
+        conn.commit()
+
+        receipt = kb.repair_terminal_orphan_runs(conn, t)
+        still_open = _open_run_ids(conn, t)
+
+    assert receipt["refused"] == "ambiguous_live_ownership"
+    assert receipt["repaired"] is False
+    assert still_open != []  # not closed
+
+
+def test_r16_repair_allows_expired_claim_expiry(kanban_home):
+    """An *expired* claim (claim_lock/worker_pid already NULL, claim_expires in
+    the past) is NOT ambiguous and may be closed — the fence is precise."""
+    with kb.connect() as conn:
+        t = _claim_then_detach(conn, "expired-claim")
+        conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (t,))
+        # Stale, already-expired claim timestamp with no lock / worker.
+        conn.execute(
+            "UPDATE task_runs SET claim_expires = 1 WHERE task_id = ?", (t,),
+        )
+        conn.commit()
+
+        receipt = kb.repair_terminal_orphan_runs(conn, t)
+
+    assert receipt["refused"] is None
+    assert receipt["repaired"] is True
+
+
+# ── RED: deterministic per-row receipt + bounded outcome (AION-RL2-CORE-01-R16) ─
+
+
+def test_r16_repair_receipt_discloses_per_row_before_after(kanban_home):
+    """RED: the receipt must disclose each targeted row's exact before/after
+    status and outcome plus closure evidence (not just run ids/counts)."""
+    with kb.connect() as conn:
+        t = _claim_then_detach(conn, "receipt-rows")
+        conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (t,))
+        conn.commit()
+
+        receipt = kb.repair_terminal_orphan_runs(conn, t)
+
+    assert receipt["repaired"] is True
+    rows = receipt["rows"]
+    assert len(rows) == len(receipt["closed_run_ids"])
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["run_id"] == receipt["closed_run_ids"][0]
+    assert row["before"]["status"] == "running"
+    assert row["before"]["outcome"] is None
+    assert row["after"]["status"] == "reclaimed"
+    assert row["after"]["outcome"] == "reclaimed"
+    assert row["closure"]["evidence"]
+    assert isinstance(row["closure"]["ended_at"], int)
+    # Stable ordering: rows ascending by run_id.
+    assert [r["run_id"] for r in rows] == sorted(r["run_id"] for r in rows)
+
+
+def test_r16_repair_outcome_is_not_injectable(kanban_home):
+    """RED: the repair outcome is fixed — an arbitrary ``outcome=`` kwarg is
+    rejected, so a caller cannot mark a historical row ``completed``."""
+    with kb.connect() as conn:
+        t = _claim_then_detach(conn, "outcome-injection")
+        conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (t,))
+        conn.commit()
+
+        with pytest.raises(TypeError):
+            kb.repair_terminal_orphan_runs(conn, t, outcome="completed")
+
+    with kb.connect() as conn:
+        outcomes = _runs_by_outcome(conn, t)
+
+    # The row was never marked completed.
+    assert outcomes.get("completed", 0) == 0
