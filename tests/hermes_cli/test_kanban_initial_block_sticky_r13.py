@@ -19,6 +19,7 @@ can read or write the operator's live board.
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 import pytest
@@ -258,3 +259,167 @@ def test_circuit_breaker_block_still_respects_failure_limit(isolated_db):
         # recompute respects the failure-limit guard and does not promote.
         assert kb.recompute_ready(conn) == 0
         assert kb.get_task(conn, t).status == "blocked"
+
+
+# ---------------------------------------------------------------------------
+# GREEN — manual promote_task must not bypass explicit block intent
+# ---------------------------------------------------------------------------
+
+def test_promote_creation_blocked_refused_force_false(isolated_db):
+    """``promote_task(force=False)`` must refuse a creation-time-blocked task
+    and the task must remain unclaimable."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="gated", assignee="a",
+                           initial_status="blocked")
+        ok, err = kb.promote_task(conn, t, actor="tester")
+        assert ok is False
+        assert err is not None and "explicit gate" in err
+        assert kb.get_task(conn, t).status == "blocked"
+        # Still not claimable: only 'ready' is claimable.
+        assert kb.claim_task(conn, t) is None
+
+
+def test_promote_creation_blocked_refused_force_true(isolated_db):
+    """``force=True`` overrides the *parent* gate, not an explicit
+    human/external gate — it must also refuse a creation-time block."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="gated", assignee="a",
+                           initial_status="blocked")
+        ok, err = kb.promote_task(conn, t, actor="tester", force=True)
+        assert ok is False
+        assert err is not None and "explicit gate" in err
+        assert kb.get_task(conn, t).status == "blocked"
+        assert kb.claim_task(conn, t) is None
+
+
+def test_promote_non_sticky_blocked_still_works(isolated_db):
+    """A blocked task with no sticky signal (dependency/circuit-style direct
+    block) must remain manually promotable — the sticky guard must not
+    over-block legitimate manual recovery."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="t", assignee="a")
+        conn.execute("UPDATE tasks SET status='blocked' WHERE id=?", (t,))
+        conn.commit()
+        ok, err = kb.promote_task(conn, t, actor="tester", reason="recover")
+        assert ok is True and err is None
+        assert kb.get_task(conn, t).status == "ready"
+
+
+# ---------------------------------------------------------------------------
+# GREEN — fail closed on unreadable creation-origin evidence
+# ---------------------------------------------------------------------------
+
+def test_malformed_created_payload_fails_closed(isolated_db):
+    """A ``created`` event whose payload is malformed JSON must be treated as
+    an unreadable origin and stay sticky (fail closed), never auto-promoted."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="corrupt-gate", assignee="a")
+        conn.execute("UPDATE tasks SET status='blocked' WHERE id=?", (t,))
+        conn.execute(
+            "UPDATE task_events SET payload=? WHERE task_id=? AND kind='created'",
+            ("{not valid json", t),
+        )
+        conn.commit()
+        assert kb._has_sticky_block(conn, t) is True
+        assert kb.recompute_ready(conn) == 0
+        assert kb.get_task(conn, t).status == "blocked"
+
+
+def test_non_dict_created_payload_fails_closed(isolated_db):
+    """A ``created`` payload that is valid JSON but not a dict must fail
+    closed (sticky)."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="corrupt-gate", assignee="a")
+        conn.execute("UPDATE tasks SET status='blocked' WHERE id=?", (t,))
+        conn.execute(
+            "UPDATE task_events SET payload=? WHERE task_id=? AND kind='created'",
+            ('[1, 2, 3]', t),
+        )
+        conn.commit()
+        assert kb._has_sticky_block(conn, t) is True
+        assert kb.recompute_ready(conn) == 0
+        assert kb.get_task(conn, t).status == "blocked"
+
+
+def test_non_string_created_status_fails_closed(isolated_db):
+    """A ``created`` payload whose ``status`` is present but not a string is
+    ambiguous and must fail closed (sticky)."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="corrupt-gate", assignee="a")
+        conn.execute("UPDATE tasks SET status='blocked' WHERE id=?", (t,))
+        conn.execute(
+            "UPDATE task_events SET payload=? WHERE task_id=? AND kind='created'",
+            (json.dumps({"status": None}), t),
+        )
+        conn.commit()
+        assert kb._has_sticky_block(conn, t) is True
+        assert kb.recompute_ready(conn) == 0
+        assert kb.get_task(conn, t).status == "blocked"
+
+
+def test_created_without_status_key_not_sticky(isolated_db):
+    """A legacy decompose-created event (valid dict, no ``status`` key) is a
+    normal creation, not a gate — it must NOT be treated as sticky so
+    dependency/circuit-breaker recovery for decomposed children is preserved."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="decomposed-child", assignee="a")
+        conn.execute("UPDATE tasks SET status='blocked' WHERE id=?", (t,))
+        conn.execute(
+            "UPDATE task_events SET payload=? WHERE task_id=? AND kind='created'",
+            (json.dumps({"by": "decomposer", "from_decompose_of": "root"}), t),
+        )
+        conn.commit()
+        assert kb._has_sticky_block(conn, t) is False
+        assert kb.recompute_ready(conn) == 1
+        assert kb.get_task(conn, t).status == "ready"
+
+
+# ---------------------------------------------------------------------------
+# GREEN — created is immutable origin; a later duplicate must not re-stick
+# ---------------------------------------------------------------------------
+
+def test_adversarial_duplicate_created_does_not_restick_after_unblock(isolated_db):
+    """After an explicit unblock, a later duplicate ``created {status: blocked}``
+    event must not re-stick the task — the ``unblocked`` transition is
+    authoritative and the duplicate origin is ignored."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="gated", assignee="a",
+                           initial_status="blocked")
+        assert kb.unblock_task(conn, t) is True
+        assert kb.get_task(conn, t).status == "ready"
+
+        # Adversarial: re-insert a duplicate 'created' event with block intent
+        # AFTER the unblock (it gets a higher event id).
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'created', ?, ?)",
+            (t, json.dumps({"status": "blocked"}), int(time.time())),
+        )
+        conn.commit()
+
+        assert kb._has_sticky_block(conn, t) is False
+        assert kb.recompute_ready(conn) == 0
+        assert kb.get_task(conn, t).status == "ready"
+
+
+def test_explicit_block_event_then_unblock_not_restuck(isolated_db):
+    """A creation-time block that also receives an explicit ``blocked`` event
+    (worker/operator) and then an explicit unblock must end un-stuck — the
+    most recent transition wins over both the origin and the block event."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="gated", assignee="a",
+                           initial_status="blocked")
+        # Simulate an explicit re-block after a (hypothetical) claim, then
+        # unblock: the unblocked transition must be authoritative.
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'blocked', ?, ?)",
+            (t, json.dumps({"reason": "review-required"}), int(time.time())),
+        )
+        conn.commit()
+        assert kb._has_sticky_block(conn, t) is True
+
+        assert kb.unblock_task(conn, t) is True
+        assert kb._has_sticky_block(conn, t) is False
+        assert kb.recompute_ready(conn) == 0
+        assert kb.get_task(conn, t).status == "ready"
