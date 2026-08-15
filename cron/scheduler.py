@@ -3908,6 +3908,7 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
                 success=False,
                 error="Dispatch claim rejected; execution was not started.",
                 job=job,
+                session_required=not job.get("no_agent"),
             )
             return True  # not an error — already handled/removed
 
@@ -4221,6 +4222,7 @@ def tick(
                     success=False,
                     error=f"Executor dispatch failed: {submit_err}",
                     job=job,
+                    session_required=not job.get("no_agent"),
                 )
                 # Interpreter began finalizing between the guard above and the
                 # submit — release the in-flight claim we just took and skip.
