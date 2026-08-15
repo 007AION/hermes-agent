@@ -142,17 +142,38 @@ class _FileLock:
             self._fh = None
 
 
-def _read_entries(path: Path) -> list[dict[str, Any]]:
+class ActiveSessionRegistryUnreadable(RuntimeError):
+    """Raised when the active-session registry exists but cannot be read/parsed.
+
+    Distinct from a missing registry (``FileNotFoundError`` → genuinely empty),
+    so callers — notably the dispatcher's ``profile_active_session_capacity``
+    preflight — can propagate an explicit "capacity unknown" signal instead of
+    silently collapsing a corrupt registry to ``active_count == 0`` and failing
+    open as if the profile were free.
+    """
+
+
+def _read_entries(
+    path: Path, *, raise_on_corrupt: bool = False
+) -> list[dict[str, Any]]:
     try:
         with open(path, "r", encoding="utf-8") as fh:
             data = json.load(fh)
     except FileNotFoundError:
         return []
-    except Exception:
+    except Exception as exc:
         logger.warning("Ignoring corrupt active session registry at %s", path)
+        if raise_on_corrupt:
+            raise ActiveSessionRegistryUnreadable(
+                f"active session registry at {path} is unreadable"
+            ) from exc
         return []
     entries = data.get("entries") if isinstance(data, dict) else data
     if not isinstance(entries, list):
+        if raise_on_corrupt:
+            raise ActiveSessionRegistryUnreadable(
+                f"active session registry at {path} has an invalid shape"
+            )
         return []
     return [entry for entry in entries if isinstance(entry, dict)]
 
@@ -390,7 +411,7 @@ def profile_active_session_capacity() -> Optional[tuple[int, int]]:
         return None
     state_path = _state_path()
     with _FileLock(_lock_path()):
-        raw_entries = _read_entries(state_path)
+        raw_entries = _read_entries(state_path, raise_on_corrupt=True)
         entries = _prune_dead(raw_entries)
         if len(entries) != len(raw_entries):
             # Persist the prune so a recycled PID can't keep the profile

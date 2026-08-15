@@ -17044,13 +17044,23 @@ def main(
                         record_session_admission_refusal as _record_refusal,
                     )
 
-                    _recorded = _record_refusal(
-                        task_id=os.environ["HERMES_KANBAN_TASK"],
-                        pid=os.getpid(),
-                        session_id=getattr(cli, "session_id", "") or "",
-                        profile=os.environ.get("HERMES_PROFILE", "") or "",
-                    )
-                    _admit_exit = _SL_CODE if _recorded else 1
+                    # Bind the refusal to the current spawn/run via the
+                    # dispatcher-known fresh run identity (HERMES_KANBAN_RUN_ID
+                    # == the task's current_run_id). Without a run identity we
+                    # cannot produce a non-replayable receipt, so fail closed
+                    # (plain nonzero) rather than emit an unverifiable sentinel.
+                    _run_id = os.environ.get("HERMES_KANBAN_RUN_ID", "") or ""
+                    if _run_id:
+                        _recorded = _record_refusal(
+                            task_id=os.environ["HERMES_KANBAN_TASK"],
+                            pid=os.getpid(),
+                            session_id=getattr(cli, "session_id", "") or "",
+                            profile=os.environ.get("HERMES_PROFILE", "") or "",
+                            nonce=_run_id,
+                        )
+                        _admit_exit = _SL_CODE if _recorded else 1
+                    else:
+                        _admit_exit = 1
                 except Exception:
                     _admit_exit = 1
             sys.exit(_admit_exit)

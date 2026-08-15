@@ -7701,6 +7701,15 @@ class DispatchResult:
     correctness), but the degraded read is surfaced here so telemetry can
     distinguish "uncapped profile" from "cap unknown" instead of silently
     failing open. (AION-RL2-CORE-01-SESSION_ADMISSION)"""
+    skipped_profile_session_capacity_unknown_deferred: list[tuple[str, str]] = field(
+        default_factory=list
+    )
+    """Tasks whose assignee profile's capacity was unknown AND whose most
+    recent closed run was ``session_capped`` (an authenticated admission
+    refusal). These are DEFERRED (left ``ready``/unclaimed, no spawn) rather
+    than failed-open, so persistent capacity-unknown plus authenticated rc=69
+    cannot zero-budget respawn-loop across dispatcher ticks. Each entry is
+    ``(task_id, assignee)``. (AION-RL2-CORE-01-SESSION_ADMISSION-R3)"""
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
@@ -7844,9 +7853,17 @@ def record_session_admission_refusal(
     A kanban worker that is refused admission by ``_claim_active_session`` calls
     this *before* exiting with ``KANBAN_SESSION_LIMIT_EXIT_CODE``. The receipt
     is written into the existing ``task_events`` lifecycle surface and binds the
-    refusal to this exact ``(task_id, pid)`` via a fresh ``nonce``, so the
-    dispatcher's ``detect_crashed_workers`` can origin-authenticate the sentinel
-    — an unrelated child exiting rc=69 (no receipt) stays a real failure.
+    refusal to this exact ``(task_id, pid)`` AND the current spawn/run via
+    ``nonce`` — the dispatcher-known fresh run identity (the worker's
+    ``HERMES_KANBAN_RUN_ID``, equal to the task's ``current_run_id``). The
+    dispatcher's ``detect_crashed_workers`` verifies the nonce against the
+    current run id during reap, so a still-fresh receipt from an earlier
+    genuine refusal cannot authenticate a later run whose OS pid was recycled.
+    An unrelated child exiting rc=69 (no receipt) stays a real failure.
+
+    ``nonce`` must be supplied by the worker as the dispatcher-known run id.
+    If it is omitted, a random token is generated and the receipt can never
+    authenticate (the caller must then fail closed).
 
     Returns ``True`` only when the receipt was durably committed. On any failure
     (DB busy/corrupt, delegation guard, etc.) it logs and returns ``False`` so
@@ -7884,16 +7901,33 @@ def _has_session_admission_refusal_receipt(
     task_id: str,
     pid: int,
     *,
+    run_id: Optional[str] = None,
     now: Optional[float] = None,
 ) -> bool:
-    """Return True when a fresh, pid-bound admission-refusal receipt exists.
+    """Return True when a fresh, run-bound admission-refusal receipt exists.
 
     Must be called from inside the caller's open transaction (``detect_crashed_workers``
     runs it inside ``write_txn``) so the read is consistent with the task row being
-    reclaimed. A receipt only authenticates the sentinel when its recorded pid
-    equals the task's ``worker_pid`` and it is still inside the receipt TTL window.
+    reclaimed. A receipt only authenticates the sentinel when ALL of the following
+    hold:
+
+    * its recorded pid equals the task's ``worker_pid``;
+    * its recorded nonce equals the current run identity ``run_id`` (the task's
+      ``current_run_id``, which is fresh for every spawn/run); and
+    * it is still inside the receipt TTL window.
+
+    The ``run_id`` binding makes the receipt non-replayable: a still-fresh receipt
+    from an earlier genuine refusal carries the earlier run's id, so it can never
+    authenticate a later run even when the OS recycles the pid. A receipt without a
+    valid current nonce/identity (missing, empty, or mismatched ``run_id``) is
+    rejected (returns ``False``).
     """
     now = time.time() if now is None else now
+    if not run_id:
+        # No current run identity to bind against — fail closed rather than
+        # accept a receipt that could belong to any prior run.
+        return False
+    run_id = str(run_id)
     cutoff = int(now) - _SESSION_ADMISSION_RECEIPT_TTL_SECONDS
     rows = conn.execute(
         "SELECT payload FROM task_events "
@@ -7908,11 +7942,55 @@ def _has_session_admission_refusal_receipt(
         except (json.JSONDecodeError, TypeError):
             continue
         try:
-            if int(payload.get("pid", 0)) == int(pid):
+            if int(payload.get("pid", 0)) == int(pid) and str(
+                payload.get("nonce", "")
+            ) == run_id:
                 return True
         except (TypeError, ValueError):
             continue
     return False
+
+
+def _consume_session_admission_refusal_receipt(
+    conn: sqlite3.Connection,
+    task_id: str,
+    pid: int,
+    run_id: str,
+    *,
+    now: Optional[float] = None,
+) -> int:
+    """Consume (delete) the authenticated admission-refusal receipt(s).
+
+    After ``_has_session_admission_refusal_receipt`` returns True, delete the
+    matching ``session_admission_refused`` event(s) for ``(task_id, pid, run_id)``
+    so they can never authenticate a later run — defense in depth on top of the
+    run-id binding, covering a hypothetical run-id collision. Returns the number
+    of receipts deleted. Must be called inside the caller's open transaction.
+    """
+    now = time.time() if now is None else now
+    cutoff = int(now) - _SESSION_ADMISSION_RECEIPT_TTL_SECONDS
+    rows = conn.execute(
+        "SELECT id, payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'session_admission_refused' "
+        "AND created_at >= ?",
+        (task_id, cutoff),
+    ).fetchall()
+    deleted = 0
+    for row in rows:
+        try:
+            payload = json.loads(row["payload"] or "{}")
+        except (json.JSONDecodeError, TypeError):
+            continue
+        try:
+            matches = int(payload.get("pid", 0)) == int(pid) and str(
+                payload.get("nonce", "")
+            ) == str(run_id)
+        except (TypeError, ValueError):
+            matches = False
+        if matches:
+            conn.execute("DELETE FROM task_events WHERE id = ?", (row["id"],))
+            deleted += 1
+    return deleted
 
 
 def reap_worker_zombies() -> "list[int]":
@@ -8545,7 +8623,8 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # (task_id, pid, claimer, protocol_violation, error_text)
     with write_txn(conn):
         rows = conn.execute(
-            "SELECT id, worker_pid, claim_lock, started_at FROM tasks "
+            "SELECT id, worker_pid, claim_lock, started_at, current_run_id "
+            "FROM tasks "
             "WHERE status = 'running' AND worker_pid IS NOT NULL"
         ).fetchall()
         host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
@@ -8616,12 +8695,18 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     "claimer": row["claim_lock"],
                     "exit_code": code,
                 }
-            elif kind == "session_limit_exit" and _has_session_admission_refusal_receipt(
-                conn, row["id"], pid
+            elif (
+                kind == "session_limit_exit"
+                and _has_session_admission_refusal_receipt(
+                    conn, row["id"], pid, run_id=row["current_run_id"]
+                )
             ):
                 # Origin-authenticated admission refusal: the raw sentinel is
                 # bound to an actual ``_claim_active_session`` refusal by a
-                # durable ``session_admission_refused`` receipt for THIS pid.
+                # durable ``session_admission_refused`` receipt for THIS pid AND
+                # THIS run (the receipt nonce must equal the task's current run
+                # id, so a stale receipt from an earlier run whose OS pid was
+                # recycled can never authenticate a later run).
                 # The assignee profile's canonical registry was saturated by a
                 # concurrent live lease (the TOCTOU backstop: preflight saw a
                 # free slot, but another session grabbed it before the child's
@@ -8631,6 +8716,11 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 # the re-spawn until the slot is actually free.
                 protocol_violation = False
                 session_capped_exit = True
+                # Consume the receipt so it cannot be replayed by a later run
+                # (defense in depth on top of the run-id binding above).
+                _consume_session_admission_refusal_receipt(
+                    conn, row["id"], pid, row["current_run_id"]
+                )
                 error_text = (
                     f"pid {pid} refused active-session admission (profile at "
                     f"session limit) — requeued without counting a failure"
@@ -9982,6 +10072,26 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
 _SESSION_CAPACITY_UNREADABLE = object()
 
 
+def _last_run_outcome_is_session_capped(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Return True when the task's most recent closed run was ``session_capped``.
+
+    A ``session_capped`` run outcome is only ever recorded by the authenticated
+    admission-refusal path in ``detect_crashed_workers`` (a receipt bound to the
+    current run authenticated the rc=69 sentinel), so this is exactly the
+    "authenticated rc=69" signal. The dispatcher uses it to bound the loop where
+    persistent capacity-unknown would otherwise immediately re-spawn a task that
+    was just refused — see the ``_SESSION_CAPACITY_UNREADABLE`` branch in
+    ``_dispatch_once_locked``. (AION-RL2-CORE-01-SESSION_ADMISSION)
+    """
+    row = conn.execute(
+        "SELECT outcome FROM task_runs "
+        "WHERE task_id = ? AND ended_at IS NOT NULL "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    return bool(row and row["outcome"] == "session_capped")
+
+
 def _profile_session_capacity(
     assignee: str,
 ) -> "object | None | tuple[int, int]":
@@ -10380,6 +10490,20 @@ def _dispatch_once_locked(
                             conn, row["id"], "session_capacity_unknown",
                             {"assignee": row_assignee},
                         )
+            # Bound the zero-budget respawn loop: if capacity is still unknown
+            # AND this task was just requeued from an authenticated admission
+            # refusal (its most recent closed run is ``session_capped``), DEFER
+            # (leave ``ready``/unclaimed, no spawn) instead of failing open.
+            # Otherwise the same dispatcher tick would immediately re-spawn the
+            # task that detect_crashed_workers just released, and persistent
+            # capacity-unknown + authenticated rc=69 would loop forever with no
+            # failure budget charged. (AION-RL2-CORE-01-SESSION_ADMISSION-R3)
+            if _last_run_outcome_is_session_capped(conn, row["id"]):
+                result.skipped_profile_session_capacity_unknown_deferred.append((
+                    row["id"],
+                    row_assignee,
+                ))
+                continue
         elif _session_cap is not None:
             _active_sessions, _max_sessions = _session_cap
             if _active_sessions >= _max_sessions:

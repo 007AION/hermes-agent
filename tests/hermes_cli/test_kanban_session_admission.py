@@ -85,8 +85,18 @@ def _clear_registry(active_sessions, alpha_home):
     active_sessions._write_entries(registry, [])
 
 
-def _write_refusal_receipt(kb, conn, task_id, pid):
-    """Append a durable admission-refusal receipt for ``(task_id, pid)``."""
+def _write_refusal_receipt(kb, conn, task_id, pid, *, run_id=None):
+    """Append a durable admission-refusal receipt bound to ``(task_id, pid, run_id)``.
+
+    The nonce must equal the task's ``current_run_id`` (the dispatcher-known
+    run identity) for ``detect_crashed_workers`` to authenticate it. When
+    ``run_id`` is omitted, read it from the task row so callers that claim the
+    task first get a matching receipt for free.
+    """
+    if run_id is None:
+        run_id = conn.execute(
+            "SELECT current_run_id FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()["current_run_id"]
     with kb.write_txn(conn):
         kb._append_event(
             conn,
@@ -96,7 +106,7 @@ def _write_refusal_receipt(kb, conn, task_id, pid):
                 "pid": int(pid),
                 "session_id": "live-session",
                 "profile": "alpha",
-                "nonce": f"nonce-{pid}",
+                "nonce": str(run_id),
             },
         )
 
@@ -315,7 +325,7 @@ def test_unrelated_rc69_without_receipt_is_real_failure(
 def test_record_session_admission_refusal_writes_verifiable_receipt(
     isolated_session_admission_env,
 ):
-    """The public receipt writer persists a pid-bound receipt that the
+    """The public receipt writer persists a run-bound receipt that the
     dispatcher's verifier can read back (durable + distinguishable)."""
     kb = isolated_session_admission_env["kanban_db"]
 
@@ -323,20 +333,63 @@ def test_record_session_admission_refusal_writes_verifiable_receipt(
         tid = kb.create_task(conn, title="refused", assignee="alpha")
 
     pid = 77777
+    run_id = "run-abc-123"
     assert (
         kb.record_session_admission_refusal(
-            task_id=tid, pid=pid, session_id="s", profile="alpha"
+            task_id=tid, pid=pid, session_id="s", profile="alpha", nonce=run_id
         )
         is True
     )
 
     # Read back on a fresh connection to prove durability across processes.
     with kb.connect_closing() as conn:
-        assert kb._has_session_admission_refusal_receipt(conn, tid, pid) is True
+        # Authenticates only when the dispatcher-known run identity matches.
+        assert (
+            kb._has_session_admission_refusal_receipt(conn, tid, pid, run_id=run_id)
+            is True
+        )
         # A different pid is not authenticated.
         assert (
-            kb._has_session_admission_refusal_receipt(conn, tid, pid + 1) is False
+            kb._has_session_admission_refusal_receipt(conn, tid, pid + 1, run_id=run_id)
+            is False
         )
+        # A stale / mismatched run identity is rejected (non-replayable).
+        assert (
+            kb._has_session_admission_refusal_receipt(
+                conn, tid, pid, run_id="other-run"
+            )
+            is False
+        )
+        # A missing run identity is rejected (fail closed).
+        assert kb._has_session_admission_refusal_receipt(conn, tid, pid) is False
+
+
+def test_receipt_without_nonce_does_not_authenticate(
+    isolated_session_admission_env,
+):
+    """Hostile regression: a receipt with no nonce (or a nonce that does not
+    match the current run identity) is rejected — it cannot authenticate the
+    rc=69 sentinel."""
+    kb = isolated_session_admission_env["kanban_db"]
+
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="no-nonce", assignee="alpha")
+        # A receipt carrying only a matching pid, with NO nonce.
+        with kb.write_txn(conn):
+            kb._append_event(
+                conn,
+                tid,
+                "session_admission_refused",
+                {"pid": 12345},
+            )
+        # Even with the current run identity supplied, a nonce-less receipt
+        # cannot authenticate (its nonce is empty != run_id).
+        assert (
+            kb._has_session_admission_refusal_receipt(conn, tid, 12345, run_id="42")
+            is False
+        )
+        # And with no run identity at all it is rejected too.
+        assert kb._has_session_admission_refusal_receipt(conn, tid, 12345) is False
 
 
 def test_session_capacity_unreadable_is_observable_and_bounded(
@@ -439,6 +492,120 @@ def test_real_crash_still_counts_and_trips_breaker(
         )
 
 
+def test_stale_receipt_pid_reuse_cannot_authenticate_later_run(
+    isolated_session_admission_env, monkeypatch
+):
+    """Hostile stale-receipt / PID-reuse regression: one genuine receipt from
+    an earlier run cannot authenticate a later run even when the OS recycles
+    the pid and no new receipt is written."""
+    kb = isolated_session_admission_env["kanban_db"]
+
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect_closing() as conn:
+        host = kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="reuse", assignee="alpha")
+
+        # Run 1: claim + genuine refusal + receipt bound to run 1's identity.
+        pid = 54321
+        kb.claim_task(conn, tid, claimer=f"{host}:r1")
+        conn.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (pid, tid))
+        conn.commit()
+        _write_refusal_receipt(kb, conn, tid, pid)  # nonce == run 1 current_run_id
+        kb._record_worker_exit(pid, _exited_status(kb.KANBAN_SESSION_LIMIT_EXIT_CODE))
+        kb.detect_crashed_workers(conn)  # -> authenticated session_capped (run 1)
+
+        # Run 2: same task re-claimed with a RECYCLED pid, but NO new receipt.
+        kb.claim_task(conn, tid, claimer=f"{host}:r2")  # new run, new run id
+        conn.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (pid, tid))
+        conn.commit()
+        # Unrelated rc=69 (no receipt) on the recycled pid.
+        kb._record_worker_exit(pid, _exited_status(kb.KANBAN_SESSION_LIMIT_EXIT_CODE))
+        crashed = kb.detect_crashed_workers(conn)
+
+        # The stale run-1 receipt must NOT authenticate run 2 -> real failure.
+        assert tid in crashed
+        sc = getattr(kb.detect_crashed_workers, "_last_session_capped", [])
+        assert tid not in sc
+
+
+def test_corrupt_registry_produces_capacity_unknown_not_empty(
+    isolated_session_admission_env,
+):
+    """Hostile regression: a corrupt/unreadable active-session registry is
+    surfaced as explicit capacity-unknown, never silently collapsed to
+    ``active_count == 0`` (which would fail open and spawn)."""
+    kb = isolated_session_admission_env["kanban_db"]
+    alpha_home = isolated_session_admission_env["alpha_home"]
+
+    registry = Path(alpha_home) / "runtime" / "active_sessions.json"
+    registry.write_text("{ this is not valid json !!!", encoding="utf-8")
+
+    # The corrupt registry is NOT treated as empty (0 active): it is explicit
+    # capacity-unknown.
+    assert kb._profile_session_capacity("alpha") is kb._SESSION_CAPACITY_UNREADABLE
+
+
+def test_persistent_capacity_unknown_plus_authenticated_refusal_is_bounded(
+    isolated_session_admission_env, monkeypatch
+):
+    """Hostile multi-tick regression: persistent capacity-unknown combined with
+    an authenticated admission refusal must NOT immediately zero-budget
+    respawn-loop. The second (and later) tick defers instead of re-spawning."""
+    kb = isolated_session_admission_env["kanban_db"]
+
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    monkeypatch.setattr(
+        kb,
+        "_profile_session_capacity",
+        lambda _assignee: kb._SESSION_CAPACITY_UNREADABLE,
+    )
+
+    with kb.connect_closing() as conn:
+        kb.create_board(slug="default", name="Test")
+        tid = kb.create_task(conn, title="loop", assignee="alpha")
+
+        # Tick 1: fresh task fail-opens to exactly one spawn.
+        res1 = kb.dispatch_once(conn, spawn_fn=_fake_spawn, dry_run=False)
+        assert len(res1.spawned) == 1
+        assert res1.spawned[0][0] == tid
+
+        # The worker (pid 12345 from _fake_spawn) exits 69 with a valid
+        # authenticated receipt bound to the current run.
+        pid = 12345
+        run_id = conn.execute(
+            "SELECT current_run_id FROM tasks WHERE id = ?", (tid,)
+        ).fetchone()["current_run_id"]
+        _write_refusal_receipt(kb, conn, tid, pid, run_id=run_id)
+        kb._record_worker_exit(pid, _exited_status(kb.KANBAN_SESSION_LIMIT_EXIT_CODE))
+        crashed = kb.detect_crashed_workers(conn)
+        assert tid not in crashed  # authenticated -> session_capped, no crash
+        sc = getattr(kb.detect_crashed_workers, "_last_session_capped", [])
+        assert tid in sc
+        task = kb.get_task(conn, tid)
+        assert task.status == "ready"
+        assert task.consecutive_failures == 0
+
+        # Tick 2: capacity still unknown AND last run was session_capped ->
+        # DEFER, no immediate respawn.
+        res2 = kb.dispatch_once(conn, spawn_fn=_fake_spawn, dry_run=False)
+        assert len(res2.spawned) == 0
+        assert res2.skipped_profile_session_capacity_unknown_deferred == [
+            (tid, "alpha")
+        ]
+        task = kb.get_task(conn, tid)
+        assert task.status == "ready"  # still ready, not spawned, not blocked
+
+        # Tick 3: persistent unknown -> still deferred (bounded, no loop).
+        res3 = kb.dispatch_once(conn, spawn_fn=_fake_spawn, dry_run=False)
+        assert len(res3.spawned) == 0
+        assert res3.skipped_profile_session_capacity_unknown_deferred == [
+            (tid, "alpha")
+        ]
+
+
 def test_dispatch_result_has_session_admission_fields():
     """Schema-level invariant: DispatchResult exposes all session-admission
     receipt fields."""
@@ -449,5 +616,7 @@ def test_dispatch_result_has_session_admission_fields():
     assert r.skipped_profile_session_capped == []
     assert hasattr(r, "skipped_profile_session_capacity_unknown")
     assert r.skipped_profile_session_capacity_unknown == []
+    assert hasattr(r, "skipped_profile_session_capacity_unknown_deferred")
+    assert r.skipped_profile_session_capacity_unknown_deferred == []
     assert hasattr(r, "session_capped")
     assert r.session_capped == []
