@@ -340,3 +340,193 @@ def test_migration_adds_receipt_columns_to_existing_ledger(monkeypatch, tmp_path
     assert "pre_hashes" in record
     assert "post_hashes" in record
     assert "gateway_generation" in record
+
+
+# ---------------------------------------------------------------------------
+# R23 hostile regressions — five audited fail-open/ordering findings
+# ---------------------------------------------------------------------------
+
+
+# Finding 1: RECEIPT_IDENTITY_SUBSTITUTION_FAIL_OPEN
+def test_identity_substitution_fails_closed(monkeypatch, tmp_path):
+    """Finishing job-a's execution with job-b must not persist job-b's identity.
+
+    The post-receipt stays bound to the stored execution's job id and records an
+    explicit ``caller_job_id_mismatch`` capture error instead of silently
+    accepting the foreign job.
+    """
+    from cron.receipt import canonical_job_hash
+    import cron.jobs as jobs_mod
+
+    executions = _point_ledger(monkeypatch, tmp_path)
+    monkeypatch.setattr(jobs_mod, "load_jobs", lambda: [_job(id="job-a"), _job(id="job-b")])
+
+    record = executions.create_execution("job-a", source="builtin", job=_job(id="job-a"))
+    completed = executions.finish_execution(record["id"], success=True, job=_job(id="job-b"))
+
+    post_hashes = json.loads(completed["post_hashes"])
+    assert post_hashes["job_id"] == "job-a"
+    assert post_hashes["job_id"] != "job-b"
+    assert "caller_job_id_mismatch" in post_hashes["capture_errors"]
+    # The hash is bound to the stored job-a, not the substituted job-b.
+    assert post_hashes["selected_job_sha256"] == canonical_job_hash(_job(id="job-a"))
+    assert post_hashes["selected_job_sha256"] != canonical_job_hash(_job(id="job-b"))
+
+
+# Finding 2: SIBLING_SET_UNAVAILABLE_HASHED_AS_EMPTY
+def test_sibling_store_unavailable_is_not_hashed_as_empty(monkeypatch, tmp_path):
+    """An unreadable sibling store must not be recorded as a proven empty set.
+
+    ``sibling_set_sha256`` is ``None`` and a capture error is recorded, so an
+    unavailable input can never masquerade as a success hash of an empty set.
+    """
+    import cron.jobs as jobs_mod
+
+    executions = _point_ledger(monkeypatch, tmp_path)
+
+    def _unreadable_store():
+        raise OSError("jobs store unreadable")
+
+    monkeypatch.setattr(jobs_mod, "load_jobs", _unreadable_store)
+
+    record = executions.create_execution("job-a", source="builtin", job=_job(id="job-a"))
+    pre_hashes = json.loads(record["pre_hashes"])
+    assert pre_hashes["sibling_set_sha256"] is None
+    assert "sibling_set_unavailable" in pre_hashes["capture_errors"]
+    assert any("sibling_store_unavailable" in e for e in pre_hashes["capture_errors"])
+
+
+def test_proven_empty_sibling_set_is_still_hashed(monkeypatch, tmp_path):
+    """Positive control: a genuinely empty sibling store is a real zero-set and
+    must still yield a non-null hash with no capture error (distinct from the
+    unavailable case above)."""
+    import cron.jobs as jobs_mod
+
+    executions = _point_ledger(monkeypatch, tmp_path)
+    monkeypatch.setattr(jobs_mod, "load_jobs", lambda: [])
+
+    record = executions.create_execution("job-a", source="builtin", job=_job(id="job-a"))
+    pre_hashes = json.loads(record["pre_hashes"])
+    assert pre_hashes["sibling_set_sha256"] is not None
+    assert pre_hashes["capture_errors"] == []
+
+
+# Finding 3: PARTIAL_MEMORY_EVENTS_ACCEPTED
+def test_partial_memory_events_fails_closed(monkeypatch):
+    """A truncated memory.events file (some required members missing) must not
+    look like a complete snapshot — each missing member is explicit evidence."""
+    from cron import receipt
+
+    monkeypatch.setattr(receipt, "own_cgroup_path", lambda: "/test.slice")
+
+    def fake_read(name):
+        return {
+            "pids.current": "13\n",
+            "pids.max": "100\n",
+            "pids.peak": "25\n",
+            "pids.events": "max 0\n",
+            "memory.current": "259280896\n",
+            "memory.max": "1258291200\n",
+            "memory.peak": "330194944\n",
+            # Truncated: only 'low' and 'high' survive; max/oom/oom_kill/oom_group_kill gone.
+            "memory.events": "low 0\nhigh 0\n",
+        }.get(name)
+
+    monkeypatch.setattr(receipt, "_read_cgroup_text", fake_read)
+
+    snap = receipt.capture_cgroup_snapshot()
+    assert snap["memory"]["events"]["max"] is None
+    assert "cgroup_memory_events_max_unavailable" in snap["capture_errors"]
+    assert "cgroup_memory_events_oom_unavailable" in snap["capture_errors"]
+    assert "cgroup_memory_events_oom_kill_unavailable" in snap["capture_errors"]
+    assert "cgroup_memory_events_oom_group_kill_unavailable" in snap["capture_errors"]
+
+
+def test_partial_pids_events_fails_closed(monkeypatch):
+    """A missing pids.events member must also be explicit fail-closed evidence."""
+    from cron import receipt
+
+    monkeypatch.setattr(receipt, "own_cgroup_path", lambda: "/test.slice")
+
+    def fake_read(name):
+        return {
+            "pids.current": "13\n",
+            "pids.max": "100\n",
+            "pids.peak": "25\n",
+            "pids.events": "",  # empty -> no 'max' member
+            "memory.current": "259280896\n",
+            "memory.max": "1258291200\n",
+            "memory.peak": "330194944\n",
+            "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n",
+        }.get(name)
+
+    monkeypatch.setattr(receipt, "_read_cgroup_text", fake_read)
+
+    snap = receipt.capture_cgroup_snapshot()
+    assert snap["pids"]["events"]["max"] is None
+    assert "cgroup_pids_events_unavailable" in snap["capture_errors"]
+
+
+# Finding 4: INTERRUPTED_TERMINAL_RECEIPT_INCOMPLETE
+def test_dead_owner_recovery_persists_complete_terminal_receipt(monkeypatch, tmp_path):
+    """Dead-owner terminalization must leave one complete logical receipt — a
+    release record plus a post snapshot and post hashes — not silent nulls."""
+    executions = _point_ledger(monkeypatch, tmp_path)
+    record = executions.create_execution("dead-owner", source="builtin", job=_job(id="dead-owner"))
+    with sqlite3.connect(executions.EXECUTIONS_FILE) as conn:
+        conn.execute(
+            "UPDATE executions SET process_id=?, process_started_at=? WHERE id=?",
+            ("old-import", -1, record["id"]),
+        )
+
+    assert executions.recover_interrupted_executions() == 1
+    recovered = executions.latest_execution("dead-owner")
+    assert recovered["status"] == "unknown"
+    assert recovered["release"] is not None
+    assert recovered["post_snapshot"] is not None
+    assert recovered["post_hashes"] is not None
+
+    release = json.loads(recovered["release"])
+    assert release["result"] == "unknown"
+    assert release["released_at"]
+    assert release["lease_owner"]["process_id"] == "old-import"
+    assert release["lease_owner"]["pid"] == record["pid"]
+    assert release["process_closure"]["closed"] is True
+    assert release["process_closure"]["pid_alive"] is False
+
+    post_snapshot = json.loads(recovered["post_snapshot"])
+    assert post_snapshot["captured_at"]
+    assert post_snapshot["lease_owner_pid"] == record["pid"]
+
+    post_hashes = json.loads(recovered["post_hashes"])
+    assert post_hashes["job_id"] == "dead-owner"
+
+
+# Finding 5: PRE_ACQUISITION_ORDERING_AMBIGUOUS
+def test_pre_acquisition_snapshot_precedes_admission(monkeypatch, tmp_path):
+    """The pre-acquisition snapshot's captured_at must be <= admission's
+    admitted_at, deterministically and without any ordering-violation error."""
+    executions = _point_ledger(monkeypatch, tmp_path)
+    record = executions.create_execution("job-receipt", source="builtin", job=_job())
+    pre = json.loads(record["pre_snapshot"])
+    admission = json.loads(record["admission"])
+    assert pre["captured_at"] <= admission["admitted_at"]
+    assert "pre_admission_ordering_violation" not in pre.get("capture_errors", [])
+
+
+def test_pre_acquisition_ordering_inversion_fails_closed(monkeypatch, tmp_path):
+    """If a snapshot's captured_at ever lands after admission (e.g. a clock
+    adjustment), the receipt records an explicit ordering-violation error."""
+    executions = _point_ledger(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        executions, "capture_resource_snapshot",
+        lambda job, **kw: {
+            "schema_version": "receipt-snapshot-v1",
+            "captured_at": "9999-01-01T00:00:00+00:00",
+            "capture_errors": [],
+        },
+    )
+    record = executions.create_execution("job-receipt", source="builtin", job=_job())
+    pre = json.loads(record["pre_snapshot"])
+    assert "pre_admission_ordering_violation" in pre["capture_errors"]
+

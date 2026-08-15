@@ -113,6 +113,7 @@ def sibling_set_hash(siblings: List[Dict[str, Any]]) -> str:
 def capture_integrity_hashes(
     job_id: Optional[str], selected_job: Optional[Dict[str, Any]],
     siblings: Optional[List[Dict[str, Any]]] = None,
+    sibling_load_error: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Return the pre/post integrity hashes for one execution.
 
@@ -120,6 +121,12 @@ def capture_integrity_hashes(
     ``capture_error``) when the selected job could not be resolved — the
     fail-closed branch: an execution whose job identity is unknown must not
     claim integrity.
+
+    ``siblings=None`` (or a non-empty ``sibling_load_error``) means the sibling
+    store could not be *read* and must be recorded as unavailable, never as a
+    proven empty sibling set: an unreadable store is indistinguishable from a
+    real zero-sibling set, so treating it as empty would persist a success hash
+    for input that was never actually verified.
     """
     errors: List[str] = []
     if not isinstance(selected_job, dict) or not selected_job.get("id"):
@@ -130,7 +137,16 @@ def capture_integrity_hashes(
     selected_hash = canonical_job_hash(selected_job) if isinstance(
         selected_job, dict
     ) else None
-    sibling_hash = sibling_set_hash(siblings or []) if siblings is not None else None
+
+    if sibling_load_error is not None:
+        sibling_hash = None
+        errors.append("sibling_set_unavailable")
+        errors.append(sibling_load_error)
+    elif siblings is None:
+        sibling_hash = None
+        errors.append("sibling_set_unavailable")
+    else:
+        sibling_hash = sibling_set_hash(siblings)
 
     return {
         "schema_version": HASH_SCHEMA_VERSION,
@@ -220,10 +236,18 @@ def capture_cgroup_snapshot() -> Dict[str, Any]:
         ("pids.current", pids_current), ("pids.max", pids_max),
         ("pids.peak", pids_peak), ("pids.events", pids_events_max),
         ("memory.current", memory_current), ("memory.max", memory_max),
-        ("memory.peak", memory_peak), ("memory.events", memory_events),
+        ("memory.peak", memory_peak),
     ):
         if value is None:
             errors.append(f"cgroup_{name.replace('.', '_')}_unavailable")
+
+    # Every required member of the events files must be present. A truncated or
+    # partially-readable events file (some counters parsed, some missing) must
+    # not be mistaken for a complete snapshot — each missing required member is
+    # explicit fail-closed evidence rather than a silent null.
+    for key, value in memory_events.items():
+        if value is None:
+            errors.append(f"cgroup_memory_events_{key}_unavailable")
 
     return {
         "pids": {
