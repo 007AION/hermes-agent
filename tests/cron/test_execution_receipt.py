@@ -767,3 +767,113 @@ def test_migration_adds_session_id_column_to_existing_ledger(monkeypatch, tmp_pa
     assert "session_id" in record  # column added by migration
     assert record["session_id"] is None
 
+
+# ---------------------------------------------------------------------------
+# R25 regressions — session omission + hard-interruption durability
+# ---------------------------------------------------------------------------
+
+
+def test_finish_execution_fails_closed_on_required_session_omission(monkeypatch, tmp_path):
+    """A required (agent-backed) execution must never terminalize with
+    ``session_id`` NULL and empty capture errors.
+
+    RED on the audited head: ``finish_execution(success=True, job=<agent job>)``
+    with no session id completed with ``session_id=NULL`` and
+    ``capture_errors==[]``. GREEN: ``session_required=True`` records explicit
+    ``session_id_missing`` evidence instead of a silently NULL session.
+    """
+    executions = _point_ledger(monkeypatch, tmp_path)
+    record = executions.create_execution("job-receipt", source="builtin", job=_job())
+    executions.mark_execution_running(record["id"])
+
+    completed = executions.finish_execution(
+        record["id"], success=True, job=_job(), session_required=True,
+    )
+    assert completed["status"] == "completed"
+    assert completed["session_id"] is None
+    post_hashes = json.loads(completed["post_hashes"])
+    assert "session_id_missing" in post_hashes["capture_errors"]
+
+
+def test_finish_execution_no_agent_run_is_not_session_required(monkeypatch, tmp_path):
+    """A ``no_agent`` (script) execution legitimately has no natural session, so
+    a completed row with ``session_id=NULL`` must NOT be flagged as an omission
+    when the caller does not declare the session required."""
+    executions = _point_ledger(monkeypatch, tmp_path)
+    record = executions.create_execution("job-receipt", source="builtin", job=_job())
+    executions.mark_execution_running(record["id"])
+
+    completed = executions.finish_execution(
+        record["id"], success=True, job=_job(), session_required=False,
+    )
+    assert completed["status"] == "completed"
+    assert completed["session_id"] is None
+    post_hashes = json.loads(completed["post_hashes"])
+    assert "session_id_missing" not in post_hashes["capture_errors"]
+
+
+def test_bind_execution_session_durably_binds_before_execution(monkeypatch, tmp_path):
+    """The natural session identity is bound onto the running row at creation
+    time — before provider/model execution — so it is already durable."""
+    executions = _point_ledger(monkeypatch, tmp_path)
+    record = executions.create_execution("job-receipt", source="builtin", job=_job())
+    executions.mark_execution_running(record["id"])
+
+    bound = executions.bind_execution_session(
+        record["id"], "cron_job-receipt_20260816_004448",
+    )
+    assert bound["session_id"] == "cron_job-receipt_20260816_004448"
+
+    # The bind is idempotent: re-binding the same id is a no-op.
+    rebound = executions.bind_execution_session(
+        record["id"], "cron_job-receipt_20260816_004448",
+    )
+    assert rebound["session_id"] == "cron_job-receipt_20260816_004448"
+
+    persisted = executions.latest_execution("job-receipt")
+    assert persisted["session_id"] == "cron_job-receipt_20260816_004448"
+
+
+def test_bind_execution_session_survives_hard_interruption_recovery(monkeypatch, tmp_path):
+    """Hard interruption AFTER session creation must not lose the binding.
+
+    RED on the audited head: the session id was only persisted at finish, so a
+    running execution recovered to ``unknown`` had ``session_id=NULL``. GREEN:
+    the id is bound at creation (before provider/model execution), so recovery
+    preserves it while terminalizing the abandoned attempt as ``unknown``.
+    """
+    executions = _point_ledger(monkeypatch, tmp_path)
+    record = executions.create_execution("job-receipt", source="builtin", job=_job())
+    executions.mark_execution_running(record["id"])
+
+    # Session created and durably bound BEFORE the (subsequently interrupted)
+    # agent run.
+    executions.bind_execution_session(record["id"], "cron_job-receipt_20260816_004448")
+
+    # Simulate the owner exiting before finish: a foreign, provably-dead owner.
+    with sqlite3.connect(executions.EXECUTIONS_FILE) as conn:
+        conn.execute(
+            "UPDATE executions SET process_id=?, process_started_at=? WHERE id=?",
+            ("old-import", -1, record["id"]),
+        )
+
+    assert executions.recover_interrupted_executions() == 1
+    recovered = executions.latest_execution("job-receipt")
+    assert recovered["status"] == "unknown"
+    assert recovered["session_id"] == "cron_job-receipt_20260816_004448"
+
+
+def test_bind_execution_session_rejects_conflicting_rebind(monkeypatch, tmp_path):
+    """A conflicting second bind never overwrites the bound id and is recorded
+    as explicit ``session_id_substitution`` fail-closed evidence."""
+    executions = _point_ledger(monkeypatch, tmp_path)
+    record = executions.create_execution("job-receipt", source="builtin", job=_job())
+    executions.mark_execution_running(record["id"])
+
+    executions.bind_execution_session(record["id"], "cron_job-receipt_ORIGINAL")
+    rebound = executions.bind_execution_session(record["id"], "cron_job-receipt_SUBSTITUTE")
+
+    assert rebound["session_id"] == "cron_job-receipt_ORIGINAL"
+    pre_hashes = json.loads(rebound["pre_hashes"])
+    assert "session_id_substitution" in pre_hashes["capture_errors"]
+

@@ -270,10 +270,81 @@ def mark_execution_running(execution_id: str) -> Optional[Dict[str, Any]]:
         ).fetchone())
 
 
+def _append_pre_capture_error(
+    conn: sqlite3.Connection, execution_id: str,
+    raw_pre_hashes: Optional[str], error: str,
+) -> None:
+    """Append a capture error to the stored pre-hash receipt in place.
+
+    Used to persist fail-closed evidence (e.g. a session-id substitution) at
+    bind time, before a post-receipt exists. Operates on the caller's already
+    open connection inside the current transaction; never raises outward.
+    """
+    try:
+        obj = json.loads(raw_pre_hashes) if raw_pre_hashes else {}
+    except (ValueError, TypeError):
+        obj = {}
+    if not isinstance(obj, dict):
+        obj = {}
+    errors = list(obj.get("capture_errors", []))
+    if error not in errors:
+        errors.append(error)
+    obj["capture_errors"] = errors
+    conn.execute(
+        "UPDATE executions SET pre_hashes=? WHERE id=?",
+        (_json_dump(obj), execution_id),
+    )
+
+
+def bind_execution_session(
+    execution_id: str, session_id: str,
+) -> Optional[Dict[str, Any]]:
+    """Durably bind the exact natural cron session identity to an execution.
+
+    Called as soon as the natural session id is created and BEFORE provider /
+    model execution, so a hard gateway/process interruption between session
+    creation and finish can never lose the binding: the id is already on the
+    immutable row when recovery later terminalizes the abandoned attempt.
+
+    Idempotent and substitution-safe: ``COALESCE(session_id, ?)`` keeps the
+    first bound id, so a later conflicting id never overwrites it. A
+    conflicting second bind is still recorded as explicit
+    ``session_id_substitution`` fail-closed evidence on the stored pre-receipt
+    (there is no post-receipt yet at bind time) so a substitution is never
+    silent.
+    """
+    incoming = str(session_id).strip()
+    if not incoming:
+        return None
+    with _transaction() as conn:
+        stored = conn.execute(
+            "SELECT session_id, pre_hashes FROM executions WHERE id=?",
+            (execution_id,),
+        ).fetchone()
+        if stored is None:
+            return None
+        existing = stored["session_id"]
+        if existing and existing != incoming:
+            # Conflicting id — never overwrite; record fail-closed evidence.
+            _append_pre_capture_error(
+                conn, execution_id, stored["pre_hashes"], "session_id_substitution",
+            )
+        else:
+            conn.execute(
+                "UPDATE executions SET session_id=COALESCE(session_id, ?) "
+                "WHERE id=? AND status IN ('claimed','running')",
+                (incoming, execution_id),
+            )
+        return _record(conn.execute(
+            "SELECT * FROM executions WHERE id=?", (execution_id,)
+        ).fetchone())
+
+
 def finish_execution(
     execution_id: str, *, success: bool, error: Optional[str] = None,
     job: Optional[Dict[str, Any]] = None,
     session_id: Optional[str] = None,
+    session_required: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """Write a terminal result once; terminal attempts cannot be rewritten.
 
@@ -290,6 +361,12 @@ def finish_execution(
     It is bound into the immutable row exactly once; a later conflicting id is
     rejected (never overwrites the already-bound value) and recorded as an
     explicit ``session_id_substitution`` fail-closed error.
+
+    ``session_required`` declares that this execution is an agent-backed run
+    that must carry a natural session identity. When True and the row
+    terminalizes with no session id (neither stored nor incoming), the omission
+    is recorded as an explicit ``session_id_missing`` fail-closed error instead
+    of a silently NULL session.
     """
     now = _hermes_now().isoformat()
     status = "completed" if success else "failed"
@@ -364,12 +441,21 @@ def finish_execution(
         # (COALESCE below keeps the first); the mismatch is still recorded as
         # explicit fail-closed evidence so a substitution is never silent.
         incoming_session_id = str(session_id).strip() if session_id else None
-        if incoming_session_id:
-            stored_session_id = stored["session_id"]
-            if stored_session_id and stored_session_id != incoming_session_id:
-                post_hashes_obj["capture_errors"] = list(
-                    post_hashes_obj.get("capture_errors", [])
-                ) + ["session_id_substitution"]
+        stored_session_id = stored["session_id"]
+        if incoming_session_id and stored_session_id and stored_session_id != incoming_session_id:
+            post_hashes_obj["capture_errors"] = list(
+                post_hashes_obj.get("capture_errors", [])
+            ) + ["session_id_substitution"]
+        # Fail-closed omission: a required (agent-backed) execution must never
+        # terminalize with session_id still NULL and no evidence. When the
+        # caller declares the session required and neither the stored row nor
+        # the incoming caller supplied an identity, record it explicitly rather
+        # than silently completing without one (R25 omission fail-open).
+        bound_session_id = stored_session_id or incoming_session_id
+        if session_required and not bound_session_id:
+            post_hashes_obj["capture_errors"] = list(
+                post_hashes_obj.get("capture_errors", [])
+            ) + ["session_id_missing"]
         post_hashes = _json_dump(post_hashes_obj)
 
         cur = conn.execute(

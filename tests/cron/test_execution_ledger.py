@@ -274,6 +274,9 @@ def test_run_one_job_records_running_then_terminal(monkeypatch):
     # The exact natural cron session identity surfaced by run_job is threaded
     # through to the immutable execution ledger (R24 session binding).
     assert events[-1][2]["session_id"] == "cron_job-3_20260816_004448"
+    # The agent-backed run is declared session-required, so a missing session
+    # would fail closed instead of silently completing NULL (R25).
+    assert events[-1][2]["session_required"] is True
 
 
 def test_provider_start_recovers_interrupted_records_before_tick(monkeypatch):

@@ -278,7 +278,12 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
 }
 
 from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run, claim_dispatch, heartbeat_run_claim
-from cron.executions import create_execution, finish_execution, mark_execution_running
+from cron.executions import (
+    bind_execution_session,
+    create_execution,
+    finish_execution,
+    mark_execution_running,
+)
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
@@ -3010,6 +3015,21 @@ def run_job(
     _cron_session_id = f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
     if session_holder is not None:
         session_holder.append(_cron_session_id)
+    # Durably bind the exact natural cron session identity into the immutable
+    # execution ledger row BEFORE provider/model execution, so a hard
+    # gateway/process interruption between session creation and finish can
+    # never lose it (R25 hard-interruption durability). Best-effort here:
+    # finish_execution still records fail-closed omission evidence if the
+    # required binding is somehow absent at the terminal write.
+    _execution_id = job.get("execution_id")
+    if _execution_id:
+        try:
+            bind_execution_session(_execution_id, _cron_session_id)
+        except Exception:
+            logger.warning(
+                "Job '%s': failed to durably bind cron session %s to execution %s",
+                job_id, _cron_session_id, _execution_id,
+            )
 
     logger.info("Running job '%s' (ID: %s)", job_name, job_id)
     logger.info("Prompt: %s", prompt[:100])
@@ -3866,6 +3886,9 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
     execution_id = job.get("execution_id")
     if not execution_id:
         execution_id = create_execution(job["id"], source="direct", job=job)["id"]
+        # Expose the id back on the job dict so run_job can durably bind the
+        # natural session identity at creation time (R25 hard-interruption).
+        job["execution_id"] = execution_id
     _session_holder: list = []
     try:
         # Pre-run dispatch claim (issue #38758): atomically commit a finite
@@ -4005,6 +4028,7 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             error=error,
             job=job,
             session_id=_session_holder[0] if _session_holder else None,
+            session_required=not job.get("no_agent"),
         )
         return True
 
@@ -4018,6 +4042,7 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             error=str(e),
             job=job,
             session_id=_session_holder[0] if _session_holder else None,
+            session_required=not job.get("no_agent"),
         )
         return False
 
