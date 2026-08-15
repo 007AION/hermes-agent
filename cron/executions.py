@@ -18,12 +18,31 @@ from typing import Any, Dict, Iterator, List, Optional
 
 from hermes_constants import get_hermes_home
 from hermes_time import now as _hermes_now
+from cron.receipt import (
+    capture_integrity_hashes,
+    capture_resource_snapshot,
+    lease_owner_identity,
+    resolve_gateway_generation,
+)
 
 EXECUTIONS_FILE = get_hermes_home().resolve() / "cron" / "executions.db"
 MAX_TERMINAL_EXECUTIONS = 1000
 _TERMINAL_STATES = ("completed", "failed", "unknown")
 _lock = threading.RLock()
 _PROCESS_ID = uuid.uuid4().hex
+
+# Receipt columns added for immutable admission-to-release evidence. Each holds
+# a JSON string (or NULL). They are appended to an existing ``executions`` DB
+# via a guarded ALTER so older ledgers migrate in place without a rebuild.
+_RECEIPT_COLUMNS = (
+    "gateway_generation",
+    "admission",
+    "pre_snapshot",
+    "pre_hashes",
+    "release",
+    "post_snapshot",
+    "post_hashes",
+)
 
 
 def _connect() -> sqlite3.Connection:
@@ -62,6 +81,23 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_executions_status_claimed "
         "ON executions(status, claimed_at DESC, id DESC)"
     )
+    _migrate_receipt_columns(conn)
+
+
+def _migrate_receipt_columns(conn: sqlite3.Connection) -> None:
+    """Add any missing receipt columns to an existing executions table.
+
+    ``CREATE TABLE IF NOT EXISTS`` never extends a pre-existing table, so a
+    ledger written by an older Hermes release must be migrated in place. Each
+    column is appended only when absent; the migration is idempotent and never
+    rewrites existing rows.
+    """
+    existing = {
+        row[1] for row in conn.execute("PRAGMA table_info(executions)").fetchall()
+    }
+    for column in _RECEIPT_COLUMNS:
+        if column not in existing:
+            conn.execute(f"ALTER TABLE executions ADD COLUMN {column} TEXT")
 
 
 @contextmanager
@@ -122,19 +158,93 @@ def _prune_unlocked(conn: sqlite3.Connection) -> None:
     )
 
 
-def create_execution(job_id: str, *, source: str) -> Dict[str, Any]:
-    """Persist a claimed attempt before executor/provider dispatch."""
-    now = _hermes_now().isoformat()
+def _resolve_job_and_siblings(
+    job_id: Optional[str], job: Optional[Dict[str, Any]]
+) -> "tuple[Optional[Dict[str, Any]], List[Dict[str, Any]], Optional[str]]":
+    """Resolve the selected job and its siblings for integrity hashing.
+
+    Prefers the caller-supplied ``job`` (the scheduler already has it in hand)
+    and only falls back to a fresh store load when it is absent or mismatched.
+    Returns ``(selected_job, siblings, sibling_load_error)``. When the job
+    store cannot be read, ``siblings`` is empty but ``sibling_load_error`` is a
+    non-empty marker so the hash layer records the sibling set as *unavailable*
+    (fail-closed) rather than as a proven empty sibling set.
+    """
+    sibling_load_error: Optional[str] = None
+    try:
+        from cron.jobs import load_jobs
+
+        jobs = load_jobs()
+    except Exception as exc:
+        jobs = []
+        sibling_load_error = f"sibling_store_unavailable:{type(exc).__name__}"
+
+    selected = job
+    if not isinstance(selected, dict) or selected.get("id") != job_id:
+        selected = next((j for j in jobs if j.get("id") == job_id), None)
+    siblings = [j for j in jobs if j.get("id") != job_id]
+    return selected, siblings, sibling_load_error
+
+
+def _json_dump(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
+def create_execution(
+    job_id: str, *, source: str, job: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Persist a claimed attempt before executor/provider dispatch.
+
+    In addition to the base identity, this records the pre-acquisition receipt:
+    gateway generation, the admission/lease record, an immutable resource
+    snapshot taken *before* the run, and integrity hashes of the selected job
+    and its siblings. Captures happen outside the ledger lock so a slow
+    ``/proc`` walk never stalls the write.
+    """
     execution_id = uuid.uuid4().hex
     pid = os.getpid()
+    process_started_at = _process_start_time(pid)
+
+    lease_owner = lease_owner_identity(_PROCESS_ID, pid, process_started_at)
+    gateway_generation = resolve_gateway_generation()
+    selected_job, siblings, sibling_load_error = _resolve_job_and_siblings(job_id, job)
+
+    # The pre-acquisition snapshot is captured *before* admission so its
+    # ``captured_at`` is deterministically <= ``admitted_at``. The ordering is
+    # then machine-validated below and any inversion (e.g. a clock adjustment)
+    # is recorded as explicit fail-closed evidence instead of being left
+    # ambiguous.
+    pre_snapshot_obj = capture_resource_snapshot(selected_job, pid=pid)
+    now = _hermes_now().isoformat()
+
+    captured_at = pre_snapshot_obj.get("captured_at")
+    if captured_at is not None and str(captured_at) > now:
+        pre_snapshot_obj["capture_errors"] = list(
+            pre_snapshot_obj.get("capture_errors", [])
+        ) + ["pre_admission_ordering_violation"]
+
+    admission = _json_dump({
+        "result": "admitted",
+        "admitted_at": now,
+        "acquisition": "claimed",
+        "lease_owner": lease_owner,
+    })
+    pre_snapshot = _json_dump(pre_snapshot_obj)
+    pre_hashes = _json_dump(capture_integrity_hashes(
+        job_id, selected_job, siblings, sibling_load_error=sibling_load_error,
+    ))
+    gateway_generation_json = _json_dump(gateway_generation) if gateway_generation else None
+
     with _transaction() as conn:
         conn.execute(
             """INSERT INTO executions
                (id, job_id, source, process_id, pid, process_started_at,
-                status, claimed_at)
-               VALUES (?, ?, ?, ?, ?, ?, 'claimed', ?)""",
+                status, claimed_at, gateway_generation, admission,
+                pre_snapshot, pre_hashes)
+               VALUES (?, ?, ?, ?, ?, ?, 'claimed', ?, ?, ?, ?, ?)""",
             (execution_id, str(job_id), str(source), _PROCESS_ID, pid,
-             _process_start_time(pid), now),
+             process_started_at, now, gateway_generation_json,
+             admission, pre_snapshot, pre_hashes),
         )
         row = conn.execute(
             "SELECT * FROM executions WHERE id=?", (execution_id,)
@@ -160,16 +270,72 @@ def mark_execution_running(execution_id: str) -> Optional[Dict[str, Any]]:
 
 def finish_execution(
     execution_id: str, *, success: bool, error: Optional[str] = None,
+    job: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
-    """Write a terminal result once; terminal attempts cannot be rewritten."""
+    """Write a terminal result once; terminal attempts cannot be rewritten.
+
+    On the write path this also records the post-release receipt: the release
+    record (lease owner + process closure) and an immediate post-release
+    resource snapshot + integrity hashes, so a timeout/failure/retry that
+    reaches this function still persists a fail-closed receipt.
+
+    The post-receipt is bound to the execution's *stored* job identity, not the
+    caller-supplied job: a caller finishing one execution with a different job
+    cannot substitute a foreign identity into the immutable receipt.
+    """
     now = _hermes_now().isoformat()
     status = "completed" if success else "failed"
     detail = None if success else (str(error) if error else "unknown failure")
+
+    pid = os.getpid()
+    process_started_at = _process_start_time(pid)
+    lease_owner = lease_owner_identity(_PROCESS_ID, pid, process_started_at)
+    release = _json_dump({
+        "result": status,
+        "released_at": now,
+        "lease_owner": lease_owner,
+        "process_closure": {
+            "closed": True,
+            "closed_at": now,
+            "pid_alive": _owner_is_live(pid, process_started_at),
+        },
+    })
+
+    # Bind the post-receipt to the execution's *stored* job identity, not the
+    # caller-supplied job. The read and the terminal write share one connection
+    # (and one lock hold) so a single finish still opens exactly one connection.
     with _transaction() as conn:
+        stored = conn.execute(
+            "SELECT job_id FROM executions WHERE id=?", (execution_id,)
+        ).fetchone()
+        if stored is None:
+            return None
+        stored_job_id = stored["job_id"]
+
+        caller_job_id = job.get("id") if isinstance(job, dict) else None
+        identity_mismatch = caller_job_id is not None and str(caller_job_id) != stored_job_id
+        # On a caller identity mismatch, ignore the foreign job and resolve the
+        # stored identity from the store; the mismatch itself is recorded below
+        # as fail-closed evidence so a substitution can never silently succeed.
+        resolved_job = None if identity_mismatch else job
+        selected_job, siblings, sibling_load_error = _resolve_job_and_siblings(
+            stored_job_id, resolved_job
+        )
+        post_snapshot = _json_dump(capture_resource_snapshot(selected_job, pid=pid))
+        post_hashes_obj = capture_integrity_hashes(
+            stored_job_id, selected_job, siblings, sibling_load_error=sibling_load_error,
+        )
+        if identity_mismatch:
+            post_hashes_obj["capture_errors"] = list(
+                post_hashes_obj.get("capture_errors", [])
+            ) + ["caller_job_id_mismatch"]
+        post_hashes = _json_dump(post_hashes_obj)
+
         cur = conn.execute(
-            """UPDATE executions SET status=?, finished_at=?, error=?
+            """UPDATE executions
+               SET status=?, finished_at=?, error=?, release=?, post_snapshot=?, post_hashes=?
                WHERE id=? AND status IN ('claimed','running')""",
-            (status, now, detail, execution_id),
+            (status, now, detail, release, post_snapshot, post_hashes, execution_id),
         )
         if cur.rowcount != 1:
             return None
@@ -180,12 +346,25 @@ def finish_execution(
 
 
 def recover_interrupted_executions() -> int:
-    """Mark provably abandoned attempts unknown without scheduling retries."""
+    """Mark provably abandoned attempts unknown without scheduling retries.
+
+    The recovered execution still receives a complete terminal receipt: an
+    identity-bound release record (the abandoned owner's original identity) and
+    an immediate post-release snapshot + integrity hashes. Exact evidence that
+    is unavailable after the owner exited is recorded as explicit capture
+    errors rather than a silently null terminal disposition.
+    """
     now = _hermes_now().isoformat()
-    changed = 0
+    error_msg = (
+        "Scheduler restarted after this execution's owner exited before a durable "
+        "terminal state; whether side effects ran is unknown."
+    )
+    # Phase 1: identify abandoned rows under a short lock (owner-liveness checks
+    # and /proc walks are kept out of the write lock below).
+    abandoned: List[Dict[str, Any]] = []
     with _transaction() as conn:
         rows = conn.execute(
-            """SELECT id, process_id, pid, process_started_at FROM executions
+            """SELECT id, job_id, process_id, pid, process_started_at FROM executions
                WHERE status IN ('claimed','running')"""
         ).fetchall()
         for row in rows:
@@ -193,17 +372,50 @@ def recover_interrupted_executions() -> int:
                 continue
             if _owner_is_live(int(row["pid"]), row["process_started_at"]):
                 continue
+            abandoned.append({
+                "id": row["id"],
+                "job_id": row["job_id"],
+                "process_id": row["process_id"],
+                "pid": int(row["pid"]),
+                "process_started_at": row["process_started_at"],
+            })
+
+    changed = 0
+    for row in abandoned:
+        # Bind the release to the abandoned owner's *original* identity, not the
+        # recovering process's.
+        lease_owner = lease_owner_identity(
+            row["process_id"], row["pid"], row["process_started_at"]
+        )
+        release = _json_dump({
+            "result": "unknown",
+            "released_at": now,
+            "lease_owner": lease_owner,
+            "process_closure": {
+                "closed": True,
+                "closed_at": now,
+                "pid_alive": False,
+                "reason": "owner_exited_before_terminal_state",
+            },
+        })
+        selected_job, siblings, sibling_load_error = _resolve_job_and_siblings(
+            row["job_id"], None
+        )
+        post_snapshot = _json_dump(capture_resource_snapshot(selected_job, pid=row["pid"]))
+        post_hashes = _json_dump(capture_integrity_hashes(
+            row["job_id"], selected_job, siblings, sibling_load_error=sibling_load_error,
+        ))
+
+        with _transaction() as conn:
             cur = conn.execute(
-                """UPDATE executions SET status='unknown', finished_at=?, error=?
+                """UPDATE executions
+                   SET status='unknown', finished_at=?, error=?, release=?, post_snapshot=?, post_hashes=?
                    WHERE id=? AND status IN ('claimed','running')""",
-                (now,
-                 "Scheduler restarted after this execution's owner exited before a durable "
-                 "terminal state; whether side effects ran is unknown.",
-                 row["id"]),
+                (now, error_msg, release, post_snapshot, post_hashes, row["id"]),
             )
             changed += cur.rowcount
-        if changed:
-            _prune_unlocked(conn)
+            if cur.rowcount:
+                _prune_unlocked(conn)
     return changed
 
 

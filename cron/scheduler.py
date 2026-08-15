@@ -3854,7 +3854,7 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
     """
     execution_id = job.get("execution_id")
     if not execution_id:
-        execution_id = create_execution(job["id"], source="direct")["id"]
+        execution_id = create_execution(job["id"], source="direct", job=job)["id"]
     try:
         # Pre-run dispatch claim (issue #38758): atomically commit a finite
         # one-shot's dispatch BEFORE its side effect runs, so a tick that dies
@@ -3872,6 +3872,7 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
                 execution_id,
                 success=False,
                 error="Dispatch claim rejected; execution was not started.",
+                job=job,
             )
             return True  # not an error — already handled/removed
 
@@ -3985,14 +3986,14 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
 
         if not _consume_interrupted_flag(job["id"]):
             mark_job_run(job["id"], success, error, delivery_error=delivery_error)
-        finish_execution(execution_id, success=success, error=error)
+        finish_execution(execution_id, success=success, error=error, job=job)
         return True
 
     except Exception as e:
         logger.error("Error processing job %s: %s", job['id'], e)
         if not _consume_interrupted_flag(job["id"]):
             mark_job_run(job["id"], False, str(e))
-        finish_execution(execution_id, success=False, error=str(e))
+        finish_execution(execution_id, success=False, error=str(e), job=job)
         return False
 
 
@@ -4149,7 +4150,7 @@ def tick(
                 _running_job_ids.add(job_id)
             # Record the attempt before executor dispatch. Recovery classifies
             # abandoned records as unknown; it never automatically retries them.
-            execution = create_execution(job_id, source="builtin")
+            execution = create_execution(job_id, source="builtin", job=job)
             dispatched_job = dict(job, execution_id=execution["id"])
             _ctx = contextvars.copy_context()
 
@@ -4169,6 +4170,7 @@ def tick(
                     execution["id"],
                     success=False,
                     error=f"Executor dispatch failed: {submit_err}",
+                    job=job,
                 )
                 # Interpreter began finalizing between the guard above and the
                 # submit — release the in-flight claim we just took and skip.
