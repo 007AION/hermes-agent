@@ -17021,7 +17021,24 @@ def main(
     # Handle single query mode
     if query or image:
         if not cli._claim_active_session("cli", stderr=bool(quiet)):
-            sys.exit(1)
+            _admit_exit = 1
+            # Kanban workers: an active-session admission refusal is a
+            # transient backpressure condition (the assignee profile is already
+            # saturated by a concurrent live session), NOT a task failure. Exit
+            # with the dedicated sentinel so the dispatcher's reap classifier
+            # requeues the task to ``ready`` WITHOUT counting a failure — the
+            # preflight→child-acquire TOCTOU is unavoidable, so the refusal
+            # must carry a backpressure classification rather than a crash.
+            # (AION-RL2-CORE-01-SESSION_ADMISSION)
+            if os.environ.get("HERMES_KANBAN_TASK"):
+                try:
+                    from hermes_cli.kanban_db import (
+                        KANBAN_SESSION_LIMIT_EXIT_CODE as _SL_CODE,
+                    )
+                    _admit_exit = _SL_CODE
+                except Exception:
+                    _admit_exit = 1
+            sys.exit(_admit_exit)
         try:
             query, single_query_images = _collect_query_images(query, image)
             # Kanban workers spawn with ``hermes chat -q "work kanban task <id>"``;
