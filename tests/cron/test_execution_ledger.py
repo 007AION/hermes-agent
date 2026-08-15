@@ -258,7 +258,10 @@ def test_run_one_job_records_running_then_terminal(monkeypatch):
     monkeypatch.setattr(
         scheduler,
         "run_job",
-        lambda job, *, defer_agent_teardown=None: (True, "output", "response", None),
+        lambda job, *, defer_agent_teardown=None, session_holder=None: (
+            session_holder.append("cron_job-3_20260816_004448") if session_holder is not None else None,
+            (True, "output", "response", None),
+        )[1],
     )
     monkeypatch.setattr(scheduler, "save_job_output", lambda *_args: None)
     monkeypatch.setattr(scheduler, "_deliver_result", lambda *_args, **_kwargs: None)
@@ -268,6 +271,9 @@ def test_run_one_job_records_running_then_terminal(monkeypatch):
     assert events[0] == ("running", "exec-3")
     assert events[-1][0:2] == ("finish", "exec-3")
     assert events[-1][2]["success"] is True
+    # The exact natural cron session identity surfaced by run_job is threaded
+    # through to the immutable execution ledger (R24 session binding).
+    assert events[-1][2]["session_id"] == "cron_job-3_20260816_004448"
 
 
 def test_provider_start_recovers_interrupted_records_before_tick(monkeypatch):

@@ -2747,7 +2747,8 @@ def _guard_job_credential_exfil(job: dict) -> None:
 
 
 def run_job(
-    job: dict, *, defer_agent_teardown: Optional[list] = None
+    job: dict, *, defer_agent_teardown: Optional[list] = None,
+    session_holder: Optional[list] = None,
 ) -> tuple[bool, str, str, Optional[str]]:
     """
     Execute a single cron job.
@@ -2761,6 +2762,14 @@ def run_job(
     torn-down async client (defense-in-depth alongside the interpreter-shutdown
     guard). When ``None`` (the default) teardown happens inline as before, so
     every existing caller is unchanged.
+
+    ``session_holder``: when a caller passes a list, ``run_job`` appends the
+    natural cron session id (``cron_<job_id>_<timestamp>``) to it once the
+    agent-backed run is admitted, so the caller can bind that exact identity
+    into the immutable execution ledger row (R24
+    IMMUTABLE_SESSION_BINDING_ABSENT). Early-return paths (``no_agent``,
+    injection-blocked, wake-gate skip) never create an agent session and leave
+    the holder empty.
 
     Returns:
         Tuple of (success, full_output_doc, final_response, error_message)
@@ -2999,6 +3008,8 @@ def run_job(
         return True, "", SILENT_MARKER, None
     origin = _resolve_origin(job)
     _cron_session_id = f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
+    if session_holder is not None:
+        session_holder.append(_cron_session_id)
 
     logger.info("Running job '%s' (ID: %s)", job_name, job_id)
     logger.info("Prompt: %s", prompt[:100])
@@ -3855,6 +3866,7 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
     execution_id = job.get("execution_id")
     if not execution_id:
         execution_id = create_execution(job["id"], source="direct", job=job)["id"]
+    _session_holder: list = []
     try:
         # Pre-run dispatch claim (issue #38758): atomically commit a finite
         # one-shot's dispatch BEFORE its side effect runs, so a tick that dies
@@ -3906,7 +3918,8 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         _deferred_agents: list = []
         try:
             success, output, final_response, error = run_job(
-                job, defer_agent_teardown=_deferred_agents
+                job, defer_agent_teardown=_deferred_agents,
+                session_holder=_session_holder,
             )
         except BaseException:
             # run_job's finally still hands back the agent when it raises; tear
@@ -3986,14 +3999,26 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
 
         if not _consume_interrupted_flag(job["id"]):
             mark_job_run(job["id"], success, error, delivery_error=delivery_error)
-        finish_execution(execution_id, success=success, error=error, job=job)
+        finish_execution(
+            execution_id,
+            success=success,
+            error=error,
+            job=job,
+            session_id=_session_holder[0] if _session_holder else None,
+        )
         return True
 
     except Exception as e:
         logger.error("Error processing job %s: %s", job['id'], e)
         if not _consume_interrupted_flag(job["id"]):
             mark_job_run(job["id"], False, str(e))
-        finish_execution(execution_id, success=False, error=str(e), job=job)
+        finish_execution(
+            execution_id,
+            success=False,
+            error=str(e),
+            job=job,
+            session_id=_session_holder[0] if _session_holder else None,
+        )
         return False
 
 

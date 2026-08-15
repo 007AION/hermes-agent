@@ -21,6 +21,7 @@ from hermes_time import now as _hermes_now
 from cron.receipt import (
     capture_integrity_hashes,
     capture_resource_snapshot,
+    diff_job_field_views,
     lease_owner_identity,
     resolve_gateway_generation,
 )
@@ -42,6 +43,7 @@ _RECEIPT_COLUMNS = (
     "release",
     "post_snapshot",
     "post_hashes",
+    "session_id",
 )
 
 
@@ -271,6 +273,7 @@ def mark_execution_running(execution_id: str) -> Optional[Dict[str, Any]]:
 def finish_execution(
     execution_id: str, *, success: bool, error: Optional[str] = None,
     job: Optional[Dict[str, Any]] = None,
+    session_id: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Write a terminal result once; terminal attempts cannot be rewritten.
 
@@ -282,6 +285,11 @@ def finish_execution(
     The post-receipt is bound to the execution's *stored* job identity, not the
     caller-supplied job: a caller finishing one execution with a different job
     cannot substitute a foreign identity into the immutable receipt.
+
+    ``session_id`` (when provided) is the exact natural cron session identity.
+    It is bound into the immutable row exactly once; a later conflicting id is
+    rejected (never overwrites the already-bound value) and recorded as an
+    explicit ``session_id_substitution`` fail-closed error.
     """
     now = _hermes_now().isoformat()
     status = "completed" if success else "failed"
@@ -306,7 +314,8 @@ def finish_execution(
     # (and one lock hold) so a single finish still opens exactly one connection.
     with _transaction() as conn:
         stored = conn.execute(
-            "SELECT job_id FROM executions WHERE id=?", (execution_id,)
+            "SELECT job_id, pre_hashes, session_id FROM executions WHERE id=?",
+            (execution_id,),
         ).fetchone()
         if stored is None:
             return None
@@ -329,13 +338,47 @@ def finish_execution(
             post_hashes_obj["capture_errors"] = list(
                 post_hashes_obj.get("capture_errors", [])
             ) + ["caller_job_id_mismatch"]
+
+        # Classified field-level delta between the admission (pre) and release
+        # (post) canonical views. This proves every per-run delta and, when any
+        # nonvolatile (stable/redacted) field moved, surfaces it as explicit
+        # fail-closed evidence instead of leaving the pre/post hash drift opaque.
+        pre_fields = None
+        try:
+            stored_pre_hashes = json.loads(stored["pre_hashes"]) if stored["pre_hashes"] else None
+            if isinstance(stored_pre_hashes, dict):
+                pre_fields = stored_pre_hashes.get("selected_job_fields")
+        except (ValueError, TypeError):
+            pre_fields = None
+        field_diff = diff_job_field_views(
+            pre_fields, post_hashes_obj.get("selected_job_fields")
+        )
+        post_hashes_obj["selected_job_field_diff"] = field_diff
+        if field_diff.get("nonvolatile_drift"):
+            post_hashes_obj["capture_errors"] = list(
+                post_hashes_obj.get("capture_errors", [])
+            ) + ["nonvolatile_job_drift"]
+
+        # Bind the exact natural cron session identity exactly once. A second
+        # write with a different id can never overwrite the bound value
+        # (COALESCE below keeps the first); the mismatch is still recorded as
+        # explicit fail-closed evidence so a substitution is never silent.
+        incoming_session_id = str(session_id).strip() if session_id else None
+        if incoming_session_id:
+            stored_session_id = stored["session_id"]
+            if stored_session_id and stored_session_id != incoming_session_id:
+                post_hashes_obj["capture_errors"] = list(
+                    post_hashes_obj.get("capture_errors", [])
+                ) + ["session_id_substitution"]
         post_hashes = _json_dump(post_hashes_obj)
 
         cur = conn.execute(
             """UPDATE executions
-               SET status=?, finished_at=?, error=?, release=?, post_snapshot=?, post_hashes=?
+               SET status=?, finished_at=?, error=?, release=?, post_snapshot=?, post_hashes=?,
+                   session_id=COALESCE(session_id, ?)
                WHERE id=? AND status IN ('claimed','running')""",
-            (status, now, detail, release, post_snapshot, post_hashes, execution_id),
+            (status, now, detail, release, post_snapshot, post_hashes,
+             incoming_session_id, execution_id),
         )
         if cur.rowcount != 1:
             return None
