@@ -24,8 +24,8 @@ from typing import Any, Callable
 
 REPO_CONFIGS: dict[str, dict[str, Any]] = {
     "kiddhu/aion-governance": {
-        "protected_issues": (673, 691, 682),
-        "hard_forbidden_autoclose_issues": (673, 691, 682),
+        "protected_issues": (879, 882, 883),
+        "hard_forbidden_autoclose_issues": (879, 882, 883),
     },
     # CatalogFlow / SeekAPI implementation repo lane. This gate still enforces
     # exact head, role separation, CLEAN merge state, approvals, and green/current
