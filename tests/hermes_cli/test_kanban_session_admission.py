@@ -12,10 +12,13 @@ Two bounded fixes are covered here:
    assignee profile's *canonical* active-session registry (under its own lock,
    dead PIDs pruned) and defers a saturated profile while leaving the task
    ``ready``/unclaimed with no run created (``skipped_profile_session_capped``).
-2. **TOCTOU backstop** — an active-session admission refusal carries a dedicated
-   exit sentinel (``KANBAN_SESSION_LIMIT_EXIT_CODE``) that the reap classifier
-   maps to a ``session_capped`` requeue WITHOUT counting a failure, so a late
-   lease release can never trip the circuit breaker.
+2. **Origin-authenticated TOCTOU backstop** — an active-session admission
+   refusal carries a dedicated exit sentinel (``KANBAN_SESSION_LIMIT_EXIT_CODE``)
+   *plus* a durable ``session_admission_refused`` receipt binding the exit to an
+   actual ``_claim_active_session`` refusal for that exact ``(task_id, pid)``.
+   The reap classifier only maps the sentinel to a ``session_capped`` requeue
+   (no failure counted) when that receipt is present; an unrelated rc=69 without
+   a receipt stays a real nonzero failure that the circuit breaker bounds.
 """
 
 from __future__ import annotations
@@ -80,6 +83,22 @@ def _write_lease(active_sessions, alpha_home, pid):
 def _clear_registry(active_sessions, alpha_home):
     registry = Path(alpha_home) / "runtime" / "active_sessions.json"
     active_sessions._write_entries(registry, [])
+
+
+def _write_refusal_receipt(kb, conn, task_id, pid):
+    """Append a durable admission-refusal receipt for ``(task_id, pid)``."""
+    with kb.write_txn(conn):
+        kb._append_event(
+            conn,
+            task_id,
+            "session_admission_refused",
+            {
+                "pid": int(pid),
+                "session_id": "live-session",
+                "profile": "alpha",
+                "nonce": f"nonce-{pid}",
+            },
+        )
 
 
 def _fake_spawn(*args, **kwargs):
@@ -185,7 +204,10 @@ def test_classify_worker_exit_recognizes_session_limit_sentinel(
     pid = 55555
     kb._record_worker_exit(pid, _exited_status(kb.KANBAN_SESSION_LIMIT_EXIT_CODE))
     kind, code = kb._classify_worker_exit(pid)
-    assert kind == "session_capped"
+    # The raw sentinel is classified as ``session_limit_exit`` — origin
+    # authentication (receipt binding) happens in ``detect_crashed_workers``,
+    # not here, so an unrelated rc=69 is never silently mapped to session_capped.
+    assert kind == "session_limit_exit"
     assert code == kb.KANBAN_SESSION_LIMIT_EXIT_CODE
 
     # Distinct from the quota-wall sentinel and a generic non-zero exit.
@@ -201,9 +223,10 @@ def test_classify_worker_exit_recognizes_session_limit_sentinel(
 def test_session_limit_exit_requeues_without_counting_failure(
     isolated_session_admission_env, monkeypatch
 ):
-    """The TOCTOU backstop: a session-limit sentinel exit releases the task to
-    ``ready`` and leaves ``consecutive_failures`` untouched, so a late lease
-    release can never trip the breaker — across many hits."""
+    """The origin-authenticated TOCTOU backstop: a session-limit sentinel exit
+    *bound to a durable admission-refusal receipt* releases the task to ``ready``
+    and leaves ``consecutive_failures`` untouched, so a late lease release can
+    never trip the breaker — across many hits."""
     kb = isolated_session_admission_env["kanban_db"]
 
     monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
@@ -221,6 +244,9 @@ def test_session_limit_exit_requeues_without_counting_failure(
                 (pid, 0, tid),
             )
             conn.commit()
+            # Origin-authenticate: bind the sentinel to an actual admission
+            # refusal for this pid before recording the exit.
+            _write_refusal_receipt(kb, conn, tid, pid)
             kb._record_worker_exit(
                 pid, _exited_status(kb.KANBAN_SESSION_LIMIT_EXIT_CODE)
             )
@@ -247,6 +273,139 @@ def test_session_limit_exit_requeues_without_counting_failure(
         ]
         assert "session_capped" in outcomes
         assert "crashed" not in outcomes
+
+
+def test_unrelated_rc69_without_receipt_is_real_failure(
+    isolated_session_admission_env, monkeypatch
+):
+    """Hostile regression: an unrelated rc=69 with NO admission-refusal receipt
+    is a real nonzero failure, not a zero-budget session_capped replay."""
+    kb = isolated_session_admission_env["kanban_db"]
+
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect_closing() as conn:
+        host = kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="unrelated-69", assignee="alpha")
+
+        for i in range(2):  # DEFAULT_FAILURE_LIMIT == 2
+            pid = 90000 + i
+            conn.execute(
+                "UPDATE tasks SET status='running', worker_pid=?, "
+                "claim_lock=? WHERE id=?",
+                (pid, f"{host}:w{i}", tid),
+            )
+            conn.commit()
+            # Sentinel exit but NO receipt -> must be a real failure.
+            kb._record_worker_exit(
+                pid, _exited_status(kb.KANBAN_SESSION_LIMIT_EXIT_CODE)
+            )
+            crashed = kb.detect_crashed_workers(conn)
+            assert tid in crashed, f"hit {i}: unrelated rc=69 must be a crash"
+            sc = getattr(kb.detect_crashed_workers, "_last_session_capped", [])
+            assert tid not in sc, f"hit {i}: must not be session_capped"
+
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked", (
+            f"unrelated rc=69 must trip the breaker, got {task.status}"
+        )
+
+
+def test_record_session_admission_refusal_writes_verifiable_receipt(
+    isolated_session_admission_env,
+):
+    """The public receipt writer persists a pid-bound receipt that the
+    dispatcher's verifier can read back (durable + distinguishable)."""
+    kb = isolated_session_admission_env["kanban_db"]
+
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="refused", assignee="alpha")
+
+    pid = 77777
+    assert (
+        kb.record_session_admission_refusal(
+            task_id=tid, pid=pid, session_id="s", profile="alpha"
+        )
+        is True
+    )
+
+    # Read back on a fresh connection to prove durability across processes.
+    with kb.connect_closing() as conn:
+        assert kb._has_session_admission_refusal_receipt(conn, tid, pid) is True
+        # A different pid is not authenticated.
+        assert (
+            kb._has_session_admission_refusal_receipt(conn, tid, pid + 1) is False
+        )
+
+
+def test_session_capacity_unreadable_is_observable_and_bounded(
+    isolated_session_admission_env, monkeypatch
+):
+    """Hostile regression: a persistently unreadable profile config/registry is
+    surfaced observably (dedicated bucket + event) and stays bounded (fail-open
+    to a single spawn, not a silent unbounded replay)."""
+    kb = isolated_session_admission_env["kanban_db"]
+
+    monkeypatch.setattr(
+        kb,
+        "_profile_session_capacity",
+        lambda _assignee: kb._SESSION_CAPACITY_UNREADABLE,
+    )
+
+    with kb.connect_closing() as conn:
+        kb.create_board(slug="default", name="Test")
+        tid = kb.create_task(conn, title="unreadable-cap", assignee="alpha")
+
+    with kb.connect_closing() as conn:
+        res = kb.dispatch_once(conn, spawn_fn=_fake_spawn, dry_run=False)
+
+    # Observable: the degraded read is surfaced in a dedicated bucket.
+    assert res.skipped_profile_session_capacity_unknown == [(tid, "alpha")]
+    # Bounded: it still fail-opens to exactly one spawn (the child's own gate
+    # protects correctness), not an unbounded replay.
+    assert len(res.spawned) == 1
+    assert res.spawned[0][0] == tid
+    assert not res.skipped_profile_session_capped
+
+    # A durable observable event was emitted.
+    with kb.connect_closing() as conn:
+        kinds = [
+            r["kind"]
+            for r in conn.execute(
+                "SELECT kind FROM task_events WHERE task_id=? "
+                "AND kind='session_capacity_unknown'",
+                (tid,),
+            ).fetchall()
+        ]
+        assert kinds == ["session_capacity_unknown"]
+
+
+def test_profile_session_capacity_distinguishes_unreadable(
+    isolated_session_admission_env, monkeypatch
+):
+    """The preflight distinguishes uncapped / non-existent / unreadable: a
+    synthetic or uncapped profile fails open (None), while an unreadable config
+    surfaces the distinguishable ``_SESSION_CAPACITY_UNREADABLE`` sentinel."""
+    kb = isolated_session_admission_env["kanban_db"]
+
+    # Non-existent profile -> fail-open (None), NOT "capacity unknown".
+    assert kb._profile_session_capacity("alice") is None
+
+    # Existing uncapped profile (beta has no config) -> None.
+    assert kb._profile_session_capacity("beta") is None
+
+    # Existing capped profile with an empty registry -> (active, max).
+    assert kb._profile_session_capacity("alpha") == (0, 1)
+
+    # Unreadable config -> the distinguishable sentinel.
+    import hermes_cli.config as _cfg
+
+    def _boom():
+        raise OSError("config unreadable")
+
+    monkeypatch.setattr(_cfg, "read_raw_config", _boom)
+    assert kb._profile_session_capacity("alpha") is kb._SESSION_CAPACITY_UNREADABLE
 
 
 def test_real_crash_still_counts_and_trips_breaker(
@@ -281,11 +440,14 @@ def test_real_crash_still_counts_and_trips_breaker(
 
 
 def test_dispatch_result_has_session_admission_fields():
-    """Schema-level invariant: DispatchResult exposes both new receipt fields."""
+    """Schema-level invariant: DispatchResult exposes all session-admission
+    receipt fields."""
     from hermes_cli.kanban_db import DispatchResult
 
     r = DispatchResult()
     assert hasattr(r, "skipped_profile_session_capped")
     assert r.skipped_profile_session_capped == []
+    assert hasattr(r, "skipped_profile_session_capacity_unknown")
+    assert r.skipped_profile_session_capacity_unknown == []
     assert hasattr(r, "session_capped")
     assert r.session_capped == []

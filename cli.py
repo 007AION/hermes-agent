@@ -17029,13 +17029,28 @@ def main(
             # requeues the task to ``ready`` WITHOUT counting a failure — the
             # preflight→child-acquire TOCTOU is unavoidable, so the refusal
             # must carry a backpressure classification rather than a crash.
+            #
+            # Origin-authentication: the sentinel is only honoured when a
+            # durable ``session_admission_refused`` receipt binds this worker's
+            # pid + task id to the actual admission refusal. Write that receipt
+            # FIRST; only exit with the sentinel when it was durably committed,
+            # otherwise exit a plain nonzero so the dispatcher treats it as a
+            # real failure (an unproven 69 must never replay with zero budget).
             # (AION-RL2-CORE-01-SESSION_ADMISSION)
             if os.environ.get("HERMES_KANBAN_TASK"):
                 try:
                     from hermes_cli.kanban_db import (
                         KANBAN_SESSION_LIMIT_EXIT_CODE as _SL_CODE,
+                        record_session_admission_refusal as _record_refusal,
                     )
-                    _admit_exit = _SL_CODE
+
+                    _recorded = _record_refusal(
+                        task_id=os.environ["HERMES_KANBAN_TASK"],
+                        pid=os.getpid(),
+                        session_id=getattr(cli, "session_id", "") or "",
+                        profile=os.environ.get("HERMES_PROFILE", "") or "",
+                    )
+                    _admit_exit = _SL_CODE if _recorded else 1
                 except Exception:
                     _admit_exit = 1
             sys.exit(_admit_exit)
