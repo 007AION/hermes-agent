@@ -398,4 +398,3 @@ def test_read_entries_raise_on_corrupt_accepts_valid_entries(tmp_path, monkeypat
     assert entries == [
         {"lease_id": "a", "session_id": "s", "surface": "cli", "pid": 1},
     ]
-
