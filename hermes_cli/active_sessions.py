@@ -142,19 +142,46 @@ class _FileLock:
             self._fh = None
 
 
-def _read_entries(path: Path) -> list[dict[str, Any]]:
+class ActiveSessionRegistryUnreadable(RuntimeError):
+    """Raised when the active-session registry exists but cannot be read/parsed.
+
+    Distinct from a missing registry (``FileNotFoundError`` → genuinely empty),
+    so callers — notably the dispatcher's ``profile_active_session_capacity``
+    preflight — can propagate an explicit "capacity unknown" signal instead of
+    silently collapsing a corrupt registry to ``active_count == 0`` and failing
+    open as if the profile were free.
+    """
+
+
+def _read_entries(
+    path: Path, *, raise_on_corrupt: bool = False
+) -> list[dict[str, Any]]:
     try:
         with open(path, "r", encoding="utf-8") as fh:
             data = json.load(fh)
     except FileNotFoundError:
         return []
-    except Exception:
+    except Exception as exc:
         logger.warning("Ignoring corrupt active session registry at %s", path)
+        if raise_on_corrupt:
+            raise ActiveSessionRegistryUnreadable(
+                f"active session registry at {path} is unreadable"
+            ) from exc
         return []
     entries = data.get("entries") if isinstance(data, dict) else data
     if not isinstance(entries, list):
+        if raise_on_corrupt:
+            raise ActiveSessionRegistryUnreadable(
+                f"active session registry at {path} has an invalid shape"
+            )
         return []
-    return [entry for entry in entries if isinstance(entry, dict)]
+    if any(not isinstance(entry, dict) for entry in entries):
+        if raise_on_corrupt:
+            raise ActiveSessionRegistryUnreadable(
+                f"active session registry at {path} has an invalid entry shape"
+            )
+        entries = [entry for entry in entries if isinstance(entry, dict)]
+    return entries
 
 
 def _write_entries(path: Path, entries: list[dict[str, Any]]) -> None:
@@ -355,3 +382,45 @@ def active_session_registry_snapshot() -> list[dict[str, Any]]:
         entries = _prune_dead(_read_entries(state_path))
         _write_entries(state_path, entries)
         return entries
+
+
+def profile_active_session_capacity() -> Optional[tuple[int, int]]:
+    """Consult the *active* profile's active-session registry capacity.
+
+    Returns ``(active_count, max_sessions)`` when the active profile (the
+    current ``get_hermes_home()`` scope) has a ``max_concurrent_sessions``
+    cap configured, else ``None`` (uncapped → never saturated).
+
+    Dead (recycled-PID) leases are pruned under the profile's own
+    ``active_sessions.lock`` first, mirroring :func:`try_acquire_active_session`,
+    so a stale PID never falsely saturates the profile. Callers that need a
+    profile other than the current one scope it with
+    ``set_hermes_home_override`` (see ``_resolve_worker_cli_toolsets`` in
+    ``hermes_cli/kanban_db.py`` for the canonical pattern).
+
+    This is the dispatcher's preflight probe for session admission: a worker
+    can ``kanban_complete`` its task while its process still holds the
+    assignee profile's sole session lease through finalization / background
+    review, so board status (``status='running'``) alone cannot prove the
+    profile is actually free to admit another session.
+    """
+    try:
+        # Lazy import: config is a heavier module and this keeps the
+        # active-session registry importable from the dispatcher hot path
+        # without a top-level import cycle.
+        from hermes_cli.config import read_raw_config
+
+        max_sessions = resolve_max_concurrent_sessions(read_raw_config())
+    except Exception:
+        max_sessions = None
+    if max_sessions is None:
+        return None
+    state_path = _state_path()
+    with _FileLock(_lock_path()):
+        raw_entries = _read_entries(state_path, raise_on_corrupt=True)
+        entries = _prune_dead(raw_entries)
+        if len(entries) != len(raw_entries):
+            # Persist the prune so a recycled PID can't keep the profile
+            # falsely saturated on a later read.
+            _write_entries(state_path, entries)
+        return (len(entries), max_sessions)

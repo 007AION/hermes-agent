@@ -17021,7 +17021,49 @@ def main(
     # Handle single query mode
     if query or image:
         if not cli._claim_active_session("cli", stderr=bool(quiet)):
-            sys.exit(1)
+            _admit_exit = 1
+            # Kanban workers: an active-session admission refusal is a
+            # transient backpressure condition (the assignee profile is already
+            # saturated by a concurrent live session), NOT a task failure. Exit
+            # with the dedicated sentinel so the dispatcher's reap classifier
+            # requeues the task to ``ready`` WITHOUT counting a failure — the
+            # preflight→child-acquire TOCTOU is unavoidable, so the refusal
+            # must carry a backpressure classification rather than a crash.
+            #
+            # Origin-authentication: the sentinel is only honoured when a
+            # durable ``session_admission_refused`` receipt binds this worker's
+            # pid + task id to the actual admission refusal. Write that receipt
+            # FIRST; only exit with the sentinel when it was durably committed,
+            # otherwise exit a plain nonzero so the dispatcher treats it as a
+            # real failure (an unproven 69 must never replay with zero budget).
+            # (AION-RL2-CORE-01-SESSION_ADMISSION)
+            if os.environ.get("HERMES_KANBAN_TASK"):
+                try:
+                    from hermes_cli.kanban_db import (
+                        KANBAN_SESSION_LIMIT_EXIT_CODE as _SL_CODE,
+                        record_session_admission_refusal as _record_refusal,
+                    )
+
+                    # Bind the refusal to the current spawn/run via the
+                    # dispatcher-known fresh run identity (HERMES_KANBAN_RUN_ID
+                    # == the task's current_run_id). Without a run identity we
+                    # cannot produce a non-replayable receipt, so fail closed
+                    # (plain nonzero) rather than emit an unverifiable sentinel.
+                    _run_id = os.environ.get("HERMES_KANBAN_RUN_ID", "") or ""
+                    if _run_id:
+                        _recorded = _record_refusal(
+                            task_id=os.environ["HERMES_KANBAN_TASK"],
+                            pid=os.getpid(),
+                            session_id=getattr(cli, "session_id", "") or "",
+                            profile=os.environ.get("HERMES_PROFILE", "") or "",
+                            nonce=_run_id,
+                        )
+                        _admit_exit = _SL_CODE if _recorded else 1
+                    else:
+                        _admit_exit = 1
+                except Exception:
+                    _admit_exit = 1
+            sys.exit(_admit_exit)
         try:
             query, single_query_images = _collect_query_images(query, image)
             # Kanban workers spawn with ``hermes chat -q "work kanban task <id>"``;
