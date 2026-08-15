@@ -175,7 +175,13 @@ def _read_entries(
                 f"active session registry at {path} has an invalid shape"
             )
         return []
-    return [entry for entry in entries if isinstance(entry, dict)]
+    if any(not isinstance(entry, dict) for entry in entries):
+        if raise_on_corrupt:
+            raise ActiveSessionRegistryUnreadable(
+                f"active session registry at {path} has an invalid entry shape"
+            )
+        entries = [entry for entry in entries if isinstance(entry, dict)]
+    return entries
 
 
 def _write_entries(path: Path, entries: list[dict[str, Any]]) -> None:

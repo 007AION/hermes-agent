@@ -547,6 +547,25 @@ def test_corrupt_registry_produces_capacity_unknown_not_empty(
     assert kb._profile_session_capacity("alpha") is kb._SESSION_CAPACITY_UNREADABLE
 
 
+def test_semantically_corrupt_registry_entries_produce_capacity_unknown(
+    isolated_session_admission_env,
+):
+    """Hostile regression: a syntactically VALID registry whose entry members
+    are semantically corrupt (non-object members) is surfaced as explicit
+    capacity-unknown, never silently filtered down to ``active_count == 0``
+    (which would fail open and spawn under unknown real capacity)."""
+    kb = isolated_session_admission_env["kanban_db"]
+    alpha_home = isolated_session_admission_env["alpha_home"]
+
+    registry = Path(alpha_home) / "runtime" / "active_sessions.json"
+    # Syntactically valid JSON with a semantically invalid entry member.
+    registry.write_text('{"entries": ["not-an-entry"]}', encoding="utf-8")
+
+    # The semantically-corrupt registry must be explicit capacity-unknown, not
+    # silently collapsed to (0, 1).
+    assert kb._profile_session_capacity("alpha") is kb._SESSION_CAPACITY_UNREADABLE
+
+
 def test_persistent_capacity_unknown_plus_authenticated_refusal_is_bounded(
     isolated_session_admission_env, monkeypatch
 ):

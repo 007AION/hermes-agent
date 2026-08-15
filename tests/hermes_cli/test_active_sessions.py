@@ -6,6 +6,8 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import pytest
+
 from hermes_cli import active_sessions
 
 
@@ -354,3 +356,46 @@ def test_pid_start_time_mismatch_prunes_reused_pid(tmp_path, monkeypatch):
         "new-session"
     ]
     lease.release()
+
+
+def test_read_entries_raise_on_corrupt_rejects_semantically_invalid_members(
+    tmp_path, monkeypatch
+):
+    """Fail-closed capacity read must reject syntactically-valid JSON whose
+    entry members are semantically invalid (non-object members), rather than
+    silently filtering them down to an empty (0 active) registry."""
+    home = tmp_path / ".hermes"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    runtime = home / "runtime"
+    runtime.mkdir(parents=True)
+    registry = runtime / "active_sessions.json"
+    # Syntactically valid JSON with a semantically invalid entry member.
+    registry.write_text(
+        '{"entries": ["not-an-entry", {"pid": 1}]}', encoding="utf-8"
+    )
+
+    with pytest.raises(active_sessions.ActiveSessionRegistryUnreadable):
+        active_sessions._read_entries(registry, raise_on_corrupt=True)
+
+
+def test_read_entries_raise_on_corrupt_accepts_valid_entries(tmp_path, monkeypatch):
+    """Fail-closed capacity read still returns valid entries unchanged (a
+    control proving the semantic-corruption guard does not reject real
+    leases)."""
+    home = tmp_path / ".hermes"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    runtime = home / "runtime"
+    runtime.mkdir(parents=True)
+    registry = runtime / "active_sessions.json"
+    active_sessions._write_entries(
+        registry,
+        [
+            {"lease_id": "a", "session_id": "s", "surface": "cli", "pid": 1},
+        ],
+    )
+
+    entries = active_sessions._read_entries(registry, raise_on_corrupt=True)
+    assert entries == [
+        {"lease_id": "a", "session_id": "s", "surface": "cli", "pid": 1},
+    ]
+
