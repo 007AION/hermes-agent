@@ -232,6 +232,7 @@ def test_generic_submit_failure_finishes_attempt_and_releases_guard(monkeypatch)
         ("exec-submit-fail", {
             "success": False,
             "error": "Executor dispatch failed: executor rejected",
+            "job": {"id": "submit-fail"},
         })
     ]
     assert "submit-fail" not in scheduler.get_running_job_ids()
