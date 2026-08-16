@@ -233,6 +233,7 @@ def test_generic_submit_failure_finishes_attempt_and_releases_guard(monkeypatch)
             "success": False,
             "error": "Executor dispatch failed: executor rejected",
             "job": {"id": "submit-fail"},
+            "session_required": True,
         })
     ]
     assert "submit-fail" not in scheduler.get_running_job_ids()
@@ -258,7 +259,10 @@ def test_run_one_job_records_running_then_terminal(monkeypatch):
     monkeypatch.setattr(
         scheduler,
         "run_job",
-        lambda job, *, defer_agent_teardown=None: (True, "output", "response", None),
+        lambda job, *, defer_agent_teardown=None, session_holder=None: (
+            session_holder.append("cron_job-3_20260816_004448") if session_holder is not None else None,
+            (True, "output", "response", None),
+        )[1],
     )
     monkeypatch.setattr(scheduler, "save_job_output", lambda *_args: None)
     monkeypatch.setattr(scheduler, "_deliver_result", lambda *_args, **_kwargs: None)
@@ -268,6 +272,12 @@ def test_run_one_job_records_running_then_terminal(monkeypatch):
     assert events[0] == ("running", "exec-3")
     assert events[-1][0:2] == ("finish", "exec-3")
     assert events[-1][2]["success"] is True
+    # The exact natural cron session identity surfaced by run_job is threaded
+    # through to the immutable execution ledger (R24 session binding).
+    assert events[-1][2]["session_id"] == "cron_job-3_20260816_004448"
+    # The agent-backed run is declared session-required, so a missing session
+    # would fail closed instead of silently completing NULL (R25).
+    assert events[-1][2]["session_required"] is True
 
 
 def test_provider_start_recovers_interrupted_records_before_tick(monkeypatch):
@@ -440,3 +450,115 @@ def test_job_listing_exposes_latest_execution(monkeypatch, tmp_path):
     listed = jobs.list_jobs(include_disabled=True)
     assert listed[0]["latest_execution"]["id"] == record["id"]
     assert listed[0]["latest_execution"]["status"] == "running"
+
+
+# ---------------------------------------------------------------------------
+# R26 regressions — dispatch-claim rejection and executor-submit failure
+# terminal paths must fail closed on a missing required session
+# ---------------------------------------------------------------------------
+
+
+def _agent_job(job_id: str, **overrides) -> dict:
+    base = {
+        "id": job_id,
+        "name": f"{job_id} agent job",
+        "prompt": "do the thing",
+        "skills": [],
+        "schedule": {"kind": "interval", "minutes": 11520, "display": "every 11520m"},
+        "enabled": True,
+        "workdir": None,
+    }
+    base.update(overrides)
+    return base
+
+
+def test_run_one_job_dispatch_rejection_fails_closed_on_missing_session(monkeypatch, tmp_path):
+    """A dispatch-claim rejection of an agent-backed direct run must terminalize
+    with explicit ``session_id_missing`` evidence, not a silently NULL session.
+
+    RED on the audited head: ``run_one_job`` with ``claim_dispatch=False``
+    terminalized ``status=failed``, ``session_id=NULL`` and
+    ``capture_errors==[]``. GREEN: the terminal row carries
+    ``session_id_missing`` in ``post_hashes.capture_errors``.
+    """
+    import cron.scheduler as scheduler
+
+    executions = _point_ledger(monkeypatch, tmp_path)
+    monkeypatch.setattr(scheduler, "claim_dispatch", lambda _job_id: False)
+
+    assert scheduler.run_one_job(_agent_job("agent-reject")) is True
+
+    row = executions.latest_execution("agent-reject")
+    assert row["status"] == "failed"
+    assert row["session_id"] is None
+    post_hashes = json.loads(row["post_hashes"])
+    assert "session_id_missing" in post_hashes["capture_errors"]
+
+
+def test_run_one_job_dispatch_rejection_no_agent_is_not_session_required(monkeypatch, tmp_path):
+    """A ``no_agent`` script dispatch rejection legitimately has no natural
+    session, so a NULL session must NOT be flagged as an omission."""
+    import cron.scheduler as scheduler
+
+    executions = _point_ledger(monkeypatch, tmp_path)
+    monkeypatch.setattr(scheduler, "claim_dispatch", lambda _job_id: False)
+
+    assert scheduler.run_one_job(_agent_job("script-reject", no_agent=True)) is True
+
+    row = executions.latest_execution("script-reject")
+    assert row["status"] == "failed"
+    assert row["session_id"] is None
+    post_hashes = json.loads(row["post_hashes"])
+    assert "session_id_missing" not in post_hashes["capture_errors"]
+
+
+def test_tick_executor_submit_failure_fails_closed_on_missing_session(monkeypatch, tmp_path):
+    """An executor pool-submit failure of an agent-backed builtin run must
+    terminalize with explicit ``session_id_missing`` evidence."""
+    import cron.scheduler as scheduler
+
+    executions = _point_ledger(monkeypatch, tmp_path)
+
+    class BrokenPool:
+        def submit(self, _callable):
+            raise ValueError("executor rejected")
+
+    monkeypatch.setattr(
+        scheduler, "get_due_jobs", lambda: [_agent_job("submit-reject")],
+    )
+    monkeypatch.setattr(scheduler, "advance_next_run", lambda _job_id: None)
+    monkeypatch.setattr(scheduler, "_get_parallel_pool", lambda _workers: BrokenPool())
+
+    scheduler.tick(verbose=False, sync=False)
+
+    row = executions.latest_execution("submit-reject")
+    assert row["status"] == "failed"
+    assert row["session_id"] is None
+    post_hashes = json.loads(row["post_hashes"])
+    assert "session_id_missing" in post_hashes["capture_errors"]
+
+
+def test_tick_executor_submit_failure_no_agent_is_not_session_required(monkeypatch, tmp_path):
+    """A ``no_agent`` builtin executor-submit failure must not flag the NULL
+    session as an omission."""
+    import cron.scheduler as scheduler
+
+    executions = _point_ledger(monkeypatch, tmp_path)
+
+    class BrokenPool:
+        def submit(self, _callable):
+            raise ValueError("executor rejected")
+
+    monkeypatch.setattr(
+        scheduler, "get_due_jobs", lambda: [_agent_job("script-submit-reject", no_agent=True)],
+    )
+    monkeypatch.setattr(scheduler, "advance_next_run", lambda _job_id: None)
+    monkeypatch.setattr(scheduler, "_get_parallel_pool", lambda _workers: BrokenPool())
+
+    scheduler.tick(verbose=False, sync=False)
+
+    row = executions.latest_execution("script-submit-reject")
+    assert row["status"] == "failed"
+    assert row["session_id"] is None
+    post_hashes = json.loads(row["post_hashes"])
+    assert "session_id_missing" not in post_hashes["capture_errors"]

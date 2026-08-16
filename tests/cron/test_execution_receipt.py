@@ -198,7 +198,7 @@ def test_create_execution_records_pre_snapshot_and_hashes(monkeypatch, tmp_path)
     assert pre_snapshot["captured_at"]
 
     pre_hashes = json.loads(record["pre_hashes"])
-    assert pre_hashes["schema_version"] == "receipt-hash-v1"
+    assert pre_hashes["schema_version"] == "receipt-hash-v2"
     assert pre_hashes["job_id"] == "job-receipt"
     assert pre_hashes["selected_job_sha256"]
     assert pre_hashes["sibling_set_sha256"]
@@ -530,3 +530,440 @@ def test_pre_acquisition_ordering_inversion_fails_closed(monkeypatch, tmp_path):
     pre = json.loads(record["pre_snapshot"])
     assert "pre_admission_ordering_violation" in pre["capture_errors"]
 
+
+# ---------------------------------------------------------------------------
+# R24 regressions — hash reconciliation + immutable session binding
+# ---------------------------------------------------------------------------
+
+
+# Finding 1: UNRECONCILED_SELECTED_JOB_HASH_DRIFT
+def test_execution_id_is_runtime_claim_and_not_hashed():
+    """The scheduler-injected ``execution_id`` must not enter the stable hash.
+
+    RED on the audited head: ``canonical_job_hash(job)`` differed from
+    ``canonical_job_hash({**job, 'execution_id': ...})``, so the pre-admission
+    and post-release hashes of the same stable job diverged with no way to
+    prove the cause. GREEN: the field is classified as a runtime claim and
+    excluded, so the hashes are equal.
+    """
+    from cron.receipt import canonical_job_hash, classify_job_field
+
+    job = _job()
+    dispatched = dict(job, execution_id="c0f18a23b0534423b42fbd503be0bc3f")
+    assert classify_job_field("execution_id") == "runtime_claim"
+    assert canonical_job_hash(job) == canonical_job_hash(dispatched)
+
+
+def test_classify_job_field_partitions_definition_and_runtime_claims():
+    """Every field is exactly stable / redacted / runtime_claim.
+
+    Material job/prompt/provider/model/schedule fields must never be excluded
+    (stable or redacted), while only per-run/claim fields are excluded.
+    """
+    from cron.receipt import classify_job_field
+
+    assert classify_job_field("execution_id") == "runtime_claim"
+    assert classify_job_field("session_id") == "runtime_claim"
+    assert classify_job_field("last_run_at") == "runtime_claim"
+    assert classify_job_field("next_run_at") == "runtime_claim"
+    assert classify_job_field("state") == "runtime_claim"
+
+    assert classify_job_field("prompt") == "redacted"
+    assert classify_job_field("deliver") == "redacted"
+    assert classify_job_field("base_url") == "redacted"
+
+    for material in ("id", "name", "schedule", "enabled", "model", "provider",
+                     "skills", "workdir"):
+        assert classify_job_field(material) == "stable"
+
+
+def test_canonical_job_field_view_is_public_safe_and_reproducible():
+    """The classified field view redacts secrets and reproduces the hash."""
+    from cron.receipt import (
+        canonical_job_field_view,
+        canonical_job_hash,
+        diff_job_field_views,
+    )
+
+    job = _job(prompt="TOP_SECRET_INSTRUCTION", deliver="telegram:-100123")
+    view = canonical_job_field_view(job)
+
+    # No prompt/secret plaintext survives into the view.
+    blob = json.dumps(view)
+    assert "TOP_SECRET_INSTRUCTION" not in blob
+    assert "telegram:-100123" not in blob
+
+    # Prompt/deliver are redacted to digests; stable fields keep their value.
+    assert view["prompt"]["class"] == "redacted"
+    assert "sha256" in view["prompt"] and "value" not in view["prompt"]
+    assert view["deliver"]["class"] == "redacted"
+    assert view["name"]["class"] == "stable"
+    assert view["name"]["value"] == "receipt job"
+    assert view["enabled"]["class"] == "stable"
+    assert view["enabled"]["value"] is True
+
+    # The view of a job is deterministic and reconciles with itself.
+    assert canonical_job_field_view(job) == view
+    assert diff_job_field_views(view, view)["drift_is_reconciled"] is True
+
+    # The hash is reproducible from the view's stable+redacted material:
+    # reconstruct the canonical dict the hash is built from.
+    canonical = {}
+    for key, entry in view.items():
+        cls = entry["class"]
+        if cls == "runtime_claim":
+            continue
+        if cls == "redacted":
+            canonical[f"{key}_sha256"] = entry["sha256"]
+        else:
+            canonical[key] = entry["value"]
+    import hashlib
+    from cron.receipt import _json_dumps_canonical
+    recomputed = hashlib.sha256(
+        _json_dumps_canonical(canonical).encode("utf-8")
+    ).hexdigest()
+    assert recomputed == canonical_job_hash(job)
+
+
+def test_diff_job_field_views_reconciles_runtime_claim_deltas():
+    """Runtime-claim-only deltas (execution_id / volatile fields) reconcile."""
+    from cron.receipt import canonical_job_field_view, diff_job_field_views
+
+    pre = canonical_job_field_view(_job())
+    post = canonical_job_field_view(dict(
+        _job(),
+        execution_id="c0f18a23b0534423b42fbd503be0bc3f",
+        next_run_at="2026-08-24T00:00:00+00:00",
+        last_run_at="2026-08-16T00:00:00+00:00",
+    ))
+
+    diff = diff_job_field_views(pre, post)
+    assert diff["drift_is_reconciled"] is True
+    assert diff["nonvolatile_drift"] == []
+    assert all(c["class"] == "runtime_claim" for c in diff["changed_fields"])
+
+
+def test_diff_job_field_views_flags_nonvolatile_drift():
+    """A changed stable or redacted field is nonvolatile drift, not reconciled."""
+    from cron.receipt import canonical_job_field_view, diff_job_field_views
+
+    pre = canonical_job_field_view(_job())
+    post = canonical_job_field_view(_job(enabled=False, prompt="changed prompt"))
+
+    diff = diff_job_field_views(pre, post)
+    assert diff["drift_is_reconciled"] is False
+    assert set(diff["nonvolatile_drift"]) == {"enabled", "prompt"}
+    assert any(c["field"] == "prompt" and c["class"] == "redacted"
+               for c in diff["changed_fields"])
+
+
+def test_finish_execution_binds_session_id_into_immutable_row(monkeypatch, tmp_path):
+    """The exact natural cron session id is bound into the immutable row."""
+    executions = _point_ledger(monkeypatch, tmp_path)
+    record = executions.create_execution("job-receipt", source="builtin", job=_job())
+    assert record["session_id"] is None  # not known at admission
+
+    executions.mark_execution_running(record["id"])
+    completed = executions.finish_execution(
+        record["id"], success=True, job=_job(),
+        session_id="cron_job-receipt_20260816_004448",
+    )
+    assert completed["session_id"] == "cron_job-receipt_20260816_004448"
+
+    persisted = executions.latest_execution("job-receipt")
+    assert persisted["session_id"] == "cron_job-receipt_20260816_004448"
+
+
+def test_finish_execution_rejects_session_id_substitution(monkeypatch, tmp_path):
+    """A conflicting session id can never overwrite the already-bound identity."""
+    executions = _point_ledger(monkeypatch, tmp_path)
+    record = executions.create_execution("job-receipt", source="builtin", job=_job())
+    executions.mark_execution_running(record["id"])
+
+    # Simulate an already-bound session identity on the running row.
+    with sqlite3.connect(executions.EXECUTIONS_FILE) as conn:
+        conn.execute(
+            "UPDATE executions SET session_id=? WHERE id=?",
+            ("cron_job-receipt_ORIGINAL", record["id"]),
+        )
+
+    completed = executions.finish_execution(
+        record["id"], success=True, job=_job(),
+        session_id="cron_job-receipt_SUBSTITUTE",
+    )
+    assert completed["session_id"] == "cron_job-receipt_ORIGINAL"
+    post_hashes = json.loads(completed["post_hashes"])
+    assert "session_id_substitution" in post_hashes["capture_errors"]
+
+
+def test_finish_execution_persists_classified_field_diff_and_reconciles_hash(
+    monkeypatch, tmp_path,
+):
+    """Natural pre→post hash equality plus a classified field-diff manifest."""
+    executions = _point_ledger(monkeypatch, tmp_path)
+    record = executions.create_execution("job-receipt", source="builtin", job=_job())
+    executions.mark_execution_running(record["id"])
+
+    # The natural path finishes with the same job dict + the injected execution_id.
+    completed = executions.finish_execution(
+        record["id"], success=True, job=dict(_job(), execution_id=record["id"]),
+        session_id="cron_job-receipt_20260816_004448",
+    )
+
+    pre_hashes = json.loads(completed["pre_hashes"])
+    post_hashes = json.loads(completed["post_hashes"])
+
+    # Pre/post hashes of the same stable definition are now equal.
+    assert pre_hashes["selected_job_sha256"] == post_hashes["selected_job_sha256"]
+
+    # The receipt persists a classified, public-safe field-diff manifest.
+    diff = post_hashes["selected_job_field_diff"]
+    assert diff["schema_version"] == "receipt-field-diff-v1"
+    assert diff["drift_is_reconciled"] is True
+    assert diff["nonvolatile_drift"] == []
+    assert post_hashes["capture_errors"] == []
+
+    # Both pre and post views are persisted (public-safe) for reproduction.
+    assert pre_hashes["selected_job_fields"]["prompt"]["class"] == "redacted"
+    assert post_hashes["selected_job_fields"]["prompt"]["class"] == "redacted"
+
+
+def test_finish_execution_flags_nonvolatile_job_drift(monkeypatch, tmp_path):
+    """A stable-field change between admission and release fails closed."""
+    executions = _point_ledger(monkeypatch, tmp_path)
+    record = executions.create_execution("job-receipt", source="builtin", job=_job())
+    executions.mark_execution_running(record["id"])
+
+    # The job's enabled flag flipped during the run — material, nonvolatile drift.
+    completed = executions.finish_execution(
+        record["id"], success=True, job=_job(enabled=False),
+    )
+    post_hashes = json.loads(completed["post_hashes"])
+    assert "nonvolatile_job_drift" in post_hashes["capture_errors"]
+    assert post_hashes["selected_job_field_diff"]["drift_is_reconciled"] is False
+    assert post_hashes["selected_job_field_diff"]["nonvolatile_drift"] == ["enabled"]
+
+
+def test_migration_adds_session_id_column_to_existing_ledger(monkeypatch, tmp_path):
+    """A pre-R24 ledger migrates additively to carry the session_id column."""
+    import cron.executions as executions
+
+    db = tmp_path / "cron" / "executions.db"
+    db.parent.mkdir(parents=True)
+    conn = sqlite3.connect(db)
+    conn.execute(
+        """CREATE TABLE executions (
+             id TEXT PRIMARY KEY, job_id TEXT NOT NULL, source TEXT NOT NULL,
+             process_id TEXT NOT NULL, pid INTEGER NOT NULL, process_started_at INTEGER,
+             status TEXT NOT NULL, claimed_at TEXT NOT NULL,
+             started_at TEXT, finished_at TEXT, error TEXT
+           )"""
+    )
+    conn.commit()
+    conn.close()
+
+    monkeypatch.setattr(executions, "EXECUTIONS_FILE", db)
+    record = executions.create_execution("job-receipt", source="builtin", job=_job())
+    assert "session_id" in record  # column added by migration
+    assert record["session_id"] is None
+
+
+# ---------------------------------------------------------------------------
+# R25 regressions — session omission + hard-interruption durability
+# ---------------------------------------------------------------------------
+
+
+def test_finish_execution_fails_closed_on_required_session_omission(monkeypatch, tmp_path):
+    """A required (agent-backed) execution must never terminalize with
+    ``session_id`` NULL and empty capture errors.
+
+    RED on the audited head: ``finish_execution(success=True, job=<agent job>)``
+    with no session id completed with ``session_id=NULL`` and
+    ``capture_errors==[]``. GREEN: ``session_required=True`` records explicit
+    ``session_id_missing`` evidence instead of a silently NULL session.
+    """
+    executions = _point_ledger(monkeypatch, tmp_path)
+    record = executions.create_execution("job-receipt", source="builtin", job=_job())
+    executions.mark_execution_running(record["id"])
+
+    completed = executions.finish_execution(
+        record["id"], success=True, job=_job(), session_required=True,
+    )
+    assert completed["status"] == "completed"
+    assert completed["session_id"] is None
+    post_hashes = json.loads(completed["post_hashes"])
+    assert "session_id_missing" in post_hashes["capture_errors"]
+
+
+def test_finish_execution_no_agent_run_is_not_session_required(monkeypatch, tmp_path):
+    """A ``no_agent`` (script) execution legitimately has no natural session, so
+    a completed row with ``session_id=NULL`` must NOT be flagged as an omission
+    when the caller does not declare the session required."""
+    executions = _point_ledger(monkeypatch, tmp_path)
+    record = executions.create_execution("job-receipt", source="builtin", job=_job())
+    executions.mark_execution_running(record["id"])
+
+    completed = executions.finish_execution(
+        record["id"], success=True, job=_job(), session_required=False,
+    )
+    assert completed["status"] == "completed"
+    assert completed["session_id"] is None
+    post_hashes = json.loads(completed["post_hashes"])
+    assert "session_id_missing" not in post_hashes["capture_errors"]
+
+
+def test_bind_execution_session_durably_binds_before_execution(monkeypatch, tmp_path):
+    """The natural session identity is bound onto the running row at creation
+    time — before provider/model execution — so it is already durable."""
+    executions = _point_ledger(monkeypatch, tmp_path)
+    record = executions.create_execution("job-receipt", source="builtin", job=_job())
+    executions.mark_execution_running(record["id"])
+
+    bound = executions.bind_execution_session(
+        record["id"], "cron_job-receipt_20260816_004448",
+    )
+    assert bound["session_id"] == "cron_job-receipt_20260816_004448"
+
+    # The bind is idempotent: re-binding the same id is a no-op.
+    rebound = executions.bind_execution_session(
+        record["id"], "cron_job-receipt_20260816_004448",
+    )
+    assert rebound["session_id"] == "cron_job-receipt_20260816_004448"
+
+    persisted = executions.latest_execution("job-receipt")
+    assert persisted["session_id"] == "cron_job-receipt_20260816_004448"
+
+
+def test_bind_execution_session_survives_hard_interruption_recovery(monkeypatch, tmp_path):
+    """Hard interruption AFTER session creation must not lose the binding.
+
+    RED on the audited head: the session id was only persisted at finish, so a
+    running execution recovered to ``unknown`` had ``session_id=NULL``. GREEN:
+    the id is bound at creation (before provider/model execution), so recovery
+    preserves it while terminalizing the abandoned attempt as ``unknown``.
+    """
+    executions = _point_ledger(monkeypatch, tmp_path)
+    record = executions.create_execution("job-receipt", source="builtin", job=_job())
+    executions.mark_execution_running(record["id"])
+
+    # Session created and durably bound BEFORE the (subsequently interrupted)
+    # agent run.
+    executions.bind_execution_session(record["id"], "cron_job-receipt_20260816_004448")
+
+    # Simulate the owner exiting before finish: a foreign, provably-dead owner.
+    with sqlite3.connect(executions.EXECUTIONS_FILE) as conn:
+        conn.execute(
+            "UPDATE executions SET process_id=?, process_started_at=? WHERE id=?",
+            ("old-import", -1, record["id"]),
+        )
+
+    assert executions.recover_interrupted_executions() == 1
+    recovered = executions.latest_execution("job-receipt")
+    assert recovered["status"] == "unknown"
+    assert recovered["session_id"] == "cron_job-receipt_20260816_004448"
+
+
+def test_bind_execution_session_rejects_conflicting_rebind(monkeypatch, tmp_path):
+    """A conflicting second bind never overwrites the bound id and is recorded
+    as explicit ``session_id_substitution`` fail-closed evidence."""
+    executions = _point_ledger(monkeypatch, tmp_path)
+    record = executions.create_execution("job-receipt", source="builtin", job=_job())
+    executions.mark_execution_running(record["id"])
+
+    executions.bind_execution_session(record["id"], "cron_job-receipt_ORIGINAL")
+    rebound = executions.bind_execution_session(record["id"], "cron_job-receipt_SUBSTITUTE")
+
+    assert rebound["session_id"] == "cron_job-receipt_ORIGINAL"
+    pre_hashes = json.loads(rebound["pre_hashes"])
+    assert "session_id_substitution" in pre_hashes["capture_errors"]
+
+
+# ---------------------------------------------------------------------------
+# R27 regressions — recovery terminalization records session omission
+# ---------------------------------------------------------------------------
+
+
+def _dead_owner(executions, record):
+    """Point an execution at a provably-dead foreign owner so recovery reaps it."""
+    with sqlite3.connect(executions.EXECUTIONS_FILE) as conn:
+        conn.execute(
+            "UPDATE executions SET process_id=?, process_started_at=? WHERE id=?",
+            ("old-import", -1, record["id"]),
+        )
+
+
+def test_create_execution_derives_session_required_from_no_agent(monkeypatch, tmp_path):
+    """The durable session-required flag is derived from ``no_agent`` at admission.
+
+    An absent/falsy ``no_agent`` is agent-backed (session required); a truthy
+    ``no_agent`` is a script watchdog (exempt). Neither caller needs to spell
+    out the flag — it is persisted on the immutable row.
+    """
+    executions = _point_ledger(monkeypatch, tmp_path)
+    agent = executions.create_execution("agent-job", source="builtin", job=_job(id="agent-job"))
+    assert agent["session_required"] == 1
+
+    script = executions.create_execution(
+        "script-job", source="builtin", job=_job(id="script-job", no_agent=True),
+    )
+    assert script["session_required"] == 0
+
+
+@pytest.mark.parametrize("source", ["builtin", "direct"])
+@pytest.mark.parametrize("no_agent", [False, True])
+def test_recovery_records_session_omission_for_agent_backed_rows(
+    monkeypatch, tmp_path, source, no_agent,
+):
+    """An abandoned agent-backed execution recovered with a still-NULL session
+    must append ``session_id_missing``; a ``no_agent`` execution must not.
+
+    RED on the audited head: every builtin/direct recovery (agent or no_agent)
+    terminalized with ``session_id=NULL`` and ``capture_errors==[]``, so the two
+    agent-backed cases silently lost the required-session omission. GREEN: the
+    admission-time ``session_required`` flag is durable, so recovery flags only
+    the agent-backed rows and leaves ``no_agent`` rows exempt.
+    """
+    executions = _point_ledger(monkeypatch, tmp_path)
+    job = _job(id=f"{source}-{'script' if no_agent else 'agent'}", no_agent=no_agent)
+    record = executions.create_execution(job["id"], source=source, job=job)
+
+    # The classification must be durable at admission, before the owner exits.
+    assert record["session_required"] == (0 if no_agent else 1)
+
+    _dead_owner(executions, record)
+    assert executions.recover_interrupted_executions() == 1
+    recovered = executions.latest_execution(job["id"])
+    assert recovered["status"] == "unknown"
+    assert recovered["session_id"] is None
+
+    post_hashes = json.loads(recovered["post_hashes"])
+    if no_agent:
+        assert "session_id_missing" not in post_hashes["capture_errors"]
+    else:
+        assert "session_id_missing" in post_hashes["capture_errors"]
+
+
+def test_migration_adds_session_required_column_to_existing_ledger(monkeypatch, tmp_path):
+    """A pre-R27 ledger migrates additively to carry the session_required flag."""
+    import cron.executions as executions
+
+    db = tmp_path / "cron" / "executions.db"
+    db.parent.mkdir(parents=True)
+    conn = sqlite3.connect(db)
+    conn.execute(
+        """CREATE TABLE executions (
+             id TEXT PRIMARY KEY, job_id TEXT NOT NULL, source TEXT NOT NULL,
+             process_id TEXT NOT NULL, pid INTEGER NOT NULL, process_started_at INTEGER,
+             status TEXT NOT NULL, claimed_at TEXT NOT NULL,
+             started_at TEXT, finished_at TEXT, error TEXT
+           )"""
+    )
+    conn.commit()
+    conn.close()
+
+    monkeypatch.setattr(executions, "EXECUTIONS_FILE", db)
+    record = executions.create_execution(
+        "job-receipt", source="builtin", job=_job(no_agent=False),
+    )
+    assert "session_required" in record  # column added by migration
+    assert record["session_required"] == 1

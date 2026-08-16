@@ -29,7 +29,18 @@ from typing import Any, Dict, List, Optional
 from hermes_time import now as _hermes_now
 
 SNAPSHOT_SCHEMA_VERSION = "receipt-snapshot-v1"
-HASH_SCHEMA_VERSION = "receipt-hash-v1"
+HASH_SCHEMA_VERSION = "receipt-hash-v2"
+FIELD_DIFF_SCHEMA_VERSION = "receipt-field-diff-v1"
+
+# Field classes used by the classified canonical view and the field-diff
+# manifest. Every job field is exactly one of:
+#   * ``runtime_claim`` — per-run / claim / volatile: excluded from the stable
+#     hash, legitimately moves on every fire.
+#   * ``redacted``      — prompt/secret: replaced by a one-way SHA-256 digest.
+#   * ``stable``        — definitional: kept in the hash in full.
+_FIELD_CLASS_STABLE = "stable"
+_FIELD_CLASS_REDACTED = "redacted"
+_FIELD_CLASS_RUNTIME_CLAIM = "runtime_claim"
 
 # Job fields whose plaintext must never enter a receipt's canonical
 # serialization. They are replaced by a one-way SHA-256 digest of their value
@@ -43,10 +54,20 @@ _REDACT_FIELDS = frozenset({
 # transient status). Excluded entirely from the integrity hash: they are not
 # part of a job's stable definition, so their normal per-run movement must not
 # be misread as drift.
+#
+# ``execution_id`` and ``session_id`` are runtime claim fields injected by the
+# scheduler around a single dispatch: ``execution_id`` is the execution
+# ledger's own back-reference to the attempt being written, and ``session_id``
+# is the natural cron session identity. Both are absent from the stored job
+# record and appear only on the in-memory dict threaded through one run, so
+# they MUST be excluded — otherwise the pre-admission and post-release hashes
+# of the *same* stable job definition diverge (the R24
+# UNRECONCILED_SELECTED_JOB_HASH_DRIFT finding).
 _VOLATILE_FIELDS = frozenset({
     "next_run_at", "last_run_at", "last_status", "last_error",
     "last_delivery_error", "repeat", "state", "paused_at", "paused_reason",
     "created_at", "updated_at",
+    "execution_id", "session_id",
 })
 
 
@@ -64,35 +85,119 @@ def _redacted_value_hash(value: Any) -> str:
     return _sha256_text(_json_dumps_canonical(value))
 
 
+def classify_job_field(key: str) -> str:
+    """Classify a job field as ``stable`` / ``redacted`` / ``runtime_claim``.
+
+    This is the single source of truth for what enters the stable-definition
+    hash and what is excluded, so exclusions are explicit and can never
+    silently swallow a material job/prompt/provider/model/schedule change:
+    only fields in ``_VOLATILE_FIELDS`` are excluded; every other field is
+    either redacted (secret-bearing) or kept in full.
+    """
+    if key in _VOLATILE_FIELDS:
+        return _FIELD_CLASS_RUNTIME_CLAIM
+    if key in _REDACT_FIELDS:
+        return _FIELD_CLASS_REDACTED
+    return _FIELD_CLASS_STABLE
+
+
+def _canonicalize_value(value: Any) -> Any:
+    """Canonical representation of a non-redacted, non-volatile field value."""
+    if isinstance(value, dict):
+        return _json_dumps_canonical(value)
+    if isinstance(value, list):
+        return sorted(_json_dumps_canonical(item) for item in value)
+    return value
+
+
 def canonical_job_hash(job: Dict[str, Any]) -> str:
     """SHA-256 of a job's stable definition, redacting prompt/secret fields.
 
     The canonical view keeps identity, scheduling, scope and structural fields
     (so any definition drift is detected) while replacing ``prompt``, ``origin``,
-    ``deliver`` and ``base_url`` with their SHA-256 digests and dropping volatile
-    per-run counters. No prompt/config/secret plaintext survives into the
-    serialized string that is hashed.
+    ``deliver`` and ``base_url`` with their SHA-256 digests and dropping
+    volatile per-run counters and scheduler-injected runtime claim fields. No
+    prompt/config/secret plaintext survives into the serialized string that is
+    hashed.
     """
     if not isinstance(job, dict):
         return _sha256_text("null")
 
     canonical: Dict[str, Any] = {}
     for key in sorted(job.keys()):
-        if key in _VOLATILE_FIELDS:
-            continue
-        if key in _REDACT_FIELDS:
-            canonical[f"{key}_sha256"] = _redacted_value_hash(job.get(key))
+        cls = classify_job_field(key)
+        if cls == _FIELD_CLASS_RUNTIME_CLAIM:
             continue
         value = job.get(key)
-        if isinstance(value, dict):
-            canonical[key] = _json_dumps_canonical(value)
-        elif isinstance(value, list):
-            canonical[key] = sorted(
-                _json_dumps_canonical(item) for item in value
-            )
-        else:
-            canonical[key] = value
+        if cls == _FIELD_CLASS_REDACTED:
+            canonical[f"{key}_sha256"] = _redacted_value_hash(value)
+            continue
+        canonical[key] = _canonicalize_value(value)
     return _sha256_text(_json_dumps_canonical(canonical))
+
+
+def canonical_job_field_view(job: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Public-safe classified field map for one job.
+
+    Every field is classified (``stable`` / ``redacted`` / ``runtime_claim``)
+    and its redacted-or-canonical representation stored, so the receipt can
+    reproduce the integrity hash and prove field-level deltas without ever
+    persisting prompt/secret plaintext. ``None`` for a non-dict job.
+    """
+    if not isinstance(job, dict):
+        return None
+
+    view: Dict[str, Any] = {}
+    for key in sorted(job.keys()):
+        cls = classify_job_field(key)
+        value = job.get(key)
+        if cls == _FIELD_CLASS_RUNTIME_CLAIM:
+            view[key] = {"class": cls}
+        elif cls == _FIELD_CLASS_REDACTED:
+            view[key] = {"class": cls, "sha256": _redacted_value_hash(value)}
+        else:
+            view[key] = {"class": cls, "value": _canonicalize_value(value)}
+    return view
+
+
+def diff_job_field_views(
+    pre: Optional[Dict[str, Any]], post: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Classified field-level delta between pre and post canonical views.
+
+    Proves every delta and classifies it: a changed ``runtime_claim`` field is
+    expected per-run movement, while a changed ``stable`` or ``redacted`` field
+    is material nonvolatile drift and is surfaced (fail-closed) rather than
+    silently swallowed.
+    """
+    pre = pre if isinstance(pre, dict) else {}
+    post = post if isinstance(post, dict) else {}
+
+    changed: List[Dict[str, Any]] = []
+    nonvolatile: List[str] = []
+    for key in sorted(set(pre) | set(post)):
+        p = pre.get(key)
+        q = post.get(key)
+        if p == q:
+            continue
+        p_cls = p.get("class") if isinstance(p, dict) else None
+        q_cls = q.get("class") if isinstance(q, dict) else None
+        cls = q_cls or p_cls
+        changed.append({
+            "field": key,
+            "class": cls,
+            "pre": "absent" if p is None else p,
+            "post": "absent" if q is None else q,
+        })
+        if cls != _FIELD_CLASS_RUNTIME_CLAIM:
+            nonvolatile.append(key)
+
+    return {
+        "schema_version": FIELD_DIFF_SCHEMA_VERSION,
+        "changed_fields": changed,
+        "nonvolatile_drift": nonvolatile,
+        "drift_is_reconciled": not nonvolatile,
+    }
 
 
 def sibling_set_hash(siblings: List[Dict[str, Any]]) -> str:
@@ -137,6 +242,9 @@ def capture_integrity_hashes(
     selected_hash = canonical_job_hash(selected_job) if isinstance(
         selected_job, dict
     ) else None
+    selected_fields = canonical_job_field_view(selected_job) if isinstance(
+        selected_job, dict
+    ) else None
 
     if sibling_load_error is not None:
         sibling_hash = None
@@ -152,6 +260,7 @@ def capture_integrity_hashes(
         "schema_version": HASH_SCHEMA_VERSION,
         "job_id": job_id,
         "selected_job_sha256": selected_hash,
+        "selected_job_fields": selected_fields,
         "sibling_set_sha256": sibling_hash,
         "capture_errors": errors,
     }

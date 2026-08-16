@@ -18,7 +18,7 @@ def _patch_pipeline(monkeypatch, *, success=True, output="out", final="final res
     """Patch the job pipeline primitives and record the call order."""
     calls = []
 
-    def fake_run_job(job, *, defer_agent_teardown=None):
+    def fake_run_job(job, *, defer_agent_teardown=None, session_holder=None):
         calls.append(("run_job", job["id"]))
         fr = final if silent_marker_in is None else silent_marker_in
         return (success, output, fr, error)
@@ -103,7 +103,7 @@ def test_run_one_job_failed_job_delivers_error(monkeypatch):
 def test_run_one_job_exception_marks_failure(monkeypatch):
     """If run_job raises, the helper marks the run failed and returns False
     rather than propagating."""
-    def boom(job, *, defer_agent_teardown=None):
+    def boom(job, *, defer_agent_teardown=None, session_holder=None):
         raise RuntimeError("kaboom")
 
     monkeypatch.setattr(s, "run_job", boom)
@@ -136,7 +136,7 @@ def test_run_one_job_installs_secret_scope_under_multiplex(monkeypatch, tmp_path
 
     scope_during_run = {}
 
-    def fake_run_job(job, *, defer_agent_teardown=None):
+    def fake_run_job(job, *, defer_agent_teardown=None, session_holder=None):
         # This is where resolve_runtime_provider() would read a secret. Prove a
         # scope is installed and the profile's secret resolves without raising.
         scope_during_run["scope"] = ss.current_secret_scope()
@@ -176,7 +176,7 @@ def test_run_one_job_delivers_before_agent_teardown(monkeypatch):
         def close(self):
             order.append("agent.close")
 
-    def fake_run_job(job, *, defer_agent_teardown=None):
+    def fake_run_job(job, *, defer_agent_teardown=None, session_holder=None):
         order.append("run_job")
         # Mimic run_job's deferral contract: hand the live agent back so the
         # caller tears it down after delivery instead of in run_job's finally.
@@ -215,7 +215,7 @@ def test_run_one_job_tears_down_deferred_agent_when_delivery_raises(monkeypatch)
         def close(self):
             order.append("agent.close")
 
-    def fake_run_job(job, *, defer_agent_teardown=None):
+    def fake_run_job(job, *, defer_agent_teardown=None, session_holder=None):
         defer_agent_teardown.append(FakeAgent())
         return (True, "out", "final response", None)
 
@@ -250,7 +250,7 @@ def test_run_one_job_tears_down_deferred_agent_when_save_raises(monkeypatch):
         def close(self):
             order.append("agent.close")
 
-    def fake_run_job(job, *, defer_agent_teardown=None):
+    def fake_run_job(job, *, defer_agent_teardown=None, session_holder=None):
         defer_agent_teardown.append(FakeAgent())
         return (True, "out", "final response", None)
 

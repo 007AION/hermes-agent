@@ -21,6 +21,7 @@ from hermes_time import now as _hermes_now
 from cron.receipt import (
     capture_integrity_hashes,
     capture_resource_snapshot,
+    diff_job_field_views,
     lease_owner_identity,
     resolve_gateway_generation,
 )
@@ -42,7 +43,14 @@ _RECEIPT_COLUMNS = (
     "release",
     "post_snapshot",
     "post_hashes",
+    "session_id",
 )
+
+# A dedicated INTEGER flag (not a JSON receipt payload) so recovery can read —
+# durably, at admission time — whether an abandoned execution was agent-backed
+# (session required) or no_agent (exempt). R27: recover_interrupted_executions
+# appends ``session_id_missing`` for the former and never for the latter.
+_SESSION_REQUIRED_COLUMN = "session_required"
 
 
 def _connect() -> sqlite3.Connection:
@@ -98,6 +106,10 @@ def _migrate_receipt_columns(conn: sqlite3.Connection) -> None:
     for column in _RECEIPT_COLUMNS:
         if column not in existing:
             conn.execute(f"ALTER TABLE executions ADD COLUMN {column} TEXT")
+    if _SESSION_REQUIRED_COLUMN not in existing:
+        conn.execute(
+            f"ALTER TABLE executions ADD COLUMN {_SESSION_REQUIRED_COLUMN} INTEGER"
+        )
 
 
 @contextmanager
@@ -192,6 +204,7 @@ def _json_dump(value: Any) -> str:
 
 def create_execution(
     job_id: str, *, source: str, job: Optional[Dict[str, Any]] = None,
+    session_required: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """Persist a claimed attempt before executor/provider dispatch.
 
@@ -200,6 +213,13 @@ def create_execution(
     snapshot taken *before* the run, and integrity hashes of the selected job
     and its siblings. Captures happen outside the ledger lock so a slow
     ``/proc`` walk never stalls the write.
+
+    ``session_required`` persists whether this attempt is agent-backed and must
+    therefore carry a natural session identity. When left ``None`` it is derived
+    from the admission-time job's ``no_agent`` flag (absent/falsy = agent-backed
+    = required; ``no_agent=True`` = script watchdog = exempt). The value is
+    stored on the immutable row so recovery can read it long after the owner
+    exited (see ``recover_interrupted_executions``).
     """
     execution_id = uuid.uuid4().hex
     pid = os.getpid()
@@ -235,16 +255,26 @@ def create_execution(
     ))
     gateway_generation_json = _json_dump(gateway_generation) if gateway_generation else None
 
+    # Durable session-required classification (R27): an agent-backed execution
+    # must carry a natural session identity. Derived from the admission-time
+    # job's ``no_agent`` flag — absent/falsy ``no_agent`` means agent-backed
+    # (session required); ``no_agent=True`` means a script watchdog (exempt).
+    # Recovery later reads this flag to decide whether a NULL-session
+    # terminalization is an omission. Callers may override explicitly.
+    if session_required is None:
+        session_required = bool(job) and not job.get("no_agent")
+    session_required_flag = 1 if session_required else 0
+
     with _transaction() as conn:
         conn.execute(
             """INSERT INTO executions
                (id, job_id, source, process_id, pid, process_started_at,
                 status, claimed_at, gateway_generation, admission,
-                pre_snapshot, pre_hashes)
-               VALUES (?, ?, ?, ?, ?, ?, 'claimed', ?, ?, ?, ?, ?)""",
+                pre_snapshot, pre_hashes, session_required)
+               VALUES (?, ?, ?, ?, ?, ?, 'claimed', ?, ?, ?, ?, ?, ?)""",
             (execution_id, str(job_id), str(source), _PROCESS_ID, pid,
              process_started_at, now, gateway_generation_json,
-             admission, pre_snapshot, pre_hashes),
+             admission, pre_snapshot, pre_hashes, session_required_flag),
         )
         row = conn.execute(
             "SELECT * FROM executions WHERE id=?", (execution_id,)
@@ -268,9 +298,81 @@ def mark_execution_running(execution_id: str) -> Optional[Dict[str, Any]]:
         ).fetchone())
 
 
+def _append_pre_capture_error(
+    conn: sqlite3.Connection, execution_id: str,
+    raw_pre_hashes: Optional[str], error: str,
+) -> None:
+    """Append a capture error to the stored pre-hash receipt in place.
+
+    Used to persist fail-closed evidence (e.g. a session-id substitution) at
+    bind time, before a post-receipt exists. Operates on the caller's already
+    open connection inside the current transaction; never raises outward.
+    """
+    try:
+        obj = json.loads(raw_pre_hashes) if raw_pre_hashes else {}
+    except (ValueError, TypeError):
+        obj = {}
+    if not isinstance(obj, dict):
+        obj = {}
+    errors = list(obj.get("capture_errors", []))
+    if error not in errors:
+        errors.append(error)
+    obj["capture_errors"] = errors
+    conn.execute(
+        "UPDATE executions SET pre_hashes=? WHERE id=?",
+        (_json_dump(obj), execution_id),
+    )
+
+
+def bind_execution_session(
+    execution_id: str, session_id: str,
+) -> Optional[Dict[str, Any]]:
+    """Durably bind the exact natural cron session identity to an execution.
+
+    Called as soon as the natural session id is created and BEFORE provider /
+    model execution, so a hard gateway/process interruption between session
+    creation and finish can never lose the binding: the id is already on the
+    immutable row when recovery later terminalizes the abandoned attempt.
+
+    Idempotent and substitution-safe: ``COALESCE(session_id, ?)`` keeps the
+    first bound id, so a later conflicting id never overwrites it. A
+    conflicting second bind is still recorded as explicit
+    ``session_id_substitution`` fail-closed evidence on the stored pre-receipt
+    (there is no post-receipt yet at bind time) so a substitution is never
+    silent.
+    """
+    incoming = str(session_id).strip()
+    if not incoming:
+        return None
+    with _transaction() as conn:
+        stored = conn.execute(
+            "SELECT session_id, pre_hashes FROM executions WHERE id=?",
+            (execution_id,),
+        ).fetchone()
+        if stored is None:
+            return None
+        existing = stored["session_id"]
+        if existing and existing != incoming:
+            # Conflicting id — never overwrite; record fail-closed evidence.
+            _append_pre_capture_error(
+                conn, execution_id, stored["pre_hashes"], "session_id_substitution",
+            )
+        else:
+            conn.execute(
+                "UPDATE executions SET session_id=COALESCE(session_id, ?) "
+                "WHERE id=? AND status IN ('claimed','running')",
+                (incoming, execution_id),
+            )
+        return _record(conn.execute(
+            "SELECT * FROM executions WHERE id=?", (execution_id,)
+        ).fetchone())
+
+
 def finish_execution(
     execution_id: str, *, success: bool, error: Optional[str] = None,
     job: Optional[Dict[str, Any]] = None,
+    session_id: Optional[str] = None,
+    session_required: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """Write a terminal result once; terminal attempts cannot be rewritten.
 
@@ -282,6 +384,17 @@ def finish_execution(
     The post-receipt is bound to the execution's *stored* job identity, not the
     caller-supplied job: a caller finishing one execution with a different job
     cannot substitute a foreign identity into the immutable receipt.
+
+    ``session_id`` (when provided) is the exact natural cron session identity.
+    It is bound into the immutable row exactly once; a later conflicting id is
+    rejected (never overwrites the already-bound value) and recorded as an
+    explicit ``session_id_substitution`` fail-closed error.
+
+    ``session_required`` declares that this execution is an agent-backed run
+    that must carry a natural session identity. When True and the row
+    terminalizes with no session id (neither stored nor incoming), the omission
+    is recorded as an explicit ``session_id_missing`` fail-closed error instead
+    of a silently NULL session.
     """
     now = _hermes_now().isoformat()
     status = "completed" if success else "failed"
@@ -306,7 +419,8 @@ def finish_execution(
     # (and one lock hold) so a single finish still opens exactly one connection.
     with _transaction() as conn:
         stored = conn.execute(
-            "SELECT job_id FROM executions WHERE id=?", (execution_id,)
+            "SELECT job_id, pre_hashes, session_id FROM executions WHERE id=?",
+            (execution_id,),
         ).fetchone()
         if stored is None:
             return None
@@ -329,13 +443,56 @@ def finish_execution(
             post_hashes_obj["capture_errors"] = list(
                 post_hashes_obj.get("capture_errors", [])
             ) + ["caller_job_id_mismatch"]
+
+        # Classified field-level delta between the admission (pre) and release
+        # (post) canonical views. This proves every per-run delta and, when any
+        # nonvolatile (stable/redacted) field moved, surfaces it as explicit
+        # fail-closed evidence instead of leaving the pre/post hash drift opaque.
+        pre_fields = None
+        try:
+            stored_pre_hashes = json.loads(stored["pre_hashes"]) if stored["pre_hashes"] else None
+            if isinstance(stored_pre_hashes, dict):
+                pre_fields = stored_pre_hashes.get("selected_job_fields")
+        except (ValueError, TypeError):
+            pre_fields = None
+        field_diff = diff_job_field_views(
+            pre_fields, post_hashes_obj.get("selected_job_fields")
+        )
+        post_hashes_obj["selected_job_field_diff"] = field_diff
+        if field_diff.get("nonvolatile_drift"):
+            post_hashes_obj["capture_errors"] = list(
+                post_hashes_obj.get("capture_errors", [])
+            ) + ["nonvolatile_job_drift"]
+
+        # Bind the exact natural cron session identity exactly once. A second
+        # write with a different id can never overwrite the bound value
+        # (COALESCE below keeps the first); the mismatch is still recorded as
+        # explicit fail-closed evidence so a substitution is never silent.
+        incoming_session_id = str(session_id).strip() if session_id else None
+        stored_session_id = stored["session_id"]
+        if incoming_session_id and stored_session_id and stored_session_id != incoming_session_id:
+            post_hashes_obj["capture_errors"] = list(
+                post_hashes_obj.get("capture_errors", [])
+            ) + ["session_id_substitution"]
+        # Fail-closed omission: a required (agent-backed) execution must never
+        # terminalize with session_id still NULL and no evidence. When the
+        # caller declares the session required and neither the stored row nor
+        # the incoming caller supplied an identity, record it explicitly rather
+        # than silently completing without one (R25 omission fail-open).
+        bound_session_id = stored_session_id or incoming_session_id
+        if session_required and not bound_session_id:
+            post_hashes_obj["capture_errors"] = list(
+                post_hashes_obj.get("capture_errors", [])
+            ) + ["session_id_missing"]
         post_hashes = _json_dump(post_hashes_obj)
 
         cur = conn.execute(
             """UPDATE executions
-               SET status=?, finished_at=?, error=?, release=?, post_snapshot=?, post_hashes=?
+               SET status=?, finished_at=?, error=?, release=?, post_snapshot=?, post_hashes=?,
+                   session_id=COALESCE(session_id, ?)
                WHERE id=? AND status IN ('claimed','running')""",
-            (status, now, detail, release, post_snapshot, post_hashes, execution_id),
+            (status, now, detail, release, post_snapshot, post_hashes,
+             incoming_session_id, execution_id),
         )
         if cur.rowcount != 1:
             return None
@@ -353,6 +510,11 @@ def recover_interrupted_executions() -> int:
     an immediate post-release snapshot + integrity hashes. Exact evidence that
     is unavailable after the owner exited is recorded as explicit capture
     errors rather than a silently null terminal disposition.
+
+    A recovered agent-backed execution (``session_required`` persisted at
+    admission) whose row still has a NULL ``session_id`` is recorded with an
+    explicit ``session_id_missing`` capture error; a ``no_agent`` execution
+    (``session_required`` falsy) is exempt and never flagged.
     """
     now = _hermes_now().isoformat()
     error_msg = (
@@ -364,7 +526,7 @@ def recover_interrupted_executions() -> int:
     abandoned: List[Dict[str, Any]] = []
     with _transaction() as conn:
         rows = conn.execute(
-            """SELECT id, job_id, process_id, pid, process_started_at FROM executions
+            """SELECT id, job_id, process_id, pid, process_started_at, session_id, session_required FROM executions
                WHERE status IN ('claimed','running')"""
         ).fetchall()
         for row in rows:
@@ -378,6 +540,8 @@ def recover_interrupted_executions() -> int:
                 "process_id": row["process_id"],
                 "pid": int(row["pid"]),
                 "process_started_at": row["process_started_at"],
+                "session_id": row["session_id"],
+                "session_required": row["session_required"],
             })
 
     changed = 0
@@ -402,9 +566,19 @@ def recover_interrupted_executions() -> int:
             row["job_id"], None
         )
         post_snapshot = _json_dump(capture_resource_snapshot(selected_job, pid=row["pid"]))
-        post_hashes = _json_dump(capture_integrity_hashes(
+        post_hashes_obj = capture_integrity_hashes(
             row["job_id"], selected_job, siblings, sibling_load_error=sibling_load_error,
-        ))
+        )
+        # Fail-closed omission on the recovery path (R27): an abandoned
+        # agent-backed (session-required) execution terminalizing with a still
+        # NULL session must record explicit session_id_missing evidence — never
+        # a silently NULL session. no_agent rows (session_required falsy) stay
+        # exempt and keep their ordinary (possibly empty) capture_errors.
+        if row["session_required"] and not row["session_id"]:
+            post_hashes_obj["capture_errors"] = list(
+                post_hashes_obj.get("capture_errors", [])
+            ) + ["session_id_missing"]
+        post_hashes = _json_dump(post_hashes_obj)
 
         with _transaction() as conn:
             cur = conn.execute(

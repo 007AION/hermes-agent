@@ -278,7 +278,12 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
 }
 
 from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run, claim_dispatch, heartbeat_run_claim
-from cron.executions import create_execution, finish_execution, mark_execution_running
+from cron.executions import (
+    bind_execution_session,
+    create_execution,
+    finish_execution,
+    mark_execution_running,
+)
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
@@ -2747,7 +2752,8 @@ def _guard_job_credential_exfil(job: dict) -> None:
 
 
 def run_job(
-    job: dict, *, defer_agent_teardown: Optional[list] = None
+    job: dict, *, defer_agent_teardown: Optional[list] = None,
+    session_holder: Optional[list] = None,
 ) -> tuple[bool, str, str, Optional[str]]:
     """
     Execute a single cron job.
@@ -2761,6 +2767,14 @@ def run_job(
     torn-down async client (defense-in-depth alongside the interpreter-shutdown
     guard). When ``None`` (the default) teardown happens inline as before, so
     every existing caller is unchanged.
+
+    ``session_holder``: when a caller passes a list, ``run_job`` appends the
+    natural cron session id (``cron_<job_id>_<timestamp>``) to it once the
+    agent-backed run is admitted, so the caller can bind that exact identity
+    into the immutable execution ledger row (R24
+    IMMUTABLE_SESSION_BINDING_ABSENT). Early-return paths (``no_agent``,
+    injection-blocked, wake-gate skip) never create an agent session and leave
+    the holder empty.
 
     Returns:
         Tuple of (success, full_output_doc, final_response, error_message)
@@ -2999,6 +3013,23 @@ def run_job(
         return True, "", SILENT_MARKER, None
     origin = _resolve_origin(job)
     _cron_session_id = f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
+    if session_holder is not None:
+        session_holder.append(_cron_session_id)
+    # Durably bind the exact natural cron session identity into the immutable
+    # execution ledger row BEFORE provider/model execution, so a hard
+    # gateway/process interruption between session creation and finish can
+    # never lose it (R25 hard-interruption durability). Best-effort here:
+    # finish_execution still records fail-closed omission evidence if the
+    # required binding is somehow absent at the terminal write.
+    _execution_id = job.get("execution_id")
+    if _execution_id:
+        try:
+            bind_execution_session(_execution_id, _cron_session_id)
+        except Exception:
+            logger.warning(
+                "Job '%s': failed to durably bind cron session %s to execution %s",
+                job_id, _cron_session_id, _execution_id,
+            )
 
     logger.info("Running job '%s' (ID: %s)", job_name, job_id)
     logger.info("Prompt: %s", prompt[:100])
@@ -3855,6 +3886,10 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
     execution_id = job.get("execution_id")
     if not execution_id:
         execution_id = create_execution(job["id"], source="direct", job=job)["id"]
+        # Expose the id back on the job dict so run_job can durably bind the
+        # natural session identity at creation time (R25 hard-interruption).
+        job["execution_id"] = execution_id
+    _session_holder: list = []
     try:
         # Pre-run dispatch claim (issue #38758): atomically commit a finite
         # one-shot's dispatch BEFORE its side effect runs, so a tick that dies
@@ -3873,6 +3908,7 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
                 success=False,
                 error="Dispatch claim rejected; execution was not started.",
                 job=job,
+                session_required=not job.get("no_agent"),
             )
             return True  # not an error — already handled/removed
 
@@ -3906,7 +3942,8 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         _deferred_agents: list = []
         try:
             success, output, final_response, error = run_job(
-                job, defer_agent_teardown=_deferred_agents
+                job, defer_agent_teardown=_deferred_agents,
+                session_holder=_session_holder,
             )
         except BaseException:
             # run_job's finally still hands back the agent when it raises; tear
@@ -3986,14 +4023,28 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
 
         if not _consume_interrupted_flag(job["id"]):
             mark_job_run(job["id"], success, error, delivery_error=delivery_error)
-        finish_execution(execution_id, success=success, error=error, job=job)
+        finish_execution(
+            execution_id,
+            success=success,
+            error=error,
+            job=job,
+            session_id=_session_holder[0] if _session_holder else None,
+            session_required=not job.get("no_agent"),
+        )
         return True
 
     except Exception as e:
         logger.error("Error processing job %s: %s", job['id'], e)
         if not _consume_interrupted_flag(job["id"]):
             mark_job_run(job["id"], False, str(e))
-        finish_execution(execution_id, success=False, error=str(e), job=job)
+        finish_execution(
+            execution_id,
+            success=False,
+            error=str(e),
+            job=job,
+            session_id=_session_holder[0] if _session_holder else None,
+            session_required=not job.get("no_agent"),
+        )
         return False
 
 
@@ -4171,6 +4222,7 @@ def tick(
                     success=False,
                     error=f"Executor dispatch failed: {submit_err}",
                     job=job,
+                    session_required=not job.get("no_agent"),
                 )
                 # Interpreter began finalizing between the guard above and the
                 # submit — release the in-flight claim we just took and skip.
