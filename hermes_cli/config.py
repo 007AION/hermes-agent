@@ -2962,6 +2962,16 @@ DEFAULT_CONFIG = {
         # 1 = serial (pre-v0.9 behaviour).
         # Also overridable via HERMES_CRON_MAX_PARALLEL env var.
         "max_parallel_jobs": None,
+        # Minimum free cgroup-v2 pids headroom required to admit one scheduled
+        # execution on the built-in ticker (R31 pids.max containment). When the
+        # gateway runs under a finite TasksMax/pids.max (e.g. a systemd unit), a
+        # due job whose worker/provider/subprocess fan-out cannot be covered by
+        # the current free headroom is deferred to the next tick instead of
+        # failing with "can't start new thread". An unlimited ("max"),
+        # unavailable or malformed pids metric disables the check (platform
+        # fallback); a value <= 0 disables it explicitly. See
+        # cron.scheduler._cron_pids_admission_budget.
+        "pids_admission_reserve": 16,
         # Per-job output-file retention: save_job_output keeps the N most
         # recent .md files and prunes older ones. 0 or negative disables
         # pruning (for operators who manage cleanup externally). Default 50.
