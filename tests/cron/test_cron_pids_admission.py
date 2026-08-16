@@ -10,7 +10,9 @@ headroom recovers. On hosts with no finite pids ceiling (unlimited / cgroup v1
 """
 
 import pathlib
+from datetime import timedelta
 
+import cron.jobs as jobs
 import cron.scheduler as sched
 from cron import scheduler
 
@@ -234,3 +236,85 @@ class TestTickPidsAdmission:
         assert sched.tick(verbose=False) == 3
         assert sorted(st["submitted"]) == ["a", "b", "c"]
         assert sorted(st["advanced"]) == ["a", "b", "c"]
+
+
+# ---------------------------------------------------------------------------
+# real-storage stale-recurring conservation across a pids-budget defer
+# ---------------------------------------------------------------------------
+
+class TestStaleDueDeferConservation:
+    """Real-storage integration: a recurring job already beyond its catch-up
+    grace window is fast-forwarded by ``get_due_jobs()`` before admission is
+    known. A pids-budget defer must conserve that due state (re-anchor
+    ``next_run_at`` to the present) so recovery on the next cadence submits the
+    same obligation exactly once — no execution row, no failed/completed
+    receipt, and no cadence loss while deferred."""
+
+    @staticmethod
+    def _stale_recurring_job(tmp_path, monkeypatch, minutes_past=35):
+        monkeypatch.setattr(jobs, "CRON_DIR", tmp_path / "cron")
+        monkeypatch.setattr(jobs, "JOBS_FILE", tmp_path / "cron" / "jobs.json")
+        monkeypatch.setattr(jobs, "OUTPUT_DIR", tmp_path / "cron" / "output")
+        job = jobs.create_job(prompt="stale due obligation", schedule="every 1h")
+        records = jobs.load_jobs()
+        records[0]["next_run_at"] = (
+            jobs._hermes_now() - timedelta(minutes=minutes_past)
+        ).isoformat()
+        jobs.save_jobs(records)
+        return job
+
+    @staticmethod
+    def _stub_runtime(monkeypatch, budget):
+        executions = []
+        submissions = []
+        monkeypatch.setattr(sched, "_cron_pids_admission_budget", lambda: budget)
+        monkeypatch.setattr(
+            sched,
+            "create_execution",
+            lambda *a, **kw: executions.append((a, kw)) or {"id": "unexpected"},
+        )
+        monkeypatch.setattr(
+            sched,
+            "run_one_job",
+            lambda *a, **kw: submissions.append((a, kw)) or True,
+        )
+        monkeypatch.setattr("tools.mcp_tool._kill_orphaned_mcp_children", lambda: None)
+        return executions, submissions
+
+    def test_stale_due_job_deferred_by_budget_remains_due(self, tmp_path, monkeypatch):
+        job = self._stale_recurring_job(tmp_path, monkeypatch)
+        executions, submissions = self._stub_runtime(monkeypatch, budget=0)
+
+        assert sched.tick(verbose=False) == 0
+        assert executions == []
+        assert submissions == []
+
+        persisted = jobs.get_job(job["id"])
+        persisted_next = jobs._ensure_aware(
+            jobs.datetime.fromisoformat(persisted["next_run_at"])
+        )
+        assert persisted_next <= jobs._hermes_now(), (
+            "budget-exhausted job must remain due for next-cadence recovery; "
+            f"persisted next_run_at was advanced to {persisted_next.isoformat()}"
+        )
+
+    def test_recovered_headroom_submits_deferred_job_exactly_once(
+        self, tmp_path, monkeypatch
+    ):
+        job = self._stale_recurring_job(tmp_path, monkeypatch)
+        executions, submissions = self._stub_runtime(monkeypatch, budget=0)
+
+        # Phase 1: defer — nothing submitted, no execution row, still due.
+        assert sched.tick(verbose=False) == 0
+        assert executions == []
+        assert submissions == []
+        persisted = jobs.get_job(job["id"])
+        assert jobs._ensure_aware(
+            jobs.datetime.fromisoformat(persisted["next_run_at"])
+        ) <= jobs._hermes_now()
+
+        # Phase 2: headroom recovers — the SAME obligation submits exactly once.
+        monkeypatch.setattr(sched, "_cron_pids_admission_budget", lambda: None)
+        assert sched.tick(verbose=False) == 1
+        assert len(submissions) == 1
+        assert len(executions) == 1

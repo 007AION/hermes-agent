@@ -1857,6 +1857,39 @@ def advance_next_run(job_id: str) -> bool:
         return False
 
 
+def restore_due_next_run(job_id: str) -> bool:
+    """Re-anchor a deferred recurring job's ``next_run_at`` to the present so
+    it stays due and retries on the next cadence.
+
+    ``get_due_jobs()`` fast-forwards a stale recurring job (one whose scheduled
+    time lies beyond its catch-up grace window) to its next future occurrence
+    BEFORE admission is known, so a backlog does not burst-fire on restart.
+    When the pids admission budget then defers that job for this tick, that
+    fast-forward is already persisted — the job is no longer due and its
+    obligation would be silently dropped on the next cadence. This undoes that
+    side effect for the deferred job only: it re-anchors ``next_run_at`` to now
+    (still in the past on the next tick, and within grace, so it is not
+    re-fast-forwarded) without manufacturing an execution row or a
+    failed/completed receipt.
+
+    One-shot jobs are left unchanged — they are never fast-forwarded by
+    ``get_due_jobs()`` and keep their own retry/claim semantics.
+
+    Returns True if ``next_run_at`` was restored, False otherwise.
+    """
+    with _jobs_lock():
+        jobs = load_jobs()
+        for job in jobs:
+            if job["id"] == job_id:
+                kind = job.get("schedule", {}).get("kind")
+                if kind not in {"cron", "interval"}:
+                    return False
+                job["next_run_at"] = _hermes_now().isoformat()
+                save_jobs(jobs)
+                return True
+        return False
+
+
 def _machine_id() -> str:
     """Stable-ish identifier for claim attribution/debugging (NOT correctness).
 

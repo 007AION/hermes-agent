@@ -377,7 +377,7 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
     "QQBOT_HOME_CHANNEL": "QQ_HOME_CHANNEL",
 }
 
-from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run, claim_dispatch, heartbeat_run_claim
+from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run, restore_due_next_run, claim_dispatch, heartbeat_run_claim
 from cron.executions import (
     bind_execution_session,
     create_execution,
@@ -4239,6 +4239,7 @@ def tick(
                 _admission_budget -= 1
             admitted_jobs.append(job)
         for job in deferred_jobs:
+            restore_due_next_run(job["id"])
             logger.info(
                 "Job '%s' deferred — insufficient cgroup pids headroom; "
                 "will retry on the next cadence",
