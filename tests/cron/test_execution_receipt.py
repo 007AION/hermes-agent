@@ -877,3 +877,93 @@ def test_bind_execution_session_rejects_conflicting_rebind(monkeypatch, tmp_path
     pre_hashes = json.loads(rebound["pre_hashes"])
     assert "session_id_substitution" in pre_hashes["capture_errors"]
 
+
+# ---------------------------------------------------------------------------
+# R27 regressions — recovery terminalization records session omission
+# ---------------------------------------------------------------------------
+
+
+def _dead_owner(executions, record):
+    """Point an execution at a provably-dead foreign owner so recovery reaps it."""
+    with sqlite3.connect(executions.EXECUTIONS_FILE) as conn:
+        conn.execute(
+            "UPDATE executions SET process_id=?, process_started_at=? WHERE id=?",
+            ("old-import", -1, record["id"]),
+        )
+
+
+def test_create_execution_derives_session_required_from_no_agent(monkeypatch, tmp_path):
+    """The durable session-required flag is derived from ``no_agent`` at admission.
+
+    An absent/falsy ``no_agent`` is agent-backed (session required); a truthy
+    ``no_agent`` is a script watchdog (exempt). Neither caller needs to spell
+    out the flag — it is persisted on the immutable row.
+    """
+    executions = _point_ledger(monkeypatch, tmp_path)
+    agent = executions.create_execution("agent-job", source="builtin", job=_job(id="agent-job"))
+    assert agent["session_required"] == 1
+
+    script = executions.create_execution(
+        "script-job", source="builtin", job=_job(id="script-job", no_agent=True),
+    )
+    assert script["session_required"] == 0
+
+
+@pytest.mark.parametrize("source", ["builtin", "direct"])
+@pytest.mark.parametrize("no_agent", [False, True])
+def test_recovery_records_session_omission_for_agent_backed_rows(
+    monkeypatch, tmp_path, source, no_agent,
+):
+    """An abandoned agent-backed execution recovered with a still-NULL session
+    must append ``session_id_missing``; a ``no_agent`` execution must not.
+
+    RED on the audited head: every builtin/direct recovery (agent or no_agent)
+    terminalized with ``session_id=NULL`` and ``capture_errors==[]``, so the two
+    agent-backed cases silently lost the required-session omission. GREEN: the
+    admission-time ``session_required`` flag is durable, so recovery flags only
+    the agent-backed rows and leaves ``no_agent`` rows exempt.
+    """
+    executions = _point_ledger(monkeypatch, tmp_path)
+    job = _job(id=f"{source}-{'script' if no_agent else 'agent'}", no_agent=no_agent)
+    record = executions.create_execution(job["id"], source=source, job=job)
+
+    # The classification must be durable at admission, before the owner exits.
+    assert record["session_required"] == (0 if no_agent else 1)
+
+    _dead_owner(executions, record)
+    assert executions.recover_interrupted_executions() == 1
+    recovered = executions.latest_execution(job["id"])
+    assert recovered["status"] == "unknown"
+    assert recovered["session_id"] is None
+
+    post_hashes = json.loads(recovered["post_hashes"])
+    if no_agent:
+        assert "session_id_missing" not in post_hashes["capture_errors"]
+    else:
+        assert "session_id_missing" in post_hashes["capture_errors"]
+
+
+def test_migration_adds_session_required_column_to_existing_ledger(monkeypatch, tmp_path):
+    """A pre-R27 ledger migrates additively to carry the session_required flag."""
+    import cron.executions as executions
+
+    db = tmp_path / "cron" / "executions.db"
+    db.parent.mkdir(parents=True)
+    conn = sqlite3.connect(db)
+    conn.execute(
+        """CREATE TABLE executions (
+             id TEXT PRIMARY KEY, job_id TEXT NOT NULL, source TEXT NOT NULL,
+             process_id TEXT NOT NULL, pid INTEGER NOT NULL, process_started_at INTEGER,
+             status TEXT NOT NULL, claimed_at TEXT NOT NULL,
+             started_at TEXT, finished_at TEXT, error TEXT
+           )"""
+    )
+    conn.commit()
+    conn.close()
+
+    monkeypatch.setattr(executions, "EXECUTIONS_FILE", db)
+    record = executions.create_execution(
+        "job-receipt", source="builtin", job=_job(no_agent=False),
+    )
+    assert "session_required" in record  # column added by migration
+    assert record["session_required"] == 1
