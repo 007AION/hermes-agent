@@ -6742,18 +6742,84 @@ def promote_task(
     return True, None
 
 
-def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Transition ``blocked``/``scheduled`` -> ready or todo.
+def _has_block_loop_origin(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Return True when ``task_id`` was routed to triage by the loop breaker.
 
-    Defensively closes any stale ``current_run_id`` pointer before flipping
-    status. In the common path (``block_task`` closed the run already) this
-    is a no-op. If a future or external write left the pointer dangling,
-    the leaked run is closed as ``reclaimed`` inside the same txn so the
-    runs invariant (``current_run_id IS NULL`` ⇔ run row in terminal
-    state) holds for the rest of this function's lifetime.
+    ``block_task`` emits a ``block_loop_detected`` event exactly once per trip
+    (when ``block_recurrences`` reaches ``BLOCK_RECURRENCE_LIMIT``). That
+    event is the only machine-readable provenance that a triage task came from
+    the unblock-loop breaker rather than ordinary intake / specification. The
+    triage-recovery path in :func:`unblock_task` gates on this predicate so a
+    specifier's or intake's triage task is never silently promoted by an
+    unblock.
+    """
+    row = conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'block_loop_detected' LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    return row is not None
+
+
+def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Transition ``blocked``/``scheduled`` -> ready/todo, and recover a
+    block-loop-origin ``triage`` task.
+
+    Two distinct paths:
+
+    * **Block-loop triage recovery** (``status == 'triage'``): a triage task
+      that carries a ``block_loop_detected`` event was escalated by the loop
+      breaker, not by ordinary intake/specification. When the underlying
+      capability gate is now satisfied this is the safe, auditable resume
+      path. Parent-gated like the ordinary unblock (``ready`` iff every
+      parent is ``done``/``archived``, else ``todo``); the loop counter is
+      reset (fresh start — mirroring ``complete_task``) and a
+      ``recovered_triage`` event is appended. Any triage task WITHOUT that
+      provenance returns ``False`` (fail closed).
+
+    * **Ordinary unblock** (``status == 'blocked'/'scheduled'``): unchanged.
+      Defensively closes any stale ``current_run_id`` pointer before flipping
+      status. In the common path (``block_task`` closed the run already) this
+      is a no-op. If a future or external write left the pointer dangling,
+      the leaked run is closed as ``reclaimed`` inside the same txn so the
+      runs invariant (``current_run_id IS NULL`` ⇔ run row in terminal
+      state) holds for the rest of this function's lifetime.
     """
     now = int(time.time())
     with write_txn(conn):
+        cur_status_row = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if cur_status_row is None:
+            return False
+        if cur_status_row["status"] == "triage":
+            # Block-loop-origin triage recovery (AION-RL2-CORE-01-R29). Gate
+            # on ``block_loop_detected`` provenance: ordinary intake/specifier
+            # triage must stay fail-closed (it goes through ``specify`` or
+            # ``decompose``), never silently promoted by an unblock.
+            if not _has_block_loop_origin(conn, task_id):
+                return False
+            undone_parents = conn.execute(
+                "SELECT 1 FROM task_links l "
+                "JOIN tasks p ON p.id = l.parent_id "
+                "WHERE l.child_id = ? AND p.status NOT IN ('done', 'archived') LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            new_status = "todo" if undone_parents else "ready"
+            cur = conn.execute(
+                "UPDATE tasks SET status = ?, current_run_id = NULL, "
+                "consecutive_failures = 0, last_failure_error = NULL, "
+                "block_recurrences = 0, block_kind = NULL "
+                "WHERE id = ? AND status = 'triage'",
+                (new_status, task_id),
+            )
+            if cur.rowcount != 1:
+                return False
+            _append_event(
+                conn, task_id, "recovered_triage",
+                {"from": "block_loop_detected", "status": new_status},
+            )
+            return True
+
         stale = conn.execute(
             "SELECT current_run_id FROM tasks WHERE id = ? AND status IN ('blocked', 'scheduled')",
             (task_id,),
