@@ -26,6 +26,7 @@ The fix extends ``unblock_task`` with a narrow, provenance-gated branch:
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -34,13 +35,23 @@ from hermes_cli import kanban_db as kb
 
 
 @pytest.fixture
-def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Isolated HERMES_HOME + pinned Native Kanban DB (no live-board leak).
+
+    Wraps every DB-creating operation in :func:`hermes_cli.kanban_db.isolated_kanban_env`
+    so the fixture stays hermetic even when the test is launched by a dispatched
+    worker that inherits ``HERMES_KANBAN_DB`` / ``HERMES_KANBAN_BOARD`` /
+    workspaces/logs pins. Setting only ``HERMES_HOME`` + ``Path.home`` is NOT
+    sufficient: ``kanban_db_path()`` honours ``HERMES_KANBAN_DB`` first, so a
+    non-rebound probe writes synthetic rows into the live board (the exact
+    AION-RL2-CORE-01-R29-R1 defect)."""
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    kb.init_db()
-    return home
+    with kb.isolated_kanban_env(home):
+        kb.init_db()
+        yield home
 
 
 def _running_task(conn, title="t"):
@@ -232,3 +243,100 @@ def test_normal_blocked_unblock_unchanged(kanban_home: Path) -> None:
         assert kb.get_task(conn, tid).status == "ready"
         # No recovery event on the ordinary path.
         assert not any(e.kind == "recovered_triage" for e in kb.list_events(conn, tid))
+
+
+# ---------------------------------------------------------------------------
+# RED/GREEN — inherited-pin isolation (AION-RL2-CORE-01-R29-R1)
+# ---------------------------------------------------------------------------
+
+
+def test_red_inherited_kanban_db_pin_escapes_without_isolated_env(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """RED: reproduce the exact escape behind the R29 live-board pollution.
+
+    A probe that inherits the dispatcher-injected ``HERMES_KANBAN_DB`` pin but
+    only sets ``HERMES_HOME`` + ``Path.home`` (the pre-fix ``kanban_home``
+    fixture behaviour) writes synthetic rows into the PINNED DB — because
+    :func:`hermes_cli.kanban_db.kanban_db_path` honours ``HERMES_KANBAN_DB``
+    before ``HERMES_HOME``. The pinned DB is a disposable sentinel, never the
+    real aion-factory board.
+    """
+    import hermes_cli.kanban_db as _kb
+
+    sentinel = tmp_path / "sentinel-live-factory"
+    sentinel.mkdir()
+    sentinel_db = sentinel / "kanban.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(sentinel_db))
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "aion-factory")
+
+    with _kb.connect() as conn:
+        _kb.create_task(conn, title="real-factory-task", assignee="a")
+        before = [
+            r["id"] for r in conn.execute("SELECT id FROM tasks ORDER BY id").fetchall()
+        ]
+
+    # Pre-fix R29 fixture behaviour: isolated HERMES_HOME + Path.home, but the
+    # kanban DB pin is left in place (the defect).
+    isolated = tmp_path / "isolated-home"
+    isolated.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(isolated))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    _kb.init_db()
+    with _kb.connect() as conn:
+        leaked = _kb.create_task(conn, title="t")
+
+    with _kb.connect() as conn:
+        after = [
+            r["id"] for r in conn.execute("SELECT id FROM tasks ORDER BY id").fetchall()
+        ]
+
+    # The escape: the synthetic row landed in the pinned sentinel, and the
+    # intended isolated home received nothing.
+    assert leaked in after
+    assert len(after) == len(before) + 1
+    assert not (isolated / "kanban.db").exists()
+
+
+def test_green_isolated_kanban_env_zero_delta_to_sentinel(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """GREEN: ``isolated_kanban_env`` binds R29 synthetic fixtures away from
+    the pinned sentinel, leaving it zero-delta across repeated runs."""
+    import hermes_cli.kanban_db as _kb
+
+    sentinel = tmp_path / "sentinel-live-factory"
+    sentinel.mkdir()
+    sentinel_db = sentinel / "kanban.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(sentinel_db))
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "aion-factory")
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(sentinel))
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACES_ROOT", str(sentinel / "workspaces"))
+    monkeypatch.setenv("HERMES_KANBAN_ATTACHMENTS_ROOT", str(sentinel / "attachments"))
+
+    with _kb.connect() as conn:
+        _kb.create_task(conn, title="real-factory-task", assignee="a")
+        before = [
+            r["id"] for r in conn.execute("SELECT id FROM tasks ORDER BY id").fetchall()
+        ]
+
+    for run in (1, 2):  # repeated run must remain zero-delta
+        iso = tmp_path / f"isolated-probe-{run}"
+        iso.mkdir()
+        with _kb.isolated_kanban_env(iso):
+            with _kb.connect() as conn:
+                # Mirror the R29 synthetic fixtures: a block-loop-origin "t",
+                # an ordinary intake triage, and a terminal "done" task.
+                _kb.create_task(conn, title="t")
+                _kb.create_task(conn, title="intake", triage=True)
+                _kb.create_task(conn, title="done", assignee="worker")
+
+        with _kb.connect() as conn:
+            after = [
+                r["id"] for r in conn.execute("SELECT id FROM tasks ORDER BY id").fetchall()
+            ]
+        assert after == before, f"run {run}: sentinel mutated"
+
+    # Inherited pins are restored on context exit.
+    assert os.environ.get("HERMES_KANBAN_DB") == str(sentinel_db)
+    assert os.environ.get("HERMES_KANBAN_BOARD") == "aion-factory"
