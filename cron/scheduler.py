@@ -48,6 +48,106 @@ from hermes_time import now as _hermes_now
 logger = logging.getLogger(__name__)
 
 
+# R31 — builtin cron admission containment (shared-cgroup pids.max).
+#
+# The built-in ticker runs inside the gateway process, which on systemd hosts
+# sits in a service cgroup with a finite pids.max (TasksMax). A due scheduled
+# execution fans out: parallel tool workers (R18 caps at 4), a per-call
+# provider thread, sandbox-write subprocesses and browser child processes.
+# Before this change the ticker admitted a due job with no check on how much
+# free pids headroom the shared cgroup still had, so an aggregate overlap could
+# exhaust pids.max and strand unrelated obligations (R28: three sandbox EAGAINs
+# plus one `RuntimeError: can't start new thread`). The helpers below read the
+# cgroup v2 pids controller and let `tick` DEFER a due job to the next cadence
+# instead of manufacturing an execution that is doomed to fail.
+
+_CRON_PIDS_ADMISSION_RESERVE_DEFAULT = 16
+
+
+def _cron_pids_admission_reserve() -> int:
+    """Minimum free pids headroom required to admit one scheduled execution.
+
+    Read from ``cron.pids_admission_reserve`` in config.yaml. Default 16 — the
+    fan-out budget of a single cron execution (parallel tool workers + a
+    provider call thread + sandbox-write subprocesses + browser children). A
+    non-positive value disables the containment entirely (headroom is treated
+    as always sufficient), preserving the pre-R31 behaviour.
+    """
+    try:
+        cfg = load_config() or {}
+        cron_cfg = cfg.get("cron", {}) if isinstance(cfg, dict) else {}
+        raw = cron_cfg.get("pids_admission_reserve")
+        if raw is None:
+            return _CRON_PIDS_ADMISSION_RESERVE_DEFAULT
+        return int(raw)
+    except Exception:
+        return _CRON_PIDS_ADMISSION_RESERVE_DEFAULT
+
+
+def _cron_pids_headroom() -> Optional[int]:
+    """Free pids headroom for this process's service cgroup, or None.
+
+    Reads the cgroup v2 pids controller (``pids.max - pids.current``) for the
+    cgroup the gateway process belongs to. Returns ``None`` when there is no
+    finite ceiling to enforce:
+
+      * ``pids.max == "max"`` — unlimited (the common non-systemd / no-TasksMax
+        case);
+      * the cgroup is unavailable or not a cgroup-v2 hierarchy (macOS, Windows,
+        cgroup v1, containers without the pids controller) — platform fallback,
+        ordinary behaviour preserved;
+      * a metric is malformed — treated as unavailable rather than fail-closed,
+        so a bad read can never starve the schedule.
+
+    Otherwise returns ``max(0, pids.max - pids.current)``.
+    """
+    try:
+        text = Path("/proc/self/cgroup").read_text(encoding="utf-8")
+    except OSError:
+        return None
+    match = re.search(r"^0::(.+)$", text, re.MULTILINE)
+    if not match:
+        return None  # not a cgroup v2 unified hierarchy
+    base = Path(f"/sys/fs/cgroup{match.group(1).strip()}")
+    try:
+        max_raw = (base / "pids.max").read_text(encoding="utf-8").strip()
+        cur_raw = (base / "pids.current").read_text(encoding="utf-8").strip()
+    except OSError:
+        return None  # no pids controller / not mounted
+    if max_raw == "max":
+        return None  # unlimited — no finite ceiling to enforce
+    try:
+        pids_max = int(max_raw)
+        pids_current = int(cur_raw)
+    except ValueError:
+        return None  # malformed metric — treat as unavailable
+    if pids_max < 0 or pids_current < 0:
+        return None
+    return max(0, pids_max - pids_current)
+
+
+def _cron_pids_admission_budget() -> Optional[int]:
+    """Number of scheduled executions this tick may safely admit.
+
+    Returns ``None`` (unbounded — admit normally, subject only to
+    ``max_parallel_jobs``) when there is no finite pids ceiling, or when the
+    reserve is non-positive (containment disabled). Otherwise returns
+    ``floor(headroom / reserve)``: each admitted execution is assumed to need
+    up to ``reserve`` free pids for its worker/provider/subprocess fan-out, so
+    the aggregate due work is bounded by the headroom the shared cgroup can
+    actually cover. A result of ``0`` defers every due job this tick; deferred
+    jobs keep their ``next_run_at`` in the past and are retried on the next
+    cadence (no execution row is manufactured, no run is dropped).
+    """
+    reserve = _cron_pids_admission_reserve()
+    if reserve <= 0:
+        return None
+    headroom = _cron_pids_headroom()
+    if headroom is None:
+        return None
+    return headroom // reserve
+
+
 def _set_cron_session_title(session_db, session_id, base_title):
     """Robustly title a finished cron session before it is closed.
 
@@ -4121,12 +4221,37 @@ def tick(
         if verbose:
             logger.info("%s - %s job(s) due", _hermes_now().strftime('%H:%M:%S'), len(due_jobs))
 
-        # Advance next_run_at for all recurring jobs FIRST, under the file lock,
-        # before any execution begins.  This preserves at-most-once semantics.
-        # For parallel jobs that are already running, advance_next_run keeps
-        # bumping next_run_at forward so the grace window never expires.
-        # mark_job_run() overwrites next_run_at on completion.
+        # R31 admission containment: bound this tick's aggregate submissions by
+        # the free pids headroom the shared service cgroup can safely cover.
+        # A job that would be admitted past that budget is DEFERRED — it keeps
+        # its next_run_at in the past, so it stays due and retries on the next
+        # cadence; no execution row is manufactured and no run is dropped. On
+        # hosts with no finite pids ceiling (or when the reserve is disabled)
+        # the budget is None and every due job is admitted as before.
+        _admission_budget = _cron_pids_admission_budget()
+        admitted_jobs: list = []
+        deferred_jobs: list = []
         for job in due_jobs:
+            if _admission_budget is not None:
+                if _admission_budget <= 0:
+                    deferred_jobs.append(job)
+                    continue
+                _admission_budget -= 1
+            admitted_jobs.append(job)
+        for job in deferred_jobs:
+            logger.info(
+                "Job '%s' deferred — insufficient cgroup pids headroom; "
+                "will retry on the next cadence",
+                job.get("name", job.get("id")),
+            )
+
+        # Advance next_run_at for the admitted recurring jobs FIRST, under the
+        # file lock, before any execution begins.  This preserves at-most-once
+        # semantics.  For parallel jobs that are already running,
+        # advance_next_run keeps bumping next_run_at forward so the grace
+        # window never expires.  mark_job_run() overwrites next_run_at on
+        # completion.
+        for job in admitted_jobs:
             advance_next_run(job["id"])
 
         # Resolve max parallel workers: env var > config.yaml > unbounded.
@@ -4152,7 +4277,7 @@ def tick(
         if verbose:
             logger.info(
                 "Running %d job(s) in parallel (max_workers=%s)",
-                len(due_jobs),
+                len(admitted_jobs),
                 _max_workers if _max_workers else "unbounded",
             )
 
@@ -4169,8 +4294,8 @@ def tick(
         # That alone only keeps workdir jobs from overlapping EACH OTHER;
         # run_job's _terminal_cwd_lock is what additionally stops a concurrently
         # firing workdir-less parallel-pool job from observing the override.
-        sequential_jobs = [j for j in due_jobs if (j.get("workdir") or "").strip()]
-        parallel_jobs = [j for j in due_jobs if not (j.get("workdir") or "").strip()]
+        sequential_jobs = [j for j in admitted_jobs if (j.get("workdir") or "").strip()]
+        parallel_jobs = [j for j in admitted_jobs if not (j.get("workdir") or "").strip()]
 
         _results: list = []
         _all_futures: list = []
