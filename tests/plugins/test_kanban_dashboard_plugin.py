@@ -3457,7 +3457,16 @@ def _function_return_summary(trel, func, call, env, prov, caller_relpath, funcs,
     key = (trel, func.name)
     if key in ret_visited:
         return (None, None)
-    ret_visited.add(key)
+    # Path-local active recursion stack. The current function belongs to the
+    # active call path only for THIS invocation's analysis: we copy the entry
+    # stack, add the current function, and evaluate every sibling return arm
+    # from its own fresh copy of that stack. Nested helper calls therefore
+    # extend only their own path, and completing one sibling arm cannot mark a
+    # helper as "visited" for a later sibling arm (the R4 false-positive
+    # regression). True cycles and depth exhaustion still resolve to UNKNOWN
+    # via the entry-stack membership check above.
+    path_stack = set(ret_visited)
+    path_stack.add(key)
 
     # Base the callee's environment on its own module globals (so it sees its
     # own ``from hermes_cli import kanban_db`` / ``from ... import connect``),
@@ -3491,7 +3500,7 @@ def _function_return_summary(trel, func, call, env, prov, caller_relpath, funcs,
             bms.append(None)
             continue
         tag, bm = _expr_prov(ret.value, sub_env, sub_prov, trel, funcs, import_map,
-                             module_envs, canonical_boundary, depth + 1, ret_visited)
+                             module_envs, canonical_boundary, depth + 1, set(path_stack))
         tags.append(tag if tag is not None else UNKNOWN_RETURN)
         bms.append(bm)
     if not _definitely_returns(func.body):
@@ -4235,6 +4244,87 @@ def _return_lattice_closure():
             "def f(flag, sql):\n"
             "    selected = choose(flag)\n"
             "    selected.execute(sql)\n"
+        ),
+    }, True))
+
+    # --- repeated same-wrapper arms must still propagate (path-local) -------
+    # The R4 regression: a shared recursion stack let the first ``make()`` arm
+    # mark ``make`` as visited, so the second sibling ``make()`` arm was
+    # misclassified as a cycle and dropped to UNKNOWN. With path-local stacks
+    # every sibling arm is evaluated from the same clean entry stack.
+    cases.append(("TWO_SAME_WRAPPER_ARMS_MUST_STILL_PROPAGATE", {
+        "app.py": (
+            "from hermes_cli import kanban_db\n\n"
+            "def make():\n"
+            "    return kanban_db.connect()\n\n"
+            "def choose(flag):\n"
+            "    if flag:\n"
+            "        return make()\n"
+            "    return make()\n\n"
+            "def f(flag, sql):\n"
+            "    choose(flag).execute(sql)\n"
+        ),
+    }, True))
+    cases.append(("TWO_SAME_TWO_HOP_WRAPPER_ARMS_MUST_STILL_PROPAGATE", {
+        "app.py": (
+            "from hermes_cli import kanban_db\n\n"
+            "def make():\n"
+            "    return kanban_db.connect()\n\n"
+            "def wrap():\n"
+            "    return make()\n\n"
+            "def choose(flag):\n"
+            "    if flag:\n"
+            "        return wrap()\n"
+            "    return wrap()\n\n"
+            "def f(flag, sql):\n"
+            "    choose(flag).execute(sql)\n"
+        ),
+    }, True))
+    cases.append(("THREE_SAME_WRAPPER_ARMS_MUST_STILL_PROPAGATE", {
+        "app.py": (
+            "from hermes_cli import kanban_db\n\n"
+            "def make():\n"
+            "    return kanban_db.connect()\n\n"
+            "def choose(flag):\n"
+            "    if flag == 1:\n"
+            "        return make()\n"
+            "    if flag == 2:\n"
+            "        return make()\n"
+            "    return make()\n\n"
+            "def f(flag, sql):\n"
+            "    choose(flag).execute(sql)\n"
+        ),
+    }, True))
+    cases.append(("SAME_HELPER_INDEPENDENT_BRANCHES_MUST_STILL_PROPAGATE", {
+        "app.py": (
+            "from hermes_cli import kanban_db\n\n"
+            "def make():\n"
+            "    return kanban_db.connect()\n\n"
+            "def left():\n"
+            "    return make()\n\n"
+            "def right():\n"
+            "    return make()\n\n"
+            "def choose(flag):\n"
+            "    if flag:\n"
+            "        return left()\n"
+            "    return right()\n\n"
+            "def f(flag, sql):\n"
+            "    choose(flag).execute(sql)\n"
+        ),
+    }, True))
+    cases.append(("DIFFERENT_ACYCLIC_WRAPPERS_SAME_TAG_MUST_STILL_PROPAGATE", {
+        "app.py": (
+            "from hermes_cli import kanban_db\n\n"
+            "def make_a():\n"
+            "    return kanban_db.connect()\n\n"
+            "def make_b():\n"
+            "    return kanban_db.connect()\n\n"
+            "def choose(flag):\n"
+            "    if flag:\n"
+            "        return make_a()\n"
+            "    return make_b()\n\n"
+            "def f(flag, sql):\n"
+            "    choose(flag).execute(sql)\n"
         ),
     }, True))
 
