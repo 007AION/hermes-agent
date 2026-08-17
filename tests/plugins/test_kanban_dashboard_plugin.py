@@ -2796,24 +2796,41 @@ def _build_import_map(files):
     return import_map
 
 
-def _receiver_prov(node, env, prov, import_map=None, relpath=None):
+def _receiver_prov(node, env, prov, import_map=None, relpath=None,
+                   funcs=None, module_envs=None, canonical_boundary=None,
+                   depth=0, ret_visited=None):
     """Return the Kanban object provenance tag for a receiver expression, else None.
 
     A receiver may be a name, a direct factory call (``kanban_db.connect()``),
-    or a cursor-derivation chain (``conn.cursor()``). Only proven Kanban
+    a cursor-derivation chain (``conn.cursor()``), or — when the interprocedural
+    context is available — a helper call whose summarized return is a proven
+    Kanban connection/cursor/bound method. Only proven Kanban
     connection/cursor/method provenance is returned; non-Kanban receivers
     (logger, sqlite3) carry no tag.
     """
     if isinstance(node, ast.Name):
         p = prov.get(node.id)
         return p if p in _KANBAN_OBJECT_TAGS else None
-    if isinstance(node, ast.Call) and import_map is not None:
-        if _is_kanban_factory(node, env, prov, import_map, relpath):
-            return PROV_CONN
+    if isinstance(node, ast.Call):
+        if import_map is not None:
+            if _is_kanban_factory(node, env, prov, import_map, relpath):
+                return PROV_CONN
         fn = node.func
         if isinstance(fn, ast.Attribute) and fn.attr == "cursor":
-            if _receiver_prov(fn.value, env, prov, import_map, relpath) is not None:
+            if _receiver_prov(fn.value, env, prov, import_map, relpath,
+                              funcs, module_envs, canonical_boundary, depth, ret_visited) is not None:
                 return PROV_CURSOR
+        # Helper-call receiver: ``get_conn()`` / ``get_cursor()`` / ``get_run()``.
+        if isinstance(fn, ast.Name) and funcs is not None:
+            target = _resolve_callee(fn.id, relpath, funcs, import_map)
+            if target is not None:
+                trel, tfunc = target
+                if trel != canonical_boundary:
+                    tag, _bm = _function_return_summary(
+                        trel, tfunc, node, env, prov, relpath, funcs, import_map,
+                        module_envs, canonical_boundary, depth, ret_visited)
+                    if tag in _KANBAN_OBJECT_TAGS:
+                        return tag
     return None
 
 
@@ -2890,6 +2907,36 @@ def _is_kanban_factory(call, env, prov, import_map, relpath):
     return False
 
 
+def _factory_callable_prov(node, env, prov, import_map=None, relpath=None):
+    """Return PROV_KANBAN_CONNECT if ``node`` names the Kanban connection
+    factory *callable* without invoking it, else None.
+
+    Covers the imported symbol (``from hermes_cli.kanban_db import connect`` ->
+    ``connect``) and the attribute form (``kanban_db.connect``) where
+    ``kanban_db`` is the proven factory module. This is the callable identity
+    that must survive ``make = kanban_db.connect`` / ``make = connect`` and any
+    plain/repeated alias of ``make``.
+    """
+    if isinstance(node, ast.Name):
+        if prov.get(node.id) == PROV_KANBAN_CONNECT:
+            return PROV_KANBAN_CONNECT
+        if import_map is not None and relpath is not None:
+            target = import_map.get((relpath, node.id))
+            if target and target[0] == CANONICAL_BOUNDARY and target[1] == "connect":
+                return PROV_KANBAN_CONNECT
+        return None
+    if isinstance(node, ast.Attribute) and node.attr == "connect":
+        base = node.value
+        if isinstance(base, ast.Name):
+            if prov.get(base.id) == PROV_KANBAN_MODULE:
+                return PROV_KANBAN_CONNECT
+            if import_map is not None and relpath is not None:
+                target = import_map.get((relpath, base.id))
+                if target and target[0] == CANONICAL_BOUNDARY:
+                    return PROV_KANBAN_CONNECT
+    return None
+
+
 def scan_status_sql(files, entrypoints=None, canonical_boundary=CANONICAL_BOUNDARY):
     """Scan a set of files for direct ``tasks.status`` lifecycle SQL.
 
@@ -2919,6 +2966,11 @@ def scan_status_sql(files, entrypoints=None, canonical_boundary=CANONICAL_BOUNDA
 
     import_map = _build_import_map(files)
 
+    module_envs = {}
+    for relpath, tree in trees.items():
+        if tree is not None:
+            module_envs[relpath] = _module_env(tree, relpath, import_map)
+
     eps = []
     if entrypoints is None:
         for relpath, tree in trees.items():
@@ -2940,7 +2992,7 @@ def scan_status_sql(files, entrypoints=None, canonical_boundary=CANONICAL_BOUNDA
         if entrypoints is not None:
             _seed_entrypoint_params(func, prov)
         _process_stmts(func.body, env, prov, relpath, funcs, import_map, raw,
-                       canonical_boundary, 0, set())
+                       canonical_boundary, 0, set(), module_envs)
 
     # Dedupe (a function reached via multiple entrypoints/inlines is one find).
     seen = set()
@@ -2982,21 +3034,33 @@ def _module_env(tree, relpath, import_map):
     return env, prov
 
 
-def _assign_target(env, prov, tgt, value, relpath, import_map):
+def _assign_target(env, prov, tgt, value, relpath, import_map, funcs=None,
+                   module_envs=None, canonical_boundary=None, depth=0, ret_visited=None):
     if isinstance(tgt, ast.Name):
-        _assign(env, prov, tgt.id, value, relpath, import_map)
+        _assign(env, prov, tgt.id, value, relpath, import_map, funcs,
+                module_envs, canonical_boundary, depth, ret_visited)
     elif isinstance(tgt, (ast.Tuple, ast.List)) and isinstance(value, (ast.Tuple, ast.List)):
         if len(tgt.elts) == len(value.elts):
             for te, ve in zip(tgt.elts, value.elts):
-                _assign_target(env, prov, te, ve, relpath, import_map)
+                _assign_target(env, prov, te, ve, relpath, import_map, funcs,
+                               module_envs, canonical_boundary, depth, ret_visited)
 
 
-def _assign(env, prov, name, value, relpath, import_map):
+def _assign(env, prov, name, value, relpath, import_map, funcs=None,
+            module_envs=None, canonical_boundary=None, depth=0, ret_visited=None):
     # Bound mutation method alias: ``run = conn.execute``.
     if isinstance(value, ast.Attribute) and value.attr in MUTATION_METHODS:
         env[name] = ("__BOUND_METHOD__", value.attr)
-        if _receiver_prov(value.value, env, prov, import_map, relpath) is not None:
+        if _receiver_prov(value.value, env, prov, import_map, relpath,
+                          funcs, module_envs, canonical_boundary, depth, ret_visited) is not None:
             prov[name] = PROV_METHOD
+        return
+    # Kanban connection factory *callable* alias: ``make = kanban_db.connect`` /
+    # ``make = connect``. The callable identity must survive so ``conn = make()``
+    # is still recognized as a factory invocation.
+    if (isinstance(value, ast.Attribute) and value.attr == "connect"
+            and _factory_callable_prov(value, env, prov, import_map, relpath)):
+        prov[name] = PROV_KANBAN_CONNECT
         return
     # Opaque bound method alias: ``run = getattr(conn, 'execute')``.
     if (isinstance(value, ast.Call) and isinstance(value.func, ast.Name)
@@ -3004,30 +3068,57 @@ def _assign(env, prov, name, value, relpath, import_map):
         attr_name = _fold_string(value.args[1], env)
         if isinstance(attr_name, str) and attr_name in MUTATION_METHODS:
             env[name] = ("__BOUND_METHOD__", attr_name)
-            if _receiver_prov(value.args[0], env, prov, import_map, relpath) is not None:
+            if _receiver_prov(value.args[0], env, prov, import_map, relpath,
+                              funcs, module_envs, canonical_boundary, depth, ret_visited) is not None:
                 prov[name] = PROV_METHOD
             return
     # Kanban cursor: ``cur = conn.cursor()``.
     if (isinstance(value, ast.Call) and isinstance(value.func, ast.Attribute)
             and value.func.attr == "cursor"):
-        if _receiver_prov(value.func.value, env, prov, import_map, relpath) is not None:
+        if _receiver_prov(value.func.value, env, prov, import_map, relpath,
+                          funcs, module_envs, canonical_boundary, depth, ret_visited) is not None:
             prov[name] = PROV_CURSOR
         return
     # Kanban connection factory: ``conn = kanban_db.connect(...)`` / ``_conn(...)``.
     if isinstance(value, ast.Call) and _is_kanban_factory(value, env, prov, import_map, relpath):
         prov[name] = PROV_CONN
         return
+    # Helper-call return provenance: ``conn = get_conn()`` / ``run = get_run(conn)``
+    # / ``cur = get_cursor(conn)`` (local or mapped cross-file helper).
+    if (isinstance(value, ast.Call) and isinstance(value.func, ast.Name)
+            and funcs is not None):
+        target = _resolve_callee(value.func.id, relpath, funcs, import_map)
+        if target is not None:
+            trel, tfunc = target
+            if trel != canonical_boundary:
+                rv = ret_visited if ret_visited is not None else set()
+                tag, bm = _function_return_summary(
+                    trel, tfunc, value, env, prov, relpath, funcs, import_map,
+                    module_envs, canonical_boundary, depth, rv)
+                if tag == PROV_METHOD:
+                    env[name] = bm
+                    prov[name] = PROV_METHOD
+                    return
+                if tag in (PROV_CONN, PROV_CURSOR):
+                    prov[name] = tag
+                    return
+                if tag == PROV_KANBAN_CONNECT:
+                    prov[name] = PROV_KANBAN_CONNECT
+                    return
     if isinstance(value, ast.Constant) and isinstance(value.value, str):
         env[name] = value.value
         return
     if isinstance(value, ast.List):
         env[name] = _fold_list(value, env)
         return
-    # Plain alias: ``db = conn`` (inherit Kanban provenance).
+    # Plain alias: ``db = conn`` (inherit Kanban provenance) or a factory-callable
+    # alias (``make2 = make``).
     if isinstance(value, ast.Name):
         p = prov.get(value.id)
         if p in _KANBAN_OBJECT_TAGS:
             prov[name] = p
+        if p == PROV_KANBAN_CONNECT:
+            prov[name] = PROV_KANBAN_CONNECT
         # A bound mutation method also keeps its callable identity through a
         # plain alias: ``run = conn.execute; alias = run`` must stay callable.
         bm = env.get(value.id)
@@ -3039,30 +3130,32 @@ def _assign(env, prov, name, value, relpath, import_map):
 
 
 def _process_stmts(stmts, env, prov, relpath, funcs, import_map, violations,
-                   canonical_boundary, depth, visited):
+                   canonical_boundary, depth, visited, module_envs):
     if depth > 24:
         return
     for stmt in stmts:
         _process_stmt(stmt, env, prov, relpath, funcs, import_map, violations,
-                      canonical_boundary, depth, visited)
+                      canonical_boundary, depth, visited, module_envs)
 
 
 def _process_stmt(stmt, env, prov, relpath, funcs, import_map, violations,
-                  canonical_boundary, depth, visited):
+                  canonical_boundary, depth, visited, module_envs):
     if isinstance(stmt, ast.Assign):
         _scan_calls(stmt.value, env, prov, relpath, funcs, import_map, violations,
-                    canonical_boundary, depth, visited)
+                    canonical_boundary, depth, visited, module_envs)
         for tgt in stmt.targets:
-            _assign_target(env, prov, tgt, stmt.value, relpath, import_map)
+            _assign_target(env, prov, tgt, stmt.value, relpath, import_map,
+                           funcs, module_envs, canonical_boundary, depth, None)
     elif isinstance(stmt, ast.AnnAssign):
         if stmt.value is not None:
             _scan_calls(stmt.value, env, prov, relpath, funcs, import_map, violations,
-                        canonical_boundary, depth, visited)
+                        canonical_boundary, depth, visited, module_envs)
         if isinstance(stmt.target, ast.Name) and stmt.value is not None:
-            _assign(env, prov, stmt.target.id, stmt.value, relpath, import_map)
+            _assign(env, prov, stmt.target.id, stmt.value, relpath, import_map,
+                    funcs, module_envs, canonical_boundary, depth, None)
     elif isinstance(stmt, ast.AugAssign):
         _scan_calls(stmt.value, env, prov, relpath, funcs, import_map, violations,
-                    canonical_boundary, depth, visited)
+                    canonical_boundary, depth, visited, module_envs)
         if isinstance(stmt.target, ast.Name):
             cur = env.get(stmt.target.id, UNRESOLVED)
             inc = _fold_string(stmt.value, env)
@@ -3070,64 +3163,64 @@ def _process_stmt(stmt, env, prov, relpath, funcs, import_map, violations,
                 env[stmt.target.id] = cur + inc
     elif isinstance(stmt, ast.Expr):
         _scan_calls(stmt.value, env, prov, relpath, funcs, import_map, violations,
-                    canonical_boundary, depth, visited)
+                    canonical_boundary, depth, visited, module_envs)
     elif isinstance(stmt, ast.Return):
         if stmt.value is not None:
             _scan_calls(stmt.value, env, prov, relpath, funcs, import_map, violations,
-                        canonical_boundary, depth, visited)
+                        canonical_boundary, depth, visited, module_envs)
     elif isinstance(stmt, ast.If):
         _scan_calls(stmt.test, env, prov, relpath, funcs, import_map, violations,
-                    canonical_boundary, depth, visited)
+                    canonical_boundary, depth, visited, module_envs)
         _process_stmts(stmt.body, env, prov, relpath, funcs, import_map, violations,
-                       canonical_boundary, depth + 1, visited)
+                       canonical_boundary, depth + 1, visited, module_envs)
         _process_stmts(stmt.orelse, env, prov, relpath, funcs, import_map, violations,
-                       canonical_boundary, depth + 1, visited)
+                       canonical_boundary, depth + 1, visited, module_envs)
     elif isinstance(stmt, (ast.For, ast.AsyncFor)):
         _scan_calls(stmt.iter, env, prov, relpath, funcs, import_map, violations,
-                    canonical_boundary, depth, visited)
+                    canonical_boundary, depth, visited, module_envs)
         _process_stmts(stmt.body, env, prov, relpath, funcs, import_map, violations,
-                       canonical_boundary, depth + 1, visited)
+                       canonical_boundary, depth + 1, visited, module_envs)
         _process_stmts(stmt.orelse, env, prov, relpath, funcs, import_map, violations,
-                       canonical_boundary, depth + 1, visited)
+                       canonical_boundary, depth + 1, visited, module_envs)
     elif isinstance(stmt, (ast.With, ast.AsyncWith)):
         for item in stmt.items:
             _scan_calls(item.context_expr, env, prov, relpath, funcs, import_map,
-                        violations, canonical_boundary, depth, visited)
+                        violations, canonical_boundary, depth, visited, module_envs)
         _process_stmts(stmt.body, env, prov, relpath, funcs, import_map, violations,
-                       canonical_boundary, depth + 1, visited)
+                       canonical_boundary, depth + 1, visited, module_envs)
     elif isinstance(stmt, ast.Try):
         _process_stmts(stmt.body, env, prov, relpath, funcs, import_map, violations,
-                       canonical_boundary, depth + 1, visited)
+                       canonical_boundary, depth + 1, visited, module_envs)
         for h in stmt.handlers:
             _process_stmts(h.body, env, prov, relpath, funcs, import_map, violations,
-                           canonical_boundary, depth + 1, visited)
+                           canonical_boundary, depth + 1, visited, module_envs)
         _process_stmts(stmt.orelse, env, prov, relpath, funcs, import_map, violations,
-                       canonical_boundary, depth + 1, visited)
+                       canonical_boundary, depth + 1, visited, module_envs)
         _process_stmts(stmt.finalbody, env, prov, relpath, funcs, import_map, violations,
-                       canonical_boundary, depth + 1, visited)
+                       canonical_boundary, depth + 1, visited, module_envs)
     elif isinstance(stmt, ast.While):
         _scan_calls(stmt.test, env, prov, relpath, funcs, import_map, violations,
-                    canonical_boundary, depth, visited)
+                    canonical_boundary, depth, visited, module_envs)
         _process_stmts(stmt.body, env, prov, relpath, funcs, import_map, violations,
-                       canonical_boundary, depth + 1, visited)
+                       canonical_boundary, depth + 1, visited, module_envs)
         _process_stmts(stmt.orelse, env, prov, relpath, funcs, import_map, violations,
-                       canonical_boundary, depth + 1, visited)
+                       canonical_boundary, depth + 1, visited, module_envs)
 
 
 def _scan_calls(node, env, prov, relpath, funcs, import_map, violations,
-                canonical_boundary, depth, visited):
+                canonical_boundary, depth, visited, module_envs):
     if node is None:
         return
     if isinstance(node, ast.Call):
         _classify_call(node, env, prov, relpath, funcs, import_map, violations,
-                       canonical_boundary, depth, visited)
+                       canonical_boundary, depth, visited, module_envs)
     for child in ast.iter_child_nodes(node):
         _scan_calls(child, env, prov, relpath, funcs, import_map, violations,
-                    canonical_boundary, depth, visited)
+                    canonical_boundary, depth, visited, module_envs)
 
 
 def _classify_call(call, env, prov, relpath, funcs, import_map, violations,
-                   canonical_boundary, depth, visited):
+                   canonical_boundary, depth, visited, module_envs):
     if depth > 24:
         return
     fn = call.func
@@ -3142,7 +3235,8 @@ def _classify_call(call, env, prov, relpath, funcs, import_map, violations,
             return
         if fn.attr in MUTATION_METHODS:
             # Flag only when the receiver is a *proven* Kanban object.
-            if _receiver_prov(fn.value, env, prov, import_map, relpath) is None:
+            if _receiver_prov(fn.value, env, prov, import_map, relpath,
+                              funcs, module_envs, canonical_boundary, depth, set()) is None:
                 return
             sql_arg = call.args[0] if call.args else None
             if sql_arg is None:
@@ -3156,7 +3250,8 @@ def _classify_call(call, env, prov, relpath, funcs, import_map, violations,
         if len(fn.args) >= 2:
             attr_name = _fold_string(fn.args[1], env)
             if isinstance(attr_name, str) and attr_name in MUTATION_METHODS:
-                if _receiver_prov(fn.args[0], env, prov, import_map, relpath) is None:
+                if _receiver_prov(fn.args[0], env, prov, import_map, relpath,
+                                  funcs, module_envs, canonical_boundary, depth, set()) is None:
                     return
                 sql_arg = call.args[0] if call.args else None
                 if sql_arg is None:
@@ -3191,7 +3286,7 @@ def _classify_call(call, env, prov, relpath, funcs, import_map, violations,
         sub_env = _bind_params(tfunc, call, env)
         sub_prov = _bind_params_prov(tfunc, call, env, prov, import_map, relpath)
         _process_stmts(tfunc.body, sub_env, sub_prov, trel, funcs, import_map, violations,
-                       canonical_boundary, depth + 1, visited)
+                       canonical_boundary, depth + 1, visited, module_envs)
 
 
 def _resolve_callee(name, relpath, funcs, import_map):
@@ -3228,6 +3323,141 @@ def _bind_params_prov(tfunc, call, env, prov, import_map, relpath):
             if pv is not None:
                 sub_prov[p.arg] = pv
     return sub_prov
+
+
+def _collect_returns(node_or_stmts, depth=0):
+    """Yield ``Return`` nodes reachable from a body, skipping nested
+    function/class/lambda definitions. Bounded by ``depth``."""
+    if depth > 24:
+        return
+    stmts = node_or_stmts if isinstance(node_or_stmts, (list, tuple)) else [node_or_stmts]
+    for node in stmts:
+        if node is None:
+            continue
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+            continue
+        if isinstance(node, ast.Return):
+            yield node
+            continue
+        for child in ast.iter_child_nodes(node):
+            yield from _collect_returns(child, depth + 1)
+
+
+def _expr_prov(node, env, prov, relpath, funcs, import_map, module_envs,
+               canonical_boundary, depth, ret_visited):
+    """Summarize the Kanban provenance of an arbitrary expression.
+
+    Returns ``(tag, bound_method)`` where ``tag`` is PROV_CONN / PROV_CURSOR /
+    PROV_METHOD / PROV_KANBAN_CONNECT / None, and ``bound_method`` is a
+    ``('__BOUND_METHOD__', attr)`` tuple for a bound mutation method (else
+    None). Conservative: unknown / non-Kanban / conflicting expressions yield
+    ``(None, None)``.
+    """
+    if depth > 24 or node is None:
+        return (None, None)
+    if isinstance(node, ast.Name):
+        tag = prov.get(node.id)
+        if tag in _KANBAN_OBJECT_TAGS:
+            if tag == PROV_METHOD:
+                bm = env.get(node.id)
+                if isinstance(bm, tuple) and len(bm) == 2 and bm[0] == "__BOUND_METHOD__":
+                    return (PROV_METHOD, bm)
+            return (tag, None)
+        if tag == PROV_KANBAN_CONNECT:
+            return (PROV_KANBAN_CONNECT, None)
+        return (None, None)
+    if isinstance(node, ast.Attribute):
+        if node.attr in MUTATION_METHODS:
+            if _receiver_prov(node.value, env, prov, import_map, relpath,
+                              funcs, module_envs, canonical_boundary, depth, ret_visited) is not None:
+                return (PROV_METHOD, ("__BOUND_METHOD__", node.attr))
+            return (None, None)
+        if node.attr == "connect" and _factory_callable_prov(node, env, prov, import_map, relpath):
+            return (PROV_KANBAN_CONNECT, None)
+        return (None, None)
+    if isinstance(node, ast.Call):
+        # Opaque bound method value: ``getattr(conn, 'execute')``.
+        if isinstance(node.func, ast.Name) and node.func.id == "getattr" and len(node.args) >= 2:
+            attr = _fold_string(node.args[1], env)
+            if isinstance(attr, str) and attr in MUTATION_METHODS:
+                if _receiver_prov(node.args[0], env, prov, import_map, relpath,
+                                  funcs, module_envs, canonical_boundary, depth, ret_visited) is not None:
+                    return (PROV_METHOD, ("__BOUND_METHOD__", attr))
+            return (None, None)
+        if _is_kanban_factory(node, env, prov, import_map, relpath):
+            return (PROV_CONN, None)
+        fn = node.func
+        if isinstance(fn, ast.Attribute) and fn.attr == "cursor":
+            if _receiver_prov(fn.value, env, prov, import_map, relpath,
+                              funcs, module_envs, canonical_boundary, depth, ret_visited) is not None:
+                return (PROV_CURSOR, None)
+            return (None, None)
+        if isinstance(fn, ast.Name):
+            target = _resolve_callee(fn.id, relpath, funcs, import_map)
+            if target is not None:
+                trel, tfunc = target
+                if trel != canonical_boundary:
+                    return _function_return_summary(
+                        trel, tfunc, node, env, prov, relpath, funcs, import_map,
+                        module_envs, canonical_boundary, depth, ret_visited)
+        return (None, None)
+    return (None, None)
+
+
+def _function_return_summary(trel, func, call, env, prov, caller_relpath, funcs,
+                             import_map, module_envs, canonical_boundary, depth,
+                             ret_visited):
+    """Argument-sensitive, cycle-safe, depth-bounded return-provenance summary.
+
+    Binds the callee's parameters to the actual call arguments, merges the
+    callee module's import provenance, and merges every reachable ``return``
+    expression's provenance. Returns ``(tag, bound_method)``; conservative
+    ``(None, None)`` for unknown / conflicting / boundary / cyclic functions.
+    """
+    if depth > 24:
+        return (None, None)
+    key = (trel, func.name)
+    if key in ret_visited:
+        return (None, None)
+    ret_visited.add(key)
+
+    # Base the callee's environment on its own module globals (so it sees its
+    # own ``from hermes_cli import kanban_db`` / ``from ... import connect``),
+    # then bind each parameter to the caller-side argument expression.
+    m_env, m_prov = (module_envs or {}).get(trel, ({}, {}))
+    sub_env = dict(m_env)
+    sub_prov = dict(m_prov)
+    for i, p in enumerate(func.args.args):
+        if i < len(call.args):
+            arg = call.args[i]
+            v = _fold_string(arg, env)
+            if isinstance(v, str):
+                sub_env[p.arg] = v
+            else:
+                bm = _bound_method_env(arg, env)
+                if bm is not None:
+                    sub_env[p.arg] = bm
+            pv = _arg_prov(arg, env, prov, import_map, caller_relpath)
+            if pv is not None:
+                sub_prov[p.arg] = pv
+
+    tags = []
+    bms = []
+    for ret in _collect_returns(func.body):
+        if ret.value is None:
+            continue
+        tag, bm = _expr_prov(ret.value, sub_env, sub_prov, trel, funcs, import_map,
+                             module_envs, canonical_boundary, depth + 1, ret_visited)
+        if tag is not None:
+            tags.append(tag)
+            bms.append(bm)
+    if not tags:
+        return (None, None)
+    first_tag = tags[0]
+    first_bm = bms[0]
+    if all(t == first_tag for t in tags) and all(b == first_bm for b in bms):
+        return (first_tag, first_bm)
+    return (None, None)
 
 
 def _record_if_violation(shape, sql_arg, call, relpath, canonical_boundary, violations):
@@ -3611,6 +3841,218 @@ def test_i01_scanner_bound_method_transport_closure():
             f"{case_id}: expected_violation={expect} observed={observed} "
             f"violations={viols}"
         )
+
+
+# ============================================================================
+# AION R4/I01 — R3 repair: factory callable + helper return provenance
+# (structural, cycle-safe, depth-bounded, argument-sensitive)
+# ============================================================================
+
+def test_i01_scanner_factory_callable_alias_then_conn():
+    """FRESH_FACTORY_CALLABLE_ALIAS_THEN_CONN: ``make = kanban_db.connect;
+    conn = make(); conn.execute(sql)`` must fail closed (factory callable
+    identity survives the alias)."""
+    files = {"app.py": (
+        "from hermes_cli import kanban_db\n\n"
+        "def f(sql):\n"
+        "    make = kanban_db.connect\n"
+        "    conn = make()\n"
+        "    conn.execute(sql)\n"
+    )}
+    viols = scan_status_sql(files, entrypoints=["app.f"])
+    assert viols, "factory callable alias must be flagged"
+    assert any(v["expectation"] == "FAIL_CLOSED_UNRESOLVED_DYNAMIC_SQL" for v in viols), viols
+
+
+def test_i01_scanner_helper_returns_conn():
+    """FRESH_HELPER_RETURNS_CONN: ``get_conn() -> kanban_db.connect();
+    conn = get_conn(); conn.execute(sql)`` must fail closed."""
+    files = {"app.py": (
+        "from hermes_cli import kanban_db\n\n"
+        "def get_conn():\n"
+        "    return kanban_db.connect()\n\n"
+        "def f(sql):\n"
+        "    conn = get_conn()\n"
+        "    conn.execute(sql)\n"
+    )}
+    viols = scan_status_sql(files, entrypoints=["app.f"])
+    assert viols, "helper-returned connection must be flagged"
+    assert any(v["expectation"] == "FAIL_CLOSED_UNRESOLVED_DYNAMIC_SQL" for v in viols), viols
+
+
+def test_i01_scanner_helper_returns_bound_method():
+    """FRESH_HELPER_RETURNS_BOUND_METHOD: ``get_run(conn) -> conn.execute;
+    run = get_run(conn); run(sql)`` must fail closed."""
+    files = {"app.py": (
+        "def get_run(conn):\n"
+        "    return conn.execute\n\n"
+        "def f(conn, sql):\n"
+        "    run = get_run(conn)\n"
+        "    run(sql)\n"
+    )}
+    viols = scan_status_sql(files, entrypoints=["app.f"])
+    assert viols, "helper-returned bound method must be flagged"
+    assert any(v["expectation"] == "FAIL_CLOSED_UNRESOLVED_DYNAMIC_SQL" for v in viols), viols
+
+
+def test_i01_scanner_helper_returns_cursor():
+    """FRESH_HELPER_RETURNS_CURSOR: ``get_cursor(conn) -> conn.cursor();
+    cur = get_cursor(conn); cur.execute(sql)`` must fail closed."""
+    files = {"app.py": (
+        "def get_cursor(conn):\n"
+        "    return conn.cursor()\n\n"
+        "def f(conn, sql):\n"
+        "    cur = get_cursor(conn)\n"
+        "    cur.execute(sql)\n"
+    )}
+    viols = scan_status_sql(files, entrypoints=["app.f"])
+    assert viols, "helper-returned cursor must be flagged"
+    assert any(v["expectation"] == "FAIL_CLOSED_UNRESOLVED_DYNAMIC_SQL" for v in viols), viols
+
+
+def _factory_helper_return_closure():
+    """Bounded metamorphic family: ``(case_id, files, expect_violation)``.
+
+    Crosses factory-callable aliases (one/two), helper return hops (one/two),
+    direct/assigned helper results, attribute/getattr bound returns,
+    conn/cursor/factory return forms, local/mapped cross-file helpers, and the
+    execute family. Kanban forms fail closed; symmetric non-Kanban (sqlite /
+    logger / engine) chains stay clean.
+    """
+    cases = []
+
+    # --- factory callable aliases (one/two) --------------------------------
+    cases.append(("FACTORY_ALIAS_ONE", {"app.py": (
+        "from hermes_cli import kanban_db\n\ndef f(sql):\n"
+        "    make = kanban_db.connect\n    conn = make()\n    conn.execute(sql)\n")}, True))
+    cases.append(("FACTORY_ALIAS_TWO", {"app.py": (
+        "from hermes_cli import kanban_db\n\ndef f(sql):\n"
+        "    make = kanban_db.connect\n    make2 = make\n    conn = make2()\n    conn.execute(sql)\n")}, True))
+    cases.append(("FACTORY_ALIAS_IMPORTED_CONNECT", {"app.py": (
+        "from hermes_cli.kanban_db import connect\n\ndef f(sql):\n"
+        "    make = connect\n    conn = make()\n    conn.execute(sql)\n")}, True))
+
+    # --- helper return hops (one/two) --------------------------------------
+    cases.append(("HELPER_RETURN_CONN_ONE_HOP", {"app.py": (
+        "from hermes_cli import kanban_db\n\ndef get_conn():\n"
+        "    return kanban_db.connect()\n\ndef f(sql):\n"
+        "    conn = get_conn()\n    conn.execute(sql)\n")}, True))
+    cases.append(("HELPER_RETURN_CONN_TWO_HOP", {"app.py": (
+        "from hermes_cli import kanban_db\n\ndef inner():\n"
+        "    return kanban_db.connect()\n\ndef outer():\n"
+        "    return inner()\n\ndef f(sql):\n"
+        "    conn = outer()\n    conn.execute(sql)\n")}, True))
+    cases.append(("HELPER_RETURN_BOUND_METHOD_TWO_HOP", {"app.py": (
+        "def get_run(conn):\n    return conn.execute\n\ndef wrap(conn):\n"
+        "    return get_run(conn)\n\ndef f(conn, sql):\n"
+        "    run = wrap(conn)\n    run(sql)\n")}, True))
+
+    # --- direct vs assigned helper results --------------------------------
+    cases.append(("HELPER_RESULT_ASSIGNED", {"app.py": (
+        "from hermes_cli import kanban_db\n\ndef get_conn():\n"
+        "    return kanban_db.connect()\n\ndef f(sql):\n"
+        "    conn = get_conn()\n    conn.execute(sql)\n")}, True))
+    cases.append(("HELPER_RESULT_DIRECT_CHAINED", {"app.py": (
+        "from hermes_cli import kanban_db\n\ndef get_conn():\n"
+        "    return kanban_db.connect()\n\ndef f(sql):\n"
+        "    get_conn().execute(sql)\n")}, True))
+
+    # --- attribute / getattr bound returns --------------------------------
+    cases.append(("HELPER_RETURN_BOUND_METHOD_ATTR", {"app.py": (
+        "def get_run(conn):\n    return conn.execute\n\ndef f(conn, sql):\n"
+        "    run = get_run(conn)\n    run(sql)\n")}, True))
+    cases.append(("HELPER_RETURN_BOUND_METHOD_GETATTR", {"app.py": (
+        "def get_run(conn):\n    return getattr(conn, 'execute')\n\ndef f(conn, sql):\n"
+        "    run = get_run(conn)\n    run(sql)\n")}, True))
+
+    # --- conn / cursor / factory return forms -----------------------------
+    cases.append(("HELPER_RETURN_CURSOR", {"app.py": (
+        "def get_cursor(conn):\n    return conn.cursor()\n\ndef f(conn, sql):\n"
+        "    cur = get_cursor(conn)\n    cur.execute(sql)\n")}, True))
+    cases.append(("HELPER_RETURN_FACTORY", {"app.py": (
+        "from hermes_cli import kanban_db\n\ndef get_factory():\n"
+        "    return kanban_db.connect\n\ndef f(sql):\n"
+        "    make = get_factory()\n    conn = make()\n    conn.execute(sql)\n")}, True))
+
+    # --- mapped cross-file helper -----------------------------------------
+    cases.append(("HELPER_CROSS_FILE_CONN", {
+        "app.py": "from helper import get_conn\n\ndef f(sql):\n    conn = get_conn()\n    conn.execute(sql)\n",
+        "helper.py": "from hermes_cli import kanban_db\n\ndef get_conn():\n    return kanban_db.connect()\n"}, True))
+    cases.append(("HELPER_CROSS_FILE_CURSOR", {
+        "app.py": "from helper import get_cursor\n\ndef f(conn, sql):\n    cur = get_cursor(conn)\n    cur.execute(sql)\n",
+        "helper.py": "def get_cursor(conn):\n    return conn.cursor()\n"}, True))
+
+    # --- execute family where applicable -----------------------------------
+    for method in ("executemany", "executescript"):
+        cases.append((f"HELPER_RETURN_BOUND_METHOD_{method.upper()}", {"app.py": (
+            f"def get_run(conn):\n    return conn.{method}\n\ndef f(conn, sql, rows):\n"
+            f"    run = get_run(conn)\n    run(sql, rows)\n")}, True))
+
+    # --- symmetric non-Kanban (sqlite / logger / engine) -------------------
+    cases.append(("NONKANBAN_SQLITE_FACTORY_ALIAS", {"app.py": (
+        "import sqlite3\n\ndef f(sql):\n"
+        "    make = sqlite3.connect\n    conn = make(':memory:')\n    conn.execute(sql)\n")}, False))
+    cases.append(("NONKANBAN_SQLITE_HELPER_RETURN", {"app.py": (
+        "import sqlite3\n\ndef get_conn():\n    return sqlite3.connect(':memory:')\n\ndef f(sql):\n"
+        "    conn = get_conn()\n    conn.execute(sql)\n")}, False))
+    cases.append(("NONKANBAN_LOGGER_HELPER_RETURN_BOUND_METHOD", {"app.py": (
+        "def get_run(logger):\n    return logger.execute\n\ndef f(logger, sql):\n"
+        "    run = get_run(logger)\n    run(sql)\n")}, False))
+    cases.append(("NONKANBAN_ENGINE_HELPER_RETURN", {"app.py": (
+        "def get_conn(engine):\n    return engine.connect()\n\ndef f(engine, sql):\n"
+        "    conn = get_conn(engine)\n    conn.execute(sql)\n")}, False))
+
+    return cases
+
+
+def test_i01_scanner_factory_helper_return_closure():
+    """Generated/metamorphic factory + helper-return provenance closure.
+
+    Every Kanban factory/helper-return transport must fail closed across one/
+    two aliases, one/two hops, direct/assigned results, attribute/getattr
+    bound returns, conn/cursor/factory forms, local/mapped cross-file helpers,
+    and the execute family; symmetric non-Kanban sqlite/logger/engine chains
+    must remain non-violating.
+    """
+    for case_id, files, expect in _factory_helper_return_closure():
+        viols = scan_status_sql(files, entrypoints=["app.f"])
+        observed = bool(viols)
+        assert observed == expect, (
+            f"{case_id}: expected_violation={expect} observed={observed} "
+            f"violations={viols}"
+        )
+
+
+def test_i01_scanner_helper_return_cycle_terminates():
+    """Cycle-safe termination: a self-recursive and a mutually-recursive
+    helper must terminate without infinite recursion and stay conservative
+    (no false Kanban provenance from an unresolvable cycle)."""
+    self_rec = {"app.py": (
+        "def get_conn():\n    return get_conn()\n\ndef f(sql):\n"
+        "    conn = get_conn()\n    conn.execute(sql)\n")}
+    mut_rec = {"app.py": (
+        "def a():\n    return b()\n\ndef b():\n    return a()\n\ndef f(sql):\n"
+        "    conn = a()\n    conn.execute(sql)\n")}
+    for files in (self_rec, mut_rec):
+        viols = scan_status_sql(files, entrypoints=["app.f"])
+        assert viols == [], f"cyclic helper return must stay clean, got {viols}"
+
+
+def test_i01_scanner_helper_return_depth_bounded():
+    """Depth-bounded termination: a 30-hop helper chain terminates cleanly
+    (the depth guard truncates analysis; no infinite recursion)."""
+    lines = ["def f(sql):\n    conn = h0()\n    conn.execute(sql)\n"]
+    for i in range(30):
+        nxt = f"h{i + 1}()" if i < 29 else "kanban_db.connect()"
+        if i == 29:
+            header = "from hermes_cli import kanban_db\n\n"
+        else:
+            header = ""
+        lines.insert(0, f"{header}def h{i}():\n    return {nxt}\n")
+    src = "\n".join(lines)
+    viols = scan_status_sql({"app.py": src}, entrypoints=["app.f"])
+    # Terminated (no exception); the >24-depth tail is conservatively unresolved.
+    assert isinstance(viols, list)
 
 
 # ============================================================================
