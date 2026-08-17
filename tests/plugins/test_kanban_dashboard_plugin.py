@@ -2796,25 +2796,59 @@ def _build_import_map(files):
     return import_map
 
 
-def _receiver_prov(node, env, prov):
-    """Return the Kanban object provenance tag for a receiver expression, else None."""
+def _receiver_prov(node, env, prov, import_map=None, relpath=None):
+    """Return the Kanban object provenance tag for a receiver expression, else None.
+
+    A receiver may be a name, a direct factory call (``kanban_db.connect()``),
+    or a cursor-derivation chain (``conn.cursor()``). Only proven Kanban
+    connection/cursor/method provenance is returned; non-Kanban receivers
+    (logger, sqlite3) carry no tag.
+    """
     if isinstance(node, ast.Name):
         p = prov.get(node.id)
         return p if p in _KANBAN_OBJECT_TAGS else None
+    if isinstance(node, ast.Call) and import_map is not None:
+        if _is_kanban_factory(node, env, prov, import_map, relpath):
+            return PROV_CONN
+        fn = node.func
+        if isinstance(fn, ast.Attribute) and fn.attr == "cursor":
+            if _receiver_prov(fn.value, env, prov, import_map, relpath) is not None:
+                return PROV_CURSOR
     return None
 
 
-def _arg_prov(arg, env, prov):
+def _arg_prov(arg, env, prov, import_map=None, relpath=None):
     """Return the Kanban object provenance tag carried by a call argument, else None."""
     if isinstance(arg, ast.Name):
         p = prov.get(arg.id)
         return p if p in _KANBAN_OBJECT_TAGS else None
+    if isinstance(arg, ast.Attribute) and arg.attr in MUTATION_METHODS:
+        if _receiver_prov(arg.value, env, prov, import_map, relpath) is not None:
+            return PROV_METHOD
     if isinstance(arg, ast.Call) and isinstance(arg.func, ast.Name) and arg.func.id == "getattr":
         if len(arg.args) >= 2:
             attr = _fold_string(arg.args[1], env)
             if isinstance(attr, str) and attr in MUTATION_METHODS:
-                if _receiver_prov(arg.args[0], env, prov):
+                if _receiver_prov(arg.args[0], env, prov, import_map, relpath):
                     return PROV_METHOD
+    return None
+
+
+def _bound_method_env(node, env):
+    """Return the ``('__BOUND_METHOD__', attr)`` callable identity for an
+    expression naming a bound mutation method, else None."""
+    if isinstance(node, ast.Name):
+        bm = env.get(node.id)
+        if isinstance(bm, tuple) and len(bm) == 2 and bm[0] == "__BOUND_METHOD__":
+            return bm
+        return None
+    if isinstance(node, ast.Attribute) and node.attr in MUTATION_METHODS:
+        return ("__BOUND_METHOD__", node.attr)
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "getattr":
+        if len(node.args) >= 2:
+            attr = _fold_string(node.args[1], env)
+            if isinstance(attr, str) and attr in MUTATION_METHODS:
+                return ("__BOUND_METHOD__", attr)
     return None
 
 
@@ -2961,7 +2995,7 @@ def _assign(env, prov, name, value, relpath, import_map):
     # Bound mutation method alias: ``run = conn.execute``.
     if isinstance(value, ast.Attribute) and value.attr in MUTATION_METHODS:
         env[name] = ("__BOUND_METHOD__", value.attr)
-        if _receiver_prov(value.value, env, prov) is not None:
+        if _receiver_prov(value.value, env, prov, import_map, relpath) is not None:
             prov[name] = PROV_METHOD
         return
     # Opaque bound method alias: ``run = getattr(conn, 'execute')``.
@@ -2970,13 +3004,13 @@ def _assign(env, prov, name, value, relpath, import_map):
         attr_name = _fold_string(value.args[1], env)
         if isinstance(attr_name, str) and attr_name in MUTATION_METHODS:
             env[name] = ("__BOUND_METHOD__", attr_name)
-            if _receiver_prov(value.args[0], env, prov) is not None:
+            if _receiver_prov(value.args[0], env, prov, import_map, relpath) is not None:
                 prov[name] = PROV_METHOD
             return
     # Kanban cursor: ``cur = conn.cursor()``.
     if (isinstance(value, ast.Call) and isinstance(value.func, ast.Attribute)
             and value.func.attr == "cursor"):
-        if _receiver_prov(value.func.value, env, prov) is not None:
+        if _receiver_prov(value.func.value, env, prov, import_map, relpath) is not None:
             prov[name] = PROV_CURSOR
         return
     # Kanban connection factory: ``conn = kanban_db.connect(...)`` / ``_conn(...)``.
@@ -2994,6 +3028,11 @@ def _assign(env, prov, name, value, relpath, import_map):
         p = prov.get(value.id)
         if p in _KANBAN_OBJECT_TAGS:
             prov[name] = p
+        # A bound mutation method also keeps its callable identity through a
+        # plain alias: ``run = conn.execute; alias = run`` must stay callable.
+        bm = env.get(value.id)
+        if isinstance(bm, tuple) and len(bm) == 2 and bm[0] == "__BOUND_METHOD__":
+            env[name] = bm
     v = _fold_string(value, env)
     if isinstance(v, str):
         env[name] = v
@@ -3103,7 +3142,7 @@ def _classify_call(call, env, prov, relpath, funcs, import_map, violations,
             return
         if fn.attr in MUTATION_METHODS:
             # Flag only when the receiver is a *proven* Kanban object.
-            if _receiver_prov(fn.value, env, prov) is None:
+            if _receiver_prov(fn.value, env, prov, import_map, relpath) is None:
                 return
             sql_arg = call.args[0] if call.args else None
             if sql_arg is None:
@@ -3117,7 +3156,7 @@ def _classify_call(call, env, prov, relpath, funcs, import_map, violations,
         if len(fn.args) >= 2:
             attr_name = _fold_string(fn.args[1], env)
             if isinstance(attr_name, str) and attr_name in MUTATION_METHODS:
-                if _receiver_prov(fn.args[0], env, prov) is None:
+                if _receiver_prov(fn.args[0], env, prov, import_map, relpath) is None:
                     return
                 sql_arg = call.args[0] if call.args else None
                 if sql_arg is None:
@@ -3150,7 +3189,7 @@ def _classify_call(call, env, prov, relpath, funcs, import_map, violations,
             return
         visited.add(key)
         sub_env = _bind_params(tfunc, call, env)
-        sub_prov = _bind_params_prov(tfunc, call, env, prov)
+        sub_prov = _bind_params_prov(tfunc, call, env, prov, import_map, relpath)
         _process_stmts(tfunc.body, sub_env, sub_prov, trel, funcs, import_map, violations,
                        canonical_boundary, depth + 1, visited)
 
@@ -3169,16 +3208,23 @@ def _bind_params(tfunc, call, env):
     sub_env = dict(env)
     for i, p in enumerate(tfunc.args.args):
         if i < len(call.args):
-            v = _fold_string(call.args[i], env)
-            sub_env[p.arg] = v if isinstance(v, str) else UNRESOLVED
+            arg = call.args[i]
+            v = _fold_string(arg, env)
+            if isinstance(v, str):
+                sub_env[p.arg] = v
+            else:
+                # A bound mutation method keeps its callable identity through a
+                # parameter binding (``mutate(conn.execute, sql)``).
+                bm = _bound_method_env(arg, env)
+                sub_env[p.arg] = bm if bm is not None else UNRESOLVED
     return sub_env
 
 
-def _bind_params_prov(tfunc, call, env, prov):
+def _bind_params_prov(tfunc, call, env, prov, import_map, relpath):
     sub_prov = dict(prov)
     for i, p in enumerate(tfunc.args.args):
         if i < len(call.args):
-            pv = _arg_prov(call.args[i], env, prov)
+            pv = _arg_prov(call.args[i], env, prov, import_map, relpath)
             if pv is not None:
                 sub_prov[p.arg] = pv
     return sub_prov
@@ -3448,6 +3494,123 @@ def test_i01_scanner_generic_sqlite_connect_nonviolating():
     }
     viols = scan_status_sql(files, entrypoints=["app.f"])
     assert viols == [], f"generic sqlite3.connect must be clean, got {viols}"
+
+
+# ---------------------------------------------------------------------------
+# AION R4/I01 — R2 repair: bound-method provenance survives alias/reflection/
+# cursor/interprocedural/factory transport (structural, not name/pattern-based)
+# ---------------------------------------------------------------------------
+
+def _bound_method_closure_cases():
+    """Bounded metamorphic family: ``(case_id, source, expect_violation)``.
+
+    Crosses receiver source (connection parameter vs. kanban_db factory),
+    method selection (attribute vs. getattr reflection), transport (direct,
+    one alias, repeated alias, cursor alias, interprocedural argument) and
+    mutation method (execute/executemany/executescript, cursor has no
+    executescript). Kanban forms must fail closed; symmetric non-Kanban
+    (logger) forms over equivalent transports stay clean.
+    """
+    cases = []
+    for method in MUTATION_METHODS:
+        cases.append((f"BM_DIRECT_{method.upper()}",
+                      f"def f(conn, sql):\n    conn.{method}(sql)\n", True))
+        cases.append((f"BM_ALIAS_{method.upper()}",
+                      f"def f(conn, sql):\n    run = conn.{method}\n    run(sql)\n", True))
+        cases.append((f"BM_ALIAS_TWICE_{method.upper()}",
+                      f"def f(conn, sql):\n    run = conn.{method}\n    alias = run\n    alias(sql)\n", True))
+        cases.append((f"BM_REFLECTED_{method.upper()}",
+                      f"def f(conn, sql):\n    run = getattr(conn, '{method}')\n    run(sql)\n", True))
+        cases.append((f"BM_REFLECTED_ALIAS_TWICE_{method.upper()}",
+                      f"def f(conn, sql):\n    run = getattr(conn, '{method}')\n    alias = run\n    alias(sql)\n", True))
+        cases.append((f"BM_INTERPROCEDURAL_{method.upper()}",
+                      f"def mutate(run, sql):\n    run(sql)\n\ndef f(conn, sql):\n    mutate(conn.{method}, sql)\n", True))
+        cases.append((f"BM_FACTORY_CHAIN_{method.upper()}",
+                      f"from hermes_cli import kanban_db\n\ndef f(sql):\n    kanban_db.connect().{method}(sql)\n", True))
+        if method != "executescript":
+            cases.append((f"BM_CURSOR_ALIAS_TWICE_{method.upper()}",
+                          f"def f(conn, sql):\n    cur = conn.cursor()\n    run = cur.{method}\n    alias = run\n    alias(sql)\n", True))
+    # Symmetric non-Kanban positives (logger) over equivalent transports.
+    for transport in ("ALIAS_TWICE", "REFLECTED_ALIAS_TWICE", "INTERPROCEDURAL"):
+        if transport == "ALIAS_TWICE":
+            src = "def f(logger, sql):\n    run = logger.execute\n    alias = run\n    alias(sql)\n"
+        elif transport == "REFLECTED_ALIAS_TWICE":
+            src = "def f(logger, sql):\n    run = getattr(logger, 'execute')\n    alias = run\n    alias(sql)\n"
+        else:
+            src = "def mutate(run, sql):\n    run(sql)\n\ndef f(logger, sql):\n    mutate(logger.execute, sql)\n"
+        cases.append((f"BM_NONKANBAN_{transport}_EXECUTE", src, False))
+    return cases
+
+
+def test_i01_scanner_redteam_alias_of_bound_method():
+    """REDTEAM_ALIAS_OF_BOUND_METHOD: ``run = conn.execute; alias = run; alias(sql)``."""
+    files = {"app.py": "def f(conn, sql):\n    run = conn.execute\n    alias = run\n    alias(sql)\n"}
+    viols = scan_status_sql(files, entrypoints=["app.f"])
+    assert viols, "aliased bound method must be flagged"
+    assert any(v["expectation"] == "FAIL_CLOSED_UNRESOLVED_DYNAMIC_SQL" for v in viols), viols
+
+
+def test_i01_scanner_redteam_alias_of_reflected_bound_method():
+    """REDTEAM_ALIAS_OF_REFLECTED_BOUND_METHOD: reflected bound method aliased twice."""
+    files = {"app.py": "def f(conn, sql):\n    run = getattr(conn, 'execute')\n    alias = run\n    alias(sql)\n"}
+    viols = scan_status_sql(files, entrypoints=["app.f"])
+    assert viols, "reflected aliased bound method must be flagged"
+    assert any(v["expectation"] == "FAIL_CLOSED_UNRESOLVED_DYNAMIC_SQL" for v in viols), viols
+
+
+def test_i01_scanner_redteam_direct_factory_chain():
+    """REDTEAM_DIRECT_FACTORY_CHAIN: ``kanban_db.connect().execute(sql)``."""
+    files = {"app.py": "from hermes_cli import kanban_db\n\ndef f(sql):\n    kanban_db.connect().execute(sql)\n"}
+    viols = scan_status_sql(files, entrypoints=["app.f"])
+    assert viols, "direct factory receiver chain must be flagged"
+    assert any(v["expectation"] == "FAIL_CLOSED_UNRESOLVED_DYNAMIC_SQL" for v in viols), viols
+
+
+def test_i01_scanner_redteam_cursor_bound_alias_twice():
+    """REDTEAM_CURSOR_BOUND_ALIAS_TWICE: cursor-derived bound method aliased twice."""
+    files = {"app.py": "def f(conn, sql):\n    cur = conn.cursor()\n    run = cur.execute\n    alias = run\n    alias(sql)\n"}
+    viols = scan_status_sql(files, entrypoints=["app.f"])
+    assert viols, "cursor-derived aliased bound method must be flagged"
+    assert any(v["expectation"] == "FAIL_CLOSED_UNRESOLVED_DYNAMIC_SQL" for v in viols), viols
+
+
+def test_i01_scanner_redteam_interprocedural_bound_method():
+    """REDTEAM_INTERPROCEDURAL_BOUND_METHOD: ``mutate(conn.execute, sql)``."""
+    files = {"app.py": "def mutate(run, sql):\n    run(sql)\n\ndef f(conn, sql):\n    mutate(conn.execute, sql)\n"}
+    viols = scan_status_sql(files, entrypoints=["app.f"])
+    assert viols, "interprocedural bound method must be flagged"
+    assert any(v["expectation"] == "FAIL_CLOSED_UNRESOLVED_DYNAMIC_SQL" for v in viols), viols
+
+
+def test_i01_scanner_non_kanban_alias_of_bound_method_nonviolating():
+    """Non-Kanban ``logger.execute`` aliased twice stays clean (provenance-based)."""
+    files = {"app.py": "def f(logger, sql):\n    run = logger.execute\n    alias = run\n    alias(sql)\n"}
+    viols = scan_status_sql(files, entrypoints=["app.f"])
+    assert viols == [], f"non-Kanban aliased bound method must be clean, got {viols}"
+
+
+def test_i01_scanner_non_kanban_interprocedural_bound_method_nonviolating():
+    """Non-Kanban ``logger.execute`` passed through a helper stays clean."""
+    files = {"app.py": "def mutate(run, sql):\n    run(sql)\n\ndef f(logger, sql):\n    mutate(logger.execute, sql)\n"}
+    viols = scan_status_sql(files, entrypoints=["app.f"])
+    assert viols == [], f"non-Kanban interprocedural bound method must be clean, got {viols}"
+
+
+def test_i01_scanner_bound_method_transport_closure():
+    """Generated/metamorphic bound-method provenance closure.
+
+    Every Kanban bound-callable transport (direct, alias, repeated alias,
+    reflection, cursor alias, interprocedural argument, factory receiver) must
+    fail closed across execute/executemany/executescript; symmetric non-Kanban
+    (logger) transports must remain non-violating.
+    """
+    for case_id, src, expect in _bound_method_closure_cases():
+        viols = scan_status_sql({"app.py": src}, entrypoints=["app.f"])
+        observed = bool(viols)
+        assert observed == expect, (
+            f"{case_id}: expected_violation={expect} observed={observed} "
+            f"violations={viols}"
+        )
 
 
 # ============================================================================
