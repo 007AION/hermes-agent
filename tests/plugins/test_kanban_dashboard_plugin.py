@@ -2579,6 +2579,13 @@ PROV_KANBAN_CONNECT = "kanban_connect"
 _KANBAN_OBJECT_TAGS = {PROV_CONN, PROV_CURSOR, PROV_METHOD}
 CONNECTION_PARAM_NAMES = {"conn", "connection", "db", "database"}
 
+# Unknown / no-provenance sentinel for the return-summary lattice. Every
+# reachable return arm that is not a supported known Kanban provenance tag
+# (unknown, non-Kanban, cyclic, bare ``return``, or implicit ``None``
+# fall-through) is classified as UNKNOWN_RETURN so it cannot silently
+# disappear from the unanimity check in ``_function_return_summary``.
+UNKNOWN_RETURN = "unknown_return"
+
 
 class _Unresolved:
     def __repr__(self):  # pragma: no cover
@@ -3404,6 +3411,35 @@ def _expr_prov(node, env, prov, relpath, funcs, import_map, module_envs,
     return (None, None)
 
 
+def _definitely_returns(stmts):
+    """Return True only if ``stmts`` is guaranteed to execute a ``return`` (or
+    ``raise``) on every control-flow path.
+
+    Used to detect an implicit ``None`` fall-through arm: if a function body
+    can reach its end without returning, that path yields ``None`` and must
+    participate in the return-summary lattice as UNKNOWN_RETURN rather than
+    disappearing. The check is deliberately conservative — loops (which may run
+    zero times) and ``try`` blocks (which may not return) never count as a
+    guaranteed terminal, and a bare ``if`` without a guaranteed-returning
+    ``else`` does not guarantee a return.
+    """
+    if stmts is None:
+        return False
+    for stmt in stmts:
+        if isinstance(stmt, (ast.Return, ast.Raise)):
+            return True
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        if isinstance(stmt, ast.If):
+            if _definitely_returns(stmt.body) and _definitely_returns(stmt.orelse):
+                return True
+            continue
+        # Assign/Expr/Pass/Import/For/While/Try/... do not guarantee a return
+        # on this path; keep scanning (a loop may run zero times, a try may
+        # not return, a plain statement falls through).
+    return False
+
+
 def _function_return_summary(trel, func, call, env, prov, caller_relpath, funcs,
                              import_map, module_envs, canonical_boundary, depth,
                              ret_visited):
@@ -3411,8 +3447,10 @@ def _function_return_summary(trel, func, call, env, prov, caller_relpath, funcs,
 
     Binds the callee's parameters to the actual call arguments, merges the
     callee module's import provenance, and merges every reachable ``return``
-    expression's provenance. Returns ``(tag, bound_method)``; conservative
-    ``(None, None)`` for unknown / conflicting / boundary / cyclic functions.
+    expression's provenance into a total-domain lattice. Returns
+    ``(tag, bound_method)``; conservative ``(None, None)`` for unknown /
+    conflicting / boundary / cyclic functions, or when any reachable return arm
+    is unknown / non-Kanban / bare / implicit-``None``.
     """
     if depth > 24:
         return (None, None)
@@ -3441,17 +3479,29 @@ def _function_return_summary(trel, func, call, env, prov, caller_relpath, funcs,
             if pv is not None:
                 sub_prov[p.arg] = pv
 
+    # Total-domain lattice: every reachable return arm participates. Unknown,
+    # non-Kanban, cyclic, bare ``return``, and implicit ``None`` fall-through
+    # arms contribute UNKNOWN_RETURN instead of being filtered out, so a
+    # remaining Kanban arm can never be mistaken for unanimous.
     tags = []
     bms = []
     for ret in _collect_returns(func.body):
         if ret.value is None:
+            tags.append(UNKNOWN_RETURN)
+            bms.append(None)
             continue
         tag, bm = _expr_prov(ret.value, sub_env, sub_prov, trel, funcs, import_map,
                              module_envs, canonical_boundary, depth + 1, ret_visited)
-        if tag is not None:
-            tags.append(tag)
-            bms.append(bm)
+        tags.append(tag if tag is not None else UNKNOWN_RETURN)
+        bms.append(bm)
+    if not _definitely_returns(func.body):
+        # A body that can fall off the end (or loop/try that may not return)
+        # contributes an implicit ``None`` arm.
+        tags.append(UNKNOWN_RETURN)
+        bms.append(None)
     if not tags:
+        return (None, None)
+    if UNKNOWN_RETURN in tags:
         return (None, None)
     first_tag = tags[0]
     first_bm = bms[0]
@@ -4053,6 +4103,155 @@ def test_i01_scanner_helper_return_depth_bounded():
     viols = scan_status_sql({"app.py": src}, entrypoints=["app.f"])
     # Terminated (no exception); the >24-depth tail is conservatively unresolved.
     assert isinstance(viols, list)
+
+
+# ============================================================================
+# AION R4/I01 — R4 repair: total-domain return-summary lattice
+# (unknown / non-Kanban / cyclic / bare / implicit-None arms participate)
+# ============================================================================
+
+def _return_lattice_closure():
+    """Bounded return-lattice family: ``(case_id, files, expect_violation)``.
+
+    Every reachable return arm of a summarized helper participates. A known
+    Kanban provenance tag is returned only when the return-arm set is nonempty
+    and every arm resolves to the exact same known tag; any unknown /
+    non-Kanban / cyclic / bare / implicit-``None`` arm, or any tag
+    disagreement, yields no proven Kanban provenance (clean). Two same-known
+    Kanban arms still propagate (fail-closed).
+    """
+    cases = []
+
+    # --- exact R3 audit reproductions (must stay clean) --------------------
+    cases.append(("AUDIT_MIXED_KANBAN_OR_UNKNOWN_OBJECT_MUST_STAY_CLEAN", {
+        "app.py": (
+            "from hermes_cli import kanban_db\n\n"
+            "def choose(flag):\n"
+            "    if flag:\n"
+            "        return kanban_db.connect()\n"
+            "    return object()\n\n"
+            "def f(flag, sql):\n"
+            "    selected = choose(flag)\n"
+            "    selected.execute(sql)\n"
+        ),
+    }, False))
+    cases.append(("AUDIT_MIXED_KANBAN_OR_SQLITE_MUST_STAY_CLEAN", {
+        "app.py": (
+            "import sqlite3\n"
+            "from hermes_cli import kanban_db\n\n"
+            "def choose(flag):\n"
+            "    if flag:\n"
+            "        return kanban_db.connect()\n"
+            "    return sqlite3.connect(':memory:')\n\n"
+            "def f(flag, sql):\n"
+            "    selected = choose(flag)\n"
+            "    selected.execute(sql)\n"
+        ),
+    }, False))
+    cases.append(("AUDIT_RECURSIVE_OR_KANBAN_MIXED_MUST_STAY_CLEAN", {
+        "app.py": (
+            "from hermes_cli import kanban_db\n\n"
+            "def choose(flag):\n"
+            "    if flag:\n"
+            "        return kanban_db.connect()\n"
+            "    return choose(flag)\n\n"
+            "def f(flag, sql):\n"
+            "    selected = choose(flag)\n"
+            "    selected.execute(sql)\n"
+        ),
+    }, False))
+
+    # --- bounded controls: mixed with explicit / bare / implicit None -------
+    cases.append(("MIXED_KANBAN_OR_EXPLICIT_NONE_MUST_STAY_CLEAN", {
+        "app.py": (
+            "from hermes_cli import kanban_db\n\n"
+            "def choose(flag):\n"
+            "    if flag:\n"
+            "        return kanban_db.connect()\n"
+            "    return None\n\n"
+            "def f(flag, sql):\n"
+            "    selected = choose(flag)\n"
+            "    selected.execute(sql)\n"
+        ),
+    }, False))
+    cases.append(("MIXED_KANBAN_OR_BARE_RETURN_MUST_STAY_CLEAN", {
+        "app.py": (
+            "from hermes_cli import kanban_db\n\n"
+            "def choose(flag):\n"
+            "    if flag:\n"
+            "        return kanban_db.connect()\n"
+            "    return\n\n"
+            "def f(flag, sql):\n"
+            "    selected = choose(flag)\n"
+            "    selected.execute(sql)\n"
+        ),
+    }, False))
+    cases.append(("MIXED_KANBAN_OR_IMPLICIT_NONE_MUST_STAY_CLEAN", {
+        "app.py": (
+            "from hermes_cli import kanban_db\n\n"
+            "def choose(flag):\n"
+            "    if flag:\n"
+            "        return kanban_db.connect()\n\n"
+            "def f(flag, sql):\n"
+            "    selected = choose(flag)\n"
+            "    selected.execute(sql)\n"
+        ),
+    }, False))
+
+    # --- bounded controls: mixed with scalar / conflicting known tags -------
+    cases.append(("MIXED_KANBAN_OR_SCALAR_MUST_STAY_CLEAN", {
+        "app.py": (
+            "from hermes_cli import kanban_db\n\n"
+            "def choose(flag):\n"
+            "    if flag:\n"
+            "        return kanban_db.connect()\n"
+            "    return 0\n\n"
+            "def f(flag, sql):\n"
+            "    selected = choose(flag)\n"
+            "    selected.execute(sql)\n"
+        ),
+    }, False))
+    cases.append(("CONFLICTING_KNOWN_TAGS_MUST_STAY_CLEAN", {
+        "app.py": (
+            "from hermes_cli import kanban_db\n\n"
+            "def choose(flag, conn):\n"
+            "    if flag:\n"
+            "        return kanban_db.connect()\n"
+            "    return conn.cursor()\n\n"
+            "def f(flag, conn, sql):\n"
+            "    selected = choose(flag, conn)\n"
+            "    selected.execute(sql)\n"
+        ),
+    }, False))
+
+    # --- two same-known Kanban arms still propagate (fail-closed) -----------
+    cases.append(("TWO_SAME_KNOWN_KANBAN_ARMS_MUST_STILL_PROPAGATE", {
+        "app.py": (
+            "from hermes_cli import kanban_db\n\n"
+            "def choose(flag):\n"
+            "    if flag:\n"
+            "        return kanban_db.connect()\n"
+            "    return kanban_db.connect()\n\n"
+            "def f(flag, sql):\n"
+            "    selected = choose(flag)\n"
+            "    selected.execute(sql)\n"
+        ),
+    }, True))
+
+    return cases
+
+
+def test_i01_scanner_return_lattice_closure():
+    """Total-domain return-summary lattice: mixed / unknown / non-Kanban /
+    cyclic / bare / implicit-None arms never yield proven Kanban provenance;
+    two same-known Kanban arms still propagate."""
+    for case_id, files, expect in _return_lattice_closure():
+        viols = scan_status_sql(files, entrypoints=["app.f"])
+        observed = bool(viols)
+        assert observed == expect, (
+            f"{case_id}: expected_violation={expect} observed={observed} "
+            f"violations={viols}"
+        )
 
 
 # ============================================================================
