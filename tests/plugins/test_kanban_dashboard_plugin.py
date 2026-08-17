@@ -7,8 +7,11 @@ REST surface without spinning up the whole dashboard.
 
 from __future__ import annotations
 
+import ast
 import importlib.util
+import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -2545,3 +2548,1188 @@ def test_dashboard_parent_notice_and_child_results_use_detail_links():
     assert "t.link_counts" not in detail
     assert "Child Results" in detail
     assert "props.data.child_results" in detail
+
+
+# ============================================================================
+# AION R4/I01 — bounded adversarial scanner for direct tasks.status SQL
+# ============================================================================
+CANONICAL_BOUNDARY = "hermes_cli/kanban_db.py"
+DASHBOARD_PLUGIN = "plugins/kanban/dashboard/plugin_api.py"
+DYNAMIC = "\x00DYNAMIC\x00"
+MUTATION_METHODS = ("execute", "executemany", "executescript")
+READ_LEAD = ("SELECT", "PRAGMA", "WITH", "EXPLAIN", "VACUUM", "ANALYZE", "ATTACH", "DETACH")
+
+
+class _Unresolved:
+    def __repr__(self):  # pragma: no cover
+        return "<UNRESOLVED>"
+
+
+UNRESOLVED = _Unresolved()
+
+
+def _norm_sql(s: str) -> str:
+    s = re.sub(r"--[^\n]*", " ", s)
+    s = re.sub(r"/\*.*?\*/", " ", s, flags=re.DOTALL)
+    return " ".join(s.split())
+
+
+def _is_read(s: str) -> bool:
+    lead = _norm_sql(s).lstrip().upper().split(" ")[0]
+    return lead in READ_LEAD
+
+
+# ---------------------------------------------------------------------------
+# String folding (bounded constant propagation)
+# ---------------------------------------------------------------------------
+
+def _fold_string(node, env, depth=0):
+    if depth > 24 or node is None:
+        return UNRESOLVED
+    if isinstance(node, ast.Constant):
+        return node.value if isinstance(node.value, str) else UNRESOLVED
+    if isinstance(node, ast.Name):
+        v = env.get(node.id, UNRESOLVED)
+        return v if isinstance(v, str) else UNRESOLVED
+    if isinstance(node, ast.JoinedStr):
+        parts = []
+        for v in node.values:
+            if isinstance(v, ast.Constant) and isinstance(v.value, str):
+                parts.append(v.value)
+            elif isinstance(v, ast.FormattedValue):
+                sub = _fold_string(v.value, env, depth + 1)
+                parts.append(sub if isinstance(sub, str) else DYNAMIC)
+            else:
+                parts.append(DYNAMIC)
+        return "".join(parts)
+    if isinstance(node, ast.BinOp):
+        if isinstance(node.op, ast.Add):
+            l = _fold_string(node.left, env, depth + 1)
+            r = _fold_string(node.right, env, depth + 1)
+            if isinstance(l, str) and isinstance(r, str):
+                return l + r
+            if isinstance(l, str):
+                return l + DYNAMIC
+            if isinstance(r, str):
+                return DYNAMIC + r
+            return DYNAMIC
+        if isinstance(node.op, ast.Mod):
+            template = _fold_string(node.left, env, depth + 1)
+            if not isinstance(template, str):
+                return UNRESOLVED
+            return _apply_percent(template, node.right, env, depth)
+    if isinstance(node, ast.Call):
+        fn = node.func
+        if isinstance(fn, ast.Attribute) and fn.attr == "join":
+            sep = _fold_string(fn.value, env, depth + 1)
+            elems = _fold_list(node.args[0], env, depth + 1) if node.args else UNRESOLVED
+            if isinstance(sep, str) and isinstance(elems, list):
+                return sep.join(elems)
+            return DYNAMIC
+        if isinstance(fn, ast.Attribute) and fn.attr == "format":
+            base = _fold_string(fn.value, env, depth + 1)
+            if not isinstance(base, str):
+                return UNRESOLVED
+            return _apply_format(base, node, env, depth)
+        return UNRESOLVED
+    return UNRESOLVED
+
+
+def _apply_percent(template, right, env, depth):
+    args = []
+    if isinstance(right, ast.Tuple):
+        for elt in right.elts:
+            v = _fold_string(elt, env, depth + 1)
+            args.append(v if isinstance(v, str) else DYNAMIC)
+    else:
+        v = _fold_string(right, env, depth + 1)
+        args.append(v if isinstance(v, str) else DYNAMIC)
+    it = iter(args)
+    out = []
+    i = 0
+    while i < len(template):
+        if template[i] == "%" and i + 1 < len(template) and template[i + 1] in "srd":
+            out.append(next(it, DYNAMIC))
+            i += 2
+            continue
+        out.append(template[i])
+        i += 1
+    return "".join(out)
+
+
+def _apply_format(base, node, env, depth):
+    args = []
+    for a in node.args:
+        v = _fold_string(a, env, depth + 1)
+        args.append(v if isinstance(v, str) else DYNAMIC)
+    it = iter(args)
+    out = []
+    i = 0
+    while i < len(base):
+        if base[i] == "{" and i + 1 < len(base) and base[i + 1] == "}":
+            out.append(next(it, DYNAMIC))
+            i += 2
+            continue
+        out.append(base[i])
+        i += 1
+    return "".join(out)
+
+
+def _fold_list(node, env, depth=0):
+    if depth > 24 or node is None:
+        return UNRESOLVED
+    if isinstance(node, ast.List):
+        out = []
+        for elt in node.elts:
+            v = _fold_string(elt, env, depth + 1)
+            out.append(v if isinstance(v, str) else DYNAMIC)
+        return out
+    if isinstance(node, ast.Name):
+        v = env.get(node.id, UNRESOLVED)
+        if isinstance(v, list):
+            return v
+        if isinstance(v, str):
+            return [v]
+        return UNRESOLVED
+    return UNRESOLVED
+
+
+# ---------------------------------------------------------------------------
+# SQL mutation classification
+# ---------------------------------------------------------------------------
+
+def _parse_set_columns(raw: str):
+    cols = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        eq = part.find("=")
+        name = (part[:eq] if eq >= 0 else part).strip().lower()
+        if DYNAMIC in name:
+            cols.append(DYNAMIC)
+        else:
+            cols.append(name)
+    return cols
+
+
+def _classify_sql(shape: str):
+    norm = _norm_sql(shape)
+    up = norm.upper()
+    if not up:
+        return None
+    if _is_read(up):
+        return None
+    m = re.match(r"^UPDATE\s+(\w+)\s+SET\s+(.+?)(?:\s+WHERE\b.*)?$", up, re.DOTALL)
+    if m:
+        return ("UPDATE", m.group(1).lower(), _parse_set_columns(m.group(2)))
+    m = re.match(r"^INSERT\s+INTO\s+(\w+)\s*\(([^)]*)\)", up, re.DOTALL)
+    if m:
+        cols = [c.strip().lower() for c in m.group(2).split(",") if c.strip()]
+        return ("INSERT", m.group(1).lower(), cols)
+    m = re.match(r"^INSERT\s+INTO\s+(\w+)", up)
+    if m:
+        return ("INSERT", m.group(1).lower(), [DYNAMIC])
+    m = re.match(r"^DELETE\s+FROM\s+(\w+)", up)
+    if m:
+        return ("DELETE", m.group(1).lower(), [])
+    m = re.match(r"^REPLACE\s+INTO\s+(\w+)\s*\(([^)]*)\)", up, re.DOTALL)
+    if m:
+        cols = [c.strip().lower() for c in m.group(2).split(",") if c.strip()]
+        return ("REPLACE", m.group(1).lower(), cols)
+    if up.startswith(("UPDATE", "INSERT", "DELETE", "REPLACE", "CREATE", "DROP", "ALTER")):
+        return ("UNKNOWN_MUTATION", None, [DYNAMIC])
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Scanner core (entrypoint-scoped, bounded interprocedural)
+# ---------------------------------------------------------------------------
+
+def _module_to_path(module, relpath=""):
+    if module.endswith(".py"):
+        return module
+    return "/".join(module.split(".")) + ".py"
+
+
+def _split_entrypoint(ep):
+    parts = ep.split(".")
+    if len(parts) >= 2:
+        name = parts[-1]
+        module = ".".join(parts[:-1])
+        return (_module_to_path(module), name)
+    return (ep, ep)
+
+
+def _build_import_map(files):
+    import_map = {}
+    for relpath, src in files.items():
+        try:
+            tree = ast.parse(src)
+        except SyntaxError:
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module is not None:
+                mod_rel = _module_to_path(node.module, relpath)
+                for alias in node.names:
+                    import_map[(relpath, alias.asname or alias.name)] = (mod_rel, alias.name)
+    return import_map
+
+
+def scan_status_sql(files, entrypoints=None, dynamic_scope=None,
+                    canonical_boundary=CANONICAL_BOUNDARY):
+    """Scan a set of files for direct ``tasks.status`` lifecycle SQL.
+
+    * ``entrypoints``: functions to begin analysis from (``"app.f"`` style).
+      When None, every module-level function in every non-boundary file is an
+      entrypoint (the real production-scan mode).
+    * ``dynamic_scope``: relpaths where unresolved-dynamic-SQL fail-closed
+      applies. None means "apply everywhere" (fixture mode). For the real
+      production scan, pass ``{plugins/kanban/dashboard/plugin_api.py}`` so the
+      fail-closed rule is scoped to the dashboard chokepoint surface.
+    """
+    trees = {}
+    for relpath, src in files.items():
+        try:
+            trees[relpath] = ast.parse(src)
+        except SyntaxError:
+            trees[relpath] = None
+
+    funcs = {}
+    for relpath, tree in trees.items():
+        if tree is None:
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef):
+                funcs[(relpath, node.name)] = node
+
+    import_map = _build_import_map(files)
+
+    eps = []
+    if entrypoints is None:
+        for relpath, tree in trees.items():
+            if tree is None or relpath == canonical_boundary:
+                continue
+            for node in tree.body:
+                if isinstance(node, ast.FunctionDef):
+                    eps.append((relpath, node.name))
+    else:
+        for ep in entrypoints:
+            relpath, name = _split_entrypoint(ep)
+            if (relpath, name) in funcs:
+                eps.append((relpath, name))
+
+    raw = []
+    for relpath, name in eps:
+        func = funcs[(relpath, name)]
+        env = _module_env(trees[relpath])
+        _process_stmts(func.body, env, relpath, funcs, import_map, raw,
+                       canonical_boundary, 0, set())
+
+    # Post-filter: scope the fail-closed rule to the dashboard chokepoint.
+    if dynamic_scope is not None:
+        raw = [v for v in raw
+               if v["expectation"] != "FAIL_CLOSED_UNRESOLVED_DYNAMIC_SQL"
+               or v["file"] in dynamic_scope]
+
+    # Dedupe (a function reached via multiple entrypoints/inlines is one find).
+    seen = set()
+    out = []
+    for v in raw:
+        key = (v["file"], v["line"], v["expectation"], v["operation"], v["table"])
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(v)
+    return out
+
+
+def _module_env(tree):
+    env = {}
+    for stmt in tree.body:
+        if isinstance(stmt, ast.Assign):
+            for tgt in stmt.targets:
+                _assign_target(env, tgt, stmt.value)
+        elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
+            if stmt.value is not None:
+                _assign(env, stmt.target.id, stmt.value)
+    return env
+
+
+def _assign_target(env, tgt, value):
+    if isinstance(tgt, ast.Name):
+        _assign(env, tgt.id, value)
+    elif isinstance(tgt, (ast.Tuple, ast.List)) and isinstance(value, (ast.Tuple, ast.List)):
+        if len(tgt.elts) == len(value.elts):
+            for te, ve in zip(tgt.elts, value.elts):
+                _assign_target(env, te, ve)
+
+
+def _assign(env, name, value):
+    if isinstance(value, ast.Constant) and isinstance(value.value, str):
+        env[name] = value.value
+    elif isinstance(value, ast.List):
+        env[name] = _fold_list(value, env)
+    elif isinstance(value, ast.Attribute) and value.attr in MUTATION_METHODS:
+        env[name] = ("__BOUND_METHOD__", value.attr)
+    else:
+        v = _fold_string(value, env)
+        if isinstance(v, str):
+            env[name] = v
+
+
+def _process_stmts(stmts, env, relpath, funcs, import_map, violations,
+                   canonical_boundary, depth, visited):
+    if depth > 24:
+        return
+    for stmt in stmts:
+        _process_stmt(stmt, env, relpath, funcs, import_map, violations,
+                      canonical_boundary, depth, visited)
+
+
+def _process_stmt(stmt, env, relpath, funcs, import_map, violations,
+                  canonical_boundary, depth, visited):
+    if isinstance(stmt, ast.Assign):
+        _scan_calls(stmt.value, env, relpath, funcs, import_map, violations,
+                    canonical_boundary, depth, visited)
+        for tgt in stmt.targets:
+            _assign_target(env, tgt, stmt.value)
+    elif isinstance(stmt, ast.AnnAssign):
+        if stmt.value is not None:
+            _scan_calls(stmt.value, env, relpath, funcs, import_map, violations,
+                        canonical_boundary, depth, visited)
+        if isinstance(stmt.target, ast.Name) and stmt.value is not None:
+            _assign(env, stmt.target.id, stmt.value)
+    elif isinstance(stmt, ast.AugAssign):
+        _scan_calls(stmt.value, env, relpath, funcs, import_map, violations,
+                    canonical_boundary, depth, visited)
+        if isinstance(stmt.target, ast.Name):
+            cur = env.get(stmt.target.id, UNRESOLVED)
+            inc = _fold_string(stmt.value, env)
+            if isinstance(cur, str) and isinstance(inc, str):
+                env[stmt.target.id] = cur + inc
+    elif isinstance(stmt, ast.Expr):
+        _scan_calls(stmt.value, env, relpath, funcs, import_map, violations,
+                    canonical_boundary, depth, visited)
+    elif isinstance(stmt, ast.Return):
+        if stmt.value is not None:
+            _scan_calls(stmt.value, env, relpath, funcs, import_map, violations,
+                        canonical_boundary, depth, visited)
+    elif isinstance(stmt, ast.If):
+        _scan_calls(stmt.test, env, relpath, funcs, import_map, violations,
+                    canonical_boundary, depth, visited)
+        _process_stmts(stmt.body, env, relpath, funcs, import_map, violations,
+                       canonical_boundary, depth + 1, visited)
+        _process_stmts(stmt.orelse, env, relpath, funcs, import_map, violations,
+                       canonical_boundary, depth + 1, visited)
+    elif isinstance(stmt, (ast.For, ast.AsyncFor)):
+        _scan_calls(stmt.iter, env, relpath, funcs, import_map, violations,
+                    canonical_boundary, depth, visited)
+        _process_stmts(stmt.body, env, relpath, funcs, import_map, violations,
+                       canonical_boundary, depth + 1, visited)
+        _process_stmts(stmt.orelse, env, relpath, funcs, import_map, violations,
+                       canonical_boundary, depth + 1, visited)
+    elif isinstance(stmt, (ast.With, ast.AsyncWith)):
+        for item in stmt.items:
+            _scan_calls(item.context_expr, env, relpath, funcs, import_map,
+                        violations, canonical_boundary, depth, visited)
+        _process_stmts(stmt.body, env, relpath, funcs, import_map, violations,
+                       canonical_boundary, depth + 1, visited)
+    elif isinstance(stmt, ast.Try):
+        _process_stmts(stmt.body, env, relpath, funcs, import_map, violations,
+                       canonical_boundary, depth + 1, visited)
+        for h in stmt.handlers:
+            _process_stmts(h.body, env, relpath, funcs, import_map, violations,
+                           canonical_boundary, depth + 1, visited)
+        _process_stmts(stmt.orelse, env, relpath, funcs, import_map, violations,
+                       canonical_boundary, depth + 1, visited)
+        _process_stmts(stmt.finalbody, env, relpath, funcs, import_map, violations,
+                       canonical_boundary, depth + 1, visited)
+    elif isinstance(stmt, ast.While):
+        _scan_calls(stmt.test, env, relpath, funcs, import_map, violations,
+                    canonical_boundary, depth, visited)
+        _process_stmts(stmt.body, env, relpath, funcs, import_map, violations,
+                       canonical_boundary, depth + 1, visited)
+        _process_stmts(stmt.orelse, env, relpath, funcs, import_map, violations,
+                       canonical_boundary, depth + 1, visited)
+
+
+def _scan_calls(node, env, relpath, funcs, import_map, violations,
+                canonical_boundary, depth, visited):
+    if node is None:
+        return
+    if isinstance(node, ast.Call):
+        _classify_call(node, env, relpath, funcs, import_map, violations,
+                       canonical_boundary, depth, visited)
+    for child in ast.iter_child_nodes(node):
+        _scan_calls(child, env, relpath, funcs, import_map, violations,
+                    canonical_boundary, depth, visited)
+
+
+def _classify_call(call, env, relpath, funcs, import_map, violations,
+                   canonical_boundary, depth, visited):
+    if depth > 24:
+        return
+    fn = call.func
+    if isinstance(fn, ast.Attribute):
+        if fn.attr == "append":
+            base = fn.value
+            if isinstance(base, ast.Name) and isinstance(env.get(base.id), list):
+                v = _fold_string(call.args[0], env) if call.args else UNRESOLVED
+                env[base.id] = env[base.id] + ([v] if isinstance(v, str) else [DYNAMIC])
+            return
+        if fn.attr == "set_task_status":
+            return
+        if fn.attr in MUTATION_METHODS:
+            sql_arg = call.args[0] if call.args else None
+            if sql_arg is None:
+                return
+            shape = _fold_string(sql_arg, env)
+            _record_if_violation(shape, sql_arg, call, relpath, canonical_boundary, violations)
+            return
+        return
+    if isinstance(fn, ast.Name):
+        if fn.id == "set_task_status":
+            return
+        bound = env.get(fn.id)
+        if isinstance(bound, tuple) and len(bound) == 2 and bound[0] == "__BOUND_METHOD__":
+            sql_arg = call.args[0] if call.args else None
+            if sql_arg is not None:
+                shape = _fold_string(sql_arg, env)
+                _record_if_violation(shape, sql_arg, call, relpath, canonical_boundary, violations)
+            return
+        target = _resolve_callee(fn.id, relpath, funcs, import_map)
+        if target is None:
+            return
+        trel, tfunc = target
+        if trel == canonical_boundary:
+            return
+        key = (trel, tfunc.name)
+        if key in visited:
+            return
+        visited.add(key)
+        sub_env = _bind_params(tfunc, call, env)
+        _process_stmts(tfunc.body, sub_env, trel, funcs, import_map, violations,
+                       canonical_boundary, depth + 1, visited)
+
+
+def _resolve_callee(name, relpath, funcs, import_map):
+    if (relpath, name) in funcs:
+        return (relpath, funcs[(relpath, name)])
+    if (relpath, name) in import_map:
+        trel, tname = import_map[(relpath, name)]
+        if (trel, tname) in funcs:
+            return (trel, funcs[(trel, tname)])
+    return None
+
+
+def _bind_params(tfunc, call, env):
+    sub_env = dict(env)
+    for i, p in enumerate(tfunc.args.args):
+        if i < len(call.args):
+            v = _fold_string(call.args[i], env)
+            sub_env[p.arg] = v if isinstance(v, str) else UNRESOLVED
+    return sub_env
+
+
+def _record_if_violation(shape, sql_arg, call, relpath, canonical_boundary, violations):
+    if relpath == canonical_boundary:
+        return
+    if shape is UNRESOLVED:
+        violations.append(_v("FAIL_CLOSED_UNRESOLVED_DYNAMIC_SQL", sql_arg, call, relpath, None, None, [DYNAMIC]))
+        return
+    parsed = _classify_sql(shape)
+    if parsed is None:
+        return
+    operation, table, columns = parsed
+    if operation == "UNKNOWN_MUTATION":
+        violations.append(_v("FAIL_CLOSED_UNRESOLVED_DYNAMIC_SQL", sql_arg, call, relpath, None, None, [DYNAMIC]))
+        return
+    if table != "tasks":
+        return
+    if any(DYNAMIC in (c or "") for c in columns):
+        violations.append(_v("FAIL_CLOSED_UNRESOLVED_DYNAMIC_SQL", sql_arg, call, relpath, operation, table, columns))
+        return
+    if "status" in columns:
+        violations.append(_v("FAIL_DIRECT_TASKS_STATUS_SQL", sql_arg, call, relpath, operation, table, columns))
+
+
+def _v(expectation, sql_arg, call, relpath, operation, table, columns):
+    line = getattr(sql_arg, "lineno", None) or getattr(call, "lineno", None)
+    return {
+        "expectation": expectation,
+        "file": relpath,
+        "line": line,
+        "operation": operation,
+        "table": table,
+        "columns": columns,
+    }
+
+
+# ============================================================================
+# AION R4/I01 — bounded adversarial scanner tests
+# (direct tasks.status lifecycle SQL outside the canonical kanban_db boundary)
+# ============================================================================
+
+_NEG_FIXTURES = [
+    {"id": "SNEG01_DIRECT_EXECUTE", "entrypoint": "app.f", "expectation": "FAIL_DIRECT_TASKS_STATUS_SQL",
+     "virtual_files": {"app.py": "def f(conn, task_id, status):\n    conn.execute(\"UPDATE tasks SET status = ? WHERE id = ?\", (status, task_id))\n"}},
+    {"id": "SNEG02_CONNECTION_ALIAS", "entrypoint": "app.f", "expectation": "FAIL_DIRECT_TASKS_STATUS_SQL",
+     "virtual_files": {"app.py": "def f(conn):\n    db = conn\n    db.execute(\"UPDATE tasks SET status='todo'\")\n"}},
+    {"id": "SNEG03_CURSOR_ALIAS", "entrypoint": "app.f", "expectation": "FAIL_DIRECT_TASKS_STATUS_SQL",
+     "virtual_files": {"app.py": "def f(conn):\n    cur = conn.cursor()\n    other = cur\n    other.execute(\"UPDATE tasks SET status='todo'\")\n"}},
+    {"id": "SNEG04_BOUND_METHOD_ALIAS", "entrypoint": "app.f", "expectation": "FAIL_DIRECT_TASKS_STATUS_SQL",
+     "virtual_files": {"app.py": "def f(conn):\n    run = conn.execute\n    run(\"UPDATE tasks SET status='todo'\")\n"}},
+    {"id": "SNEG05_MULTILINE_SQL", "entrypoint": "app.f", "expectation": "FAIL_DIRECT_TASKS_STATUS_SQL",
+     "virtual_files": {"app.py": "def f(conn):\n    conn.execute(\"\"\"\n        UPDATE tasks\n        SET status = 'todo'\n        WHERE id = 't1'\n    \"\"\")\n"}},
+    {"id": "SNEG06_ADJACENT_LITERAL_SQL", "entrypoint": "app.f", "expectation": "FAIL_DIRECT_TASKS_STATUS_SQL",
+     "virtual_files": {"app.py": "def f(conn):\n    conn.execute(\"UPDATE tasks SET \" \"status='todo' WHERE id='t1'\")\n"}},
+    {"id": "SNEG07_CONCATENATED_SQL", "entrypoint": "app.f", "expectation": "FAIL_DIRECT_TASKS_STATUS_SQL",
+     "virtual_files": {"app.py": "def f(conn):\n    sql = \"UPDATE tasks SET \" + \"status='todo' WHERE id='t1'\"\n    conn.execute(sql)\n"}},
+    {"id": "SNEG08_STATIC_FSTRING_SQL", "entrypoint": "app.f", "expectation": "FAIL_DIRECT_TASKS_STATUS_SQL",
+     "virtual_files": {"app.py": "def f(conn):\n    column = 'status'\n    sql = f\"UPDATE tasks SET {column}='todo'\"\n    conn.execute(sql)\n"}},
+    {"id": "SNEG09_STATIC_PERCENT_SQL", "entrypoint": "app.f", "expectation": "FAIL_DIRECT_TASKS_STATUS_SQL",
+     "virtual_files": {"app.py": "def f(conn):\n    sql = \"UPDATE tasks SET %s='todo'\" % 'status'\n    conn.execute(sql)\n"}},
+    {"id": "SNEG10_STATIC_FORMAT_SQL", "entrypoint": "app.f", "expectation": "FAIL_DIRECT_TASKS_STATUS_SQL",
+     "virtual_files": {"app.py": "def f(conn):\n    sql = \"UPDATE tasks SET {}='todo'\".format('status')\n    conn.execute(sql)\n"}},
+    {"id": "SNEG11_EXECUTEMANY", "entrypoint": "app.f", "expectation": "FAIL_DIRECT_TASKS_STATUS_SQL",
+     "virtual_files": {"app.py": "def f(conn, rows):\n    conn.executemany(\"UPDATE tasks SET status=? WHERE id=?\", rows)\n"}},
+    {"id": "SNEG12_EXECUTESCRIPT", "entrypoint": "app.f", "expectation": "FAIL_DIRECT_TASKS_STATUS_SQL",
+     "virtual_files": {"app.py": "def f(conn):\n    conn.executescript(\"UPDATE tasks SET status='todo';\")\n"}},
+    {"id": "SNEG13_LOCAL_WRAPPER", "entrypoint": "app.f", "expectation": "FAIL_DIRECT_TASKS_STATUS_SQL",
+     "virtual_files": {"app.py": "def mutate(db, sql):\n    db.execute(sql)\n\ndef f(conn):\n    mutate(conn, \"UPDATE tasks SET status='todo'\")\n"}},
+    {"id": "SNEG14_IMPORTED_PROJECT_HELPER", "entrypoint": "app.f", "expectation": "FAIL_DIRECT_TASKS_STATUS_SQL",
+     "virtual_files": {"app.py": "from helper import mutate\n\ndef f(conn):\n    mutate(conn, \"UPDATE tasks SET status='todo'\")\n",
+                      "helper.py": "def mutate(db, sql):\n    db.execute(sql)\n"}},
+    {"id": "SNEG15_UNRESOLVED_DYNAMIC_SQL", "entrypoint": "app.f", "expectation": "FAIL_CLOSED_UNRESOLVED_DYNAMIC_SQL",
+     "virtual_files": {"app.py": "def f(conn, sql_from_runtime):\n    conn.execute(sql_from_runtime)\n"}},
+]
+
+_POS_FIXTURES = [
+    {"id": "SPOS01_MODULE_PUBLIC_WRITER", "entrypoint": "app.f", "expectation": "PASS_CONTROLLED_PUBLIC_WRITER_CALL",
+     "virtual_files": {"app.py": "from hermes_cli import kanban_db\n\ndef f(conn, task_id):\n    return kanban_db.set_task_status(conn, task_id, 'todo')\n"}},
+    {"id": "SPOS02_IMPORTED_PUBLIC_WRITER", "entrypoint": "app.f", "expectation": "PASS_CONTROLLED_PUBLIC_WRITER_CALL",
+     "virtual_files": {"app.py": "from hermes_cli.kanban_db import set_task_status\n\ndef f(conn, task_id):\n    return set_task_status(conn, task_id, 'todo')\n"}},
+    {"id": "SPOS03_CANONICAL_BOUNDARY_SQL", "entrypoint": "hermes_cli.kanban_db.set_task_status", "expectation": "PASS_EXACT_CANONICAL_BOUNDARY",
+     "virtual_files": {"hermes_cli/kanban_db.py": "def set_task_status(conn, task_id, status):\n    conn.execute(\"UPDATE tasks SET status=? WHERE id=?\", (status, task_id))\n"}},
+    {"id": "SPOS04_NON_STATUS_DASHBOARD_PRIORITY", "entrypoint": "app.f", "expectation": "PASS_OUTSIDE_I01_CLAIM_WITHOUT_CLOSURE",
+     "virtual_files": {"app.py": "def f(conn, task_id):\n    conn.execute(\"UPDATE tasks SET priority=? WHERE id=?\", (1, task_id))\n"}},
+    {"id": "SPOS05_NON_STATUS_DASHBOARD_TITLE_BODY", "entrypoint": "app.f", "expectation": "PASS_OUTSIDE_I01_CLAIM_WITHOUT_CLOSURE",
+     "virtual_files": {"app.py": "def f(conn, task_id):\n    conn.execute(\"UPDATE tasks SET title=?, body=? WHERE id=?\", ('t', 'b', task_id))\n"}},
+]
+
+
+def _scan_fixture(fixture):
+    files = dict(fixture["virtual_files"])
+    return scan_status_sql(files, entrypoints=[fixture["entrypoint"]])
+
+
+def test_i01_scanner_negative_fixtures():
+    """All 15 named adversaries must be detected with the exact expectation."""
+    for f in _NEG_FIXTURES:
+        viols = _scan_fixture(f)
+        assert viols, f"{f['id']} should be flagged"
+        assert any(v["expectation"] == f["expectation"] for v in viols), \
+            f"{f['id']}: expected {f['expectation']}, got {[v['expectation'] for v in viols]}"
+
+
+def test_i01_scanner_positive_fixtures():
+    """All 5 positive fixtures must pass clean (no violation)."""
+    for f in _POS_FIXTURES:
+        viols = _scan_fixture(f)
+        assert viols == [], f"{f['id']} should be clean, got {viols}"
+
+
+def test_i01_scanner_mutation_kills(tmp_path):
+    """15/15 adversarial mutation kills: each negative fixture injected into a
+    temporary production-path copy must fail the scanner with its fixture id."""
+    for f in _NEG_FIXTURES:
+        # Write virtual files under a production-like path (NOT tests/).
+        for rel, src in f["virtual_files"].items():
+            p = tmp_path / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(src, encoding="utf-8")
+        # Scan the temporary production copy, entrypoint-scoped.
+        files = {rel: (tmp_path / rel).read_text(encoding="utf-8") for rel in f["virtual_files"]}
+        # Map the fixture entrypoint module -> the tmp_path relative path.
+        mod = f["entrypoint"].split(".")[0]
+        ep_rel = mod + ".py"
+        viols = scan_status_sql(files, entrypoints=[f["entrypoint"].replace(mod, ep_rel)])
+        assert viols, f"mutation {f['id']} survived: not flagged"
+        assert any(v["expectation"] == f["expectation"] for v in viols), \
+            f"mutation {f['id']}: expected {f['expectation']}"
+
+
+def _production_py_files(repo_root):
+    out = subprocess.check_output(["git", "-C", str(repo_root), "ls-files", "-z", "*.py"])
+    paths = [p.decode("utf-8") for p in out.split(b"\x00") if p]
+    return sorted(p for p in paths if not p.startswith("tests/"))
+
+
+def test_i01_scanner_green_at_head():
+    """PR-head GREEN: no direct tasks.status SQL outside the canonical boundary.
+
+    Scans every tracked production .py file (excluding tests/), scoping the
+    unresolved-dynamic-SQL fail-closed rule to the dashboard chokepoint.
+    """
+    repo_root = Path(__file__).resolve().parents[2]
+    files = {}
+    for p in _production_py_files(repo_root):
+        files[p] = (repo_root / p).read_text(encoding="utf-8", errors="replace")
+    viols = scan_status_sql(files, dynamic_scope={DASHBOARD_PLUGIN})
+    assert viols == [], f"direct tasks.status SQL outside canonical boundary: {viols}"
+
+
+def test_i01_scanner_flags_pinned_baseline_sql():
+    """Pinned baseline RED: the exact two pre-relocation SQL statements are
+    detected (the multiline CASE update and the child-demotion update)."""
+    baseline = {
+        "app.py": (
+            "def f(conn, task_id, new_status):\n"
+            "    cur = conn.execute(\n"
+            "        \"UPDATE tasks SET status = ?, \"\n"
+            "        \"  claim_lock = CASE WHEN ? = 'running' THEN claim_lock ELSE NULL END, \"\n"
+            "        \"  claim_expires = CASE WHEN ? = 'running' THEN claim_expires ELSE NULL END, \"\n"
+            "        \"  worker_pid = CASE WHEN ? = 'running' THEN worker_pid ELSE NULL END \"\n"
+            "        \"WHERE id = ?\",\n"
+            "        (new_status, new_status, new_status, new_status, task_id),\n"
+            "    )\n"
+            "    demoted = conn.execute(\n"
+            "        \"UPDATE tasks SET status = 'todo' \"\n"
+            "        \"WHERE id = ? AND status = 'ready'\",\n"
+            "        (task_id,),\n"
+            "    )\n"
+        )
+    }
+    viols = scan_status_sql(baseline, entrypoints=["app.f"])
+    direct = [v for v in viols if v["expectation"] == "FAIL_DIRECT_TASKS_STATUS_SQL"]
+    assert len(direct) == 2, f"expected 2 direct status violations, got {viols}"
+    for v in direct:
+        assert v["operation"] == "UPDATE" and v["table"] == "tasks"
+        assert "status" in v["columns"]
+
+
+# ============================================================================
+# AION R4/I01 — 44-row transaction / parity / fault matrix
+# ============================================================================
+
+class _Fault(Exception):
+    """Sentinel raised by the fault injector."""
+
+
+def _snapshot(conn):
+    def rows(t, o):
+        return [tuple(r) for r in conn.execute(f"SELECT * FROM {t} ORDER BY {o}").fetchall()]
+    return (
+        rows("tasks", "id"),
+        rows("task_runs", "id"),
+        rows("task_events", "id"),
+        rows("task_links", "parent_id, child_id"),
+    )
+
+
+def _inject(conn, when, substr, occ=1):
+    """Monkeypatch conn.execute to raise _Fault before/after the Nth statement
+    whose SQL text contains ``substr``. Returns the original execute."""
+    original = conn.execute
+    state = {"n": 0}
+
+    def patched(sql, *a, **k):
+        s = sql if isinstance(sql, str) else str(sql)
+        matched = substr in s
+        if when == "before" and matched:
+            state["n"] += 1
+            if state["n"] == occ:
+                raise _Fault(f"{when}:{substr}:{occ}")
+        r = original(sql, *a, **k)
+        if when == "after" and matched:
+            state["n"] += 1
+            if state["n"] == occ:
+                raise _Fault(f"{when}:{substr}:{occ}")
+        return r
+
+    conn.execute = patched
+    return original
+
+
+def _mk_task(conn, title="t", status="todo"):
+    tid = kb.create_task(conn, title=title)
+    if status != "ready":
+        conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, tid))
+    return tid
+
+
+def _mk_run(conn, task_id):
+    cur = conn.execute(
+        "INSERT INTO task_runs (task_id, profile, status, started_at) "
+        "VALUES (?, ?, 'running', ?)",
+        (task_id, "test", int(time.time())),
+    )
+    run_id = cur.lastrowid
+    conn.execute(
+        "UPDATE tasks SET status = 'running', current_run_id = ? WHERE id = ?",
+        (run_id, task_id),
+    )
+    return run_id
+
+
+def _task(conn, task_id):
+    return conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+
+
+def _events(conn, task_id):
+    return conn.execute(
+        "SELECT * FROM task_events WHERE task_id = ? ORDER BY id", (task_id,),
+    ).fetchall()
+
+
+def _new_conn(kanban_home):
+    return kb.connect()
+
+
+# ---------------------------------------------------------------------------
+# Parity rows (writer-level semantics)
+# ---------------------------------------------------------------------------
+
+def test_P01_todo_to_ready_no_parent(kanban_home):
+    conn = kb.connect()
+    try:
+        tid = _mk_task(conn, "a", "todo")
+        assert kb.set_task_status(conn, tid, "ready") is True
+        t = _task(conn, tid)
+        assert t["status"] == "ready"
+        assert t["claim_lock"] is None and t["claim_expires"] is None and t["worker_pid"] is None
+        evs = _events(conn, tid)
+        status_evs = [e for e in evs if e["kind"] == "status"]
+        assert len(status_evs) == 1
+    finally:
+        conn.close()
+
+
+def test_P02_triage_to_todo(kanban_home):
+    conn = kb.connect()
+    try:
+        tid = _mk_task(conn, "a", "triage")
+        assert kb.set_task_status(conn, tid, "todo") is True
+        assert _task(conn, tid)["status"] == "todo"
+    finally:
+        conn.close()
+
+
+def test_P03_ready_to_triage(kanban_home):
+    conn = kb.connect()
+    try:
+        tid = _mk_task(conn, "a", "ready")
+        assert kb.set_task_status(conn, tid, "triage") is True
+        assert _task(conn, tid)["status"] == "triage"
+    finally:
+        conn.close()
+
+
+def test_P04_same_status_todo(kanban_home):
+    conn = kb.connect()
+    try:
+        tid = _mk_task(conn, "a", "todo")
+        before = len([e for e in _events(conn, tid) if e["kind"] == "status"])
+        assert kb.set_task_status(conn, tid, "todo") is True
+        assert _task(conn, tid)["status"] == "todo"
+        after = len([e for e in _events(conn, tid) if e["kind"] == "status"])
+        assert after == before + 1  # same-status is not a no-op
+    finally:
+        conn.close()
+
+
+def test_P05_same_status_ready(kanban_home):
+    conn = kb.connect()
+    try:
+        tid = _mk_task(conn, "a", "ready")
+        before = len([e for e in _events(conn, tid) if e["kind"] == "status"])
+        assert kb.set_task_status(conn, tid, "ready") is True
+        assert _task(conn, tid)["status"] == "ready"
+        after = len([e for e in _events(conn, tid) if e["kind"] == "status"])
+        assert after == before + 1
+    finally:
+        conn.close()
+
+
+def test_P06_running_to_ready_reclaim(kanban_home):
+    conn = kb.connect()
+    try:
+        tid = _mk_task(conn, "a", "running")
+        run_id = _mk_run(conn, tid)
+        assert kb.set_task_status(conn, tid, "ready") is True
+        t = _task(conn, tid)
+        assert t["status"] == "ready"
+        assert t["current_run_id"] is None
+        assert t["claim_lock"] is None and t["claim_expires"] is None and t["worker_pid"] is None
+        run = conn.execute("SELECT * FROM task_runs WHERE id = ?", (run_id,)).fetchone()
+        assert run["status"] == "reclaimed" and run["outcome"] == "reclaimed"
+        assert run["ended_at"] is not None
+        evs = [e for e in _events(conn, tid) if e["kind"] == "status"]
+        assert len(evs) == 1 and evs[0]["run_id"] == run_id
+    finally:
+        conn.close()
+
+
+def test_P07_running_to_todo_reclaim(kanban_home):
+    conn = kb.connect()
+    try:
+        tid = _mk_task(conn, "a", "running")
+        run_id = _mk_run(conn, tid)
+        assert kb.set_task_status(conn, tid, "todo") is True
+        assert _task(conn, tid)["status"] == "todo"
+        run = conn.execute("SELECT * FROM task_runs WHERE id = ?", (run_id,)).fetchone()
+        assert run["status"] == "reclaimed"
+    finally:
+        conn.close()
+
+
+def test_P08_ready_allowed_by_done_parent(kanban_home):
+    conn = kb.connect()
+    try:
+        parent = _mk_task(conn, "p", "done")
+        child = _mk_task(conn, "c", "todo")
+        kb.link_tasks(conn, parent, child)
+        assert kb.set_task_status(conn, child, "ready") is True
+        assert _task(conn, child)["status"] == "ready"
+    finally:
+        conn.close()
+
+
+def test_P09_ready_refused_by_archived_parent(kanban_home):
+    conn = kb.connect()
+    try:
+        parent = _mk_task(conn, "p", "archived")
+        child = _mk_task(conn, "c", "todo")
+        kb.link_tasks(conn, parent, child)
+        assert kb.set_task_status(conn, child, "ready") is False
+        assert _task(conn, child)["status"] == "todo"
+    finally:
+        conn.close()
+
+
+def test_P10_ready_refused_by_non_done_parent(kanban_home):
+    conn = kb.connect()
+    try:
+        parent = _mk_task(conn, "p", "running")
+        child = _mk_task(conn, "c", "todo")
+        kb.link_tasks(conn, parent, child)
+        assert kb.set_task_status(conn, child, "ready") is False
+        assert _task(conn, child)["status"] == "todo"
+    finally:
+        conn.close()
+
+
+def test_P11_done_parent_reopen_to_todo(kanban_home):
+    conn = kb.connect()
+    try:
+        parent = _mk_task(conn, "p", "done")
+        child_a = _mk_task(conn, "ca", "ready")
+        child_b = _mk_task(conn, "cb", "todo")
+        kb.link_tasks(conn, parent, child_a)
+        kb.link_tasks(conn, parent, child_b)
+        assert kb.set_task_status(conn, parent, "todo") is True
+        assert _task(conn, parent)["status"] == "todo"
+        assert _task(conn, child_a)["status"] == "todo"  # ready child demoted
+        assert _task(conn, child_b)["status"] == "todo"  # non-ready unchanged
+    finally:
+        conn.close()
+
+
+def test_P12_archived_parent_reopen_to_triage(kanban_home):
+    conn = kb.connect()
+    try:
+        parent = _mk_task(conn, "p", "archived")
+        child_a = _mk_task(conn, "ca", "ready")
+        child_b = _mk_task(conn, "cb", "ready")
+        child_c = _mk_task(conn, "cc", "blocked")
+        for c in (child_a, child_b, child_c):
+            kb.link_tasks(conn, parent, c)
+        assert kb.set_task_status(conn, parent, "triage") is True
+        assert _task(conn, parent)["status"] == "triage"
+        assert _task(conn, child_a)["status"] == "todo"
+        assert _task(conn, child_b)["status"] == "todo"
+        assert _task(conn, child_c)["status"] == "blocked"
+    finally:
+        conn.close()
+
+
+def test_P13_done_parent_reopen_to_ready(kanban_home):
+    conn = kb.connect()
+    try:
+        grandparent = _mk_task(conn, "gp", "done")
+        parent = _mk_task(conn, "p", "done")
+        kb.link_tasks(conn, grandparent, parent)
+        child = _mk_task(conn, "c", "ready")
+        kb.link_tasks(conn, parent, child)
+        assert kb.set_task_status(conn, parent, "ready") is True
+        assert _task(conn, parent)["status"] == "ready"
+        assert _task(conn, child)["status"] == "todo"  # demoted, not re-promoted
+    finally:
+        conn.close()
+
+
+def test_P14_missing_task(kanban_home):
+    conn = kb.connect()
+    try:
+        assert kb.set_task_status(conn, "t_nonexistent", "todo") is False
+    finally:
+        conn.close()
+
+
+def test_P15_archived_parent_blocks_ready_even_though_recompute_accepts(kanban_home):
+    conn = kb.connect()
+    try:
+        parent = _mk_task(conn, "p", "archived")
+        child = _mk_task(conn, "c", "triage")
+        kb.link_tasks(conn, parent, child)
+        # Direct helper refuses ready on archived parent; recompute_ready would
+        # accept archived, so this pins the divergence.
+        assert kb.set_task_status(conn, child, "ready") is False
+        assert _task(conn, child)["status"] == "triage"
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Pre-commit fault rows (22/22 full-snapshot rollback equality)
+# ---------------------------------------------------------------------------
+
+_RUNNING_READY_FAULTS = [
+    ("F-RUNNING-READY-01", "before", "UPDATE tasks SET status = ?", 1),
+    ("F-RUNNING-READY-02", "after", "UPDATE tasks SET status = ?", 1),
+    ("F-RUNNING-READY-03", "before", "UPDATE task_runs", 1),
+    ("F-RUNNING-READY-04", "after", "UPDATE task_runs", 1),
+    ("F-RUNNING-READY-05", "before", "current_run_id = NULL", 1),
+    ("F-RUNNING-READY-06", "after", "current_run_id = NULL", 1),
+    ("F-RUNNING-READY-07", "before", "INSERT INTO task_events (task_id, run_id", 1),
+    ("F-RUNNING-READY-08", "after", "INSERT INTO task_events (task_id, run_id", 1),
+    ("F-RUNNING-READY-09", "before", "COMMIT", 1),
+]
+
+_REOPEN_FAULTS = [
+    ("F-REOPEN-TWO-CHILDREN-01", "before", "UPDATE tasks SET status = ?", 1),
+    ("F-REOPEN-TWO-CHILDREN-02", "after", "UPDATE tasks SET status = ?", 1),
+    ("F-REOPEN-TWO-CHILDREN-03", "before", "INSERT INTO task_events (task_id, run_id", 1),
+    ("F-REOPEN-TWO-CHILDREN-04", "after", "INSERT INTO task_events (task_id, run_id", 1),
+    ("F-REOPEN-TWO-CHILDREN-05", "before", "UPDATE tasks SET status = 'todo'", 1),
+    ("F-REOPEN-TWO-CHILDREN-06", "after", "UPDATE tasks SET status = 'todo'", 1),
+    ("F-REOPEN-TWO-CHILDREN-07", "before", "INSERT INTO task_events (task_id, kind", 1),
+    ("F-REOPEN-TWO-CHILDREN-08", "after", "INSERT INTO task_events (task_id, kind", 1),
+    ("F-REOPEN-TWO-CHILDREN-09", "before", "UPDATE tasks SET status = 'todo'", 2),
+    ("F-REOPEN-TWO-CHILDREN-10", "after", "UPDATE tasks SET status = 'todo'", 2),
+    ("F-REOPEN-TWO-CHILDREN-11", "before", "INSERT INTO task_events (task_id, kind", 2),
+    ("F-REOPEN-TWO-CHILDREN-12", "after", "INSERT INTO task_events (task_id, kind", 2),
+    ("F-REOPEN-TWO-CHILDREN-13", "before", "COMMIT", 1),
+]
+
+
+@pytest.mark.parametrize("row_id,when,substr,occ", _RUNNING_READY_FAULTS)
+def test_precommit_fault_running_ready(kanban_home, row_id, when, substr, occ):
+    conn = kb.connect()
+    try:
+        tid = _mk_task(conn, "a", "running")
+        _mk_run(conn, tid)
+        before = _snapshot(conn)
+        original = _inject(conn, when, substr, occ)
+        with pytest.raises(_Fault):
+            kb.set_task_status(conn, tid, "ready")
+        conn.execute = original
+        after = _snapshot(conn)
+        assert before == after, f"{row_id}: snapshot must be byte/row-value equal"
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("row_id,when,substr,occ", _REOPEN_FAULTS)
+def test_precommit_fault_reopen_two_children(kanban_home, row_id, when, substr, occ):
+    conn = kb.connect()
+    try:
+        parent = _mk_task(conn, "p", "done")
+        child_a = _mk_task(conn, "ca", "ready")
+        child_b = _mk_task(conn, "cb", "ready")
+        kb.link_tasks(conn, parent, child_a)
+        kb.link_tasks(conn, parent, child_b)
+        before = _snapshot(conn)
+        original = _inject(conn, when, substr, occ)
+        with pytest.raises(_Fault):
+            kb.set_task_status(conn, parent, "todo")
+        conn.execute = original
+        after = _snapshot(conn)
+        assert before == after, f"{row_id}: snapshot must be byte/row-value equal"
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Post-commit recompute failure rows (2/2 non-atomic boundary)
+# ---------------------------------------------------------------------------
+
+def test_PC01_update_ready_recompute_failure(kanban_home, monkeypatch):
+    conn = kb.connect()
+    try:
+        parent = _mk_task(conn, "p", "done")
+        tid = _mk_task(conn, "a", "todo")
+        kb.link_tasks(conn, parent, tid)
+
+        def boom(*a, **k):
+            raise _Fault("recompute boom")
+
+        monkeypatch.setattr(kb, "recompute_ready", boom)
+        with pytest.raises(_Fault):
+            kb.set_task_status(conn, tid, "ready")
+        # Controlled-writer commit is NOT undone by recompute failure.
+        assert _task(conn, tid)["status"] == "ready"
+        evs = [e for e in _events(conn, tid) if e["kind"] == "status"]
+        assert len(evs) == 1  # status event committed
+    finally:
+        conn.close()
+
+
+def test_PC02_bulk_ready_recompute_failure_continues(kanban_home, monkeypatch):
+    conn = kb.connect()
+    try:
+        p1 = _mk_task(conn, "p1", "done")
+        p2 = _mk_task(conn, "p2", "done")
+        first = _mk_task(conn, "first", "todo")
+        second = _mk_task(conn, "second", "todo")
+        kb.link_tasks(conn, p1, first)
+        kb.link_tasks(conn, p2, second)
+
+        calls = {"n": 0}
+        real = kb.recompute_ready
+
+        def flaky(conn_arg, *a, **k):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise _Fault("first recompute boom")
+            return real(conn_arg, *a, **k)
+
+        monkeypatch.setattr(kb, "recompute_ready", flaky)
+        with pytest.raises(_Fault):
+            kb.set_task_status(conn, first, "ready")
+        assert _task(conn, first)["status"] == "ready"  # first committed despite recompute failure
+        assert kb.set_task_status(conn, second, "ready") is True  # second independently succeeds
+        assert _task(conn, second)["status"] == "ready"
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Bulk partial rows (5/5 ordered partial-result semantics)
+# ---------------------------------------------------------------------------
+
+def test_B01_ordered_partial_status_results(kanban_home):
+    conn = kb.connect()
+    try:
+        ok_a = _mk_task(conn, "ok-a", "todo")
+        refused = _mk_task(conn, "refused", "todo")
+        blocker = _mk_task(conn, "blocker", "running")
+        kb.link_tasks(conn, blocker, refused)
+        ok_b = _mk_task(conn, "ok-b", "triage")
+
+        results = []
+        for tid in [ok_a, "t_missing", refused, ok_b]:
+            results.append(kb.set_task_status(conn, tid, "ready"))
+        assert results == [True, False, False, True]
+        assert _task(conn, ok_a)["status"] == "ready"
+        assert _task(conn, refused)["status"] == "todo"  # unchanged
+        assert _task(conn, ok_b)["status"] == "ready"
+    finally:
+        conn.close()
+
+
+def test_B02_precommit_failure_rolls_back_one_id_only(kanban_home, monkeypatch):
+    conn = kb.connect()
+    try:
+        faulted = _mk_task(conn, "faulted", "running")
+        _mk_run(conn, faulted)
+        healthy = _mk_task(conn, "healthy", "todo")
+        before_faulted = _snapshot(conn)
+
+        real = kb.set_task_status
+
+        def flaky(c, tid, status):
+            if tid == faulted:
+                # raise inside the controlled writer before commit
+                original = c.execute
+                def patched(sql, *a, **k):
+                    if "UPDATE tasks SET status = ?" in (sql if isinstance(sql, str) else str(sql)):
+                        raise _Fault("boom")
+                    return original(sql, *a, **k)
+                c.execute = patched
+                try:
+                    return real(c, tid, status)
+                finally:
+                    c.execute = original
+            return real(c, tid, status)
+
+        monkeypatch.setattr(kb, "set_task_status", flaky)
+        with pytest.raises(_Fault):
+            kb.set_task_status(conn, faulted, "ready")
+        # faulted id rolled back, healthy id still succeeds independently
+        assert kb.set_task_status(conn, healthy, "ready") is True
+        assert _task(conn, healthy)["status"] == "ready"
+        assert _task(conn, faulted)["status"] == "running"  # unchanged
+    finally:
+        conn.close()
+
+
+def test_B03_status_success_later_priority_failure(kanban_home, monkeypatch):
+    """Within one bulk id, a committed status survives a later priority fault."""
+    conn = kb.connect()
+    try:
+        tid = _mk_task(conn, "a", "todo")
+        real = kb.set_task_status
+
+        def status_then_boom(c, task_id, status):
+            ok = real(c, task_id, status)  # status commits
+            original = c.execute
+            def patched(sql, *a, **k):
+                if "UPDATE tasks SET priority" in (sql if isinstance(sql, str) else str(sql)):
+                    raise _Fault("priority boom")
+                return original(sql, *a, **k)
+            c.execute = patched
+            try:
+                with kb.write_txn(c):
+                    c.execute("UPDATE tasks SET priority = ? WHERE id = ?", (5, task_id))
+            finally:
+                c.execute = original
+            return ok
+
+        monkeypatch.setattr(kb, "set_task_status", status_then_boom)
+        with pytest.raises(_Fault):
+            kb.set_task_status(conn, tid, "ready")
+        assert _task(conn, tid)["status"] == "ready"  # status committed
+        assert _task(conn, tid)["priority"] != 5  # priority rollback
+    finally:
+        conn.close()
+
+
+def test_B04_status_refused_priority_still_applies(kanban_home):
+    conn = kb.connect()
+    try:
+        blocker = _mk_task(conn, "blocker", "running")
+        tid = _mk_task(conn, "a", "todo")
+        kb.link_tasks(conn, blocker, tid)
+        # status refused by non-done parent, but priority is independent
+        assert kb.set_task_status(conn, tid, "ready") is False
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET priority = ? WHERE id = ?", (7, tid))
+        assert _task(conn, tid)["status"] == "todo"  # unchanged
+        assert _task(conn, tid)["priority"] == 7  # priority applied
+    finally:
+        conn.close()
+
+
+def test_B05_duplicate_ids_are_separate_iterations(kanban_home):
+    conn = kb.connect()
+    try:
+        tid = _mk_task(conn, "a", "todo")
+        before = len([e for e in _events(conn, tid) if e["kind"] == "status"])
+        results = [kb.set_task_status(conn, tid, "todo"), kb.set_task_status(conn, tid, "todo")]
+        assert results == [True, True]
+        after = len([e for e in _events(conn, tid) if e["kind"] == "status"])
+        assert after == before + 2  # two status events, input not deduplicated
+    finally:
+        conn.close()
