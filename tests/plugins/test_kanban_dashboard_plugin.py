@@ -2551,6 +2551,7 @@ def test_dashboard_parent_notice_and_child_results_use_detail_links():
 
 
 # ============================================================================
+# ============================================================================
 # AION R4/I01 — bounded adversarial scanner for direct tasks.status SQL
 # ============================================================================
 CANONICAL_BOUNDARY = "hermes_cli/kanban_db.py"
@@ -2558,6 +2559,25 @@ DASHBOARD_PLUGIN = "plugins/kanban/dashboard/plugin_api.py"
 DYNAMIC = "\x00DYNAMIC\x00"
 MUTATION_METHODS = ("execute", "executemany", "executescript")
 READ_LEAD = ("SELECT", "PRAGMA", "WITH", "EXPLAIN", "VACUUM", "ANALYZE", "ATTACH", "DETACH")
+
+# --- bounded Kanban object provenance ------------------------------------
+# A name only becomes a *flag-able* target when its provenance is proven to be
+# a Kanban connection/cursor/bound execute method. Provenance is seeded from
+# the kanban_db connection factory (hermes_cli.kanban_db.connect / the dashboard
+# _conn helper) and, in explicit-entrypoint adversarial fixtures, from a
+# connection-named parameter declared by the fixture. It propagates through
+# plain aliases, ``.cursor()``, bound ``.execute``/``.executemany``/
+# ``.executescript`` methods, opaque ``getattr(obj, 'execute')``, and
+# interprocedural argument binding. Arbitrary non-Kanban ``.execute`` receivers
+# (logger, sqlite3 state/projects/session connections, console/terminal
+# engines) carry no tag and therefore stay non-violating.
+PROV_CONN = "conn"
+PROV_CURSOR = "cursor"
+PROV_METHOD = "method"
+PROV_KANBAN_MODULE = "kanban_module"
+PROV_KANBAN_CONNECT = "kanban_connect"
+_KANBAN_OBJECT_TAGS = {PROV_CONN, PROV_CURSOR, PROV_METHOD}
+CONNECTION_PARAM_NAMES = {"conn", "connection", "db", "database"}
 
 
 class _Unresolved:
@@ -2776,17 +2796,77 @@ def _build_import_map(files):
     return import_map
 
 
-def scan_status_sql(files, entrypoints=None, dynamic_scope=None,
-                    canonical_boundary=CANONICAL_BOUNDARY):
+def _receiver_prov(node, env, prov):
+    """Return the Kanban object provenance tag for a receiver expression, else None."""
+    if isinstance(node, ast.Name):
+        p = prov.get(node.id)
+        return p if p in _KANBAN_OBJECT_TAGS else None
+    return None
+
+
+def _arg_prov(arg, env, prov):
+    """Return the Kanban object provenance tag carried by a call argument, else None."""
+    if isinstance(arg, ast.Name):
+        p = prov.get(arg.id)
+        return p if p in _KANBAN_OBJECT_TAGS else None
+    if isinstance(arg, ast.Call) and isinstance(arg.func, ast.Name) and arg.func.id == "getattr":
+        if len(arg.args) >= 2:
+            attr = _fold_string(arg.args[1], env)
+            if isinstance(attr, str) and attr in MUTATION_METHODS:
+                if _receiver_prov(arg.args[0], env, prov):
+                    return PROV_METHOD
+    return None
+
+
+def _record_import_prov(prov, alias):
+    name = alias.asname or alias.name
+    if alias.name in ("kanban_db", "hermes_cli.kanban_db"):
+        prov[name] = PROV_KANBAN_MODULE
+
+
+def _record_importfrom_prov(prov, module, alias):
+    name = alias.asname or alias.name
+    mod = module or ""
+    if mod in ("hermes_cli", "hermes_cli.kanban_db"):
+        if alias.name == "kanban_db":
+            prov[name] = PROV_KANBAN_MODULE
+        elif alias.name == "connect":
+            prov[name] = PROV_KANBAN_CONNECT
+
+
+def _is_kanban_factory(call, env, prov, import_map, relpath):
+    """True if ``call`` is a Kanban connection factory invocation."""
+    fn = call.func
+    if isinstance(fn, ast.Name):
+        if fn.id == "_conn":
+            return True
+        if prov.get(fn.id) == PROV_KANBAN_CONNECT:
+            return True
+        target = import_map.get((relpath, fn.id))
+        if target and target[0] == CANONICAL_BOUNDARY and target[1] == "connect":
+            return True
+    if isinstance(fn, ast.Attribute) and fn.attr == "connect":
+        base = fn.value
+        if isinstance(base, ast.Name):
+            if prov.get(base.id) == PROV_KANBAN_MODULE:
+                return True
+            target = import_map.get((relpath, base.id))
+            if target and target[0] == CANONICAL_BOUNDARY:
+                return True
+    return False
+
+
+def scan_status_sql(files, entrypoints=None, canonical_boundary=CANONICAL_BOUNDARY):
     """Scan a set of files for direct ``tasks.status`` lifecycle SQL.
 
     * ``entrypoints``: functions to begin analysis from (``"app.f"`` style).
       When None, every module-level function in every non-boundary file is an
       entrypoint (the real production-scan mode).
-    * ``dynamic_scope``: relpaths where unresolved-dynamic-SQL fail-closed
-      applies. None means "apply everywhere" (fixture mode). For the real
-      production scan, pass ``{plugins/kanban/dashboard/plugin_api.py}`` so the
-      fail-closed rule is scoped to the dashboard chokepoint surface.
+    * A mutation call (``.execute``/``.executemany``/``.executescript`` or the
+      opaque ``getattr(obj, 'execute')``) is only a violation when its receiver
+      carries a *proven* Kanban connection/cursor/bound-method provenance.
+      Unresolved mutation-capable SQL on a proven-Kanban receiver fails closed
+      across the whole tracked production universe (no dashboard-only scope).
     """
     trees = {}
     for relpath, src in files.items():
@@ -2822,15 +2902,11 @@ def scan_status_sql(files, entrypoints=None, dynamic_scope=None,
     raw = []
     for relpath, name in eps:
         func = funcs[(relpath, name)]
-        env = _module_env(trees[relpath])
-        _process_stmts(func.body, env, relpath, funcs, import_map, raw,
+        env, prov = _module_env(trees[relpath], relpath, import_map)
+        if entrypoints is not None:
+            _seed_entrypoint_params(func, prov)
+        _process_stmts(func.body, env, prov, relpath, funcs, import_map, raw,
                        canonical_boundary, 0, set())
-
-    # Post-filter: scope the fail-closed rule to the dashboard chokepoint.
-    if dynamic_scope is not None:
-        raw = [v for v in raw
-               if v["expectation"] != "FAIL_CLOSED_UNRESOLVED_DYNAMIC_SQL"
-               or v["file"] in dynamic_scope]
 
     # Dedupe (a function reached via multiple entrypoints/inlines is one find).
     seen = set()
@@ -2844,64 +2920,109 @@ def scan_status_sql(files, entrypoints=None, dynamic_scope=None,
     return out
 
 
-def _module_env(tree):
+def _seed_entrypoint_params(func, prov):
+    """In explicit-entrypoint fixture mode, connection-named parameters are the
+    declared Kanban connection under test."""
+    params = list(func.args.posonlyargs) + list(func.args.args) + list(func.args.kwonlyargs)
+    for a in params:
+        if a.arg in CONNECTION_PARAM_NAMES:
+            prov[a.arg] = PROV_CONN
+
+
+def _module_env(tree, relpath, import_map):
     env = {}
+    prov = {}
     for stmt in tree.body:
         if isinstance(stmt, ast.Assign):
             for tgt in stmt.targets:
-                _assign_target(env, tgt, stmt.value)
+                _assign_target(env, prov, tgt, stmt.value, relpath, import_map)
         elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
             if stmt.value is not None:
-                _assign(env, stmt.target.id, stmt.value)
-    return env
+                _assign(env, prov, stmt.target.id, stmt.value, relpath, import_map)
+        elif isinstance(stmt, ast.Import):
+            for alias in stmt.names:
+                _record_import_prov(prov, alias)
+        elif isinstance(stmt, ast.ImportFrom):
+            for alias in stmt.names:
+                _record_importfrom_prov(prov, stmt.module, alias)
+    return env, prov
 
 
-def _assign_target(env, tgt, value):
+def _assign_target(env, prov, tgt, value, relpath, import_map):
     if isinstance(tgt, ast.Name):
-        _assign(env, tgt.id, value)
+        _assign(env, prov, tgt.id, value, relpath, import_map)
     elif isinstance(tgt, (ast.Tuple, ast.List)) and isinstance(value, (ast.Tuple, ast.List)):
         if len(tgt.elts) == len(value.elts):
             for te, ve in zip(tgt.elts, value.elts):
-                _assign_target(env, te, ve)
+                _assign_target(env, prov, te, ve, relpath, import_map)
 
 
-def _assign(env, name, value):
+def _assign(env, prov, name, value, relpath, import_map):
+    # Bound mutation method alias: ``run = conn.execute``.
+    if isinstance(value, ast.Attribute) and value.attr in MUTATION_METHODS:
+        env[name] = ("__BOUND_METHOD__", value.attr)
+        if _receiver_prov(value.value, env, prov) is not None:
+            prov[name] = PROV_METHOD
+        return
+    # Opaque bound method alias: ``run = getattr(conn, 'execute')``.
+    if (isinstance(value, ast.Call) and isinstance(value.func, ast.Name)
+            and value.func.id == "getattr" and len(value.args) >= 2):
+        attr_name = _fold_string(value.args[1], env)
+        if isinstance(attr_name, str) and attr_name in MUTATION_METHODS:
+            env[name] = ("__BOUND_METHOD__", attr_name)
+            if _receiver_prov(value.args[0], env, prov) is not None:
+                prov[name] = PROV_METHOD
+            return
+    # Kanban cursor: ``cur = conn.cursor()``.
+    if (isinstance(value, ast.Call) and isinstance(value.func, ast.Attribute)
+            and value.func.attr == "cursor"):
+        if _receiver_prov(value.func.value, env, prov) is not None:
+            prov[name] = PROV_CURSOR
+        return
+    # Kanban connection factory: ``conn = kanban_db.connect(...)`` / ``_conn(...)``.
+    if isinstance(value, ast.Call) and _is_kanban_factory(value, env, prov, import_map, relpath):
+        prov[name] = PROV_CONN
+        return
     if isinstance(value, ast.Constant) and isinstance(value.value, str):
         env[name] = value.value
-    elif isinstance(value, ast.List):
+        return
+    if isinstance(value, ast.List):
         env[name] = _fold_list(value, env)
-    elif isinstance(value, ast.Attribute) and value.attr in MUTATION_METHODS:
-        env[name] = ("__BOUND_METHOD__", value.attr)
-    else:
-        v = _fold_string(value, env)
-        if isinstance(v, str):
-            env[name] = v
+        return
+    # Plain alias: ``db = conn`` (inherit Kanban provenance).
+    if isinstance(value, ast.Name):
+        p = prov.get(value.id)
+        if p in _KANBAN_OBJECT_TAGS:
+            prov[name] = p
+    v = _fold_string(value, env)
+    if isinstance(v, str):
+        env[name] = v
 
 
-def _process_stmts(stmts, env, relpath, funcs, import_map, violations,
+def _process_stmts(stmts, env, prov, relpath, funcs, import_map, violations,
                    canonical_boundary, depth, visited):
     if depth > 24:
         return
     for stmt in stmts:
-        _process_stmt(stmt, env, relpath, funcs, import_map, violations,
+        _process_stmt(stmt, env, prov, relpath, funcs, import_map, violations,
                       canonical_boundary, depth, visited)
 
 
-def _process_stmt(stmt, env, relpath, funcs, import_map, violations,
+def _process_stmt(stmt, env, prov, relpath, funcs, import_map, violations,
                   canonical_boundary, depth, visited):
     if isinstance(stmt, ast.Assign):
-        _scan_calls(stmt.value, env, relpath, funcs, import_map, violations,
+        _scan_calls(stmt.value, env, prov, relpath, funcs, import_map, violations,
                     canonical_boundary, depth, visited)
         for tgt in stmt.targets:
-            _assign_target(env, tgt, stmt.value)
+            _assign_target(env, prov, tgt, stmt.value, relpath, import_map)
     elif isinstance(stmt, ast.AnnAssign):
         if stmt.value is not None:
-            _scan_calls(stmt.value, env, relpath, funcs, import_map, violations,
+            _scan_calls(stmt.value, env, prov, relpath, funcs, import_map, violations,
                         canonical_boundary, depth, visited)
         if isinstance(stmt.target, ast.Name) and stmt.value is not None:
-            _assign(env, stmt.target.id, stmt.value)
+            _assign(env, prov, stmt.target.id, stmt.value, relpath, import_map)
     elif isinstance(stmt, ast.AugAssign):
-        _scan_calls(stmt.value, env, relpath, funcs, import_map, violations,
+        _scan_calls(stmt.value, env, prov, relpath, funcs, import_map, violations,
                     canonical_boundary, depth, visited)
         if isinstance(stmt.target, ast.Name):
             cur = env.get(stmt.target.id, UNRESOLVED)
@@ -2909,64 +3030,64 @@ def _process_stmt(stmt, env, relpath, funcs, import_map, violations,
             if isinstance(cur, str) and isinstance(inc, str):
                 env[stmt.target.id] = cur + inc
     elif isinstance(stmt, ast.Expr):
-        _scan_calls(stmt.value, env, relpath, funcs, import_map, violations,
+        _scan_calls(stmt.value, env, prov, relpath, funcs, import_map, violations,
                     canonical_boundary, depth, visited)
     elif isinstance(stmt, ast.Return):
         if stmt.value is not None:
-            _scan_calls(stmt.value, env, relpath, funcs, import_map, violations,
+            _scan_calls(stmt.value, env, prov, relpath, funcs, import_map, violations,
                         canonical_boundary, depth, visited)
     elif isinstance(stmt, ast.If):
-        _scan_calls(stmt.test, env, relpath, funcs, import_map, violations,
+        _scan_calls(stmt.test, env, prov, relpath, funcs, import_map, violations,
                     canonical_boundary, depth, visited)
-        _process_stmts(stmt.body, env, relpath, funcs, import_map, violations,
+        _process_stmts(stmt.body, env, prov, relpath, funcs, import_map, violations,
                        canonical_boundary, depth + 1, visited)
-        _process_stmts(stmt.orelse, env, relpath, funcs, import_map, violations,
+        _process_stmts(stmt.orelse, env, prov, relpath, funcs, import_map, violations,
                        canonical_boundary, depth + 1, visited)
     elif isinstance(stmt, (ast.For, ast.AsyncFor)):
-        _scan_calls(stmt.iter, env, relpath, funcs, import_map, violations,
+        _scan_calls(stmt.iter, env, prov, relpath, funcs, import_map, violations,
                     canonical_boundary, depth, visited)
-        _process_stmts(stmt.body, env, relpath, funcs, import_map, violations,
+        _process_stmts(stmt.body, env, prov, relpath, funcs, import_map, violations,
                        canonical_boundary, depth + 1, visited)
-        _process_stmts(stmt.orelse, env, relpath, funcs, import_map, violations,
+        _process_stmts(stmt.orelse, env, prov, relpath, funcs, import_map, violations,
                        canonical_boundary, depth + 1, visited)
     elif isinstance(stmt, (ast.With, ast.AsyncWith)):
         for item in stmt.items:
-            _scan_calls(item.context_expr, env, relpath, funcs, import_map,
+            _scan_calls(item.context_expr, env, prov, relpath, funcs, import_map,
                         violations, canonical_boundary, depth, visited)
-        _process_stmts(stmt.body, env, relpath, funcs, import_map, violations,
+        _process_stmts(stmt.body, env, prov, relpath, funcs, import_map, violations,
                        canonical_boundary, depth + 1, visited)
     elif isinstance(stmt, ast.Try):
-        _process_stmts(stmt.body, env, relpath, funcs, import_map, violations,
+        _process_stmts(stmt.body, env, prov, relpath, funcs, import_map, violations,
                        canonical_boundary, depth + 1, visited)
         for h in stmt.handlers:
-            _process_stmts(h.body, env, relpath, funcs, import_map, violations,
+            _process_stmts(h.body, env, prov, relpath, funcs, import_map, violations,
                            canonical_boundary, depth + 1, visited)
-        _process_stmts(stmt.orelse, env, relpath, funcs, import_map, violations,
+        _process_stmts(stmt.orelse, env, prov, relpath, funcs, import_map, violations,
                        canonical_boundary, depth + 1, visited)
-        _process_stmts(stmt.finalbody, env, relpath, funcs, import_map, violations,
+        _process_stmts(stmt.finalbody, env, prov, relpath, funcs, import_map, violations,
                        canonical_boundary, depth + 1, visited)
     elif isinstance(stmt, ast.While):
-        _scan_calls(stmt.test, env, relpath, funcs, import_map, violations,
+        _scan_calls(stmt.test, env, prov, relpath, funcs, import_map, violations,
                     canonical_boundary, depth, visited)
-        _process_stmts(stmt.body, env, relpath, funcs, import_map, violations,
+        _process_stmts(stmt.body, env, prov, relpath, funcs, import_map, violations,
                        canonical_boundary, depth + 1, visited)
-        _process_stmts(stmt.orelse, env, relpath, funcs, import_map, violations,
+        _process_stmts(stmt.orelse, env, prov, relpath, funcs, import_map, violations,
                        canonical_boundary, depth + 1, visited)
 
 
-def _scan_calls(node, env, relpath, funcs, import_map, violations,
+def _scan_calls(node, env, prov, relpath, funcs, import_map, violations,
                 canonical_boundary, depth, visited):
     if node is None:
         return
     if isinstance(node, ast.Call):
-        _classify_call(node, env, relpath, funcs, import_map, violations,
+        _classify_call(node, env, prov, relpath, funcs, import_map, violations,
                        canonical_boundary, depth, visited)
     for child in ast.iter_child_nodes(node):
-        _scan_calls(child, env, relpath, funcs, import_map, violations,
+        _scan_calls(child, env, prov, relpath, funcs, import_map, violations,
                     canonical_boundary, depth, visited)
 
 
-def _classify_call(call, env, relpath, funcs, import_map, violations,
+def _classify_call(call, env, prov, relpath, funcs, import_map, violations,
                    canonical_boundary, depth, visited):
     if depth > 24:
         return
@@ -2981,6 +3102,9 @@ def _classify_call(call, env, relpath, funcs, import_map, violations,
         if fn.attr == "set_task_status":
             return
         if fn.attr in MUTATION_METHODS:
+            # Flag only when the receiver is a *proven* Kanban object.
+            if _receiver_prov(fn.value, env, prov) is None:
+                return
             sql_arg = call.args[0] if call.args else None
             if sql_arg is None:
                 return
@@ -2988,11 +3112,28 @@ def _classify_call(call, env, relpath, funcs, import_map, violations,
             _record_if_violation(shape, sql_arg, call, relpath, canonical_boundary, violations)
             return
         return
+    # Opaque/reflection getattr: ``getattr(obj, 'execute')(sql)``.
+    if isinstance(fn, ast.Call) and isinstance(fn.func, ast.Name) and fn.func.id == "getattr":
+        if len(fn.args) >= 2:
+            attr_name = _fold_string(fn.args[1], env)
+            if isinstance(attr_name, str) and attr_name in MUTATION_METHODS:
+                if _receiver_prov(fn.args[0], env, prov) is None:
+                    return
+                sql_arg = call.args[0] if call.args else None
+                if sql_arg is None:
+                    return
+                shape = _fold_string(sql_arg, env)
+                _record_if_violation(shape, sql_arg, call, relpath, canonical_boundary, violations)
+                return
+        return
     if isinstance(fn, ast.Name):
         if fn.id == "set_task_status":
             return
         bound = env.get(fn.id)
         if isinstance(bound, tuple) and len(bound) == 2 and bound[0] == "__BOUND_METHOD__":
+            # Flag only when the bound-method alias carries Kanban provenance.
+            if prov.get(fn.id) != PROV_METHOD:
+                return
             sql_arg = call.args[0] if call.args else None
             if sql_arg is not None:
                 shape = _fold_string(sql_arg, env)
@@ -3009,7 +3150,8 @@ def _classify_call(call, env, relpath, funcs, import_map, violations,
             return
         visited.add(key)
         sub_env = _bind_params(tfunc, call, env)
-        _process_stmts(tfunc.body, sub_env, trel, funcs, import_map, violations,
+        sub_prov = _bind_params_prov(tfunc, call, env, prov)
+        _process_stmts(tfunc.body, sub_env, sub_prov, trel, funcs, import_map, violations,
                        canonical_boundary, depth + 1, visited)
 
 
@@ -3030,6 +3172,16 @@ def _bind_params(tfunc, call, env):
             v = _fold_string(call.args[i], env)
             sub_env[p.arg] = v if isinstance(v, str) else UNRESOLVED
     return sub_env
+
+
+def _bind_params_prov(tfunc, call, env, prov):
+    sub_prov = dict(prov)
+    for i, p in enumerate(tfunc.args.args):
+        if i < len(call.args):
+            pv = _arg_prov(call.args[i], env, prov)
+            if pv is not None:
+                sub_prov[p.arg] = pv
+    return sub_prov
 
 
 def _record_if_violation(shape, sql_arg, call, relpath, canonical_boundary, violations):
@@ -3066,7 +3218,6 @@ def _v(expectation, sql_arg, call, relpath, operation, table, columns):
     }
 
 
-# ============================================================================
 # AION R4/I01 — bounded adversarial scanner tests
 # (direct tasks.status lifecycle SQL outside the canonical kanban_db boundary)
 # ============================================================================
@@ -3169,14 +3320,17 @@ def _production_py_files(repo_root):
 def test_i01_scanner_green_at_head():
     """PR-head GREEN: no direct tasks.status SQL outside the canonical boundary.
 
-    Scans every tracked production .py file (excluding tests/), scoping the
-    unresolved-dynamic-SQL fail-closed rule to the dashboard chokepoint.
+    Scans every tracked production .py file (excluding tests/). The unresolved
+    mutation-capable-SQL fail-closed rule applies across the whole tracked
+    universe (no dashboard-only scope), gated by proven Kanban connection
+    provenance so non-Kanban sqlite3/console/terminal ``.execute`` receivers
+    remain non-violating.
     """
     repo_root = Path(__file__).resolve().parents[2]
     files = {}
     for p in _production_py_files(repo_root):
         files[p] = (repo_root / p).read_text(encoding="utf-8", errors="replace")
-    viols = scan_status_sql(files, dynamic_scope={DASHBOARD_PLUGIN})
+    viols = scan_status_sql(files)
     assert viols == [], f"direct tasks.status SQL outside canonical boundary: {viols}"
 
 
@@ -3207,6 +3361,93 @@ def test_i01_scanner_flags_pinned_baseline_sql():
     for v in direct:
         assert v["operation"] == "UPDATE" and v["table"] == "tasks"
         assert "status" in v["columns"]
+
+
+# ---------------------------------------------------------------------------
+# AION R4/I01 — F1 repair: fail-closed universe + Kanban provenance regressions
+# ---------------------------------------------------------------------------
+
+def test_i01_scanner_getattr_reflection_fails_closed():
+    """Opaque reflection ``getattr(conn, 'execute')(sql)`` must fail closed.
+
+    Regression for audit counterexample OPAQUE_REFLECTION_GETATTR_EXECUTE.
+    """
+    files = {
+        "app.py": "def f(conn, sql):\n    getattr(conn, 'execute')(sql)\n",
+    }
+    viols = scan_status_sql(files, entrypoints=["app.f"])
+    assert viols, "getattr(conn, 'execute')(sql) must be flagged"
+    assert any(v["expectation"] == "FAIL_CLOSED_UNRESOLVED_DYNAMIC_SQL" for v in viols), viols
+
+
+def test_i01_scanner_getattr_resolved_status_fails_direct():
+    """Resolved ``getattr(conn, 'execute')('UPDATE tasks SET status=...')`` is FAIL_DIRECT."""
+    files = {
+        "app.py": "def f(conn):\n    getattr(conn, 'execute')(\"UPDATE tasks SET status='todo'\")\n",
+    }
+    viols = scan_status_sql(files, entrypoints=["app.f"])
+    assert any(v["expectation"] == "FAIL_DIRECT_TASKS_STATUS_SQL" for v in viols), viols
+
+
+def test_i01_scanner_unresolved_sql_fails_closed_outside_dashboard():
+    """Unresolved Kanban SQL in a non-dashboard tracked file fails closed.
+
+    Regression for audit counterexample UNRESOLVED_KANBAN_SQL_OUTSIDE_DASHBOARD:
+    the previous dashboard-only dynamic scope discarded unresolved results.
+    """
+    files = {
+        "other.py": "def f(conn, sql):\n    conn.execute(sql)\n",
+    }
+    viols = scan_status_sql(files, entrypoints=["other.f"])
+    assert viols, "unresolved Kanban SQL outside the dashboard must fail closed"
+    assert any(v["expectation"] == "FAIL_CLOSED_UNRESOLVED_DYNAMIC_SQL" for v in viols), viols
+
+
+def test_i01_scanner_non_kanban_execute_nonviolating():
+    """A non-Kanban ``.execute`` receiver is non-violating via proven provenance.
+
+    Regression for audit counterexample NON_KANBAN_OBJECT_FALSE_PROVENANCE:
+    ``logger.execute("UPDATE tasks SET status=...")`` is not Kanban SQL.
+    """
+    files = {
+        "app.py": "def f(logger):\n    logger.execute(\"UPDATE tasks SET status='todo'\")\n",
+    }
+    viols = scan_status_sql(files, entrypoints=["app.f"])
+    assert viols == [], f"non-Kanban logger.execute must be clean, got {viols}"
+
+
+def test_i01_scanner_factory_kanban_conn_fails_closed():
+    """A factory-proven Kanban connection fails closed on unresolved SQL.
+
+    Proves the provenance model is fail-closed (not fail-open): a connection
+    traced to the kanban_db factory is a real Kanban connection.
+    """
+    files = {
+        "app.py": (
+            "from hermes_cli import kanban_db\n"
+            "\n"
+            "def f(sql):\n"
+            "    conn = kanban_db.connect()\n"
+            "    conn.execute(sql)\n"
+        ),
+    }
+    viols = scan_status_sql(files, entrypoints=["app.f"])
+    assert any(v["expectation"] == "FAIL_CLOSED_UNRESOLVED_DYNAMIC_SQL" for v in viols), viols
+
+
+def test_i01_scanner_generic_sqlite_connect_nonviolating():
+    """A generic ``sqlite3.connect(...)`` connection is NOT Kanban and stays clean."""
+    files = {
+        "app.py": (
+            "import sqlite3\n"
+            "\n"
+            "def f(sql):\n"
+            "    conn = sqlite3.connect(':memory:')\n"
+            "    conn.execute(sql)\n"
+        ),
+    }
+    viols = scan_status_sql(files, entrypoints=["app.f"])
+    assert viols == [], f"generic sqlite3.connect must be clean, got {viols}"
 
 
 # ============================================================================
