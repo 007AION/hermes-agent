@@ -670,7 +670,7 @@ async def test_notify_returns_on_telegram_truthy_success(adapter):
 # ---------------------------------------------------------------------------
 
 
-def _capture_skill_registration(adapter, monkeypatch, entries):
+async def _capture_skill_registration(adapter, monkeypatch, entries):
     """Run ``_register_skill_group`` against a stubbed skill catalog and
     return ``(handler_callback, autocomplete_callback)``.
 
@@ -678,6 +678,9 @@ def _capture_skill_registration(adapter, monkeypatch, entries):
     ``discord.app_commands.autocomplete`` -- the production decorator is
     a no-op stub in this test file's discord mock, so capturing the
     callback through it is the direct route in tests.
+
+    ``_register_skill_group`` is async (it awaits the off-loop skill-catalog
+    scan), so this helper is async and its callers ``await`` it.
     """
     import discord
 
@@ -716,7 +719,7 @@ def _capture_skill_registration(adapter, monkeypatch, entries):
         def add_command(self, cmd):
             registered.append(cmd)
 
-    adapter._register_skill_group(_Tree())
+    await adapter._register_skill_group(_Tree())
     assert registered, "_register_skill_group did not register a command"
     return registered[0].callback, captured["autocomplete"]
 
@@ -733,7 +736,7 @@ async def test_skill_autocomplete_returns_empty_for_unauthorized(
         ("alpha", "First skill", "/alpha"),
         ("beta", "Second skill", "/beta"),
     ]
-    _handler, autocomplete = _capture_skill_registration(
+    _handler, autocomplete = await _capture_skill_registration(
         adapter, monkeypatch, entries,
     )
 
@@ -752,7 +755,7 @@ async def test_skill_autocomplete_returns_choices_for_authorized(
         ("alpha", "First skill", "/alpha"),
         ("beta", "Second skill", "/beta"),
     ]
-    _handler, autocomplete = _capture_skill_registration(
+    _handler, autocomplete = await _capture_skill_registration(
         adapter, monkeypatch, entries,
     )
 
@@ -772,7 +775,7 @@ async def test_skill_handler_rejects_before_dispatch_for_unauthorized(
     catalog-probing oracle."""
     adapter._allowed_user_ids = {"100200300"}
     entries = [("alpha", "First skill", "/alpha")]
-    handler, _autocomplete = _capture_skill_registration(
+    handler, _autocomplete = await _capture_skill_registration(
         adapter, monkeypatch, entries,
     )
 
@@ -807,7 +810,7 @@ async def test_skill_handler_known_and_unknown_produce_same_rejection(
     on the registered catalog."""
     adapter._allowed_user_ids = {"100200300"}
     entries = [("alpha", "First skill", "/alpha")]
-    handler, _ = _capture_skill_registration(adapter, monkeypatch, entries)
+    handler, _ = await _capture_skill_registration(adapter, monkeypatch, entries)
 
     adapter._run_simple_slash = AsyncMock()  # type: ignore[assignment]
 
@@ -834,7 +837,7 @@ async def test_skill_handler_dispatches_for_authorized(
     resolved cmd_key and arguments."""
     adapter._allowed_user_ids = {"100200300"}
     entries = [("alpha", "First skill", "/alpha")]
-    handler, _ = _capture_skill_registration(adapter, monkeypatch, entries)
+    handler, _ = await _capture_skill_registration(adapter, monkeypatch, entries)
 
     dispatched: list = []
 

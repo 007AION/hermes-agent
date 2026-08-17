@@ -1250,7 +1250,7 @@ class DiscordAdapter(BasePlatformAdapter):
 
             # Register slash commands
             if self._slash_commands:
-                self._register_slash_commands()
+                await self._register_slash_commands()
 
             # Start the bot in background
             self._disconnecting = False
@@ -5041,7 +5041,7 @@ class DiscordAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.debug("Discord interaction cleanup failed: %s", e)
 
-    def _register_slash_commands(self) -> None:
+    async def _register_slash_commands(self) -> None:
         """Register Discord slash commands on the command tree."""
         if not self._client:
             return
@@ -5329,7 +5329,7 @@ class DiscordAdapter(BasePlatformAdapter):
         # Register skills under a single /skill command group with category
         # subcommand groups.  This uses 1 top-level slot instead of N,
         # supporting up to 25 categories × 25 skills = 625 skills.
-        self._register_skill_group(tree)
+        await self._register_skill_group(tree)
 
         if dropped_over_cap:
             # Staying under the cap keeps the whole sync succeeding; without
@@ -5393,7 +5393,7 @@ class DiscordAdapter(BasePlatformAdapter):
             applied,
         )
 
-    def _register_skill_group(self, tree) -> None:
+    async def _register_skill_group(self, tree) -> None:
         """Register a single ``/skill`` command with autocomplete on the name.
 
         Discord enforces an ~8000-byte per-command payload limit. The older
@@ -5432,7 +5432,7 @@ class DiscordAdapter(BasePlatformAdapter):
             self._skill_entries: list[tuple[str, str, str]] = []
             self._skill_lookup: dict[str, tuple[str, str]] = {}
             self._skill_group_reserved_names: set[str] = set(existing_names)
-            self._refresh_skill_catalog_state()
+            await self._refresh_skill_catalog_state()
 
             if not self._skill_entries:
                 return
@@ -5530,7 +5530,7 @@ class DiscordAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.warning("[%s] Failed to register /skill command: %s", self.name, exc)
 
-    def _refresh_skill_catalog_state(self) -> None:
+    async def _refresh_skill_catalog_state(self) -> None:
         """Re-scan disk for skills and repopulate ``self._skill_entries``.
 
         Called once from :meth:`_register_skill_group` at startup and
@@ -5538,11 +5538,22 @@ class DiscordAdapter(BasePlatformAdapter):
         ``/reload-skills``. No Discord API calls are made — autocomplete
         and the handler both read from these instance attributes
         directly, so an in-place mutation is sufficient.
+
+        ``discord_skill_commands_by_category`` resolves skill paths and
+        reads frontmatter from disk — synchronous blocking I/O. Running it
+        on the gateway event loop starves Discord heartbeats and the
+        loop-liveness probe, which can trip the exit-75 shutdown watchdog
+        and a systemd restart that kills unrelated healthy workers (AION
+        R35). The scan is therefore offloaded to a worker thread via
+        ``asyncio.to_thread``; the in-memory attribute mutation below stays
+        on the loop because it is pure dict/list work, not discord.py tree
+        mutation.
         """
         from hermes_cli.commands import discord_skill_commands_by_category
 
         reserved = getattr(self, "_skill_group_reserved_names", set())
-        categories, uncategorized, hidden = discord_skill_commands_by_category(
+        categories, uncategorized, hidden = await asyncio.to_thread(
+            discord_skill_commands_by_category,
             reserved_names=set(reserved),
         )
         entries: list[tuple[str, str, str]] = list(uncategorized)
@@ -5556,7 +5567,7 @@ class DiscordAdapter(BasePlatformAdapter):
         self._skill_lookup = {n: (d, k) for n, d, k in entries}
         self._skill_group_hidden_count = hidden
 
-    def refresh_skill_group(self) -> tuple[int, int]:
+    async def refresh_skill_group(self) -> tuple[int, int]:
         """Rescan skills and update the live ``/skill`` autocomplete state.
 
         Invoked by :meth:`gateway.run.GatewayOrchestrator._handle_reload_skills_command`
@@ -5573,7 +5584,7 @@ class DiscordAdapter(BasePlatformAdapter):
         Returns ``(new_count, hidden_count)``.
         """
         try:
-            self._refresh_skill_catalog_state()
+            await self._refresh_skill_catalog_state()
         except Exception as exc:
             logger.warning(
                 "[%s] Failed to refresh /skill autocomplete after reload: %s",

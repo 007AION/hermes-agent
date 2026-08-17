@@ -164,6 +164,29 @@ class TestBuildChannelDirectoryOffload:
         assert [name for name, _ in calls] == ["slack"]
         assert calls[0][1] != loop_thread
 
+    def test_directory_write_runs_off_event_loop_thread(self, tmp_path):
+        """The final atomic_json_write must run off the event loop.
+
+        ``atomic_json_write`` fsyncs to disk synchronously. On the loop that
+        starves Discord heartbeats and the loop-liveness probe, feeding the
+        exit-75 restart that kills unrelated workers (AION R35). The builders
+        above already offload their work; the write was the one remaining
+        synchronous disk I/O left on the loop.
+        """
+        cache_file = tmp_path / "channel_directory.json"
+        loop_thread = threading.get_ident()
+        write_threads = []
+
+        def fake_atomic_write(path, data):
+            write_threads.append(threading.get_ident())
+
+        with patch("gateway.channel_directory.atomic_json_write", side_effect=fake_atomic_write), \
+             patch("gateway.channel_directory.DIRECTORY_PATH", cache_file):
+            asyncio.run(build_channel_directory({}))
+
+        assert write_threads
+        assert all(tid != loop_thread for tid in write_threads)
+
 
 class TestResolveChannelName:
     def _setup(self, tmp_path, platforms):

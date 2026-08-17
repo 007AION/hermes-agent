@@ -200,7 +200,13 @@ async def build_channel_directory(adapters: Dict[Any, Any]) -> Dict[str, Any]:
     }
 
     try:
-        atomic_json_write(DIRECTORY_PATH, directory)
+        # fsync in atomic_json_write is synchronous blocking disk I/O. Running
+        # it on the gateway event loop starves Discord heartbeats and the
+        # loop-liveness probe, which can trip the exit-75 shutdown watchdog and
+        # a systemd restart that kills unrelated healthy workers (AION R35).
+        # Offload the write to a worker thread, matching how the builders
+        # above already avoid touching the loop with blocking work.
+        await asyncio.to_thread(atomic_json_write, DIRECTORY_PATH, directory)
     except Exception as e:
         logger.warning("Channel directory: failed to write: %s", e)
 
