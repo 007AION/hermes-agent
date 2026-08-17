@@ -6874,6 +6874,117 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         return True
 
 
+def set_task_status(
+    conn: sqlite3.Connection, task_id: str, new_status: str,
+) -> bool:
+    """Controlled public writer for a direct ``tasks.status`` transition.
+
+    This is the single public surface the dashboard (and any other caller)
+    uses to move a task's status directly — e.g. the drag-drop moves that are
+    not covered by the structured complete/block/unblock/archive verbs
+    (``todo <-> ready``, ``running -> ready``). It appends a ``status`` event
+    row for the live feed and keeps the parent-gating / run-reclaim / child
+    demotion semantics in one controlled ``write_txn``.
+
+    When this transitions OFF ``running`` to anything other than the
+    terminal verbs above (which own their own run closing), it closes the
+    active run with outcome='reclaimed' so attempt history isn't orphaned.
+    ``running -> ready`` via drag-drop is the common case (user yanking a
+    stuck worker back to the queue).
+
+    Post-commit, when the target lands in ``done`` or ``ready``, it runs
+    :func:`recompute_ready` — a *separate* transaction that is deliberately
+    NOT atomic with this commit (legacy parity; do not strengthen).
+    """
+    with write_txn(conn):
+        # Snapshot current state so we know whether to close a run.
+        prev = conn.execute(
+            "SELECT status, current_run_id FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if prev is None:
+            return False
+
+        # Guard: don't allow promoting to 'ready' unless all parents are done.
+        # Prevents the dispatcher from spawning a child whose upstream work
+        # hasn't completed (e.g. T4 dispatched while T3 is still blocked).
+        if new_status == "ready":
+            parent_statuses = conn.execute(
+                "SELECT t.status FROM tasks t "
+                "JOIN task_links l ON l.parent_id = t.id "
+                "WHERE l.child_id = ?",
+                (task_id,),
+            ).fetchall()
+            if parent_statuses and not all(
+                p["status"] == "done" for p in parent_statuses
+            ):
+                return False
+
+        was_running = prev["status"] == "running"
+        reopening_satisfied_parent = (
+            prev["status"] in {"done", "archived"}
+            and new_status not in {"done", "archived"}
+        )
+
+        cur = conn.execute(
+            "UPDATE tasks SET status = ?, "
+            "  claim_lock = CASE WHEN ? = 'running' THEN claim_lock ELSE NULL END, "
+            "  claim_expires = CASE WHEN ? = 'running' THEN claim_expires ELSE NULL END, "
+            "  worker_pid = CASE WHEN ? = 'running' THEN worker_pid ELSE NULL END "
+            "WHERE id = ?",
+            (new_status, new_status, new_status, new_status, task_id),
+        )
+        if cur.rowcount != 1:
+            return False
+        run_id = None
+        if was_running and new_status != "running" and prev["current_run_id"]:
+            run_id = _end_run(
+                conn, task_id,
+                outcome="reclaimed", status="reclaimed",
+                summary=f"status changed to {new_status} (dashboard/direct)",
+            )
+        conn.execute(
+            "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
+            "VALUES (?, ?, 'status', ?, ?)",
+            (task_id, run_id, json.dumps({"status": new_status}), int(time.time())),
+        )
+        if reopening_satisfied_parent:
+            # A parent leaving done/archived invalidates any direct child that
+            # was sitting in ready solely because that parent used to satisfy
+            # the dependency gate. Demote those children immediately so the
+            # dashboard does not keep advertising stale-ready work.
+            for row in conn.execute(
+                "SELECT child_id FROM task_links WHERE parent_id = ? ORDER BY child_id",
+                (task_id,),
+            ).fetchall():
+                child_id = row["child_id"]
+                demoted = conn.execute(
+                    "UPDATE tasks SET status = 'todo' "
+                    "WHERE id = ? AND status = 'ready'",
+                    (child_id,),
+                )
+                if demoted.rowcount == 1:
+                    conn.execute(
+                        "INSERT INTO task_events (task_id, kind, payload, created_at) "
+                        "VALUES (?, 'status', ?, ?)",
+                        (
+                            child_id,
+                            json.dumps(
+                                {
+                                    "status": "todo",
+                                    "reason": "parent_reopened",
+                                    "parent": task_id,
+                                }
+                            ),
+                            int(time.time()),
+                        ),
+                    )
+    # If we re-opened something, children may have gone stale.
+    if new_status in {"done", "ready"}:
+        recompute_ready(conn)
+    return True
+
+
 def specify_triage_task(
     conn: sqlite3.Connection,
     task_id: str,
