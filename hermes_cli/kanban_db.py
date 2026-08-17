@@ -10071,15 +10071,31 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[tupl
     return None
 
 
-def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
+def has_spawnable_ready(
+    conn: sqlite3.Connection,
+    *,
+    max_in_progress_per_profile: Optional[int] = None,
+) -> bool:
     """Return True iff there is at least one ready+assigned+unclaimed task
-    whose assignee maps to a real Hermes profile.
+    whose assignee maps to a real Hermes profile *and* is not currently
+    capacity-deferred (active-session cap, or — when
+    ``max_in_progress_per_profile`` is supplied — per-profile in-flight cap).
 
     Used by the gateway- and CLI-embedded dispatchers' health telemetry to
     decide whether ``0 spawned`` is a "stuck" condition (real spawnable
     work waiting) or a "correctly idle" condition (only control-plane
     lanes like ``orion-cc`` / ``orion-research`` waiting on terminals
     that pull tasks via ``claim_task`` directly).
+
+    Capacity-awareness (AION-RL2-CORE-01-R34): a ready task whose assignee
+    profile is saturated — ``max_concurrent_sessions`` reached, or the
+    per-profile in-flight cap reached when the caller passes it — is deferred
+    to ``skipped_profile_session_capped`` / ``skipped_per_profile_capped`` and
+    is therefore *expected deferred work*, not a stall. Excluding those keeps
+    the stuck-warning from firing on an entirely capacity-accounted queue
+    while a genuinely spawnable / unaccounted item still trips it. Unreadable
+    or unknown capacity is NOT excluded (fail-closed): the task stays
+    "spawnable" so a real stall is never hidden.
 
     Falls back to "any ready+assigned" if ``profile_exists`` is not
     importable (e.g. partial install) — preserves the old behavior so
@@ -10097,12 +10113,37 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     except Exception:
         # Can't introspect — assume spawnable, preserve legacy behavior.
         return any(check_respawn_guard(conn, row["id"]) is None for row in rows)
-    for row in rows:
-        if (
-            profile_exists(row["assignee"])
-            and check_respawn_guard(conn, row["id"]) is None
+    # Mirror the dispatch loop's per-profile cap guard (#21582): only a
+    # positive int is a real cap; anything else means "no per-profile cap".
+    per_profile_cap = (
+        max_in_progress_per_profile
+        if isinstance(max_in_progress_per_profile, int)
+        and max_in_progress_per_profile > 0
+        else None
+    )
+    per_profile_running: dict[str, int] = {}
+    if per_profile_cap is not None:
+        for prow in conn.execute(
+            "SELECT assignee, COUNT(*) AS n FROM tasks "
+            "WHERE status = 'running' AND assignee IS NOT NULL "
+            "GROUP BY assignee"
         ):
-            return True
+            per_profile_running[prow["assignee"]] = int(prow["n"])
+    for row in rows:
+        assignee = row["assignee"]
+        if not profile_exists(assignee):
+            continue
+        if check_respawn_guard(conn, row["id"]) is not None:
+            continue
+        # Expected capacity deferral — not a stall (AION-RL2-CORE-01-R34).
+        if _assignee_session_capped(assignee):
+            continue
+        if (
+            per_profile_cap is not None
+            and per_profile_running.get(assignee, 0) >= per_profile_cap
+        ):
+            continue
+        return True
     return False
 
 
@@ -10215,6 +10256,26 @@ def _profile_session_capacity(
             reset_hermes_home_override(token)
     except Exception:
         return _SESSION_CAPACITY_UNREADABLE
+
+
+def _assignee_session_capped(assignee: str) -> bool:
+    """Return True when ``assignee``'s active-session registry is known to be
+    saturated (``max_concurrent_sessions`` reached), i.e. the dispatcher will
+    defer a ready task for this profile into ``skipped_profile_session_capped``
+    rather than spawn it.
+
+    Fail-closed: unreadable/unknown capacity (``_SESSION_CAPACITY_UNREADABLE``)
+    and an uncapped profile (``None``) both return False so the health probe
+    still treats the task as spawnable — a real stall is never hidden behind
+    an unknown-capacity deferral. (AION-RL2-CORE-01-R34)
+    """
+    cap = _profile_session_capacity(assignee)
+    if cap is _SESSION_CAPACITY_UNREADABLE:
+        return False
+    if cap is None:
+        return False
+    active, max_sessions = cap
+    return active >= max_sessions
 
 
 def dispatch_once(
