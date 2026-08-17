@@ -27,7 +27,18 @@ import pytest
 
 @pytest.fixture()
 def isolated_health_env(monkeypatch):
-    """Fresh HERMES_HOME + kanban home with a capped 'alpha' and uncapped 'beta'."""
+    """Fresh HERMES_HOME + a fully isolated Native Kanban environment.
+
+    Pins every higher-precedence Kanban selector (``HERMES_KANBAN_DB`` /
+    ``HERMES_KANBAN_BOARD`` / ``HERMES_KANBAN_HOME`` / workspaces / attachments /
+    logs roots) to the temp root via the canonical
+    :func:`hermes_cli.kanban_db.isolated_kanban_env` helper *before* the fresh
+    module import, so a dispatched worker that inherits a live
+    ``HERMES_KANBAN_DB`` / ``HERMES_KANBAN_BOARD`` cannot divert ``connect()``
+    into the authoritative board. Setting only ``HERMES_HOME`` +
+    ``HERMES_KANBAN_HOME`` is NOT sufficient: ``kanban_db_path()`` honours
+    ``HERMES_KANBAN_DB`` first (the exact R34-R1 inherited-selector defect).
+    """
     test_home = tempfile.mkdtemp(prefix="kanban_health_capacity_test_")
     for prof in ("alpha", "beta", "default"):
         os.makedirs(os.path.join(test_home, "profiles", prof), exist_ok=True)
@@ -37,24 +48,28 @@ def isolated_health_env(monkeypatch):
     with open(os.path.join(alpha_home, "config.yaml"), "w", encoding="utf-8") as fh:
         fh.write("max_concurrent_sessions: 1\n")
     monkeypatch.setenv("HERMES_HOME", test_home)
-    monkeypatch.setenv("HERMES_KANBAN_HOME", test_home)
-    # Fresh module state so hermes_cli resolves paths against the temp home.
-    for mod in list(sys.modules.keys()):
-        if (
-            mod.startswith("hermes_cli")
-            or mod.startswith("hermes_state")
-            or mod == "hermes_constants"
-        ):
-            del sys.modules[mod]
-    from hermes_cli import active_sessions
-    from hermes_cli import kanban_db
 
-    yield {
-        "kanban_db": kanban_db,
-        "active_sessions": active_sessions,
-        "test_home": test_home,
-        "alpha_home": alpha_home,
-    }
+    from hermes_cli import kanban_db as _kb_isolate
+
+    with _kb_isolate.isolated_kanban_env(Path(test_home)):
+        # Fresh module state so hermes_cli resolves paths against the isolated
+        # temp home (never an inherited live board).
+        for mod in list(sys.modules.keys()):
+            if (
+                mod.startswith("hermes_cli")
+                or mod.startswith("hermes_state")
+                or mod == "hermes_constants"
+            ):
+                del sys.modules[mod]
+        from hermes_cli import active_sessions
+        from hermes_cli import kanban_db
+
+        yield {
+            "kanban_db": kanban_db,
+            "active_sessions": active_sessions,
+            "test_home": test_home,
+            "alpha_home": alpha_home,
+        }
 
 
 def _write_lease(active_sessions, alpha_home, pid):
@@ -303,3 +318,68 @@ def test_gateway_forwards_per_profile_cap(isolated_health_env, monkeypatch, capl
     _run_watcher_for_ticks(isolated_health_env, monkeypatch, caplog, config_cap=2)
 
     assert seen.get("max_in_progress_per_profile") == 2
+
+
+# ---------------------------------------------------------------------------
+# R34-R1 — inherited-selector isolation (hostile dispatched-worker env)
+# ---------------------------------------------------------------------------
+
+
+def _task_ids(db_path):
+    """Read ordered task ids directly from a kanban.db file (env-independent)."""
+    import sqlite3
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        return [
+            r[0] for r in conn.execute("SELECT id FROM tasks ORDER BY id").fetchall()
+        ]
+    finally:
+        conn.close()
+
+
+@pytest.fixture()
+def hostile_kanban_pins(monkeypatch, tmp_path):
+    """Simulate a dispatched worker that inherited live Kanban selector pins.
+
+    Pins ``HERMES_KANBAN_DB`` / ``HERMES_KANBAN_BOARD`` / ``HERMES_KANBAN_HOME`` /
+    workspaces / attachments roots to a disposable "live factory" sentinel (a
+    temp dir, never the real aion-factory board). Returns the sentinel DB path
+    so the regression can assert zero delta against it.
+    """
+    sentinel = tmp_path / "sentinel-live-factory"
+    sentinel.mkdir()
+    sentinel_db = sentinel / "kanban.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(sentinel_db))
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "aion-factory")
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(sentinel))
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACES_ROOT", str(sentinel / "workspaces"))
+    monkeypatch.setenv("HERMES_KANBAN_ATTACHMENTS_ROOT", str(sentinel / "attachments"))
+    return sentinel_db
+
+
+def test_isolated_health_env_zero_delta_to_inherited_sentinel(
+    hostile_kanban_pins, isolated_health_env
+):
+    """R34-R1: under an inherited live-board pin, ``isolated_health_env`` must
+    still bind its synthetic writes to the isolated temp board and leave the
+    pinned sentinel board zero-delta (no task/run written to the "live" board).
+    """
+    sentinel_db = hostile_kanban_pins
+    kb = isolated_health_env["kanban_db"]
+    test_home = isolated_health_env["test_home"]
+
+    # Baseline: one real task in the sentinel "live" board (explicit db_path so
+    # the write is unambiguous and independent of env resolution).
+    with kb.connect_closing(db_path=sentinel_db) as conn:
+        kb.create_task(conn, title="real-factory-task", assignee="alpha")
+    before = _task_ids(sentinel_db)
+
+    # The fixture's synthetic write must land in the isolated board, not the
+    # inherited sentinel.
+    with kb.connect_closing() as conn:
+        kb.create_board(slug="default", name="Test")
+        kb.create_task(conn, title="admit-me", assignee="alpha")
+
+    assert _task_ids(sentinel_db) == before  # zero delta to the "live" board
+    assert len(_task_ids(Path(test_home) / "kanban.db")) == 1
