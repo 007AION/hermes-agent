@@ -1174,6 +1174,190 @@ def test_complete_records_result(kanban_home):
     assert task.completed_at is not None
 
 
+# ---------------------------------------------------------------------------
+# Factory-build terminal gate (AION-889 Phase B)
+# ---------------------------------------------------------------------------
+
+_VALID_SHA256 = "a" * 64  # 64 lowercase hex chars (well-formed digest shape)
+
+
+def _set_factory_gate(conn, task_id: str, receipt: str | None) -> None:
+    """Mark a task factory-build-gated and (optionally) bind a receipt."""
+    conn.execute(
+        "UPDATE tasks SET factory_build_gate = 1, "
+        "factory_terminal_receipt_sha256 = ? WHERE id = ?",
+        (receipt, task_id),
+    )
+    conn.commit()
+
+
+def test_complete_task_factory_gate_rejects_unreceipted_with_zero_delta(kanban_home):
+    """gate=1 + no receipt -> FAIL_CLOSED with zero mutation (RED/GREEN).
+
+    The rejection must not touch ``tasks``, ``task_runs``, or ``task_events``:
+    status, completed_at, and the event log are all byte-identical after the
+    raise. A follow-on completion after the receipt is bound must succeed,
+    proving the rejected attempt left no residue behind.
+    """
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="factory task")
+        _set_factory_gate(conn, t, receipt=None)
+
+        status_before = kb.get_task(conn, t).status
+        events_before = [e.kind for e in kb.list_events(conn, t)]
+
+        with pytest.raises(kb.FactoryTerminalReceiptRequiredError):
+            kb.complete_task(conn, t, result="done")
+
+        task = kb.get_task(conn, t)
+        assert task.status == status_before
+        assert task.completed_at is None
+        assert [e.kind for e in kb.list_events(conn, t)] == events_before
+
+        # Bind a valid receipt and retry: must now succeed (no residue).
+        conn.execute(
+            "UPDATE tasks SET factory_terminal_receipt_sha256 = ? WHERE id = ?",
+            (_VALID_SHA256, t),
+        )
+        conn.commit()
+        assert kb.complete_task(conn, t, result="done")
+        assert kb.get_task(conn, t).status == "done"
+
+
+def test_complete_task_factory_gate_rejects_malformed_receipt(kanban_home):
+    """gate=1 + a receipt that is not 64-hex -> FAIL_CLOSED.
+
+    The guard only enforces presence + 64-hex shape; content-level (C1-C10 /
+    8-field) validation is the aion-governance proof kernel's job and is NOT
+    re-implemented here.
+    """
+    bad_receipts = [
+        None,           # absent
+        "",             # empty
+        "abc",          # too short
+        "g" * 64,       # non-hex chars
+        "a" * 63,       # 63 hex chars (wrong length)
+        "A" * 65,       # 65 hex chars (wrong length)
+        _VALID_SHA256[:-1] + "!",  # trailing non-hex
+    ]
+    with kb.connect() as conn:
+        for receipt in bad_receipts:
+            t = kb.create_task(conn, title="factory task")
+            _set_factory_gate(conn, t, receipt=receipt)
+            with pytest.raises(kb.FactoryTerminalReceiptRequiredError):
+                kb.complete_task(conn, t, result="done")
+            assert kb.get_task(conn, t).status != "done"
+
+
+def test_complete_task_factory_gate_accepts_valid_64_hex_receipt(kanban_home):
+    """gate=1 + a well-formed 64-hex receipt -> completion succeeds."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="factory task")
+        _set_factory_gate(conn, t, receipt=_VALID_SHA256)
+        assert kb.complete_task(conn, t, result="done")
+        assert kb.get_task(conn, t).status == "done"
+
+
+def test_complete_task_legacy_gate_zero_parity(kanban_home):
+    """gate=0 (legacy/default) -> terminal behaviour is byte-identical.
+
+    The receipt column is ignored entirely for non-factory tasks: completion
+    succeeds whether the receipt is absent, NULL, or even a non-hex string.
+    """
+    with kb.connect() as conn:
+        # No receipt, default gate=0.
+        t1 = kb.create_task(conn, title="legacy")
+        assert kb.complete_task(conn, t1, result="done")
+        assert kb.get_task(conn, t1).status == "done"
+
+        # Garbage in the receipt column is ignored when gate=0.
+        t2 = kb.create_task(conn, title="legacy with garbage receipt")
+        conn.execute(
+            "UPDATE tasks SET factory_terminal_receipt_sha256 = 'not-a-sha' "
+            "WHERE id = ?",
+            (t2,),
+        )
+        conn.commit()
+        assert kb.complete_task(conn, t2, result="done")
+        assert kb.get_task(conn, t2).status == "done"
+
+
+def test_factory_gate_columns_migrated_idempotently_fresh_and_legacy(kanban_home, tmp_path):
+    """Additive migration adds both columns; idempotent on fresh + legacy DBs."""
+    def _task_cols(conn):
+        return {r["name"] for r in conn.execute("PRAGMA table_info(tasks)")}
+
+    # Fresh DB (kanban_home already ran init_db) has both columns with
+    # correct defaults.
+    with kb.connect() as conn:
+        assert {"factory_build_gate", "factory_terminal_receipt_sha256"} <= _task_cols(conn)
+        t = kb.create_task(conn, title="x")
+        row = conn.execute(
+            "SELECT factory_build_gate, factory_terminal_receipt_sha256 "
+            "FROM tasks WHERE id = ?",
+            (t,),
+        ).fetchone()
+        assert row["factory_build_gate"] == 0
+        assert row["factory_terminal_receipt_sha256"] is None
+
+    # Re-running init_db is idempotent and preserves the columns.
+    kb.init_db()
+    with kb.connect() as conn:
+        assert {"factory_build_gate", "factory_terminal_receipt_sha256"} <= _task_cols(conn)
+
+    # Legacy DB: a pre-gate ``tasks``/``task_events`` shape missing both
+    # columns must migrate them in on connect().
+    legacy_path = tmp_path / "legacy-factory-gate.db"
+    conn = sqlite3.connect(str(legacy_path))
+    conn.execute(
+        """
+        CREATE TABLE tasks (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            body TEXT,
+            assignee TEXT,
+            status TEXT NOT NULL,
+            priority INTEGER NOT NULL DEFAULT 0,
+            created_by TEXT,
+            created_at INTEGER NOT NULL,
+            started_at INTEGER,
+            completed_at INTEGER,
+            workspace_kind TEXT NOT NULL DEFAULT 'scratch',
+            workspace_path TEXT,
+            claim_lock TEXT,
+            claim_expires INTEGER
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE task_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            payload TEXT,
+            created_at INTEGER NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        "INSERT INTO tasks (id, title, status, created_at) "
+        "VALUES ('legacy', 'old board task', 'ready', 1)"
+    )
+    conn.commit()
+    conn.close()
+
+    with kb.connect(legacy_path) as migrated:
+        assert {"factory_build_gate", "factory_terminal_receipt_sha256"} <= _task_cols(migrated)
+        # Legacy rows default to gate=0 / NULL receipt (not factory-build).
+        row = migrated.execute(
+            "SELECT factory_build_gate, factory_terminal_receipt_sha256 "
+            "FROM tasks WHERE id = 'legacy'",
+        ).fetchone()
+        assert row["factory_build_gate"] == 0
+        assert row["factory_terminal_receipt_sha256"] is None
+
+
 def test_block_then_unblock(kanban_home):
     with kb.connect() as conn:
         t = kb.create_task(conn, title="x", assignee="a")

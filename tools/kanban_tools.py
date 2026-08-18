@@ -700,6 +700,27 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"and either drop these ids from created_cards, or pass "
                     f"created_cards=[] to skip the card-claim check entirely."
                 )
+            except kb.FactoryTerminalReceiptRequiredError as ftr_err:
+                # Structured rejection — factory-build terminal hard gate
+                # (AION-889 Phase B). The task was NOT mutated (the gate
+                # runs before the write txn with zero mutation). This is a
+                # machine hard gate, not a worker error: a factory-build
+                # task (factory_build_gate=1) cannot reach a terminal state
+                # without a bound proof-kernel OUTCOME_ACCEPTED receipt. The
+                # receipt is bound by the aion-governance proof kernel, NOT
+                # by this worker — spell that out so the worker surfaces the
+                # exact blocker instead of misreading the tool_error as a
+                # crash and retrying blindly.
+                return tool_error(
+                    f"kanban_complete blocked: {ftr_err}. "
+                    f"Your task is still in-flight (no state change). "
+                    f"This is a machine hard gate — a factory-build task "
+                    f"(factory_build_gate=1) cannot reach a terminal state "
+                    f"without a bound proof-kernel OUTCOME_ACCEPTED receipt "
+                    f"digest. The receipt must be bound by the "
+                    f"aion-governance proof kernel, not by this worker. "
+                    f"Retry only after the receipt is bound."
+                )
             if not ok:
                 return tool_error(
                     f"could not complete {tid} (unknown id or already terminal)"

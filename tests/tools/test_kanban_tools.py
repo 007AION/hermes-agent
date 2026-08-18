@@ -559,6 +559,43 @@ def test_complete_phantom_card_message_advertises_retry(worker_env):
         conn.close()
 
 
+def test_complete_factory_gate_rejection_surfaces_clear_error(worker_env):
+    """A factory-build terminal-gate rejection (AION-889 Phase B) must surface
+    a clear tool_error telling the worker the task is still in-flight and that
+    the receipt is bound by the proof kernel, not the worker. The worker has
+    no other channel to discover why completion was refused — a generic
+    failure would read like a crash and cause an abandoned run.
+    """
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    # Mark the worker's own task as factory-build gated with no receipt.
+    conn = kb.connect()
+    try:
+        conn.execute(
+            "UPDATE tasks SET factory_build_gate = 1 WHERE id = ?",
+            (worker_env,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    out = kt._handle_complete({"summary": "trying to complete a factory task"})
+    err = json.loads(out).get("error", "")
+    assert err, f"expected an error, got {out!r}"
+    # Machine-gate-specific phrasing (not a generic failure).
+    assert "factory-build" in err
+    assert "still in-flight" in err
+    assert "OUTCOME_ACCEPTED" in err
+
+    # Zero mutation: the task is genuinely still running after rejection.
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, worker_env).status == "running"
+    finally:
+        conn.close()
+
+
 def test_complete_retry_with_empty_created_cards_succeeds(worker_env):
     """After a phantom rejection, retrying kanban_complete with
     created_cards=[] (the documented escape hatch) must complete the

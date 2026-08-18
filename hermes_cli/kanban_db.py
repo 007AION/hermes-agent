@@ -2573,6 +2573,33 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
         )
 
+    if "factory_build_gate" not in cols:
+        # AION-889 Phase B: factory-build terminal gate flag. 1 = this task
+        # was produced by the AION factory-build pipeline and MUST bind a
+        # proof-kernel OUTCOME_ACCEPTED receipt before reaching a terminal
+        # state (see complete_task). 0 (default) = legacy / non-factory
+        # task, byte-identical terminal behaviour.
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "factory_build_gate",
+            "factory_build_gate INTEGER NOT NULL DEFAULT 0",
+        )
+
+    if "factory_terminal_receipt_sha256" not in cols:
+        # AION-889 Phase B: sha256 (64-hex) of the proof-kernel
+        # OUTCOME_ACCEPTED receipt bound to a factory-build task at
+        # terminalization. NULL until the receipt is bound. Content-level
+        # (C1-C10 / 8-field) validation lives in the aion-governance proof
+        # kernel, NOT here — this column only stores the digest so
+        # complete_task can enforce a FAIL_CLOSED presence+shape gate.
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "factory_terminal_receipt_sha256",
+            "factory_terminal_receipt_sha256 TEXT",
+        )
+
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
     # parses each statement in ``executescript`` against the live schema, so a
@@ -5182,6 +5209,32 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
+class FactoryTerminalReceiptRequiredError(ValueError):
+    """Raised by ``complete_task`` when a factory-build task
+    (``factory_build_gate`` = 1) reaches terminalization without a bound
+    proof-kernel OUTCOME_ACCEPTED receipt digest
+    (``factory_terminal_receipt_sha256`` must be a 64-char hex digest).
+
+    FAIL_CLOSED with zero mutation: the guard runs before the main write
+    transaction and raises without touching ``tasks``, ``task_runs``, or
+    ``task_events``. Content-level (C1-C10 / 8-field) receipt validation is
+    owned by the aion-governance proof kernel — this error only enforces that
+    a well-formed receipt digest is bound. Subclasses ``ValueError`` so the
+    worker tool layer surfaces it as a recoverable, retryable rejection
+    (the worker can bind the receipt and retry), consistent with
+    ``HallucinatedCardsError``.
+    """
+
+    def __init__(self, task_id: str):
+        self.task_id = task_id
+        super().__init__(
+            f"completion blocked: task {task_id} is factory-build gated "
+            f"(factory_build_gate=1) but has no bound OUTCOME_ACCEPTED "
+            f"receipt sha256 — factory_terminal_receipt_sha256 must be a "
+            f"64-char hex digest. Bind the proof-kernel receipt and retry."
+        )
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5248,6 +5301,27 @@ def complete_task(
             raise HallucinatedCardsError(phantom_cards, task_id)
     else:
         verified_cards = []
+
+    # Gate: factory-build terminal receipt (AION-889 Phase B). A
+    # factory-build task (factory_build_gate=1) may not reach a terminal
+    # state until a proof-kernel OUTCOME_ACCEPTED receipt digest is bound.
+    # FAIL_CLOSED with zero mutation: this is a read-before-write check that
+    # runs ahead of the main write txn and raises with no task/run/event
+    # change. Content-level (C1-C10 / 8-field) validation is NOT here — the
+    # aion-governance proof kernel owns that (single-source-of-truth logic);
+    # this guard only enforces presence + 64-hex shape.
+    _gate_row = conn.execute(
+        "SELECT factory_build_gate, factory_terminal_receipt_sha256 "
+        "FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if _gate_row is not None and _gate_row["factory_build_gate"]:
+        _receipt = _gate_row["factory_terminal_receipt_sha256"]
+        if not (
+            isinstance(_receipt, str)
+            and re.fullmatch(r"[0-9a-fA-F]{64}", _receipt)
+        ):
+            raise FactoryTerminalReceiptRequiredError(task_id)
 
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
