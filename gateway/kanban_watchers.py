@@ -1301,7 +1301,10 @@ class GatewayKanbanWatchersMixin:
                 conn = None
                 try:
                     conn = _kb.connect(board=slug)
-                    if _kb.has_spawnable_ready(conn):
+                    if _kb.has_spawnable_ready(
+                        conn,
+                        max_in_progress_per_profile=max_in_progress_per_profile,
+                    ):
                         return True
                     if _kb.has_spawnable_review(conn):
                         return True
