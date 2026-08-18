@@ -197,10 +197,10 @@ FACTORY_PROFILES = frozenset({"agent007", "gm2", "merger", "bafuxunan", "elder-s
 # REV2 — trusted kernel-executor uploader identity(ies). A proof-kernel
 # OUTCOME_ACCEPTED receipt is only accepted when bound as a task attachment
 # whose ``uploaded_by`` is one of these trusted kernel-executor identities. The
-# completing worker/caller uploads attachments through the agent toolset, which
-# stamps ``uploaded_by`` from the authenticated session identity (HERMES_PROFILE)
-# — never one of these kernel identities — so a worker cannot forge the
-# receipt's provenance (the Monarch F1 hostile proof).
+# completing worker/caller attaches files through the agent toolset
+# (``kanban_attach`` / ``kanban_attach_url``), which stamps a fixed
+# ``uploaded_by="agent"`` label — never one of these kernel identities — so a
+# worker cannot forge the receipt's provenance (the Monarch F1 hostile proof).
 FACTORY_TRUSTED_RECEIPT_UPLOADERS = frozenset({
     "aion_monarch_proof_kernel",  # aion-governance KERNEL_NAME (frozen v1.3.0)
 })
