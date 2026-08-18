@@ -1174,6 +1174,473 @@ def test_complete_records_result(kanban_home):
     assert task.completed_at is not None
 
 
+# ---------------------------------------------------------------------------
+# Factory-build terminal gate (AION-889 Phase B REV1 — authenticity)
+# ---------------------------------------------------------------------------
+
+import hashlib
+
+_FROZEN_CONTRACT_SHA = kb.FACTORY_CONTRACT_HASH_SHA256
+_RECEIPT_SCHEMA = kb.FACTORY_RECEIPT_SCHEMA
+# The trusted kernel-executor uploader identity (mirrors kb's
+# FACTORY_TRUSTED_RECEIPT_UPLOADERS — aion-governance KERNEL_NAME v1.3.0). The
+# completing worker's uploads carry its own identity, never this one.
+_TRUSTED_KERNEL_UPLOADER = "aion_monarch_proof_kernel"
+
+
+def _receipt_doc(
+    task_id: str,
+    *,
+    run_id: str = "run-1",
+    verdict: str = "OUTCOME_ACCEPTED",
+    conditions=None,
+    schema=None,
+    contract_hash=None,
+    kernel_version="aion.monarch.proof_kernel.v2",
+    binding_value=None,
+    target_task_id=None,
+    drop_fields=(),
+):
+    """Build a well-formed proof-kernel receipt document (r1..r7 all present)."""
+    if conditions is None:
+        conditions = {f"C{i}": True for i in range(1, 11)}
+    doc = {
+        "schema": schema if schema is not None else _RECEIPT_SCHEMA,
+        "verdict": verdict,
+        "kernel_version": kernel_version,
+        "contract_hash_sha256": (
+            contract_hash if contract_hash is not None else _FROZEN_CONTRACT_SHA
+        ),
+        "conditions": conditions,
+        "adapter_type_and_version": "aion_monarch_typed_adapters.task_terminal.v1",
+        "transition_class": "TASK_TERMINAL",
+        "exact_source_refs": {"task_id": task_id, "run_id": run_id},
+        "target_identity": {
+            "object_type": "kanban_task_run",
+            "object_ref_exact": f"{task_id}/{run_id}",
+            "fields": {
+                "task_id": target_task_id if target_task_id is not None else task_id,
+                "run_id": run_id,
+            },
+        },
+        "before_digest": "a" * 64,
+        "action_receipt_ref": {
+            "action_kind": "task_terminal",
+            "actor": "aion_monarch_proof_kernel",
+            "actor_role": "action_executor",
+            "actor_identity_source": "native_task_run_authorization_binding",
+            "executed_effect_ref": "task_events:status=done",
+            "executed_at": "2026-08-18T06:00:01Z",
+        },
+        "after_digest": "b" * 64,
+        "head_epoch_or_run_binding": {
+            "bound_to": "task_run_id",
+            "value": binding_value if binding_value is not None else run_id,
+            "authorization_source_ref": "native_task_run_authorization_binding",
+            "authorization_epoch_or_version": 1,
+        },
+        "acquired_at": "2026-08-18T06:00:02Z",
+    }
+    for f in drop_fields:
+        doc.pop(f, None)
+    return doc
+
+
+def _sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _mark_factory_gate(conn, task_id: str, receipt_sha: str | None) -> None:
+    """Mark a task factory-build gated and bind a receipt digest (0 -> 1)."""
+    conn.execute(
+        "UPDATE tasks SET factory_build_gate = 1, "
+        "factory_terminal_receipt_sha256 = ? WHERE id = ?",
+        (receipt_sha, task_id),
+    )
+    conn.commit()
+
+
+def _bind_receipt(conn, task_id: str, doc: dict, uploaded_by: str | None) -> str:
+    """Serialize ``doc``, store it as a task attachment stamped with
+    ``uploaded_by``, mark gate=1 and bind its sha256. Returns the bound sha256.
+
+    REV2: the uploader identity is explicit. A legitimate proof-kernel receipt
+    is bound by the trusted kernel-executor identity; a worker binds with its
+    own identity (or None) and must fail the provenance check.
+    """
+    raw = json.dumps(doc, sort_keys=True).encode("utf-8")
+    sha = _sha256(raw)
+    kb.store_attachment_bytes(
+        conn, task_id, "receipt.json", raw, uploaded_by=uploaded_by,
+    )
+    _mark_factory_gate(conn, task_id, sha)
+    return sha
+
+
+def _set_running_run(conn, task_id: str, run_id: int = 4242) -> None:
+    conn.execute(
+        "UPDATE tasks SET status = 'running', current_run_id = ? WHERE id = ?",
+        (run_id, task_id),
+    )
+    conn.commit()
+
+
+def test_complete_task_factory_gate_rejects_forged_hex_no_file_zero_delta(kanban_home):
+    """A bare ``a``*64 receipt column with no readable file -> FAIL_CLOSED with
+    zero mutation (the Monarch sentence: forged 64-hex cannot DONE)."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="factory task")
+        _mark_factory_gate(conn, t, "a" * 64)  # 64-hex, but no readable file
+
+        status_before = kb.get_task(conn, t).status
+        events_before = [e.kind for e in kb.list_events(conn, t)]
+
+        with pytest.raises(kb.FactoryTerminalReceiptRequiredError):
+            kb.complete_task(conn, t, result="done")
+
+        task = kb.get_task(conn, t)
+        assert task.status == status_before
+        assert task.completed_at is None
+        assert [e.kind for e in kb.list_events(conn, t)] == events_before
+
+
+def test_complete_task_factory_gate_rejects_non_accepted_verdict(kanban_home):
+    """Forged receipt file whose verdict != OUTCOME_ACCEPTED -> FAIL_CLOSED."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="factory task")
+        _bind_receipt(conn, t, _receipt_doc(t, verdict="FAIL_CLOSED"), _TRUSTED_KERNEL_UPLOADER)
+        with pytest.raises(kb.FactoryTerminalReceiptRequiredError):
+            kb.complete_task(conn, t, result="done")
+        assert kb.get_task(conn, t).status != "done"
+
+
+def test_complete_task_factory_gate_rejects_task_run_binding_mismatch(kanban_home):
+    """Valid kernel receipt but task/run binding mismatch -> FAIL_CLOSED."""
+    with kb.connect() as conn:
+        # target_identity.task_id mismatch.
+        t1 = kb.create_task(conn, title="factory task")
+        _bind_receipt(conn, t1, _receipt_doc("other-task-id"), _TRUSTED_KERNEL_UPLOADER)
+        with pytest.raises(kb.FactoryTerminalReceiptRequiredError):
+            kb.complete_task(conn, t1, result="done")
+        assert kb.get_task(conn, t1).status != "done"
+
+        # run binding mismatch (task has a concrete current run).
+        t2 = kb.create_task(conn, title="factory task")
+        _set_running_run(conn, t2, run_id=4242)
+        _bind_receipt(conn, t2, _receipt_doc(t2, binding_value="9999"), _TRUSTED_KERNEL_UPLOADER)
+        with pytest.raises(kb.FactoryTerminalReceiptRequiredError):
+            kb.complete_task(conn, t2, result="done")
+        assert kb.get_task(conn, t2).status != "done"
+
+
+def test_complete_task_factory_gate_rejects_sha_mismatch(kanban_home):
+    """Receipt column digest != sha256 of the bound file -> FAIL_CLOSED."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="factory task")
+        # Store a valid receipt file, but bind a DIFFERENT digest.
+        raw = json.dumps(_receipt_doc(t), sort_keys=True).encode("utf-8")
+        kb.store_attachment_bytes(conn, t, "receipt.json", raw)
+        _mark_factory_gate(conn, t, "f" * 64)  # does not match the file's sha
+        with pytest.raises(kb.FactoryTerminalReceiptRequiredError):
+            kb.complete_task(conn, t, result="done")
+        assert kb.get_task(conn, t).status != "done"
+
+
+def test_complete_task_factory_gate_accepts_valid_receipt(kanban_home):
+    """Valid complete kernel receipt + matching binding + sha -> completes."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="factory task")
+        _set_running_run(conn, t, run_id=4242)
+        _bind_receipt(conn, t, _receipt_doc(t, run_id="4242", binding_value="4242"), _TRUSTED_KERNEL_UPLOADER)
+        assert kb.complete_task(conn, t, result="done")
+        assert kb.get_task(conn, t).status == "done"
+
+
+def test_complete_task_factory_gate_rejects_worker_forged_receipt_provenance(kanban_home):
+    """Monarch F1 hostile proof #1: a worker/caller self-made fully-correct
+    OUTCOME_ACCEPTED JSON + attachment + digest still cannot DONE.
+
+    The receipt is structurally perfect and its digest matches, but it was
+    attached by the WORKER's own identity (or the agent-toolset "agent"
+    stamp, or no identity at all) — never a trusted kernel-executor identity —
+    so completion is FAIL_CLOSED.
+    """
+    with kb.connect() as conn:
+        for forged_uploader in (None, "agent", "agent007", "worker"):
+            t = kb.create_task(conn, title="factory task")
+            _set_running_run(conn, t, run_id=4242)
+            _bind_receipt(
+                conn, t,
+                _receipt_doc(t, run_id="4242", binding_value="4242"),
+                uploaded_by=forged_uploader,
+            )
+            with pytest.raises(kb.FactoryTerminalReceiptRequiredError):
+                kb.complete_task(conn, t, result="done")
+            assert kb.get_task(conn, t).status != "done"
+
+
+def test_complete_task_factory_gate_rejects_self_declared_actor_source(kanban_home):
+    """REV2 r8: a receipt whose actor_identity_source is a self-declared marker
+    (mirror of the kernel's BYPASS_SELF_DECLARED_ACTOR_IDENTITY) -> FAIL_CLOSED,
+    even when bound by a trusted kernel-executor uploader."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="factory task")
+        _set_running_run(conn, t, run_id=4242)
+        doc = _receipt_doc(t, run_id="4242", binding_value="4242")
+        doc["action_receipt_ref"]["actor_identity_source"] = "self"
+        _bind_receipt(conn, t, doc, _TRUSTED_KERNEL_UPLOADER)
+        with pytest.raises(kb.FactoryTerminalReceiptRequiredError):
+            kb.complete_task(conn, t, result="done")
+        assert kb.get_task(conn, t).status != "done"
+
+
+def test_complete_task_factory_gate_rejects_workspace_file_receipt(kanban_home, tmp_path):
+    """REV2: the receipt must be a task ATTACHMENT with trusted provenance. The
+    REV1 ``<workspace>/receipt`` fallback (directly writable by the completing
+    worker) can never satisfy the gate, even when the file is fully correct and
+    the bound digest matches — there is no ``uploaded_by`` provenance on a bare
+    workspace file."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="factory task")
+        _set_running_run(conn, t, run_id=4242)
+        doc = _receipt_doc(t, run_id="4242", binding_value="4242")
+        raw = json.dumps(doc, sort_keys=True).encode("utf-8")
+        (ws / "receipt").write_bytes(raw)
+        conn.execute(
+            "UPDATE tasks SET workspace_path = ? WHERE id = ?", (str(ws), t),
+        )
+        _mark_factory_gate(conn, t, _sha256(raw))
+        with pytest.raises(kb.FactoryTerminalReceiptRequiredError):
+            kb.complete_task(conn, t, result="done")
+        assert kb.get_task(conn, t).status != "done"
+
+
+def test_complete_task_factory_gate_rejects_malformed_receipt_sha(kanban_home):
+    """gate=1 + a receipt digest that is not 64-hex -> FAIL_CLOSED."""
+    bad_receipts = [
+        None,           # absent
+        "",             # empty
+        "abc",          # too short
+        "g" * 64,       # non-hex chars
+        "a" * 63,       # 63 hex chars (wrong length)
+        "A" * 65,       # 65 hex chars (wrong length)
+        ("a" * 63) + "!",  # trailing non-hex
+    ]
+    with kb.connect() as conn:
+        for receipt in bad_receipts:
+            t = kb.create_task(conn, title="factory task")
+            _mark_factory_gate(conn, t, receipt)
+            with pytest.raises(kb.FactoryTerminalReceiptRequiredError):
+                kb.complete_task(conn, t, result="done")
+            assert kb.get_task(conn, t).status != "done"
+
+
+def test_complete_task_legacy_gate_zero_parity(kanban_home):
+    """gate=0 (legacy/default) -> terminal behaviour is byte-identical.
+
+    The receipt column is ignored entirely for non-factory tasks: completion
+    succeeds whether the receipt is absent, NULL, or even a non-hex string.
+    """
+    with kb.connect() as conn:
+        t1 = kb.create_task(conn, title="legacy")
+        assert kb.complete_task(conn, t1, result="done")
+        assert kb.get_task(conn, t1).status == "done"
+
+        t2 = kb.create_task(conn, title="legacy with garbage receipt")
+        conn.execute(
+            "UPDATE tasks SET factory_terminal_receipt_sha256 = 'not-a-sha' "
+            "WHERE id = ?",
+            (t2,),
+        )
+        conn.commit()
+        assert kb.complete_task(conn, t2, result="done")
+        assert kb.get_task(conn, t2).status == "done"
+
+
+def test_create_task_forces_gate_on_directive_fields_even_explicit_zero(kanban_home):
+    """create with directive fields + explicit gate=0 -> server forces 1 (b1/b3)."""
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn, title="plain title", from_gm="gm2", factory_build_gate=0,
+        )
+        row = conn.execute(
+            "SELECT factory_build_gate FROM tasks WHERE id = ?", (t,),
+        ).fetchone()
+        assert row["factory_build_gate"] == 1
+
+
+def test_create_task_auto_gate_on_agent_profile_aion_title(kanban_home):
+    """factory-profile create with an AION_ title -> auto gate=1 (b2)."""
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn, title="AION_889_phase_b", created_by="agent007",
+        )
+        row = conn.execute(
+            "SELECT factory_build_gate FROM tasks WHERE id = ?", (t,),
+        ).fetchone()
+        assert row["factory_build_gate"] == 1
+
+        # Non-factory profile + non-AION title + no directive fields -> gate=0.
+        t2 = kb.create_task(conn, title="ordinary", created_by="someone-else")
+        row2 = conn.execute(
+            "SELECT factory_build_gate FROM tasks WHERE id = ?", (t2,),
+        ).fetchone()
+        assert row2["factory_build_gate"] == 0
+
+
+def test_create_task_forces_gate_on_strategic_directive_body(kanban_home):
+    """A body carrying a ``strategic_directive`` YAML key forces the gate (b1)."""
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn, title="directive", body="strategic_directive:\n  id: X\n",
+        )
+        row = conn.execute(
+            "SELECT factory_build_gate FROM tasks WHERE id = ?", (t,),
+        ).fetchone()
+        assert row["factory_build_gate"] == 1
+
+
+def test_create_task_factory_profile_total_gate_entry_zero_markers(kanban_home):
+    """Monarch F2 hostile proof #2: an official factory-build admission (a
+    factory profile creating a task) omitting ALL optional prose/title markers
+    still yields gate=1 — omission of every optional marker can never yield
+    gate=0. Gate entry is TOTAL on the authenticated creator identity.
+    """
+    with kb.connect() as conn:
+        for profile in sorted(kb.FACTORY_PROFILES):
+            t = kb.create_task(conn, title="no markers", created_by=profile)
+            row = conn.execute(
+                "SELECT factory_build_gate FROM tasks WHERE id = ?", (t,),
+            ).fetchone()
+            assert row["factory_build_gate"] == 1, (
+                f"factory profile {profile!r} with zero markers must gate=1"
+            )
+
+        # A non-factory creator with zero markers stays gate=0 (no false positive).
+        t2 = kb.create_task(conn, title="no markers", created_by="someone-else")
+        row2 = conn.execute(
+            "SELECT factory_build_gate FROM tasks WHERE id = ?", (t2,),
+        ).fetchone()
+        assert row2["factory_build_gate"] == 0
+
+
+def test_create_task_factory_profile_forces_gate_over_explicit_zero(kanban_home):
+    """REV2 b3: a factory profile's explicit gate=0 is overridden to 1."""
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn, title="no markers", created_by="gm2", factory_build_gate=0,
+        )
+        row = conn.execute(
+            "SELECT factory_build_gate FROM tasks WHERE id = ?", (t,),
+        ).fetchone()
+        assert row["factory_build_gate"] == 1
+
+
+def test_factory_build_gate_immutable_one_to_zero_rejected(kanban_home):
+    """factory_build_gate 1 -> 0 is rejected at the writer chokepoint (trigger).
+
+    The DB-level trigger is the single chokepoint every update surface (raw
+    SQL, dashboard direct status, CLI update) routes through, so a demotion
+    attempt raises and the value stays 1.
+    """
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="factory task")
+        _mark_factory_gate(conn, t, "a" * 64)
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "UPDATE tasks SET factory_build_gate = 0 WHERE id = ?", (t,),
+            )
+        row = conn.execute(
+            "SELECT factory_build_gate FROM tasks WHERE id = ?", (t,),
+        ).fetchone()
+        assert row["factory_build_gate"] == 1
+
+
+def test_factory_gate_columns_migrated_idempotently_fresh_and_legacy(kanban_home, tmp_path):
+    """Additive migration adds both columns + the immutability trigger;
+    idempotent on fresh + legacy DBs; legacy rows stay gate=0."""
+    def _task_cols(conn):
+        return {r["name"] for r in conn.execute("PRAGMA table_info(tasks)")}
+
+    def _triggers(conn):
+        return {r["name"] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'trigger'"
+        )}
+
+    # Fresh DB has both columns, correct defaults, and the trigger.
+    with kb.connect() as conn:
+        assert {"factory_build_gate", "factory_terminal_receipt_sha256"} <= _task_cols(conn)
+        assert "trg_factory_build_gate_immutable" in _triggers(conn)
+        t = kb.create_task(conn, title="x")
+        row = conn.execute(
+            "SELECT factory_build_gate, factory_terminal_receipt_sha256 "
+            "FROM tasks WHERE id = ?",
+            (t,),
+        ).fetchone()
+        assert row["factory_build_gate"] == 0
+        assert row["factory_terminal_receipt_sha256"] is None
+
+    # Re-running init_db is idempotent and preserves columns + trigger.
+    kb.init_db()
+    with kb.connect() as conn:
+        assert {"factory_build_gate", "factory_terminal_receipt_sha256"} <= _task_cols(conn)
+        assert "trg_factory_build_gate_immutable" in _triggers(conn)
+
+    # Legacy DB: a pre-gate ``tasks``/``task_events`` shape missing both
+    # columns must migrate them in on connect(); legacy rows stay gate=0.
+    legacy_path = tmp_path / "legacy-factory-gate.db"
+    conn = sqlite3.connect(str(legacy_path))
+    conn.execute(
+        """
+        CREATE TABLE tasks (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            body TEXT,
+            assignee TEXT,
+            status TEXT NOT NULL,
+            priority INTEGER NOT NULL DEFAULT 0,
+            created_by TEXT,
+            created_at INTEGER NOT NULL,
+            started_at INTEGER,
+            completed_at INTEGER,
+            workspace_kind TEXT NOT NULL DEFAULT 'scratch',
+            workspace_path TEXT,
+            claim_lock TEXT,
+            claim_expires INTEGER
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE task_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            payload TEXT,
+            created_at INTEGER NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        "INSERT INTO tasks (id, title, status, created_at) "
+        "VALUES ('legacy', 'old board task', 'ready', 1)"
+    )
+    conn.commit()
+    conn.close()
+
+    with kb.connect(legacy_path) as migrated:
+        assert {"factory_build_gate", "factory_terminal_receipt_sha256"} <= _task_cols(migrated)
+        assert "trg_factory_build_gate_immutable" in _triggers(migrated)
+        row = migrated.execute(
+            "SELECT factory_build_gate, factory_terminal_receipt_sha256 "
+            "FROM tasks WHERE id = 'legacy'",
+        ).fetchone()
+        assert row["factory_build_gate"] == 0
+        assert row["factory_terminal_receipt_sha256"] is None
+
+
 def test_block_then_unblock(kanban_home):
     with kb.connect() as conn:
         t = kb.create_task(conn, title="x", assignee="a")

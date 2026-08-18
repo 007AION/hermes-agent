@@ -139,6 +139,92 @@ KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
 _IS_WINDOWS = sys.platform == "win32"
 KANBAN_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024
 
+# ---------------------------------------------------------------------------
+# AION-889 Phase B REV2 — factory-build receipt authenticity (provenance-bound)
+# + TOTAL deterministic gate entry. The receipt guard in ``complete_task`` is a
+# READBACK-ONLY consumer of the proof kernel's OUTCOME_ACCEPTED receipt: it
+# never re-computes C1..C10 (the aion-governance proof kernel is the single
+# semantic authority). REV2 binds the receipt to an unforgeable provenance
+# surface (the task attachment ``uploaded_by`` identity) and makes gate entry
+# total on the authenticated creator identity.
+# ---------------------------------------------------------------------------
+
+# The receipt JSON ``schema`` value the guard accepts (closed shape).
+FACTORY_RECEIPT_SCHEMA = "aion.monarch.trusted_receipt.v1"
+
+# The only verdict that may reach a terminal state (closed enum).
+FACTORY_VERDICT_ACCEPTED = "OUTCOME_ACCEPTED"
+
+# Frozen v1.3.0 contract binding hash (aion-governance FROZEN_CONTRACT_SHA256,
+# PR #896). The receipt must carry this exact contract binding.
+FACTORY_CONTRACT_HASH_SHA256 = (
+    "f12a35bc8969d9647b15998163bef0c4351cf89aab456b55e1c855c5c4ab6c3e"
+)
+
+# The ten kernel output detail conditions (readback only — asserted all true).
+FACTORY_CONDITION_KEYS = tuple(f"C{i}" for i in range(1, 11))  # C1 .. C10
+
+# The 8 required ``trusted_receipt_binding`` fields (structural presence only).
+FACTORY_TRUSTED_RECEIPT_FIELDS = (
+    "adapter_type_and_version",
+    "exact_source_refs",
+    "target_identity",
+    "before_digest",
+    "action_receipt_ref",
+    "after_digest",
+    "head_epoch_or_run_binding",
+    "acquired_at",
+)
+
+# Factory semantic fields. A create request that carries any of these (as an
+# explicit field or as a YAML key in the body) is a factory-build directive.
+FACTORY_SEMANTIC_FIELDS = (
+    "factory_directive_id",
+    "from_gm",
+    "strategic_directive",
+    "authorized_scope",
+    "canonical_incident",
+)
+
+# Creator profiles whose authenticated create identity forces the gate
+# UNCONDITIONALLY (REV2 — TOTAL gate entry): any task created under a factory
+# profile is a factory-build task, regardless of title/body markers. This makes
+# gate entry total on the authenticated creator identity (``created_by``,
+# derived server-side from the session identity), so omitting every optional
+# prose/title marker can never yield gate=0 for an official factory admission.
+FACTORY_PROFILES = frozenset({"agent007", "gm2", "merger", "bafuxunan", "elder-senate"})
+
+# REV2 — trusted kernel-executor uploader identity(ies). A proof-kernel
+# OUTCOME_ACCEPTED receipt is only accepted when bound as a task attachment
+# whose ``uploaded_by`` is one of these trusted kernel-executor identities. The
+# completing worker/caller attaches files through the agent toolset
+# (``kanban_attach`` / ``kanban_attach_url``), which stamps a fixed
+# ``uploaded_by="agent"`` label — never one of these kernel identities — so a
+# worker cannot forge the receipt's provenance (the Monarch F1 hostile proof).
+FACTORY_TRUSTED_RECEIPT_UPLOADERS = frozenset({
+    "aion_monarch_proof_kernel",  # aion-governance KERNEL_NAME (frozen v1.3.0)
+})
+
+# REV2 — self-declared actor identity sources (mirror of the kernel's
+# SELF_DECLARED_ACTOR_SOURCES / BYPASS_SELF_DECLARED_ACTOR_IDENTITY). A receipt
+# whose ``action_receipt_ref.actor_identity_source`` resolves into this set is
+# rejected: actor identity must come from a canonical provider/runtime metadata
+# source, never self-declared prose.
+FACTORY_SELF_DECLARED_ACTOR_SOURCES = frozenset({
+    "", "self", "self_declared", "self-declared", "raci_prose", "narrative",
+    "agent_claim", "self_claim", "prompt", "assistant",
+})
+
+# REV2 — closed actor roles (mirror of the kernel's ACTOR_ROLES). The receipt's
+# ``action_receipt_ref.actor_role`` must be one of these.
+FACTORY_ACTOR_ROLES = frozenset({
+    "implementation_commit_author",
+    "pr_creator",
+    "action_executor",
+    "auditor",
+    "merger_or_closer",
+})
+
 
 def _assert_not_delegated_child_mutation() -> None:
     """Reject Kanban state mutations from ``delegate_task`` child contexts.
@@ -2573,6 +2659,50 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
         )
 
+    if "factory_build_gate" not in cols:
+        # AION-889 Phase B: factory-build terminal gate flag. 1 = this task
+        # was produced by the AION factory-build pipeline and MUST bind a
+        # proof-kernel OUTCOME_ACCEPTED receipt before reaching a terminal
+        # state (see complete_task). 0 (default) = legacy / non-factory
+        # task, byte-identical terminal behaviour.
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "factory_build_gate",
+            "factory_build_gate INTEGER NOT NULL DEFAULT 0",
+        )
+
+    if "factory_terminal_receipt_sha256" not in cols:
+        # AION-889 Phase B REV1: sha256 (64-hex) of the proof-kernel
+        # OUTCOME_ACCEPTED receipt bound to a factory-build task at
+        # terminalization. NULL until the receipt is bound. Content-level
+        # (C1-C10 / 8-field) validation lives in the aion-governance proof
+        # kernel, NOT here — this column only stores the digest so
+        # complete_task can enforce a FAIL_CLOSED authenticity gate.
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "factory_terminal_receipt_sha256",
+            "factory_terminal_receipt_sha256 TEXT",
+        )
+
+    # AION-889 Phase B REV1 — immutability (writer chokepoint guard). Once a
+    # task is factory-build gated (factory_build_gate=1) it may NEVER be
+    # demoted back to 0/NULL, on any update surface (dashboard direct status,
+    # CLI update, or raw SQL). The trigger enforces this at the DB layer so no
+    # caller can bypass the receipt gate by silently flipping the flag off.
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_factory_build_gate_immutable
+        BEFORE UPDATE OF factory_build_gate ON tasks
+        WHEN OLD.factory_build_gate = 1 AND COALESCE(NEW.factory_build_gate, 0) != 1
+        BEGIN
+            SELECT RAISE(ABORT,
+                'factory_build_gate is immutable: cannot demote 1 -> 0/NULL');
+        END;
+        """
+    )
+
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
     # parses each statement in ``executescript`` against the live schema, so a
@@ -3004,6 +3134,12 @@ def create_task(
     board: Optional[str] = None,
     project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
+    factory_build_gate: Optional[int] = None,
+    factory_directive_id: Optional[str] = None,
+    from_gm: Optional[str] = None,
+    strategic_directive: Optional[Any] = None,
+    authorized_scope: Optional[Any] = None,
+    canonical_incident: Optional[str] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -3213,6 +3349,25 @@ def create_task(
 
     now = int(time.time())
 
+    # AION-889 Phase B REV1 — deterministic gate entry (server-side, not
+    # caller-controlled). ``factory_build_gate`` is DERIVED from the request's
+    # factory semantics; an explicit caller value is overridden whenever the
+    # derivation forces the gate (b1/b2). See _derive_factory_build_gate.
+    factory_fields = {
+        "factory_directive_id": factory_directive_id,
+        "from_gm": from_gm,
+        "strategic_directive": strategic_directive,
+        "authorized_scope": authorized_scope,
+        "canonical_incident": canonical_incident,
+    }
+    factory_gate = _derive_factory_build_gate(
+        explicit_gate=factory_build_gate,
+        title=title,
+        body=body,
+        created_by=created_by,
+        factory_fields=factory_fields,
+    )
+
     # Resolve workspace_path from board-level default_workdir when the
     # caller did not specify one explicitly. Board defaults represent
     # persistent project checkouts, so only persistent workspace kinds may
@@ -3296,8 +3451,8 @@ def create_task(
                         branch_name, project_id, tenant, idempotency_key,
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
-                        goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id, factory_build_gate
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3322,6 +3477,7 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        factory_gate,
                     ),
                 )
                 for pid in parents:
@@ -5182,6 +5338,231 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
+class FactoryTerminalReceiptRequiredError(ValueError):
+    """Raised by ``complete_task`` when a factory-build task
+    (``factory_build_gate`` = 1) reaches terminalization without a bound,
+    *authenticated* proof-kernel OUTCOME_ACCEPTED receipt.
+
+    FAIL_CLOSED with zero mutation: the guard runs before the main write
+    transaction and raises without touching ``tasks``, ``task_runs``, or
+    ``task_events``. This is an AUTHENTICITY gate, not a shape gate: the bound
+    ``factory_terminal_receipt_sha256`` must be the sha256 of a readable receipt
+    file (task attachment matching the digest OR the ``<workspace>/receipt``
+    convention path) whose JSON passes every authenticity check (schema, closed
+    verdict, C1..C10 readback all-true, task/run binding, frozen v1.3.0
+    contract hash, kernel_version, 8 trusted_receipt_binding fields).
+
+    Content-level (C1-C10 / 8-field) *re-computation* is NOT performed here —
+    the aion-governance proof kernel is the single semantic authority; this
+    guard only enforces presence + authenticity + structural binding. Subclasses
+    ``ValueError`` so the worker tool layer surfaces it as a recoverable,
+    retryable rejection (the worker can bind the receipt and retry), consistent
+    with ``HallucinatedCardsError``.
+    """
+
+    def __init__(self, task_id: str, reason: str = "no authenticated receipt"):
+        self.task_id = task_id
+        self.reason = reason
+        super().__init__(
+            f"completion blocked: task {task_id} is factory-build gated "
+            f"(factory_build_gate=1) but has no authenticated "
+            f"OUTCOME_ACCEPTED receipt ({reason}). "
+            f"factory_terminal_receipt_sha256 must be the sha256 of a readable "
+            f"receipt file whose JSON passes the authenticity checks. Bind the "
+            f"proof-kernel receipt and retry."
+        )
+
+
+# ---------------------------------------------------------------------------
+# AION-889 Phase B REV1 — factory gate helpers
+# ---------------------------------------------------------------------------
+
+def _sha256_hex(data: bytes) -> str:
+    """Lowercase sha256 hex digest of ``data``."""
+    return hashlib.sha256(data).hexdigest()
+
+
+def _is_factory_field_present(value: Any) -> bool:
+    """True when a factory semantic field carries a non-empty value."""
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (dict, list, tuple, set)):
+        return len(value) > 0
+    return bool(value)
+
+
+def _body_has_factory_semantic_field(body: Optional[str]) -> bool:
+    """True when the task body carries any factory semantic field as a YAML key.
+
+    The directive packet (``strategic_directive`` / ``from_gm`` / …) is carried
+    in the task body as a YAML document, so a key like ``from_gm: gm2`` or
+    ``strategic_directive:`` at (possibly indented) line start is the signal.
+    """
+    if not body:
+        return False
+    for field in FACTORY_SEMANTIC_FIELDS:
+        if re.search(rf"(?m)^\s*{re.escape(field)}\s*:", body):
+            return True
+    return False
+
+
+def _derive_factory_build_gate(
+    *,
+    explicit_gate: Optional[int],
+    title: str,
+    body: Optional[str],
+    created_by: Optional[str],
+    factory_fields: Optional[dict] = None,
+) -> int:
+    """Server-side derivation of ``factory_build_gate`` (not caller-controlled).
+
+    b1: the request carries any factory semantic field (explicit param or a
+        YAML key in the body) → gate forced 1.
+    b2 (REV2 — TOTAL entry): the creator profile is a factory profile → gate
+        forced 1 UNCONDITIONALLY. The title/body conjunction is dropped: gate
+        entry is total on the authenticated creator identity (``created_by``,
+        derived server-side from the session identity), so omitting every
+        optional title/body marker can never yield gate=0 for an official
+        factory admission.
+    b3: an explicit ``factory_build_gate=0`` from the caller is OVERRIDDEN to 1
+        whenever b1 or b2 hold.
+
+    Otherwise the explicit value (or the default 0) is returned unchanged.
+    """
+    b1 = _body_has_factory_semantic_field(body) or any(
+        _is_factory_field_present(v) for v in (factory_fields or {}).values()
+    )
+    b2 = (created_by or "") in FACTORY_PROFILES
+    if b1 or b2:
+        return 1
+    return 1 if explicit_gate else 0
+
+
+def _find_factory_receipt_bytes(
+    conn: sqlite3.Connection, task_id: str, receipt_sha: str,
+) -> Optional[tuple[bytes, Optional[str]]]:
+    """Return ``(receipt_bytes, uploaded_by)`` for the task attachment whose
+    on-disk blob hashes to ``receipt_sha``, or ``None``.
+
+    REV2: the receipt MUST be a task attachment (the ``uploaded_by`` provenance
+    surface). The ``<workspace_path>/receipt`` convention path from REV1 is
+    dropped — a workspace file has no ``uploaded_by`` and is directly writable
+    by the completing worker, which is exactly the forgery vector the Monarch
+    F1 finding identifies. The ``uploaded_by`` value is returned so the caller
+    can enforce that only a trusted kernel-executor identity may bind a receipt.
+    """
+    for att in list_attachments(conn, task_id):
+        if not att.stored_path:
+            continue
+        try:
+            data = Path(att.stored_path).read_bytes()
+        except OSError:
+            continue
+        if _sha256_hex(data) == receipt_sha:
+            return data, att.uploaded_by
+    return None
+
+
+def _validate_factory_receipt(
+    receipt: Any,
+    task_id: str,
+    current_run_id: Optional[int],
+) -> None:
+    """Authenticity validation of a parsed proof-kernel receipt (r1..r8).
+
+    READBACK ONLY — this never re-computes C1..C10; it asserts that the kernel's
+    output detail (schema, closed verdict, all-ten-conditions-true) and binding
+    fields are present and consistent with the task/run under completion. On any
+    failure it raises :class:`FactoryTerminalReceiptRequiredError` (FAIL_CLOSED).
+    """
+    def _fail(reason: str) -> None:
+        raise FactoryTerminalReceiptRequiredError(task_id, reason)
+
+    if not isinstance(receipt, dict):
+        _fail("receipt is not a JSON object")
+
+    # r1 — schema marker.
+    if receipt.get("schema") != FACTORY_RECEIPT_SCHEMA:
+        _fail(f"schema != {FACTORY_RECEIPT_SCHEMA!r}")
+
+    # r2 — closed verdict enum.
+    if receipt.get("verdict") != FACTORY_VERDICT_ACCEPTED:
+        _fail(f"verdict != {FACTORY_VERDICT_ACCEPTED!r}")
+
+    # r3 — C1..C10 detail object, all ten true (readback only).
+    conditions = receipt.get("conditions")
+    if not isinstance(conditions, dict):
+        _fail("missing C1..C10 conditions detail object")
+    for key in FACTORY_CONDITION_KEYS:
+        if conditions.get(key) is not True:
+            _fail(f"condition {key} is not true")
+
+    # r4 — target identity + run binding.
+    target_identity = receipt.get("target_identity")
+    if not isinstance(target_identity, dict):
+        _fail("missing target_identity object")
+    target_task_id = target_identity.get("task_id")
+    if target_task_id is None:
+        fields = target_identity.get("fields")
+        target_task_id = fields.get("task_id") if isinstance(fields, dict) else None
+    if str(target_task_id) != str(task_id):
+        _fail("target_identity.task_id does not match the task being completed")
+
+    binding = receipt.get("head_epoch_or_run_binding")
+    if not isinstance(binding, dict):
+        _fail("missing head_epoch_or_run_binding object")
+    if current_run_id is not None:
+        run_ref = binding.get("value")
+        if run_ref is None:
+            run_ref = binding.get("run_id")
+        if run_ref is None:
+            run_ref = binding.get("task_run_id")
+        if str(run_ref) != str(current_run_id):
+            _fail("head_epoch_or_run_binding does not match the current run")
+
+    # r5 — frozen v1.3.0 contract binding.
+    contract_hash = receipt.get("contract_hash_sha256")
+    if contract_hash is None:
+        acquired = receipt.get("acquired_evidence")
+        if isinstance(acquired, dict):
+            contract = acquired.get("contract")
+            if isinstance(contract, dict):
+                contract_hash = contract.get("contract_hash_sha256")
+    if contract_hash != FACTORY_CONTRACT_HASH_SHA256:
+        _fail("contract_hash_sha256 does not match the frozen v1.3.0 contract")
+
+    # r6 — kernel_version present.
+    if not isinstance(receipt.get("kernel_version"), str) or not receipt["kernel_version"].strip():
+        _fail("kernel_version field missing")
+
+    # r7 — 8 trusted_receipt_binding fields all present (structural).
+    missing_binding_fields = [
+        f for f in FACTORY_TRUSTED_RECEIPT_FIELDS if f not in receipt
+    ]
+    if missing_binding_fields:
+        _fail(
+            "missing trusted_receipt_binding field(s): "
+            + ", ".join(missing_binding_fields)
+        )
+
+    # r8 (REV2) — actor identity must come from a canonical provider/runtime
+    # metadata source, never self-declared prose (mirrors the kernel's
+    # BYPASS_SELF_DECLARED_ACTOR_IDENTITY). This is a structural anti-
+    # impersonation readback check, not a re-computation of actor identity.
+    action = receipt.get("action_receipt_ref")
+    if not isinstance(action, dict):
+        _fail("missing action_receipt_ref object")
+    actor_identity_source = action.get("actor_identity_source")
+    if not isinstance(actor_identity_source, str) or not actor_identity_source.strip():
+        _fail("action_receipt_ref.actor_identity_source missing")
+    if actor_identity_source.strip().lower() in FACTORY_SELF_DECLARED_ACTOR_SOURCES:
+        _fail("action_receipt_ref.actor_identity_source is self-declared")
+    if action.get("actor_role") not in FACTORY_ACTOR_ROLES:
+        _fail("action_receipt_ref.actor_role is not a closed actor role")
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5248,6 +5629,61 @@ def complete_task(
             raise HallucinatedCardsError(phantom_cards, task_id)
     else:
         verified_cards = []
+
+    # Gate: factory-build terminal receipt (AION-889 Phase B REV2 —
+    # provenance-bound authenticity, not shape). A factory-build task
+    # (factory_build_gate=1) may not reach a terminal state until a proof-kernel
+    # OUTCOME_ACCEPTED receipt is bound AND authenticated: the bound
+    # ``factory_terminal_receipt_sha256`` must be the sha256 of a readable
+    # receipt TASK ATTACHMENT whose ``uploaded_by`` is a trusted kernel-executor
+    # identity (not the completing worker), and whose JSON passes r1..r8.
+    # FAIL_CLOSED with zero mutation: this is a read-before-write check that
+    # runs ahead of the main write txn and raises with no task/run/event
+    # change. No C1-C10 re-computation happens here — the aion-governance proof
+    # kernel stays the single semantic authority; this guard only enforces
+    # presence + provenance + authenticity + structural binding.
+    _gate_row = conn.execute(
+        "SELECT factory_build_gate, factory_terminal_receipt_sha256, "
+        "current_run_id FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if _gate_row is not None and _gate_row["factory_build_gate"]:
+        _receipt = _gate_row["factory_terminal_receipt_sha256"]
+        if not (
+            isinstance(_receipt, str)
+            and re.fullmatch(r"[0-9a-fA-F]{64}", _receipt)
+        ):
+            raise FactoryTerminalReceiptRequiredError(
+                task_id, reason="receipt sha256 is missing or not 64-hex"
+            )
+        _receipt_found = _find_factory_receipt_bytes(
+            conn, task_id, _receipt.lower()
+        )
+        if _receipt_found is None:
+            raise FactoryTerminalReceiptRequiredError(
+                task_id, reason="no readable receipt attachment matches the bound sha256"
+            )
+        _receipt_bytes, _receipt_uploaded_by = _receipt_found
+        if _receipt_uploaded_by not in FACTORY_TRUSTED_RECEIPT_UPLOADERS:
+            raise FactoryTerminalReceiptRequiredError(
+                task_id,
+                reason=(
+                    "receipt attachment uploaded_by "
+                    f"{_receipt_uploaded_by!r} is not a trusted kernel-executor identity"
+                ),
+            )
+        try:
+            _receipt_doc = json.loads(_receipt_bytes.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise FactoryTerminalReceiptRequiredError(
+                task_id, reason="receipt file is not valid UTF-8 JSON"
+            )
+        _current_run_id = (
+            int(expected_run_id)
+            if expected_run_id is not None
+            else _gate_row["current_run_id"]
+        )
+        _validate_factory_receipt(_receipt_doc, task_id, _current_run_id)
 
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
