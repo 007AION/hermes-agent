@@ -22,6 +22,8 @@ data the live callbacks already read from.
 """
 from __future__ import annotations
 
+import asyncio
+
 from unittest.mock import MagicMock
 
 
@@ -73,7 +75,7 @@ class TestRefreshSkillGroup:
             fake_collector,
         )
 
-        new_count, hidden = adapter.refresh_skill_group()
+        new_count, hidden = asyncio.run(adapter.refresh_skill_group())
 
         assert new_count == 1
         assert hidden == 0
@@ -104,7 +106,7 @@ class TestRefreshSkillGroup:
             fake_collector,
         )
 
-        adapter.refresh_skill_group()
+        asyncio.run(adapter.refresh_skill_group())
 
         names = [n for n, _d, _k in adapter._skill_entries]
         assert names == sorted(names) == ["alpha", "zebra"]
@@ -127,12 +129,56 @@ class TestRefreshSkillGroup:
             boom,
         )
 
-        new_count, hidden = adapter.refresh_skill_group()
+        new_count, hidden = asyncio.run(adapter.refresh_skill_group())
         # Returns previously-cached count, no crash, existing entries
         # preserved so the live autocomplete keeps working.
         assert new_count == 1
         assert hidden == 0
         assert adapter._skill_entries == [("keep", "kept", "/keep")]
+
+
+class TestSkillCatalogScanOffload:
+    """AION-RL2-CORE-01-R35 second path: the synchronous
+    ``discord_skill_commands_by_category`` filesystem scan must run off
+    the event loop.
+
+    ``discord_skill_commands_by_category`` resolves skill paths and reads
+    frontmatter from disk. On the gateway event loop that blocks Discord
+    heartbeats and the loop-liveness probe, which can trip the exit-75
+    shutdown watchdog and a systemd restart that kills unrelated healthy
+    workers (canonical incident t_e690dcc1). The collector must therefore
+    execute on a worker thread, not the loop thread.
+    """
+
+    def test_refresh_skill_group_scans_off_event_loop_thread(self, monkeypatch):
+        import threading
+
+        adapter = _make_adapter()
+        adapter._skill_entries = []
+        adapter._skill_lookup = {}
+        adapter._skill_group_reserved_names = set()
+        adapter._skill_group_hidden_count = 0
+
+        scan_threads: list[int] = []
+
+        def fake_collector(*, reserved_names):
+            scan_threads.append(threading.get_ident())
+            return ({}, [("alpha", "First skill", "/alpha")], 0)
+
+        monkeypatch.setattr(
+            "hermes_cli.commands.discord_skill_commands_by_category",
+            fake_collector,
+        )
+
+        loop_thread = threading.get_ident()
+        asyncio.run(adapter.refresh_skill_group())
+
+        assert scan_threads, "collector must have been invoked"
+        assert all(tid != loop_thread for tid in scan_threads), (
+            "discord_skill_commands_by_category ran on the event-loop "
+            "thread — it must be offloaded via asyncio.to_thread"
+        )
+        assert [n for n, _d, _k in adapter._skill_entries] == ["alpha"]
 
 
 class TestRegisterSkillGroupUsesInstanceState:
@@ -168,7 +214,7 @@ class TestRegisterSkillGroupUsesInstanceState:
             fake_collector,
         )
 
-        adapter._refresh_skill_catalog_state()
+        asyncio.run(adapter._refresh_skill_catalog_state())
 
         # Instance-level state populated — the autocomplete + handler
         # callbacks both read from these, so `refresh_skill_group`

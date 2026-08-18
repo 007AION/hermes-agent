@@ -2,6 +2,7 @@
 
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
+import asyncio
 import sys
 
 import pytest
@@ -126,7 +127,7 @@ async def test_registers_native_thread_slash_command(adapter):
     # an ephemeral rejection on the still-unresponded interaction. The
     # closure should just forward.
     adapter._handle_thread_create_slash = AsyncMock()
-    adapter._register_slash_commands()
+    await adapter._register_slash_commands()
 
     command = adapter._client.tree.commands["thread"]
     interaction = SimpleNamespace(
@@ -144,7 +145,7 @@ async def test_registers_native_thread_slash_command(adapter):
 @pytest.mark.asyncio
 async def test_registers_native_restart_slash_command(adapter):
     adapter._run_simple_slash = AsyncMock()
-    adapter._register_slash_commands()
+    await adapter._register_slash_commands()
 
     assert "restart" in adapter._client.tree.commands
 
@@ -196,7 +197,7 @@ async def test_auto_registers_missing_gateway_commands(adapter):
     """Commands in COMMAND_REGISTRY that aren't explicitly registered should
     be auto-registered by the dynamic catch-all block."""
     adapter._run_simple_slash = AsyncMock()
-    adapter._register_slash_commands()
+    await adapter._register_slash_commands()
 
     tree_names = set(adapter._client.tree.commands.keys())
 
@@ -211,7 +212,7 @@ async def test_auto_registers_missing_gateway_commands(adapter):
 async def test_auto_registered_command_dispatches_correctly(adapter):
     """Auto-registered commands should dispatch via _run_simple_slash."""
     adapter._run_simple_slash = AsyncMock()
-    adapter._register_slash_commands()
+    await adapter._register_slash_commands()
 
     # /debug has no args — test parameterless dispatch
     debug_cmd = adapter._client.tree.commands["debug"]
@@ -225,7 +226,7 @@ async def test_auto_registered_command_dispatches_correctly(adapter):
 async def test_auto_registered_command_with_args(adapter):
     """Auto-registered commands with args_hint should accept an optional args param."""
     adapter._run_simple_slash = AsyncMock()
-    adapter._register_slash_commands()
+    await adapter._register_slash_commands()
 
     # /branch has args_hint="[name]" — test dispatch with args
     branch_cmd = adapter._client.tree.commands["branch"]
@@ -253,7 +254,7 @@ async def test_auto_registers_plugin_commands_for_discord(adapter):
             }
         },
     ):
-        adapter._register_slash_commands()
+        await adapter._register_slash_commands()
 
     tree_names = set(adapter._client.tree.commands.keys())
     assert "metricas" in tree_names
@@ -282,7 +283,7 @@ async def test_auto_registered_plugin_command_without_args_hint(adapter):
             }
         },
     ):
-        adapter._register_slash_commands()
+        await adapter._register_slash_commands()
 
     assert "ping" in adapter._client.tree.commands
     ping_cmd = adapter._client.tree.commands["ping"]
@@ -307,7 +308,7 @@ async def test_plugin_command_name_conflict_skipped(adapter):
             }
         },
     ):
-        adapter._register_slash_commands()
+        await adapter._register_slash_commands()
 
     # Built-ins are registered via @tree.command as plain functions. A
     # plugin-registered override would install a _FakeCommand instance
@@ -352,7 +353,7 @@ async def test_slash_command_registration_stays_under_discord_limit(adapter):
     }
 
     with patch("hermes_cli.plugins.get_plugin_commands", return_value=many_plugins):
-        adapter._register_slash_commands()
+        await adapter._register_slash_commands()
 
     tree_names = set(adapter._client.tree.commands.keys())
 
@@ -975,7 +976,7 @@ def test_register_skill_command_is_flat_not_nested(adapter):
         "hermes_cli.commands.discord_skill_commands_by_category",
         return_value=(mock_categories, mock_uncategorized, 0),
     ):
-        adapter._register_slash_commands()
+        asyncio.run(adapter._register_slash_commands())
 
     tree = adapter._client.tree
     assert "skill" in tree.commands, "Expected /skill command to be registered"
@@ -993,7 +994,7 @@ def test_register_skill_command_empty_skills_no_command(adapter):
         "hermes_cli.commands.discord_skill_commands_by_category",
         return_value=({}, [], 0),
     ):
-        adapter._register_slash_commands()
+        asyncio.run(adapter._register_slash_commands())
 
     tree = adapter._client.tree
     assert "skill" not in tree.commands
@@ -1016,7 +1017,7 @@ def test_register_skill_command_callback_dispatches_by_name(adapter):
         "hermes_cli.commands.discord_skill_commands_by_category",
         return_value=(mock_categories, mock_uncategorized, 0),
     ):
-        adapter._register_slash_commands()
+        asyncio.run(adapter._register_slash_commands())
 
     skill_cmd = adapter._client.tree.commands["skill"]
     assert skill_cmd.callback is not None
@@ -1028,8 +1029,6 @@ def test_register_skill_command_callback_dispatches_by_name(adapter):
         dispatched.append(text)
 
     adapter._run_simple_slash = fake_run
-
-    import asyncio
 
     fake_interaction = SimpleNamespace()
     # gif-search → /gif-search with no args
@@ -1048,7 +1047,7 @@ def test_register_skill_command_handles_unknown_skill_gracefully(adapter):
         "hermes_cli.commands.discord_skill_commands_by_category",
         return_value=({"media": [("gif-search", "GIFs", "/gif-search")]}, [], 0),
     ):
-        adapter._register_slash_commands()
+        asyncio.run(adapter._register_slash_commands())
 
     skill_cmd = adapter._client.tree.commands["skill"]
 
@@ -1061,7 +1060,6 @@ def test_register_skill_command_handles_unknown_skill_gracefully(adapter):
         response=SimpleNamespace(send_message=fake_send),
     )
 
-    import asyncio
     asyncio.run(skill_cmd.callback(interaction, name="does-not-exist"))
 
     assert len(sent) == 1
@@ -1096,7 +1094,7 @@ def test_register_skill_command_payload_fits_discord_8kb_limit(adapter):
         "hermes_cli.commands.discord_skill_commands_by_category",
         return_value=(large_categories, [], 0),
     ):
-        adapter._register_slash_commands()
+        asyncio.run(adapter._register_slash_commands())
 
     skill_cmd = adapter._client.tree.commands["skill"]
     # Approximate the serialized registration payload (name + description only).
@@ -1132,7 +1130,7 @@ def test_register_skill_command_autocomplete_filters_by_name_and_description(ada
         "hermes_cli.commands.discord_skill_commands_by_category",
         return_value=(mock_categories, [], 0),
     ):
-        adapter._register_slash_commands()
+        asyncio.run(adapter._register_slash_commands())
 
     skill_cmd = adapter._client.tree.commands["skill"]
     # The callback has been wrapped with @autocomplete(name=...) — in our mock

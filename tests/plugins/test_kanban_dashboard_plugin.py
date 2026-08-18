@@ -7,8 +7,11 @@ REST surface without spinning up the whole dashboard.
 
 from __future__ import annotations
 
+import ast
 import importlib.util
+import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -2545,3 +2548,2323 @@ def test_dashboard_parent_notice_and_child_results_use_detail_links():
     assert "t.link_counts" not in detail
     assert "Child Results" in detail
     assert "props.data.child_results" in detail
+
+
+# ============================================================================
+# ============================================================================
+# AION R4/I01 — bounded adversarial scanner for direct tasks.status SQL
+# ============================================================================
+CANONICAL_BOUNDARY = "hermes_cli/kanban_db.py"
+DASHBOARD_PLUGIN = "plugins/kanban/dashboard/plugin_api.py"
+DYNAMIC = "\x00DYNAMIC\x00"
+MUTATION_METHODS = ("execute", "executemany", "executescript")
+READ_LEAD = ("SELECT", "PRAGMA", "WITH", "EXPLAIN", "VACUUM", "ANALYZE", "ATTACH", "DETACH")
+
+# --- bounded Kanban object provenance ------------------------------------
+# A name only becomes a *flag-able* target when its provenance is proven to be
+# a Kanban connection/cursor/bound execute method. Provenance is seeded from
+# the kanban_db connection factory (hermes_cli.kanban_db.connect / the dashboard
+# _conn helper) and, in explicit-entrypoint adversarial fixtures, from a
+# connection-named parameter declared by the fixture. It propagates through
+# plain aliases, ``.cursor()``, bound ``.execute``/``.executemany``/
+# ``.executescript`` methods, opaque ``getattr(obj, 'execute')``, and
+# interprocedural argument binding. Arbitrary non-Kanban ``.execute`` receivers
+# (logger, sqlite3 state/projects/session connections, console/terminal
+# engines) carry no tag and therefore stay non-violating.
+PROV_CONN = "conn"
+PROV_CURSOR = "cursor"
+PROV_METHOD = "method"
+PROV_KANBAN_MODULE = "kanban_module"
+PROV_KANBAN_CONNECT = "kanban_connect"
+_KANBAN_OBJECT_TAGS = {PROV_CONN, PROV_CURSOR, PROV_METHOD}
+CONNECTION_PARAM_NAMES = {"conn", "connection", "db", "database"}
+
+# Unknown / no-provenance sentinel for the return-summary lattice. Every
+# reachable return arm that is not a supported known Kanban provenance tag
+# (unknown, non-Kanban, cyclic, bare ``return``, or implicit ``None``
+# fall-through) is classified as UNKNOWN_RETURN so it cannot silently
+# disappear from the unanimity check in ``_function_return_summary``.
+UNKNOWN_RETURN = "unknown_return"
+
+
+class _Unresolved:
+    def __repr__(self):  # pragma: no cover
+        return "<UNRESOLVED>"
+
+
+UNRESOLVED = _Unresolved()
+
+
+def _norm_sql(s: str) -> str:
+    s = re.sub(r"--[^\n]*", " ", s)
+    s = re.sub(r"/\*.*?\*/", " ", s, flags=re.DOTALL)
+    return " ".join(s.split())
+
+
+def _is_read(s: str) -> bool:
+    lead = _norm_sql(s).lstrip().upper().split(" ")[0]
+    return lead in READ_LEAD
+
+
+# ---------------------------------------------------------------------------
+# String folding (bounded constant propagation)
+# ---------------------------------------------------------------------------
+
+def _fold_string(node, env, depth=0):
+    if depth > 24 or node is None:
+        return UNRESOLVED
+    if isinstance(node, ast.Constant):
+        return node.value if isinstance(node.value, str) else UNRESOLVED
+    if isinstance(node, ast.Name):
+        v = env.get(node.id, UNRESOLVED)
+        return v if isinstance(v, str) else UNRESOLVED
+    if isinstance(node, ast.JoinedStr):
+        parts = []
+        for v in node.values:
+            if isinstance(v, ast.Constant) and isinstance(v.value, str):
+                parts.append(v.value)
+            elif isinstance(v, ast.FormattedValue):
+                sub = _fold_string(v.value, env, depth + 1)
+                parts.append(sub if isinstance(sub, str) else DYNAMIC)
+            else:
+                parts.append(DYNAMIC)
+        return "".join(parts)
+    if isinstance(node, ast.BinOp):
+        if isinstance(node.op, ast.Add):
+            l = _fold_string(node.left, env, depth + 1)
+            r = _fold_string(node.right, env, depth + 1)
+            if isinstance(l, str) and isinstance(r, str):
+                return l + r
+            if isinstance(l, str):
+                return l + DYNAMIC
+            if isinstance(r, str):
+                return DYNAMIC + r
+            return DYNAMIC
+        if isinstance(node.op, ast.Mod):
+            template = _fold_string(node.left, env, depth + 1)
+            if not isinstance(template, str):
+                return UNRESOLVED
+            return _apply_percent(template, node.right, env, depth)
+    if isinstance(node, ast.Call):
+        fn = node.func
+        if isinstance(fn, ast.Attribute) and fn.attr == "join":
+            sep = _fold_string(fn.value, env, depth + 1)
+            elems = _fold_list(node.args[0], env, depth + 1) if node.args else UNRESOLVED
+            if isinstance(sep, str) and isinstance(elems, list):
+                return sep.join(elems)
+            return DYNAMIC
+        if isinstance(fn, ast.Attribute) and fn.attr == "format":
+            base = _fold_string(fn.value, env, depth + 1)
+            if not isinstance(base, str):
+                return UNRESOLVED
+            return _apply_format(base, node, env, depth)
+        return UNRESOLVED
+    return UNRESOLVED
+
+
+def _apply_percent(template, right, env, depth):
+    args = []
+    if isinstance(right, ast.Tuple):
+        for elt in right.elts:
+            v = _fold_string(elt, env, depth + 1)
+            args.append(v if isinstance(v, str) else DYNAMIC)
+    else:
+        v = _fold_string(right, env, depth + 1)
+        args.append(v if isinstance(v, str) else DYNAMIC)
+    it = iter(args)
+    out = []
+    i = 0
+    while i < len(template):
+        if template[i] == "%" and i + 1 < len(template) and template[i + 1] in "srd":
+            out.append(next(it, DYNAMIC))
+            i += 2
+            continue
+        out.append(template[i])
+        i += 1
+    return "".join(out)
+
+
+def _apply_format(base, node, env, depth):
+    args = []
+    for a in node.args:
+        v = _fold_string(a, env, depth + 1)
+        args.append(v if isinstance(v, str) else DYNAMIC)
+    it = iter(args)
+    out = []
+    i = 0
+    while i < len(base):
+        if base[i] == "{" and i + 1 < len(base) and base[i + 1] == "}":
+            out.append(next(it, DYNAMIC))
+            i += 2
+            continue
+        out.append(base[i])
+        i += 1
+    return "".join(out)
+
+
+def _fold_list(node, env, depth=0):
+    if depth > 24 or node is None:
+        return UNRESOLVED
+    if isinstance(node, ast.List):
+        out = []
+        for elt in node.elts:
+            v = _fold_string(elt, env, depth + 1)
+            out.append(v if isinstance(v, str) else DYNAMIC)
+        return out
+    if isinstance(node, ast.Name):
+        v = env.get(node.id, UNRESOLVED)
+        if isinstance(v, list):
+            return v
+        if isinstance(v, str):
+            return [v]
+        return UNRESOLVED
+    return UNRESOLVED
+
+
+# ---------------------------------------------------------------------------
+# SQL mutation classification
+# ---------------------------------------------------------------------------
+
+def _parse_set_columns(raw: str):
+    cols = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        eq = part.find("=")
+        name = (part[:eq] if eq >= 0 else part).strip().lower()
+        if DYNAMIC in name:
+            cols.append(DYNAMIC)
+        else:
+            cols.append(name)
+    return cols
+
+
+def _classify_sql(shape: str):
+    norm = _norm_sql(shape)
+    up = norm.upper()
+    if not up:
+        return None
+    if _is_read(up):
+        return None
+    m = re.match(r"^UPDATE\s+(\w+)\s+SET\s+(.+?)(?:\s+WHERE\b.*)?$", up, re.DOTALL)
+    if m:
+        return ("UPDATE", m.group(1).lower(), _parse_set_columns(m.group(2)))
+    m = re.match(r"^INSERT\s+INTO\s+(\w+)\s*\(([^)]*)\)", up, re.DOTALL)
+    if m:
+        cols = [c.strip().lower() for c in m.group(2).split(",") if c.strip()]
+        return ("INSERT", m.group(1).lower(), cols)
+    m = re.match(r"^INSERT\s+INTO\s+(\w+)", up)
+    if m:
+        return ("INSERT", m.group(1).lower(), [DYNAMIC])
+    m = re.match(r"^DELETE\s+FROM\s+(\w+)", up)
+    if m:
+        return ("DELETE", m.group(1).lower(), [])
+    m = re.match(r"^REPLACE\s+INTO\s+(\w+)\s*\(([^)]*)\)", up, re.DOTALL)
+    if m:
+        cols = [c.strip().lower() for c in m.group(2).split(",") if c.strip()]
+        return ("REPLACE", m.group(1).lower(), cols)
+    if up.startswith(("UPDATE", "INSERT", "DELETE", "REPLACE", "CREATE", "DROP", "ALTER")):
+        return ("UNKNOWN_MUTATION", None, [DYNAMIC])
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Scanner core (entrypoint-scoped, bounded interprocedural)
+# ---------------------------------------------------------------------------
+
+def _module_to_path(module, relpath=""):
+    if module.endswith(".py"):
+        return module
+    return "/".join(module.split(".")) + ".py"
+
+
+def _split_entrypoint(ep):
+    parts = ep.split(".")
+    if len(parts) >= 2:
+        name = parts[-1]
+        module = ".".join(parts[:-1])
+        return (_module_to_path(module), name)
+    return (ep, ep)
+
+
+def _build_import_map(files):
+    import_map = {}
+    for relpath, src in files.items():
+        try:
+            tree = ast.parse(src)
+        except SyntaxError:
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module is not None:
+                mod_rel = _module_to_path(node.module, relpath)
+                for alias in node.names:
+                    import_map[(relpath, alias.asname or alias.name)] = (mod_rel, alias.name)
+    return import_map
+
+
+def _receiver_prov(node, env, prov, import_map=None, relpath=None,
+                   funcs=None, module_envs=None, canonical_boundary=None,
+                   depth=0, ret_visited=None):
+    """Return the Kanban object provenance tag for a receiver expression, else None.
+
+    A receiver may be a name, a direct factory call (``kanban_db.connect()``),
+    a cursor-derivation chain (``conn.cursor()``), or — when the interprocedural
+    context is available — a helper call whose summarized return is a proven
+    Kanban connection/cursor/bound method. Only proven Kanban
+    connection/cursor/method provenance is returned; non-Kanban receivers
+    (logger, sqlite3) carry no tag.
+    """
+    if isinstance(node, ast.Name):
+        p = prov.get(node.id)
+        return p if p in _KANBAN_OBJECT_TAGS else None
+    if isinstance(node, ast.Call):
+        if import_map is not None:
+            if _is_kanban_factory(node, env, prov, import_map, relpath):
+                return PROV_CONN
+        fn = node.func
+        if isinstance(fn, ast.Attribute) and fn.attr == "cursor":
+            if _receiver_prov(fn.value, env, prov, import_map, relpath,
+                              funcs, module_envs, canonical_boundary, depth, ret_visited) is not None:
+                return PROV_CURSOR
+        # Helper-call receiver: ``get_conn()`` / ``get_cursor()`` / ``get_run()``.
+        if isinstance(fn, ast.Name) and funcs is not None:
+            target = _resolve_callee(fn.id, relpath, funcs, import_map)
+            if target is not None:
+                trel, tfunc = target
+                if trel != canonical_boundary:
+                    tag, _bm = _function_return_summary(
+                        trel, tfunc, node, env, prov, relpath, funcs, import_map,
+                        module_envs, canonical_boundary, depth, ret_visited)
+                    if tag in _KANBAN_OBJECT_TAGS:
+                        return tag
+    return None
+
+
+def _arg_prov(arg, env, prov, import_map=None, relpath=None):
+    """Return the Kanban object provenance tag carried by a call argument, else None."""
+    if isinstance(arg, ast.Name):
+        p = prov.get(arg.id)
+        return p if p in _KANBAN_OBJECT_TAGS else None
+    if isinstance(arg, ast.Attribute) and arg.attr in MUTATION_METHODS:
+        if _receiver_prov(arg.value, env, prov, import_map, relpath) is not None:
+            return PROV_METHOD
+    if isinstance(arg, ast.Call) and isinstance(arg.func, ast.Name) and arg.func.id == "getattr":
+        if len(arg.args) >= 2:
+            attr = _fold_string(arg.args[1], env)
+            if isinstance(attr, str) and attr in MUTATION_METHODS:
+                if _receiver_prov(arg.args[0], env, prov, import_map, relpath):
+                    return PROV_METHOD
+    return None
+
+
+def _bound_method_env(node, env):
+    """Return the ``('__BOUND_METHOD__', attr)`` callable identity for an
+    expression naming a bound mutation method, else None."""
+    if isinstance(node, ast.Name):
+        bm = env.get(node.id)
+        if isinstance(bm, tuple) and len(bm) == 2 and bm[0] == "__BOUND_METHOD__":
+            return bm
+        return None
+    if isinstance(node, ast.Attribute) and node.attr in MUTATION_METHODS:
+        return ("__BOUND_METHOD__", node.attr)
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "getattr":
+        if len(node.args) >= 2:
+            attr = _fold_string(node.args[1], env)
+            if isinstance(attr, str) and attr in MUTATION_METHODS:
+                return ("__BOUND_METHOD__", attr)
+    return None
+
+
+def _record_import_prov(prov, alias):
+    name = alias.asname or alias.name
+    if alias.name in ("kanban_db", "hermes_cli.kanban_db"):
+        prov[name] = PROV_KANBAN_MODULE
+
+
+def _record_importfrom_prov(prov, module, alias):
+    name = alias.asname or alias.name
+    mod = module or ""
+    if mod in ("hermes_cli", "hermes_cli.kanban_db"):
+        if alias.name == "kanban_db":
+            prov[name] = PROV_KANBAN_MODULE
+        elif alias.name == "connect":
+            prov[name] = PROV_KANBAN_CONNECT
+
+
+def _is_kanban_factory(call, env, prov, import_map, relpath):
+    """True if ``call`` is a Kanban connection factory invocation."""
+    fn = call.func
+    if isinstance(fn, ast.Name):
+        if fn.id == "_conn":
+            return True
+        if prov.get(fn.id) == PROV_KANBAN_CONNECT:
+            return True
+        target = import_map.get((relpath, fn.id))
+        if target and target[0] == CANONICAL_BOUNDARY and target[1] == "connect":
+            return True
+    if isinstance(fn, ast.Attribute) and fn.attr == "connect":
+        base = fn.value
+        if isinstance(base, ast.Name):
+            if prov.get(base.id) == PROV_KANBAN_MODULE:
+                return True
+            target = import_map.get((relpath, base.id))
+            if target and target[0] == CANONICAL_BOUNDARY:
+                return True
+    return False
+
+
+def _factory_callable_prov(node, env, prov, import_map=None, relpath=None):
+    """Return PROV_KANBAN_CONNECT if ``node`` names the Kanban connection
+    factory *callable* without invoking it, else None.
+
+    Covers the imported symbol (``from hermes_cli.kanban_db import connect`` ->
+    ``connect``) and the attribute form (``kanban_db.connect``) where
+    ``kanban_db`` is the proven factory module. This is the callable identity
+    that must survive ``make = kanban_db.connect`` / ``make = connect`` and any
+    plain/repeated alias of ``make``.
+    """
+    if isinstance(node, ast.Name):
+        if prov.get(node.id) == PROV_KANBAN_CONNECT:
+            return PROV_KANBAN_CONNECT
+        if import_map is not None and relpath is not None:
+            target = import_map.get((relpath, node.id))
+            if target and target[0] == CANONICAL_BOUNDARY and target[1] == "connect":
+                return PROV_KANBAN_CONNECT
+        return None
+    if isinstance(node, ast.Attribute) and node.attr == "connect":
+        base = node.value
+        if isinstance(base, ast.Name):
+            if prov.get(base.id) == PROV_KANBAN_MODULE:
+                return PROV_KANBAN_CONNECT
+            if import_map is not None and relpath is not None:
+                target = import_map.get((relpath, base.id))
+                if target and target[0] == CANONICAL_BOUNDARY:
+                    return PROV_KANBAN_CONNECT
+    return None
+
+
+def scan_status_sql(files, entrypoints=None, canonical_boundary=CANONICAL_BOUNDARY):
+    """Scan a set of files for direct ``tasks.status`` lifecycle SQL.
+
+    * ``entrypoints``: functions to begin analysis from (``"app.f"`` style).
+      When None, every module-level function in every non-boundary file is an
+      entrypoint (the real production-scan mode).
+    * A mutation call (``.execute``/``.executemany``/``.executescript`` or the
+      opaque ``getattr(obj, 'execute')``) is only a violation when its receiver
+      carries a *proven* Kanban connection/cursor/bound-method provenance.
+      Unresolved mutation-capable SQL on a proven-Kanban receiver fails closed
+      across the whole tracked production universe (no dashboard-only scope).
+    """
+    trees = {}
+    for relpath, src in files.items():
+        try:
+            trees[relpath] = ast.parse(src)
+        except SyntaxError:
+            trees[relpath] = None
+
+    funcs = {}
+    for relpath, tree in trees.items():
+        if tree is None:
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef):
+                funcs[(relpath, node.name)] = node
+
+    import_map = _build_import_map(files)
+
+    module_envs = {}
+    for relpath, tree in trees.items():
+        if tree is not None:
+            module_envs[relpath] = _module_env(tree, relpath, import_map)
+
+    eps = []
+    if entrypoints is None:
+        for relpath, tree in trees.items():
+            if tree is None or relpath == canonical_boundary:
+                continue
+            for node in tree.body:
+                if isinstance(node, ast.FunctionDef):
+                    eps.append((relpath, node.name))
+    else:
+        for ep in entrypoints:
+            relpath, name = _split_entrypoint(ep)
+            if (relpath, name) in funcs:
+                eps.append((relpath, name))
+
+    raw = []
+    for relpath, name in eps:
+        func = funcs[(relpath, name)]
+        env, prov = _module_env(trees[relpath], relpath, import_map)
+        if entrypoints is not None:
+            _seed_entrypoint_params(func, prov)
+        _process_stmts(func.body, env, prov, relpath, funcs, import_map, raw,
+                       canonical_boundary, 0, set(), module_envs)
+
+    # Dedupe (a function reached via multiple entrypoints/inlines is one find).
+    seen = set()
+    out = []
+    for v in raw:
+        key = (v["file"], v["line"], v["expectation"], v["operation"], v["table"])
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(v)
+    return out
+
+
+def _seed_entrypoint_params(func, prov):
+    """In explicit-entrypoint fixture mode, connection-named parameters are the
+    declared Kanban connection under test."""
+    params = list(func.args.posonlyargs) + list(func.args.args) + list(func.args.kwonlyargs)
+    for a in params:
+        if a.arg in CONNECTION_PARAM_NAMES:
+            prov[a.arg] = PROV_CONN
+
+
+def _module_env(tree, relpath, import_map):
+    env = {}
+    prov = {}
+    for stmt in tree.body:
+        if isinstance(stmt, ast.Assign):
+            for tgt in stmt.targets:
+                _assign_target(env, prov, tgt, stmt.value, relpath, import_map)
+        elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
+            if stmt.value is not None:
+                _assign(env, prov, stmt.target.id, stmt.value, relpath, import_map)
+        elif isinstance(stmt, ast.Import):
+            for alias in stmt.names:
+                _record_import_prov(prov, alias)
+        elif isinstance(stmt, ast.ImportFrom):
+            for alias in stmt.names:
+                _record_importfrom_prov(prov, stmt.module, alias)
+    return env, prov
+
+
+def _assign_target(env, prov, tgt, value, relpath, import_map, funcs=None,
+                   module_envs=None, canonical_boundary=None, depth=0, ret_visited=None):
+    if isinstance(tgt, ast.Name):
+        _assign(env, prov, tgt.id, value, relpath, import_map, funcs,
+                module_envs, canonical_boundary, depth, ret_visited)
+    elif isinstance(tgt, (ast.Tuple, ast.List)) and isinstance(value, (ast.Tuple, ast.List)):
+        if len(tgt.elts) == len(value.elts):
+            for te, ve in zip(tgt.elts, value.elts):
+                _assign_target(env, prov, te, ve, relpath, import_map, funcs,
+                               module_envs, canonical_boundary, depth, ret_visited)
+
+
+def _assign(env, prov, name, value, relpath, import_map, funcs=None,
+            module_envs=None, canonical_boundary=None, depth=0, ret_visited=None):
+    # Bound mutation method alias: ``run = conn.execute``.
+    if isinstance(value, ast.Attribute) and value.attr in MUTATION_METHODS:
+        env[name] = ("__BOUND_METHOD__", value.attr)
+        if _receiver_prov(value.value, env, prov, import_map, relpath,
+                          funcs, module_envs, canonical_boundary, depth, ret_visited) is not None:
+            prov[name] = PROV_METHOD
+        return
+    # Kanban connection factory *callable* alias: ``make = kanban_db.connect`` /
+    # ``make = connect``. The callable identity must survive so ``conn = make()``
+    # is still recognized as a factory invocation.
+    if (isinstance(value, ast.Attribute) and value.attr == "connect"
+            and _factory_callable_prov(value, env, prov, import_map, relpath)):
+        prov[name] = PROV_KANBAN_CONNECT
+        return
+    # Opaque bound method alias: ``run = getattr(conn, 'execute')``.
+    if (isinstance(value, ast.Call) and isinstance(value.func, ast.Name)
+            and value.func.id == "getattr" and len(value.args) >= 2):
+        attr_name = _fold_string(value.args[1], env)
+        if isinstance(attr_name, str) and attr_name in MUTATION_METHODS:
+            env[name] = ("__BOUND_METHOD__", attr_name)
+            if _receiver_prov(value.args[0], env, prov, import_map, relpath,
+                              funcs, module_envs, canonical_boundary, depth, ret_visited) is not None:
+                prov[name] = PROV_METHOD
+            return
+    # Kanban cursor: ``cur = conn.cursor()``.
+    if (isinstance(value, ast.Call) and isinstance(value.func, ast.Attribute)
+            and value.func.attr == "cursor"):
+        if _receiver_prov(value.func.value, env, prov, import_map, relpath,
+                          funcs, module_envs, canonical_boundary, depth, ret_visited) is not None:
+            prov[name] = PROV_CURSOR
+        return
+    # Kanban connection factory: ``conn = kanban_db.connect(...)`` / ``_conn(...)``.
+    if isinstance(value, ast.Call) and _is_kanban_factory(value, env, prov, import_map, relpath):
+        prov[name] = PROV_CONN
+        return
+    # Helper-call return provenance: ``conn = get_conn()`` / ``run = get_run(conn)``
+    # / ``cur = get_cursor(conn)`` (local or mapped cross-file helper).
+    if (isinstance(value, ast.Call) and isinstance(value.func, ast.Name)
+            and funcs is not None):
+        target = _resolve_callee(value.func.id, relpath, funcs, import_map)
+        if target is not None:
+            trel, tfunc = target
+            if trel != canonical_boundary:
+                rv = ret_visited if ret_visited is not None else set()
+                tag, bm = _function_return_summary(
+                    trel, tfunc, value, env, prov, relpath, funcs, import_map,
+                    module_envs, canonical_boundary, depth, rv)
+                if tag == PROV_METHOD:
+                    env[name] = bm
+                    prov[name] = PROV_METHOD
+                    return
+                if tag in (PROV_CONN, PROV_CURSOR):
+                    prov[name] = tag
+                    return
+                if tag == PROV_KANBAN_CONNECT:
+                    prov[name] = PROV_KANBAN_CONNECT
+                    return
+    if isinstance(value, ast.Constant) and isinstance(value.value, str):
+        env[name] = value.value
+        return
+    if isinstance(value, ast.List):
+        env[name] = _fold_list(value, env)
+        return
+    # Plain alias: ``db = conn`` (inherit Kanban provenance) or a factory-callable
+    # alias (``make2 = make``).
+    if isinstance(value, ast.Name):
+        p = prov.get(value.id)
+        if p in _KANBAN_OBJECT_TAGS:
+            prov[name] = p
+        if p == PROV_KANBAN_CONNECT:
+            prov[name] = PROV_KANBAN_CONNECT
+        # A bound mutation method also keeps its callable identity through a
+        # plain alias: ``run = conn.execute; alias = run`` must stay callable.
+        bm = env.get(value.id)
+        if isinstance(bm, tuple) and len(bm) == 2 and bm[0] == "__BOUND_METHOD__":
+            env[name] = bm
+    v = _fold_string(value, env)
+    if isinstance(v, str):
+        env[name] = v
+
+
+def _process_stmts(stmts, env, prov, relpath, funcs, import_map, violations,
+                   canonical_boundary, depth, visited, module_envs):
+    if depth > 24:
+        return
+    for stmt in stmts:
+        _process_stmt(stmt, env, prov, relpath, funcs, import_map, violations,
+                      canonical_boundary, depth, visited, module_envs)
+
+
+def _process_stmt(stmt, env, prov, relpath, funcs, import_map, violations,
+                  canonical_boundary, depth, visited, module_envs):
+    if isinstance(stmt, ast.Assign):
+        _scan_calls(stmt.value, env, prov, relpath, funcs, import_map, violations,
+                    canonical_boundary, depth, visited, module_envs)
+        for tgt in stmt.targets:
+            _assign_target(env, prov, tgt, stmt.value, relpath, import_map,
+                           funcs, module_envs, canonical_boundary, depth, None)
+    elif isinstance(stmt, ast.AnnAssign):
+        if stmt.value is not None:
+            _scan_calls(stmt.value, env, prov, relpath, funcs, import_map, violations,
+                        canonical_boundary, depth, visited, module_envs)
+        if isinstance(stmt.target, ast.Name) and stmt.value is not None:
+            _assign(env, prov, stmt.target.id, stmt.value, relpath, import_map,
+                    funcs, module_envs, canonical_boundary, depth, None)
+    elif isinstance(stmt, ast.AugAssign):
+        _scan_calls(stmt.value, env, prov, relpath, funcs, import_map, violations,
+                    canonical_boundary, depth, visited, module_envs)
+        if isinstance(stmt.target, ast.Name):
+            cur = env.get(stmt.target.id, UNRESOLVED)
+            inc = _fold_string(stmt.value, env)
+            if isinstance(cur, str) and isinstance(inc, str):
+                env[stmt.target.id] = cur + inc
+    elif isinstance(stmt, ast.Expr):
+        _scan_calls(stmt.value, env, prov, relpath, funcs, import_map, violations,
+                    canonical_boundary, depth, visited, module_envs)
+    elif isinstance(stmt, ast.Return):
+        if stmt.value is not None:
+            _scan_calls(stmt.value, env, prov, relpath, funcs, import_map, violations,
+                        canonical_boundary, depth, visited, module_envs)
+    elif isinstance(stmt, ast.If):
+        _scan_calls(stmt.test, env, prov, relpath, funcs, import_map, violations,
+                    canonical_boundary, depth, visited, module_envs)
+        _process_stmts(stmt.body, env, prov, relpath, funcs, import_map, violations,
+                       canonical_boundary, depth + 1, visited, module_envs)
+        _process_stmts(stmt.orelse, env, prov, relpath, funcs, import_map, violations,
+                       canonical_boundary, depth + 1, visited, module_envs)
+    elif isinstance(stmt, (ast.For, ast.AsyncFor)):
+        _scan_calls(stmt.iter, env, prov, relpath, funcs, import_map, violations,
+                    canonical_boundary, depth, visited, module_envs)
+        _process_stmts(stmt.body, env, prov, relpath, funcs, import_map, violations,
+                       canonical_boundary, depth + 1, visited, module_envs)
+        _process_stmts(stmt.orelse, env, prov, relpath, funcs, import_map, violations,
+                       canonical_boundary, depth + 1, visited, module_envs)
+    elif isinstance(stmt, (ast.With, ast.AsyncWith)):
+        for item in stmt.items:
+            _scan_calls(item.context_expr, env, prov, relpath, funcs, import_map,
+                        violations, canonical_boundary, depth, visited, module_envs)
+        _process_stmts(stmt.body, env, prov, relpath, funcs, import_map, violations,
+                       canonical_boundary, depth + 1, visited, module_envs)
+    elif isinstance(stmt, ast.Try):
+        _process_stmts(stmt.body, env, prov, relpath, funcs, import_map, violations,
+                       canonical_boundary, depth + 1, visited, module_envs)
+        for h in stmt.handlers:
+            _process_stmts(h.body, env, prov, relpath, funcs, import_map, violations,
+                           canonical_boundary, depth + 1, visited, module_envs)
+        _process_stmts(stmt.orelse, env, prov, relpath, funcs, import_map, violations,
+                       canonical_boundary, depth + 1, visited, module_envs)
+        _process_stmts(stmt.finalbody, env, prov, relpath, funcs, import_map, violations,
+                       canonical_boundary, depth + 1, visited, module_envs)
+    elif isinstance(stmt, ast.While):
+        _scan_calls(stmt.test, env, prov, relpath, funcs, import_map, violations,
+                    canonical_boundary, depth, visited, module_envs)
+        _process_stmts(stmt.body, env, prov, relpath, funcs, import_map, violations,
+                       canonical_boundary, depth + 1, visited, module_envs)
+        _process_stmts(stmt.orelse, env, prov, relpath, funcs, import_map, violations,
+                       canonical_boundary, depth + 1, visited, module_envs)
+
+
+def _scan_calls(node, env, prov, relpath, funcs, import_map, violations,
+                canonical_boundary, depth, visited, module_envs):
+    if node is None:
+        return
+    if isinstance(node, ast.Call):
+        _classify_call(node, env, prov, relpath, funcs, import_map, violations,
+                       canonical_boundary, depth, visited, module_envs)
+    for child in ast.iter_child_nodes(node):
+        _scan_calls(child, env, prov, relpath, funcs, import_map, violations,
+                    canonical_boundary, depth, visited, module_envs)
+
+
+def _classify_call(call, env, prov, relpath, funcs, import_map, violations,
+                   canonical_boundary, depth, visited, module_envs):
+    if depth > 24:
+        return
+    fn = call.func
+    if isinstance(fn, ast.Attribute):
+        if fn.attr == "append":
+            base = fn.value
+            if isinstance(base, ast.Name) and isinstance(env.get(base.id), list):
+                v = _fold_string(call.args[0], env) if call.args else UNRESOLVED
+                env[base.id] = env[base.id] + ([v] if isinstance(v, str) else [DYNAMIC])
+            return
+        if fn.attr == "set_task_status":
+            return
+        if fn.attr in MUTATION_METHODS:
+            # Flag only when the receiver is a *proven* Kanban object.
+            if _receiver_prov(fn.value, env, prov, import_map, relpath,
+                              funcs, module_envs, canonical_boundary, depth, set()) is None:
+                return
+            sql_arg = call.args[0] if call.args else None
+            if sql_arg is None:
+                return
+            shape = _fold_string(sql_arg, env)
+            _record_if_violation(shape, sql_arg, call, relpath, canonical_boundary, violations)
+            return
+        return
+    # Opaque/reflection getattr: ``getattr(obj, 'execute')(sql)``.
+    if isinstance(fn, ast.Call) and isinstance(fn.func, ast.Name) and fn.func.id == "getattr":
+        if len(fn.args) >= 2:
+            attr_name = _fold_string(fn.args[1], env)
+            if isinstance(attr_name, str) and attr_name in MUTATION_METHODS:
+                if _receiver_prov(fn.args[0], env, prov, import_map, relpath,
+                                  funcs, module_envs, canonical_boundary, depth, set()) is None:
+                    return
+                sql_arg = call.args[0] if call.args else None
+                if sql_arg is None:
+                    return
+                shape = _fold_string(sql_arg, env)
+                _record_if_violation(shape, sql_arg, call, relpath, canonical_boundary, violations)
+                return
+        return
+    if isinstance(fn, ast.Name):
+        if fn.id == "set_task_status":
+            return
+        bound = env.get(fn.id)
+        if isinstance(bound, tuple) and len(bound) == 2 and bound[0] == "__BOUND_METHOD__":
+            # Flag only when the bound-method alias carries Kanban provenance.
+            if prov.get(fn.id) != PROV_METHOD:
+                return
+            sql_arg = call.args[0] if call.args else None
+            if sql_arg is not None:
+                shape = _fold_string(sql_arg, env)
+                _record_if_violation(shape, sql_arg, call, relpath, canonical_boundary, violations)
+            return
+        target = _resolve_callee(fn.id, relpath, funcs, import_map)
+        if target is None:
+            return
+        trel, tfunc = target
+        if trel == canonical_boundary:
+            return
+        key = (trel, tfunc.name)
+        if key in visited:
+            return
+        visited.add(key)
+        sub_env = _bind_params(tfunc, call, env)
+        sub_prov = _bind_params_prov(tfunc, call, env, prov, import_map, relpath)
+        _process_stmts(tfunc.body, sub_env, sub_prov, trel, funcs, import_map, violations,
+                       canonical_boundary, depth + 1, visited, module_envs)
+
+
+def _resolve_callee(name, relpath, funcs, import_map):
+    if (relpath, name) in funcs:
+        return (relpath, funcs[(relpath, name)])
+    if (relpath, name) in import_map:
+        trel, tname = import_map[(relpath, name)]
+        if (trel, tname) in funcs:
+            return (trel, funcs[(trel, tname)])
+    return None
+
+
+def _bind_params(tfunc, call, env):
+    sub_env = dict(env)
+    for i, p in enumerate(tfunc.args.args):
+        if i < len(call.args):
+            arg = call.args[i]
+            v = _fold_string(arg, env)
+            if isinstance(v, str):
+                sub_env[p.arg] = v
+            else:
+                # A bound mutation method keeps its callable identity through a
+                # parameter binding (``mutate(conn.execute, sql)``).
+                bm = _bound_method_env(arg, env)
+                sub_env[p.arg] = bm if bm is not None else UNRESOLVED
+    return sub_env
+
+
+def _bind_params_prov(tfunc, call, env, prov, import_map, relpath):
+    sub_prov = dict(prov)
+    for i, p in enumerate(tfunc.args.args):
+        if i < len(call.args):
+            pv = _arg_prov(call.args[i], env, prov, import_map, relpath)
+            if pv is not None:
+                sub_prov[p.arg] = pv
+    return sub_prov
+
+
+def _collect_returns(node_or_stmts, depth=0):
+    """Yield ``Return`` nodes reachable from a body, skipping nested
+    function/class/lambda definitions. Bounded by ``depth``."""
+    if depth > 24:
+        return
+    stmts = node_or_stmts if isinstance(node_or_stmts, (list, tuple)) else [node_or_stmts]
+    for node in stmts:
+        if node is None:
+            continue
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+            continue
+        if isinstance(node, ast.Return):
+            yield node
+            continue
+        for child in ast.iter_child_nodes(node):
+            yield from _collect_returns(child, depth + 1)
+
+
+def _expr_prov(node, env, prov, relpath, funcs, import_map, module_envs,
+               canonical_boundary, depth, ret_visited):
+    """Summarize the Kanban provenance of an arbitrary expression.
+
+    Returns ``(tag, bound_method)`` where ``tag`` is PROV_CONN / PROV_CURSOR /
+    PROV_METHOD / PROV_KANBAN_CONNECT / None, and ``bound_method`` is a
+    ``('__BOUND_METHOD__', attr)`` tuple for a bound mutation method (else
+    None). Conservative: unknown / non-Kanban / conflicting expressions yield
+    ``(None, None)``.
+    """
+    if depth > 24 or node is None:
+        return (None, None)
+    if isinstance(node, ast.Name):
+        tag = prov.get(node.id)
+        if tag in _KANBAN_OBJECT_TAGS:
+            if tag == PROV_METHOD:
+                bm = env.get(node.id)
+                if isinstance(bm, tuple) and len(bm) == 2 and bm[0] == "__BOUND_METHOD__":
+                    return (PROV_METHOD, bm)
+            return (tag, None)
+        if tag == PROV_KANBAN_CONNECT:
+            return (PROV_KANBAN_CONNECT, None)
+        return (None, None)
+    if isinstance(node, ast.Attribute):
+        if node.attr in MUTATION_METHODS:
+            if _receiver_prov(node.value, env, prov, import_map, relpath,
+                              funcs, module_envs, canonical_boundary, depth, ret_visited) is not None:
+                return (PROV_METHOD, ("__BOUND_METHOD__", node.attr))
+            return (None, None)
+        if node.attr == "connect" and _factory_callable_prov(node, env, prov, import_map, relpath):
+            return (PROV_KANBAN_CONNECT, None)
+        return (None, None)
+    if isinstance(node, ast.Call):
+        # Opaque bound method value: ``getattr(conn, 'execute')``.
+        if isinstance(node.func, ast.Name) and node.func.id == "getattr" and len(node.args) >= 2:
+            attr = _fold_string(node.args[1], env)
+            if isinstance(attr, str) and attr in MUTATION_METHODS:
+                if _receiver_prov(node.args[0], env, prov, import_map, relpath,
+                                  funcs, module_envs, canonical_boundary, depth, ret_visited) is not None:
+                    return (PROV_METHOD, ("__BOUND_METHOD__", attr))
+            return (None, None)
+        if _is_kanban_factory(node, env, prov, import_map, relpath):
+            return (PROV_CONN, None)
+        fn = node.func
+        if isinstance(fn, ast.Attribute) and fn.attr == "cursor":
+            if _receiver_prov(fn.value, env, prov, import_map, relpath,
+                              funcs, module_envs, canonical_boundary, depth, ret_visited) is not None:
+                return (PROV_CURSOR, None)
+            return (None, None)
+        if isinstance(fn, ast.Name):
+            target = _resolve_callee(fn.id, relpath, funcs, import_map)
+            if target is not None:
+                trel, tfunc = target
+                if trel != canonical_boundary:
+                    return _function_return_summary(
+                        trel, tfunc, node, env, prov, relpath, funcs, import_map,
+                        module_envs, canonical_boundary, depth, ret_visited)
+        return (None, None)
+    return (None, None)
+
+
+def _definitely_returns(stmts):
+    """Return True only if ``stmts`` is guaranteed to execute a ``return`` (or
+    ``raise``) on every control-flow path.
+
+    Used to detect an implicit ``None`` fall-through arm: if a function body
+    can reach its end without returning, that path yields ``None`` and must
+    participate in the return-summary lattice as UNKNOWN_RETURN rather than
+    disappearing. The check is deliberately conservative — loops (which may run
+    zero times) and ``try`` blocks (which may not return) never count as a
+    guaranteed terminal, and a bare ``if`` without a guaranteed-returning
+    ``else`` does not guarantee a return.
+    """
+    if stmts is None:
+        return False
+    for stmt in stmts:
+        if isinstance(stmt, (ast.Return, ast.Raise)):
+            return True
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        if isinstance(stmt, ast.If):
+            if _definitely_returns(stmt.body) and _definitely_returns(stmt.orelse):
+                return True
+            continue
+        # Assign/Expr/Pass/Import/For/While/Try/... do not guarantee a return
+        # on this path; keep scanning (a loop may run zero times, a try may
+        # not return, a plain statement falls through).
+    return False
+
+
+def _function_return_summary(trel, func, call, env, prov, caller_relpath, funcs,
+                             import_map, module_envs, canonical_boundary, depth,
+                             ret_visited):
+    """Argument-sensitive, cycle-safe, depth-bounded return-provenance summary.
+
+    Binds the callee's parameters to the actual call arguments, merges the
+    callee module's import provenance, and merges every reachable ``return``
+    expression's provenance into a total-domain lattice. Returns
+    ``(tag, bound_method)``; conservative ``(None, None)`` for unknown /
+    conflicting / boundary / cyclic functions, or when any reachable return arm
+    is unknown / non-Kanban / bare / implicit-``None``.
+    """
+    if depth > 24:
+        return (None, None)
+    key = (trel, func.name)
+    if key in ret_visited:
+        return (None, None)
+    # Path-local active recursion stack. The current function belongs to the
+    # active call path only for THIS invocation's analysis: we copy the entry
+    # stack, add the current function, and evaluate every sibling return arm
+    # from its own fresh copy of that stack. Nested helper calls therefore
+    # extend only their own path, and completing one sibling arm cannot mark a
+    # helper as "visited" for a later sibling arm (the R4 false-positive
+    # regression). True cycles and depth exhaustion still resolve to UNKNOWN
+    # via the entry-stack membership check above.
+    path_stack = set(ret_visited)
+    path_stack.add(key)
+
+    # Base the callee's environment on its own module globals (so it sees its
+    # own ``from hermes_cli import kanban_db`` / ``from ... import connect``),
+    # then bind each parameter to the caller-side argument expression.
+    m_env, m_prov = (module_envs or {}).get(trel, ({}, {}))
+    sub_env = dict(m_env)
+    sub_prov = dict(m_prov)
+    for i, p in enumerate(func.args.args):
+        if i < len(call.args):
+            arg = call.args[i]
+            v = _fold_string(arg, env)
+            if isinstance(v, str):
+                sub_env[p.arg] = v
+            else:
+                bm = _bound_method_env(arg, env)
+                if bm is not None:
+                    sub_env[p.arg] = bm
+            pv = _arg_prov(arg, env, prov, import_map, caller_relpath)
+            if pv is not None:
+                sub_prov[p.arg] = pv
+
+    # Total-domain lattice: every reachable return arm participates. Unknown,
+    # non-Kanban, cyclic, bare ``return``, and implicit ``None`` fall-through
+    # arms contribute UNKNOWN_RETURN instead of being filtered out, so a
+    # remaining Kanban arm can never be mistaken for unanimous.
+    tags = []
+    bms = []
+    for ret in _collect_returns(func.body):
+        if ret.value is None:
+            tags.append(UNKNOWN_RETURN)
+            bms.append(None)
+            continue
+        tag, bm = _expr_prov(ret.value, sub_env, sub_prov, trel, funcs, import_map,
+                             module_envs, canonical_boundary, depth + 1, set(path_stack))
+        tags.append(tag if tag is not None else UNKNOWN_RETURN)
+        bms.append(bm)
+    if not _definitely_returns(func.body):
+        # A body that can fall off the end (or loop/try that may not return)
+        # contributes an implicit ``None`` arm.
+        tags.append(UNKNOWN_RETURN)
+        bms.append(None)
+    if not tags:
+        return (None, None)
+    if UNKNOWN_RETURN in tags:
+        return (None, None)
+    first_tag = tags[0]
+    first_bm = bms[0]
+    if all(t == first_tag for t in tags) and all(b == first_bm for b in bms):
+        return (first_tag, first_bm)
+    return (None, None)
+
+
+def _record_if_violation(shape, sql_arg, call, relpath, canonical_boundary, violations):
+    if relpath == canonical_boundary:
+        return
+    if shape is UNRESOLVED:
+        violations.append(_v("FAIL_CLOSED_UNRESOLVED_DYNAMIC_SQL", sql_arg, call, relpath, None, None, [DYNAMIC]))
+        return
+    parsed = _classify_sql(shape)
+    if parsed is None:
+        return
+    operation, table, columns = parsed
+    if operation == "UNKNOWN_MUTATION":
+        violations.append(_v("FAIL_CLOSED_UNRESOLVED_DYNAMIC_SQL", sql_arg, call, relpath, None, None, [DYNAMIC]))
+        return
+    if table != "tasks":
+        return
+    if any(DYNAMIC in (c or "") for c in columns):
+        violations.append(_v("FAIL_CLOSED_UNRESOLVED_DYNAMIC_SQL", sql_arg, call, relpath, operation, table, columns))
+        return
+    if "status" in columns:
+        violations.append(_v("FAIL_DIRECT_TASKS_STATUS_SQL", sql_arg, call, relpath, operation, table, columns))
+
+
+def _v(expectation, sql_arg, call, relpath, operation, table, columns):
+    line = getattr(sql_arg, "lineno", None) or getattr(call, "lineno", None)
+    return {
+        "expectation": expectation,
+        "file": relpath,
+        "line": line,
+        "operation": operation,
+        "table": table,
+        "columns": columns,
+    }
+
+
+# AION R4/I01 — bounded adversarial scanner tests
+# (direct tasks.status lifecycle SQL outside the canonical kanban_db boundary)
+# ============================================================================
+
+_NEG_FIXTURES = [
+    {"id": "SNEG01_DIRECT_EXECUTE", "entrypoint": "app.f", "expectation": "FAIL_DIRECT_TASKS_STATUS_SQL",
+     "virtual_files": {"app.py": "def f(conn, task_id, status):\n    conn.execute(\"UPDATE tasks SET status = ? WHERE id = ?\", (status, task_id))\n"}},
+    {"id": "SNEG02_CONNECTION_ALIAS", "entrypoint": "app.f", "expectation": "FAIL_DIRECT_TASKS_STATUS_SQL",
+     "virtual_files": {"app.py": "def f(conn):\n    db = conn\n    db.execute(\"UPDATE tasks SET status='todo'\")\n"}},
+    {"id": "SNEG03_CURSOR_ALIAS", "entrypoint": "app.f", "expectation": "FAIL_DIRECT_TASKS_STATUS_SQL",
+     "virtual_files": {"app.py": "def f(conn):\n    cur = conn.cursor()\n    other = cur\n    other.execute(\"UPDATE tasks SET status='todo'\")\n"}},
+    {"id": "SNEG04_BOUND_METHOD_ALIAS", "entrypoint": "app.f", "expectation": "FAIL_DIRECT_TASKS_STATUS_SQL",
+     "virtual_files": {"app.py": "def f(conn):\n    run = conn.execute\n    run(\"UPDATE tasks SET status='todo'\")\n"}},
+    {"id": "SNEG05_MULTILINE_SQL", "entrypoint": "app.f", "expectation": "FAIL_DIRECT_TASKS_STATUS_SQL",
+     "virtual_files": {"app.py": "def f(conn):\n    conn.execute(\"\"\"\n        UPDATE tasks\n        SET status = 'todo'\n        WHERE id = 't1'\n    \"\"\")\n"}},
+    {"id": "SNEG06_ADJACENT_LITERAL_SQL", "entrypoint": "app.f", "expectation": "FAIL_DIRECT_TASKS_STATUS_SQL",
+     "virtual_files": {"app.py": "def f(conn):\n    conn.execute(\"UPDATE tasks SET \" \"status='todo' WHERE id='t1'\")\n"}},
+    {"id": "SNEG07_CONCATENATED_SQL", "entrypoint": "app.f", "expectation": "FAIL_DIRECT_TASKS_STATUS_SQL",
+     "virtual_files": {"app.py": "def f(conn):\n    sql = \"UPDATE tasks SET \" + \"status='todo' WHERE id='t1'\"\n    conn.execute(sql)\n"}},
+    {"id": "SNEG08_STATIC_FSTRING_SQL", "entrypoint": "app.f", "expectation": "FAIL_DIRECT_TASKS_STATUS_SQL",
+     "virtual_files": {"app.py": "def f(conn):\n    column = 'status'\n    sql = f\"UPDATE tasks SET {column}='todo'\"\n    conn.execute(sql)\n"}},
+    {"id": "SNEG09_STATIC_PERCENT_SQL", "entrypoint": "app.f", "expectation": "FAIL_DIRECT_TASKS_STATUS_SQL",
+     "virtual_files": {"app.py": "def f(conn):\n    sql = \"UPDATE tasks SET %s='todo'\" % 'status'\n    conn.execute(sql)\n"}},
+    {"id": "SNEG10_STATIC_FORMAT_SQL", "entrypoint": "app.f", "expectation": "FAIL_DIRECT_TASKS_STATUS_SQL",
+     "virtual_files": {"app.py": "def f(conn):\n    sql = \"UPDATE tasks SET {}='todo'\".format('status')\n    conn.execute(sql)\n"}},
+    {"id": "SNEG11_EXECUTEMANY", "entrypoint": "app.f", "expectation": "FAIL_DIRECT_TASKS_STATUS_SQL",
+     "virtual_files": {"app.py": "def f(conn, rows):\n    conn.executemany(\"UPDATE tasks SET status=? WHERE id=?\", rows)\n"}},
+    {"id": "SNEG12_EXECUTESCRIPT", "entrypoint": "app.f", "expectation": "FAIL_DIRECT_TASKS_STATUS_SQL",
+     "virtual_files": {"app.py": "def f(conn):\n    conn.executescript(\"UPDATE tasks SET status='todo';\")\n"}},
+    {"id": "SNEG13_LOCAL_WRAPPER", "entrypoint": "app.f", "expectation": "FAIL_DIRECT_TASKS_STATUS_SQL",
+     "virtual_files": {"app.py": "def mutate(db, sql):\n    db.execute(sql)\n\ndef f(conn):\n    mutate(conn, \"UPDATE tasks SET status='todo'\")\n"}},
+    {"id": "SNEG14_IMPORTED_PROJECT_HELPER", "entrypoint": "app.f", "expectation": "FAIL_DIRECT_TASKS_STATUS_SQL",
+     "virtual_files": {"app.py": "from helper import mutate\n\ndef f(conn):\n    mutate(conn, \"UPDATE tasks SET status='todo'\")\n",
+                      "helper.py": "def mutate(db, sql):\n    db.execute(sql)\n"}},
+    {"id": "SNEG15_UNRESOLVED_DYNAMIC_SQL", "entrypoint": "app.f", "expectation": "FAIL_CLOSED_UNRESOLVED_DYNAMIC_SQL",
+     "virtual_files": {"app.py": "def f(conn, sql_from_runtime):\n    conn.execute(sql_from_runtime)\n"}},
+]
+
+_POS_FIXTURES = [
+    {"id": "SPOS01_MODULE_PUBLIC_WRITER", "entrypoint": "app.f", "expectation": "PASS_CONTROLLED_PUBLIC_WRITER_CALL",
+     "virtual_files": {"app.py": "from hermes_cli import kanban_db\n\ndef f(conn, task_id):\n    return kanban_db.set_task_status(conn, task_id, 'todo')\n"}},
+    {"id": "SPOS02_IMPORTED_PUBLIC_WRITER", "entrypoint": "app.f", "expectation": "PASS_CONTROLLED_PUBLIC_WRITER_CALL",
+     "virtual_files": {"app.py": "from hermes_cli.kanban_db import set_task_status\n\ndef f(conn, task_id):\n    return set_task_status(conn, task_id, 'todo')\n"}},
+    {"id": "SPOS03_CANONICAL_BOUNDARY_SQL", "entrypoint": "hermes_cli.kanban_db.set_task_status", "expectation": "PASS_EXACT_CANONICAL_BOUNDARY",
+     "virtual_files": {"hermes_cli/kanban_db.py": "def set_task_status(conn, task_id, status):\n    conn.execute(\"UPDATE tasks SET status=? WHERE id=?\", (status, task_id))\n"}},
+    {"id": "SPOS04_NON_STATUS_DASHBOARD_PRIORITY", "entrypoint": "app.f", "expectation": "PASS_OUTSIDE_I01_CLAIM_WITHOUT_CLOSURE",
+     "virtual_files": {"app.py": "def f(conn, task_id):\n    conn.execute(\"UPDATE tasks SET priority=? WHERE id=?\", (1, task_id))\n"}},
+    {"id": "SPOS05_NON_STATUS_DASHBOARD_TITLE_BODY", "entrypoint": "app.f", "expectation": "PASS_OUTSIDE_I01_CLAIM_WITHOUT_CLOSURE",
+     "virtual_files": {"app.py": "def f(conn, task_id):\n    conn.execute(\"UPDATE tasks SET title=?, body=? WHERE id=?\", ('t', 'b', task_id))\n"}},
+]
+
+
+def _scan_fixture(fixture):
+    files = dict(fixture["virtual_files"])
+    return scan_status_sql(files, entrypoints=[fixture["entrypoint"]])
+
+
+def test_i01_scanner_negative_fixtures():
+    """All 15 named adversaries must be detected with the exact expectation."""
+    for f in _NEG_FIXTURES:
+        viols = _scan_fixture(f)
+        assert viols, f"{f['id']} should be flagged"
+        assert any(v["expectation"] == f["expectation"] for v in viols), \
+            f"{f['id']}: expected {f['expectation']}, got {[v['expectation'] for v in viols]}"
+
+
+def test_i01_scanner_positive_fixtures():
+    """All 5 positive fixtures must pass clean (no violation)."""
+    for f in _POS_FIXTURES:
+        viols = _scan_fixture(f)
+        assert viols == [], f"{f['id']} should be clean, got {viols}"
+
+
+def test_i01_scanner_mutation_kills(tmp_path):
+    """15/15 adversarial mutation kills: each negative fixture injected into a
+    temporary production-path copy must fail the scanner with its fixture id."""
+    for f in _NEG_FIXTURES:
+        # Write virtual files under a production-like path (NOT tests/).
+        for rel, src in f["virtual_files"].items():
+            p = tmp_path / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(src, encoding="utf-8")
+        # Scan the temporary production copy, entrypoint-scoped.
+        files = {rel: (tmp_path / rel).read_text(encoding="utf-8") for rel in f["virtual_files"]}
+        # Map the fixture entrypoint module -> the tmp_path relative path.
+        mod = f["entrypoint"].split(".")[0]
+        ep_rel = mod + ".py"
+        viols = scan_status_sql(files, entrypoints=[f["entrypoint"].replace(mod, ep_rel)])
+        assert viols, f"mutation {f['id']} survived: not flagged"
+        assert any(v["expectation"] == f["expectation"] for v in viols), \
+            f"mutation {f['id']}: expected {f['expectation']}"
+
+
+def _production_py_files(repo_root):
+    out = subprocess.check_output(["git", "-C", str(repo_root), "ls-files", "-z", "*.py"])
+    paths = [p.decode("utf-8") for p in out.split(b"\x00") if p]
+    return sorted(p for p in paths if not p.startswith("tests/"))
+
+
+def test_i01_scanner_green_at_head():
+    """PR-head GREEN: no direct tasks.status SQL outside the canonical boundary.
+
+    Scans every tracked production .py file (excluding tests/). The unresolved
+    mutation-capable-SQL fail-closed rule applies across the whole tracked
+    universe (no dashboard-only scope), gated by proven Kanban connection
+    provenance so non-Kanban sqlite3/console/terminal ``.execute`` receivers
+    remain non-violating.
+    """
+    repo_root = Path(__file__).resolve().parents[2]
+    files = {}
+    for p in _production_py_files(repo_root):
+        files[p] = (repo_root / p).read_text(encoding="utf-8", errors="replace")
+    viols = scan_status_sql(files)
+    assert viols == [], f"direct tasks.status SQL outside canonical boundary: {viols}"
+
+
+def test_i01_scanner_flags_pinned_baseline_sql():
+    """Pinned baseline RED: the exact two pre-relocation SQL statements are
+    detected (the multiline CASE update and the child-demotion update)."""
+    baseline = {
+        "app.py": (
+            "def f(conn, task_id, new_status):\n"
+            "    cur = conn.execute(\n"
+            "        \"UPDATE tasks SET status = ?, \"\n"
+            "        \"  claim_lock = CASE WHEN ? = 'running' THEN claim_lock ELSE NULL END, \"\n"
+            "        \"  claim_expires = CASE WHEN ? = 'running' THEN claim_expires ELSE NULL END, \"\n"
+            "        \"  worker_pid = CASE WHEN ? = 'running' THEN worker_pid ELSE NULL END \"\n"
+            "        \"WHERE id = ?\",\n"
+            "        (new_status, new_status, new_status, new_status, task_id),\n"
+            "    )\n"
+            "    demoted = conn.execute(\n"
+            "        \"UPDATE tasks SET status = 'todo' \"\n"
+            "        \"WHERE id = ? AND status = 'ready'\",\n"
+            "        (task_id,),\n"
+            "    )\n"
+        )
+    }
+    viols = scan_status_sql(baseline, entrypoints=["app.f"])
+    direct = [v for v in viols if v["expectation"] == "FAIL_DIRECT_TASKS_STATUS_SQL"]
+    assert len(direct) == 2, f"expected 2 direct status violations, got {viols}"
+    for v in direct:
+        assert v["operation"] == "UPDATE" and v["table"] == "tasks"
+        assert "status" in v["columns"]
+
+
+# ---------------------------------------------------------------------------
+# AION R4/I01 — F1 repair: fail-closed universe + Kanban provenance regressions
+# ---------------------------------------------------------------------------
+
+def test_i01_scanner_getattr_reflection_fails_closed():
+    """Opaque reflection ``getattr(conn, 'execute')(sql)`` must fail closed.
+
+    Regression for audit counterexample OPAQUE_REFLECTION_GETATTR_EXECUTE.
+    """
+    files = {
+        "app.py": "def f(conn, sql):\n    getattr(conn, 'execute')(sql)\n",
+    }
+    viols = scan_status_sql(files, entrypoints=["app.f"])
+    assert viols, "getattr(conn, 'execute')(sql) must be flagged"
+    assert any(v["expectation"] == "FAIL_CLOSED_UNRESOLVED_DYNAMIC_SQL" for v in viols), viols
+
+
+def test_i01_scanner_getattr_resolved_status_fails_direct():
+    """Resolved ``getattr(conn, 'execute')('UPDATE tasks SET status=...')`` is FAIL_DIRECT."""
+    files = {
+        "app.py": "def f(conn):\n    getattr(conn, 'execute')(\"UPDATE tasks SET status='todo'\")\n",
+    }
+    viols = scan_status_sql(files, entrypoints=["app.f"])
+    assert any(v["expectation"] == "FAIL_DIRECT_TASKS_STATUS_SQL" for v in viols), viols
+
+
+def test_i01_scanner_unresolved_sql_fails_closed_outside_dashboard():
+    """Unresolved Kanban SQL in a non-dashboard tracked file fails closed.
+
+    Regression for audit counterexample UNRESOLVED_KANBAN_SQL_OUTSIDE_DASHBOARD:
+    the previous dashboard-only dynamic scope discarded unresolved results.
+    """
+    files = {
+        "other.py": "def f(conn, sql):\n    conn.execute(sql)\n",
+    }
+    viols = scan_status_sql(files, entrypoints=["other.f"])
+    assert viols, "unresolved Kanban SQL outside the dashboard must fail closed"
+    assert any(v["expectation"] == "FAIL_CLOSED_UNRESOLVED_DYNAMIC_SQL" for v in viols), viols
+
+
+def test_i01_scanner_non_kanban_execute_nonviolating():
+    """A non-Kanban ``.execute`` receiver is non-violating via proven provenance.
+
+    Regression for audit counterexample NON_KANBAN_OBJECT_FALSE_PROVENANCE:
+    ``logger.execute("UPDATE tasks SET status=...")`` is not Kanban SQL.
+    """
+    files = {
+        "app.py": "def f(logger):\n    logger.execute(\"UPDATE tasks SET status='todo'\")\n",
+    }
+    viols = scan_status_sql(files, entrypoints=["app.f"])
+    assert viols == [], f"non-Kanban logger.execute must be clean, got {viols}"
+
+
+def test_i01_scanner_factory_kanban_conn_fails_closed():
+    """A factory-proven Kanban connection fails closed on unresolved SQL.
+
+    Proves the provenance model is fail-closed (not fail-open): a connection
+    traced to the kanban_db factory is a real Kanban connection.
+    """
+    files = {
+        "app.py": (
+            "from hermes_cli import kanban_db\n"
+            "\n"
+            "def f(sql):\n"
+            "    conn = kanban_db.connect()\n"
+            "    conn.execute(sql)\n"
+        ),
+    }
+    viols = scan_status_sql(files, entrypoints=["app.f"])
+    assert any(v["expectation"] == "FAIL_CLOSED_UNRESOLVED_DYNAMIC_SQL" for v in viols), viols
+
+
+def test_i01_scanner_generic_sqlite_connect_nonviolating():
+    """A generic ``sqlite3.connect(...)`` connection is NOT Kanban and stays clean."""
+    files = {
+        "app.py": (
+            "import sqlite3\n"
+            "\n"
+            "def f(sql):\n"
+            "    conn = sqlite3.connect(':memory:')\n"
+            "    conn.execute(sql)\n"
+        ),
+    }
+    viols = scan_status_sql(files, entrypoints=["app.f"])
+    assert viols == [], f"generic sqlite3.connect must be clean, got {viols}"
+
+
+# ---------------------------------------------------------------------------
+# AION R4/I01 — R2 repair: bound-method provenance survives alias/reflection/
+# cursor/interprocedural/factory transport (structural, not name/pattern-based)
+# ---------------------------------------------------------------------------
+
+def _bound_method_closure_cases():
+    """Bounded metamorphic family: ``(case_id, source, expect_violation)``.
+
+    Crosses receiver source (connection parameter vs. kanban_db factory),
+    method selection (attribute vs. getattr reflection), transport (direct,
+    one alias, repeated alias, cursor alias, interprocedural argument) and
+    mutation method (execute/executemany/executescript, cursor has no
+    executescript). Kanban forms must fail closed; symmetric non-Kanban
+    (logger) forms over equivalent transports stay clean.
+    """
+    cases = []
+    for method in MUTATION_METHODS:
+        cases.append((f"BM_DIRECT_{method.upper()}",
+                      f"def f(conn, sql):\n    conn.{method}(sql)\n", True))
+        cases.append((f"BM_ALIAS_{method.upper()}",
+                      f"def f(conn, sql):\n    run = conn.{method}\n    run(sql)\n", True))
+        cases.append((f"BM_ALIAS_TWICE_{method.upper()}",
+                      f"def f(conn, sql):\n    run = conn.{method}\n    alias = run\n    alias(sql)\n", True))
+        cases.append((f"BM_REFLECTED_{method.upper()}",
+                      f"def f(conn, sql):\n    run = getattr(conn, '{method}')\n    run(sql)\n", True))
+        cases.append((f"BM_REFLECTED_ALIAS_TWICE_{method.upper()}",
+                      f"def f(conn, sql):\n    run = getattr(conn, '{method}')\n    alias = run\n    alias(sql)\n", True))
+        cases.append((f"BM_INTERPROCEDURAL_{method.upper()}",
+                      f"def mutate(run, sql):\n    run(sql)\n\ndef f(conn, sql):\n    mutate(conn.{method}, sql)\n", True))
+        cases.append((f"BM_FACTORY_CHAIN_{method.upper()}",
+                      f"from hermes_cli import kanban_db\n\ndef f(sql):\n    kanban_db.connect().{method}(sql)\n", True))
+        if method != "executescript":
+            cases.append((f"BM_CURSOR_ALIAS_TWICE_{method.upper()}",
+                          f"def f(conn, sql):\n    cur = conn.cursor()\n    run = cur.{method}\n    alias = run\n    alias(sql)\n", True))
+    # Symmetric non-Kanban positives (logger) over equivalent transports.
+    for transport in ("ALIAS_TWICE", "REFLECTED_ALIAS_TWICE", "INTERPROCEDURAL"):
+        if transport == "ALIAS_TWICE":
+            src = "def f(logger, sql):\n    run = logger.execute\n    alias = run\n    alias(sql)\n"
+        elif transport == "REFLECTED_ALIAS_TWICE":
+            src = "def f(logger, sql):\n    run = getattr(logger, 'execute')\n    alias = run\n    alias(sql)\n"
+        else:
+            src = "def mutate(run, sql):\n    run(sql)\n\ndef f(logger, sql):\n    mutate(logger.execute, sql)\n"
+        cases.append((f"BM_NONKANBAN_{transport}_EXECUTE", src, False))
+    return cases
+
+
+def test_i01_scanner_redteam_alias_of_bound_method():
+    """REDTEAM_ALIAS_OF_BOUND_METHOD: ``run = conn.execute; alias = run; alias(sql)``."""
+    files = {"app.py": "def f(conn, sql):\n    run = conn.execute\n    alias = run\n    alias(sql)\n"}
+    viols = scan_status_sql(files, entrypoints=["app.f"])
+    assert viols, "aliased bound method must be flagged"
+    assert any(v["expectation"] == "FAIL_CLOSED_UNRESOLVED_DYNAMIC_SQL" for v in viols), viols
+
+
+def test_i01_scanner_redteam_alias_of_reflected_bound_method():
+    """REDTEAM_ALIAS_OF_REFLECTED_BOUND_METHOD: reflected bound method aliased twice."""
+    files = {"app.py": "def f(conn, sql):\n    run = getattr(conn, 'execute')\n    alias = run\n    alias(sql)\n"}
+    viols = scan_status_sql(files, entrypoints=["app.f"])
+    assert viols, "reflected aliased bound method must be flagged"
+    assert any(v["expectation"] == "FAIL_CLOSED_UNRESOLVED_DYNAMIC_SQL" for v in viols), viols
+
+
+def test_i01_scanner_redteam_direct_factory_chain():
+    """REDTEAM_DIRECT_FACTORY_CHAIN: ``kanban_db.connect().execute(sql)``."""
+    files = {"app.py": "from hermes_cli import kanban_db\n\ndef f(sql):\n    kanban_db.connect().execute(sql)\n"}
+    viols = scan_status_sql(files, entrypoints=["app.f"])
+    assert viols, "direct factory receiver chain must be flagged"
+    assert any(v["expectation"] == "FAIL_CLOSED_UNRESOLVED_DYNAMIC_SQL" for v in viols), viols
+
+
+def test_i01_scanner_redteam_cursor_bound_alias_twice():
+    """REDTEAM_CURSOR_BOUND_ALIAS_TWICE: cursor-derived bound method aliased twice."""
+    files = {"app.py": "def f(conn, sql):\n    cur = conn.cursor()\n    run = cur.execute\n    alias = run\n    alias(sql)\n"}
+    viols = scan_status_sql(files, entrypoints=["app.f"])
+    assert viols, "cursor-derived aliased bound method must be flagged"
+    assert any(v["expectation"] == "FAIL_CLOSED_UNRESOLVED_DYNAMIC_SQL" for v in viols), viols
+
+
+def test_i01_scanner_redteam_interprocedural_bound_method():
+    """REDTEAM_INTERPROCEDURAL_BOUND_METHOD: ``mutate(conn.execute, sql)``."""
+    files = {"app.py": "def mutate(run, sql):\n    run(sql)\n\ndef f(conn, sql):\n    mutate(conn.execute, sql)\n"}
+    viols = scan_status_sql(files, entrypoints=["app.f"])
+    assert viols, "interprocedural bound method must be flagged"
+    assert any(v["expectation"] == "FAIL_CLOSED_UNRESOLVED_DYNAMIC_SQL" for v in viols), viols
+
+
+def test_i01_scanner_non_kanban_alias_of_bound_method_nonviolating():
+    """Non-Kanban ``logger.execute`` aliased twice stays clean (provenance-based)."""
+    files = {"app.py": "def f(logger, sql):\n    run = logger.execute\n    alias = run\n    alias(sql)\n"}
+    viols = scan_status_sql(files, entrypoints=["app.f"])
+    assert viols == [], f"non-Kanban aliased bound method must be clean, got {viols}"
+
+
+def test_i01_scanner_non_kanban_interprocedural_bound_method_nonviolating():
+    """Non-Kanban ``logger.execute`` passed through a helper stays clean."""
+    files = {"app.py": "def mutate(run, sql):\n    run(sql)\n\ndef f(logger, sql):\n    mutate(logger.execute, sql)\n"}
+    viols = scan_status_sql(files, entrypoints=["app.f"])
+    assert viols == [], f"non-Kanban interprocedural bound method must be clean, got {viols}"
+
+
+def test_i01_scanner_bound_method_transport_closure():
+    """Generated/metamorphic bound-method provenance closure.
+
+    Every Kanban bound-callable transport (direct, alias, repeated alias,
+    reflection, cursor alias, interprocedural argument, factory receiver) must
+    fail closed across execute/executemany/executescript; symmetric non-Kanban
+    (logger) transports must remain non-violating.
+    """
+    for case_id, src, expect in _bound_method_closure_cases():
+        viols = scan_status_sql({"app.py": src}, entrypoints=["app.f"])
+        observed = bool(viols)
+        assert observed == expect, (
+            f"{case_id}: expected_violation={expect} observed={observed} "
+            f"violations={viols}"
+        )
+
+
+# ============================================================================
+# AION R4/I01 — R3 repair: factory callable + helper return provenance
+# (structural, cycle-safe, depth-bounded, argument-sensitive)
+# ============================================================================
+
+def test_i01_scanner_factory_callable_alias_then_conn():
+    """FRESH_FACTORY_CALLABLE_ALIAS_THEN_CONN: ``make = kanban_db.connect;
+    conn = make(); conn.execute(sql)`` must fail closed (factory callable
+    identity survives the alias)."""
+    files = {"app.py": (
+        "from hermes_cli import kanban_db\n\n"
+        "def f(sql):\n"
+        "    make = kanban_db.connect\n"
+        "    conn = make()\n"
+        "    conn.execute(sql)\n"
+    )}
+    viols = scan_status_sql(files, entrypoints=["app.f"])
+    assert viols, "factory callable alias must be flagged"
+    assert any(v["expectation"] == "FAIL_CLOSED_UNRESOLVED_DYNAMIC_SQL" for v in viols), viols
+
+
+def test_i01_scanner_helper_returns_conn():
+    """FRESH_HELPER_RETURNS_CONN: ``get_conn() -> kanban_db.connect();
+    conn = get_conn(); conn.execute(sql)`` must fail closed."""
+    files = {"app.py": (
+        "from hermes_cli import kanban_db\n\n"
+        "def get_conn():\n"
+        "    return kanban_db.connect()\n\n"
+        "def f(sql):\n"
+        "    conn = get_conn()\n"
+        "    conn.execute(sql)\n"
+    )}
+    viols = scan_status_sql(files, entrypoints=["app.f"])
+    assert viols, "helper-returned connection must be flagged"
+    assert any(v["expectation"] == "FAIL_CLOSED_UNRESOLVED_DYNAMIC_SQL" for v in viols), viols
+
+
+def test_i01_scanner_helper_returns_bound_method():
+    """FRESH_HELPER_RETURNS_BOUND_METHOD: ``get_run(conn) -> conn.execute;
+    run = get_run(conn); run(sql)`` must fail closed."""
+    files = {"app.py": (
+        "def get_run(conn):\n"
+        "    return conn.execute\n\n"
+        "def f(conn, sql):\n"
+        "    run = get_run(conn)\n"
+        "    run(sql)\n"
+    )}
+    viols = scan_status_sql(files, entrypoints=["app.f"])
+    assert viols, "helper-returned bound method must be flagged"
+    assert any(v["expectation"] == "FAIL_CLOSED_UNRESOLVED_DYNAMIC_SQL" for v in viols), viols
+
+
+def test_i01_scanner_helper_returns_cursor():
+    """FRESH_HELPER_RETURNS_CURSOR: ``get_cursor(conn) -> conn.cursor();
+    cur = get_cursor(conn); cur.execute(sql)`` must fail closed."""
+    files = {"app.py": (
+        "def get_cursor(conn):\n"
+        "    return conn.cursor()\n\n"
+        "def f(conn, sql):\n"
+        "    cur = get_cursor(conn)\n"
+        "    cur.execute(sql)\n"
+    )}
+    viols = scan_status_sql(files, entrypoints=["app.f"])
+    assert viols, "helper-returned cursor must be flagged"
+    assert any(v["expectation"] == "FAIL_CLOSED_UNRESOLVED_DYNAMIC_SQL" for v in viols), viols
+
+
+def _factory_helper_return_closure():
+    """Bounded metamorphic family: ``(case_id, files, expect_violation)``.
+
+    Crosses factory-callable aliases (one/two), helper return hops (one/two),
+    direct/assigned helper results, attribute/getattr bound returns,
+    conn/cursor/factory return forms, local/mapped cross-file helpers, and the
+    execute family. Kanban forms fail closed; symmetric non-Kanban (sqlite /
+    logger / engine) chains stay clean.
+    """
+    cases = []
+
+    # --- factory callable aliases (one/two) --------------------------------
+    cases.append(("FACTORY_ALIAS_ONE", {"app.py": (
+        "from hermes_cli import kanban_db\n\ndef f(sql):\n"
+        "    make = kanban_db.connect\n    conn = make()\n    conn.execute(sql)\n")}, True))
+    cases.append(("FACTORY_ALIAS_TWO", {"app.py": (
+        "from hermes_cli import kanban_db\n\ndef f(sql):\n"
+        "    make = kanban_db.connect\n    make2 = make\n    conn = make2()\n    conn.execute(sql)\n")}, True))
+    cases.append(("FACTORY_ALIAS_IMPORTED_CONNECT", {"app.py": (
+        "from hermes_cli.kanban_db import connect\n\ndef f(sql):\n"
+        "    make = connect\n    conn = make()\n    conn.execute(sql)\n")}, True))
+
+    # --- helper return hops (one/two) --------------------------------------
+    cases.append(("HELPER_RETURN_CONN_ONE_HOP", {"app.py": (
+        "from hermes_cli import kanban_db\n\ndef get_conn():\n"
+        "    return kanban_db.connect()\n\ndef f(sql):\n"
+        "    conn = get_conn()\n    conn.execute(sql)\n")}, True))
+    cases.append(("HELPER_RETURN_CONN_TWO_HOP", {"app.py": (
+        "from hermes_cli import kanban_db\n\ndef inner():\n"
+        "    return kanban_db.connect()\n\ndef outer():\n"
+        "    return inner()\n\ndef f(sql):\n"
+        "    conn = outer()\n    conn.execute(sql)\n")}, True))
+    cases.append(("HELPER_RETURN_BOUND_METHOD_TWO_HOP", {"app.py": (
+        "def get_run(conn):\n    return conn.execute\n\ndef wrap(conn):\n"
+        "    return get_run(conn)\n\ndef f(conn, sql):\n"
+        "    run = wrap(conn)\n    run(sql)\n")}, True))
+
+    # --- direct vs assigned helper results --------------------------------
+    cases.append(("HELPER_RESULT_ASSIGNED", {"app.py": (
+        "from hermes_cli import kanban_db\n\ndef get_conn():\n"
+        "    return kanban_db.connect()\n\ndef f(sql):\n"
+        "    conn = get_conn()\n    conn.execute(sql)\n")}, True))
+    cases.append(("HELPER_RESULT_DIRECT_CHAINED", {"app.py": (
+        "from hermes_cli import kanban_db\n\ndef get_conn():\n"
+        "    return kanban_db.connect()\n\ndef f(sql):\n"
+        "    get_conn().execute(sql)\n")}, True))
+
+    # --- attribute / getattr bound returns --------------------------------
+    cases.append(("HELPER_RETURN_BOUND_METHOD_ATTR", {"app.py": (
+        "def get_run(conn):\n    return conn.execute\n\ndef f(conn, sql):\n"
+        "    run = get_run(conn)\n    run(sql)\n")}, True))
+    cases.append(("HELPER_RETURN_BOUND_METHOD_GETATTR", {"app.py": (
+        "def get_run(conn):\n    return getattr(conn, 'execute')\n\ndef f(conn, sql):\n"
+        "    run = get_run(conn)\n    run(sql)\n")}, True))
+
+    # --- conn / cursor / factory return forms -----------------------------
+    cases.append(("HELPER_RETURN_CURSOR", {"app.py": (
+        "def get_cursor(conn):\n    return conn.cursor()\n\ndef f(conn, sql):\n"
+        "    cur = get_cursor(conn)\n    cur.execute(sql)\n")}, True))
+    cases.append(("HELPER_RETURN_FACTORY", {"app.py": (
+        "from hermes_cli import kanban_db\n\ndef get_factory():\n"
+        "    return kanban_db.connect\n\ndef f(sql):\n"
+        "    make = get_factory()\n    conn = make()\n    conn.execute(sql)\n")}, True))
+
+    # --- mapped cross-file helper -----------------------------------------
+    cases.append(("HELPER_CROSS_FILE_CONN", {
+        "app.py": "from helper import get_conn\n\ndef f(sql):\n    conn = get_conn()\n    conn.execute(sql)\n",
+        "helper.py": "from hermes_cli import kanban_db\n\ndef get_conn():\n    return kanban_db.connect()\n"}, True))
+    cases.append(("HELPER_CROSS_FILE_CURSOR", {
+        "app.py": "from helper import get_cursor\n\ndef f(conn, sql):\n    cur = get_cursor(conn)\n    cur.execute(sql)\n",
+        "helper.py": "def get_cursor(conn):\n    return conn.cursor()\n"}, True))
+
+    # --- execute family where applicable -----------------------------------
+    for method in ("executemany", "executescript"):
+        cases.append((f"HELPER_RETURN_BOUND_METHOD_{method.upper()}", {"app.py": (
+            f"def get_run(conn):\n    return conn.{method}\n\ndef f(conn, sql, rows):\n"
+            f"    run = get_run(conn)\n    run(sql, rows)\n")}, True))
+
+    # --- symmetric non-Kanban (sqlite / logger / engine) -------------------
+    cases.append(("NONKANBAN_SQLITE_FACTORY_ALIAS", {"app.py": (
+        "import sqlite3\n\ndef f(sql):\n"
+        "    make = sqlite3.connect\n    conn = make(':memory:')\n    conn.execute(sql)\n")}, False))
+    cases.append(("NONKANBAN_SQLITE_HELPER_RETURN", {"app.py": (
+        "import sqlite3\n\ndef get_conn():\n    return sqlite3.connect(':memory:')\n\ndef f(sql):\n"
+        "    conn = get_conn()\n    conn.execute(sql)\n")}, False))
+    cases.append(("NONKANBAN_LOGGER_HELPER_RETURN_BOUND_METHOD", {"app.py": (
+        "def get_run(logger):\n    return logger.execute\n\ndef f(logger, sql):\n"
+        "    run = get_run(logger)\n    run(sql)\n")}, False))
+    cases.append(("NONKANBAN_ENGINE_HELPER_RETURN", {"app.py": (
+        "def get_conn(engine):\n    return engine.connect()\n\ndef f(engine, sql):\n"
+        "    conn = get_conn(engine)\n    conn.execute(sql)\n")}, False))
+
+    return cases
+
+
+def test_i01_scanner_factory_helper_return_closure():
+    """Generated/metamorphic factory + helper-return provenance closure.
+
+    Every Kanban factory/helper-return transport must fail closed across one/
+    two aliases, one/two hops, direct/assigned results, attribute/getattr
+    bound returns, conn/cursor/factory forms, local/mapped cross-file helpers,
+    and the execute family; symmetric non-Kanban sqlite/logger/engine chains
+    must remain non-violating.
+    """
+    for case_id, files, expect in _factory_helper_return_closure():
+        viols = scan_status_sql(files, entrypoints=["app.f"])
+        observed = bool(viols)
+        assert observed == expect, (
+            f"{case_id}: expected_violation={expect} observed={observed} "
+            f"violations={viols}"
+        )
+
+
+def test_i01_scanner_helper_return_cycle_terminates():
+    """Cycle-safe termination: a self-recursive and a mutually-recursive
+    helper must terminate without infinite recursion and stay conservative
+    (no false Kanban provenance from an unresolvable cycle)."""
+    self_rec = {"app.py": (
+        "def get_conn():\n    return get_conn()\n\ndef f(sql):\n"
+        "    conn = get_conn()\n    conn.execute(sql)\n")}
+    mut_rec = {"app.py": (
+        "def a():\n    return b()\n\ndef b():\n    return a()\n\ndef f(sql):\n"
+        "    conn = a()\n    conn.execute(sql)\n")}
+    for files in (self_rec, mut_rec):
+        viols = scan_status_sql(files, entrypoints=["app.f"])
+        assert viols == [], f"cyclic helper return must stay clean, got {viols}"
+
+
+def test_i01_scanner_helper_return_depth_bounded():
+    """Depth-bounded termination: a 30-hop helper chain terminates cleanly
+    (the depth guard truncates analysis; no infinite recursion)."""
+    lines = ["def f(sql):\n    conn = h0()\n    conn.execute(sql)\n"]
+    for i in range(30):
+        nxt = f"h{i + 1}()" if i < 29 else "kanban_db.connect()"
+        if i == 29:
+            header = "from hermes_cli import kanban_db\n\n"
+        else:
+            header = ""
+        lines.insert(0, f"{header}def h{i}():\n    return {nxt}\n")
+    src = "\n".join(lines)
+    viols = scan_status_sql({"app.py": src}, entrypoints=["app.f"])
+    # Terminated (no exception); the >24-depth tail is conservatively unresolved.
+    assert isinstance(viols, list)
+
+
+# ============================================================================
+# AION R4/I01 — R4 repair: total-domain return-summary lattice
+# (unknown / non-Kanban / cyclic / bare / implicit-None arms participate)
+# ============================================================================
+
+def _return_lattice_closure():
+    """Bounded return-lattice family: ``(case_id, files, expect_violation)``.
+
+    Every reachable return arm of a summarized helper participates. A known
+    Kanban provenance tag is returned only when the return-arm set is nonempty
+    and every arm resolves to the exact same known tag; any unknown /
+    non-Kanban / cyclic / bare / implicit-``None`` arm, or any tag
+    disagreement, yields no proven Kanban provenance (clean). Two same-known
+    Kanban arms still propagate (fail-closed).
+    """
+    cases = []
+
+    # --- exact R3 audit reproductions (must stay clean) --------------------
+    cases.append(("AUDIT_MIXED_KANBAN_OR_UNKNOWN_OBJECT_MUST_STAY_CLEAN", {
+        "app.py": (
+            "from hermes_cli import kanban_db\n\n"
+            "def choose(flag):\n"
+            "    if flag:\n"
+            "        return kanban_db.connect()\n"
+            "    return object()\n\n"
+            "def f(flag, sql):\n"
+            "    selected = choose(flag)\n"
+            "    selected.execute(sql)\n"
+        ),
+    }, False))
+    cases.append(("AUDIT_MIXED_KANBAN_OR_SQLITE_MUST_STAY_CLEAN", {
+        "app.py": (
+            "import sqlite3\n"
+            "from hermes_cli import kanban_db\n\n"
+            "def choose(flag):\n"
+            "    if flag:\n"
+            "        return kanban_db.connect()\n"
+            "    return sqlite3.connect(':memory:')\n\n"
+            "def f(flag, sql):\n"
+            "    selected = choose(flag)\n"
+            "    selected.execute(sql)\n"
+        ),
+    }, False))
+    cases.append(("AUDIT_RECURSIVE_OR_KANBAN_MIXED_MUST_STAY_CLEAN", {
+        "app.py": (
+            "from hermes_cli import kanban_db\n\n"
+            "def choose(flag):\n"
+            "    if flag:\n"
+            "        return kanban_db.connect()\n"
+            "    return choose(flag)\n\n"
+            "def f(flag, sql):\n"
+            "    selected = choose(flag)\n"
+            "    selected.execute(sql)\n"
+        ),
+    }, False))
+
+    # --- bounded controls: mixed with explicit / bare / implicit None -------
+    cases.append(("MIXED_KANBAN_OR_EXPLICIT_NONE_MUST_STAY_CLEAN", {
+        "app.py": (
+            "from hermes_cli import kanban_db\n\n"
+            "def choose(flag):\n"
+            "    if flag:\n"
+            "        return kanban_db.connect()\n"
+            "    return None\n\n"
+            "def f(flag, sql):\n"
+            "    selected = choose(flag)\n"
+            "    selected.execute(sql)\n"
+        ),
+    }, False))
+    cases.append(("MIXED_KANBAN_OR_BARE_RETURN_MUST_STAY_CLEAN", {
+        "app.py": (
+            "from hermes_cli import kanban_db\n\n"
+            "def choose(flag):\n"
+            "    if flag:\n"
+            "        return kanban_db.connect()\n"
+            "    return\n\n"
+            "def f(flag, sql):\n"
+            "    selected = choose(flag)\n"
+            "    selected.execute(sql)\n"
+        ),
+    }, False))
+    cases.append(("MIXED_KANBAN_OR_IMPLICIT_NONE_MUST_STAY_CLEAN", {
+        "app.py": (
+            "from hermes_cli import kanban_db\n\n"
+            "def choose(flag):\n"
+            "    if flag:\n"
+            "        return kanban_db.connect()\n\n"
+            "def f(flag, sql):\n"
+            "    selected = choose(flag)\n"
+            "    selected.execute(sql)\n"
+        ),
+    }, False))
+
+    # --- bounded controls: mixed with scalar / conflicting known tags -------
+    cases.append(("MIXED_KANBAN_OR_SCALAR_MUST_STAY_CLEAN", {
+        "app.py": (
+            "from hermes_cli import kanban_db\n\n"
+            "def choose(flag):\n"
+            "    if flag:\n"
+            "        return kanban_db.connect()\n"
+            "    return 0\n\n"
+            "def f(flag, sql):\n"
+            "    selected = choose(flag)\n"
+            "    selected.execute(sql)\n"
+        ),
+    }, False))
+    cases.append(("CONFLICTING_KNOWN_TAGS_MUST_STAY_CLEAN", {
+        "app.py": (
+            "from hermes_cli import kanban_db\n\n"
+            "def choose(flag, conn):\n"
+            "    if flag:\n"
+            "        return kanban_db.connect()\n"
+            "    return conn.cursor()\n\n"
+            "def f(flag, conn, sql):\n"
+            "    selected = choose(flag, conn)\n"
+            "    selected.execute(sql)\n"
+        ),
+    }, False))
+
+    # --- two same-known Kanban arms still propagate (fail-closed) -----------
+    cases.append(("TWO_SAME_KNOWN_KANBAN_ARMS_MUST_STILL_PROPAGATE", {
+        "app.py": (
+            "from hermes_cli import kanban_db\n\n"
+            "def choose(flag):\n"
+            "    if flag:\n"
+            "        return kanban_db.connect()\n"
+            "    return kanban_db.connect()\n\n"
+            "def f(flag, sql):\n"
+            "    selected = choose(flag)\n"
+            "    selected.execute(sql)\n"
+        ),
+    }, True))
+
+    # --- repeated same-wrapper arms must still propagate (path-local) -------
+    # The R4 regression: a shared recursion stack let the first ``make()`` arm
+    # mark ``make`` as visited, so the second sibling ``make()`` arm was
+    # misclassified as a cycle and dropped to UNKNOWN. With path-local stacks
+    # every sibling arm is evaluated from the same clean entry stack.
+    cases.append(("TWO_SAME_WRAPPER_ARMS_MUST_STILL_PROPAGATE", {
+        "app.py": (
+            "from hermes_cli import kanban_db\n\n"
+            "def make():\n"
+            "    return kanban_db.connect()\n\n"
+            "def choose(flag):\n"
+            "    if flag:\n"
+            "        return make()\n"
+            "    return make()\n\n"
+            "def f(flag, sql):\n"
+            "    choose(flag).execute(sql)\n"
+        ),
+    }, True))
+    cases.append(("TWO_SAME_TWO_HOP_WRAPPER_ARMS_MUST_STILL_PROPAGATE", {
+        "app.py": (
+            "from hermes_cli import kanban_db\n\n"
+            "def make():\n"
+            "    return kanban_db.connect()\n\n"
+            "def wrap():\n"
+            "    return make()\n\n"
+            "def choose(flag):\n"
+            "    if flag:\n"
+            "        return wrap()\n"
+            "    return wrap()\n\n"
+            "def f(flag, sql):\n"
+            "    choose(flag).execute(sql)\n"
+        ),
+    }, True))
+    cases.append(("THREE_SAME_WRAPPER_ARMS_MUST_STILL_PROPAGATE", {
+        "app.py": (
+            "from hermes_cli import kanban_db\n\n"
+            "def make():\n"
+            "    return kanban_db.connect()\n\n"
+            "def choose(flag):\n"
+            "    if flag == 1:\n"
+            "        return make()\n"
+            "    if flag == 2:\n"
+            "        return make()\n"
+            "    return make()\n\n"
+            "def f(flag, sql):\n"
+            "    choose(flag).execute(sql)\n"
+        ),
+    }, True))
+    cases.append(("SAME_HELPER_INDEPENDENT_BRANCHES_MUST_STILL_PROPAGATE", {
+        "app.py": (
+            "from hermes_cli import kanban_db\n\n"
+            "def make():\n"
+            "    return kanban_db.connect()\n\n"
+            "def left():\n"
+            "    return make()\n\n"
+            "def right():\n"
+            "    return make()\n\n"
+            "def choose(flag):\n"
+            "    if flag:\n"
+            "        return left()\n"
+            "    return right()\n\n"
+            "def f(flag, sql):\n"
+            "    choose(flag).execute(sql)\n"
+        ),
+    }, True))
+    cases.append(("DIFFERENT_ACYCLIC_WRAPPERS_SAME_TAG_MUST_STILL_PROPAGATE", {
+        "app.py": (
+            "from hermes_cli import kanban_db\n\n"
+            "def make_a():\n"
+            "    return kanban_db.connect()\n\n"
+            "def make_b():\n"
+            "    return kanban_db.connect()\n\n"
+            "def choose(flag):\n"
+            "    if flag:\n"
+            "        return make_a()\n"
+            "    return make_b()\n\n"
+            "def f(flag, sql):\n"
+            "    choose(flag).execute(sql)\n"
+        ),
+    }, True))
+
+    return cases
+
+
+def test_i01_scanner_return_lattice_closure():
+    """Total-domain return-summary lattice: mixed / unknown / non-Kanban /
+    cyclic / bare / implicit-None arms never yield proven Kanban provenance;
+    two same-known Kanban arms still propagate."""
+    for case_id, files, expect in _return_lattice_closure():
+        viols = scan_status_sql(files, entrypoints=["app.f"])
+        observed = bool(viols)
+        assert observed == expect, (
+            f"{case_id}: expected_violation={expect} observed={observed} "
+            f"violations={viols}"
+        )
+
+
+# ============================================================================
+# AION R4/I01 — 44-row transaction / parity / fault matrix
+# ============================================================================
+
+class _Fault(Exception):
+    """Sentinel raised by the fault injector."""
+
+
+def _snapshot(conn):
+    def rows(t, o):
+        return [tuple(r) for r in conn.execute(f"SELECT * FROM {t} ORDER BY {o}").fetchall()]
+    return (
+        rows("tasks", "id"),
+        rows("task_runs", "id"),
+        rows("task_events", "id"),
+        rows("task_links", "parent_id, child_id"),
+    )
+
+
+def _inject(conn, when, substr, occ=1):
+    """Monkeypatch conn.execute to raise _Fault before/after the Nth statement
+    whose SQL text contains ``substr``. Returns the original execute."""
+    original = conn.execute
+    state = {"n": 0}
+
+    def patched(sql, *a, **k):
+        s = sql if isinstance(sql, str) else str(sql)
+        matched = substr in s
+        if when == "before" and matched:
+            state["n"] += 1
+            if state["n"] == occ:
+                raise _Fault(f"{when}:{substr}:{occ}")
+        r = original(sql, *a, **k)
+        if when == "after" and matched:
+            state["n"] += 1
+            if state["n"] == occ:
+                raise _Fault(f"{when}:{substr}:{occ}")
+        return r
+
+    conn.execute = patched
+    return original
+
+
+def _mk_task(conn, title="t", status="todo"):
+    tid = kb.create_task(conn, title=title)
+    if status != "ready":
+        conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, tid))
+    return tid
+
+
+def _mk_run(conn, task_id):
+    cur = conn.execute(
+        "INSERT INTO task_runs (task_id, profile, status, started_at) "
+        "VALUES (?, ?, 'running', ?)",
+        (task_id, "test", int(time.time())),
+    )
+    run_id = cur.lastrowid
+    conn.execute(
+        "UPDATE tasks SET status = 'running', current_run_id = ? WHERE id = ?",
+        (run_id, task_id),
+    )
+    return run_id
+
+
+def _task(conn, task_id):
+    return conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+
+
+def _events(conn, task_id):
+    return conn.execute(
+        "SELECT * FROM task_events WHERE task_id = ? ORDER BY id", (task_id,),
+    ).fetchall()
+
+
+def _new_conn(kanban_home):
+    return kb.connect()
+
+
+# ---------------------------------------------------------------------------
+# Parity rows (writer-level semantics)
+# ---------------------------------------------------------------------------
+
+def test_P01_todo_to_ready_no_parent(kanban_home):
+    conn = kb.connect()
+    try:
+        tid = _mk_task(conn, "a", "todo")
+        assert kb.set_task_status(conn, tid, "ready") is True
+        t = _task(conn, tid)
+        assert t["status"] == "ready"
+        assert t["claim_lock"] is None and t["claim_expires"] is None and t["worker_pid"] is None
+        evs = _events(conn, tid)
+        status_evs = [e for e in evs if e["kind"] == "status"]
+        assert len(status_evs) == 1
+    finally:
+        conn.close()
+
+
+def test_P02_triage_to_todo(kanban_home):
+    conn = kb.connect()
+    try:
+        tid = _mk_task(conn, "a", "triage")
+        assert kb.set_task_status(conn, tid, "todo") is True
+        assert _task(conn, tid)["status"] == "todo"
+    finally:
+        conn.close()
+
+
+def test_P03_ready_to_triage(kanban_home):
+    conn = kb.connect()
+    try:
+        tid = _mk_task(conn, "a", "ready")
+        assert kb.set_task_status(conn, tid, "triage") is True
+        assert _task(conn, tid)["status"] == "triage"
+    finally:
+        conn.close()
+
+
+def test_P04_same_status_todo(kanban_home):
+    conn = kb.connect()
+    try:
+        tid = _mk_task(conn, "a", "todo")
+        before = len([e for e in _events(conn, tid) if e["kind"] == "status"])
+        assert kb.set_task_status(conn, tid, "todo") is True
+        assert _task(conn, tid)["status"] == "todo"
+        after = len([e for e in _events(conn, tid) if e["kind"] == "status"])
+        assert after == before + 1  # same-status is not a no-op
+    finally:
+        conn.close()
+
+
+def test_P05_same_status_ready(kanban_home):
+    conn = kb.connect()
+    try:
+        tid = _mk_task(conn, "a", "ready")
+        before = len([e for e in _events(conn, tid) if e["kind"] == "status"])
+        assert kb.set_task_status(conn, tid, "ready") is True
+        assert _task(conn, tid)["status"] == "ready"
+        after = len([e for e in _events(conn, tid) if e["kind"] == "status"])
+        assert after == before + 1
+    finally:
+        conn.close()
+
+
+def test_P06_running_to_ready_reclaim(kanban_home):
+    conn = kb.connect()
+    try:
+        tid = _mk_task(conn, "a", "running")
+        run_id = _mk_run(conn, tid)
+        assert kb.set_task_status(conn, tid, "ready") is True
+        t = _task(conn, tid)
+        assert t["status"] == "ready"
+        assert t["current_run_id"] is None
+        assert t["claim_lock"] is None and t["claim_expires"] is None and t["worker_pid"] is None
+        run = conn.execute("SELECT * FROM task_runs WHERE id = ?", (run_id,)).fetchone()
+        assert run["status"] == "reclaimed" and run["outcome"] == "reclaimed"
+        assert run["ended_at"] is not None
+        evs = [e for e in _events(conn, tid) if e["kind"] == "status"]
+        assert len(evs) == 1 and evs[0]["run_id"] == run_id
+    finally:
+        conn.close()
+
+
+def test_P07_running_to_todo_reclaim(kanban_home):
+    conn = kb.connect()
+    try:
+        tid = _mk_task(conn, "a", "running")
+        run_id = _mk_run(conn, tid)
+        assert kb.set_task_status(conn, tid, "todo") is True
+        assert _task(conn, tid)["status"] == "todo"
+        run = conn.execute("SELECT * FROM task_runs WHERE id = ?", (run_id,)).fetchone()
+        assert run["status"] == "reclaimed"
+    finally:
+        conn.close()
+
+
+def test_P08_ready_allowed_by_done_parent(kanban_home):
+    conn = kb.connect()
+    try:
+        parent = _mk_task(conn, "p", "done")
+        child = _mk_task(conn, "c", "todo")
+        kb.link_tasks(conn, parent, child)
+        assert kb.set_task_status(conn, child, "ready") is True
+        assert _task(conn, child)["status"] == "ready"
+    finally:
+        conn.close()
+
+
+def test_P09_ready_refused_by_archived_parent(kanban_home):
+    conn = kb.connect()
+    try:
+        parent = _mk_task(conn, "p", "archived")
+        child = _mk_task(conn, "c", "todo")
+        kb.link_tasks(conn, parent, child)
+        assert kb.set_task_status(conn, child, "ready") is False
+        assert _task(conn, child)["status"] == "todo"
+    finally:
+        conn.close()
+
+
+def test_P10_ready_refused_by_non_done_parent(kanban_home):
+    conn = kb.connect()
+    try:
+        parent = _mk_task(conn, "p", "running")
+        child = _mk_task(conn, "c", "todo")
+        kb.link_tasks(conn, parent, child)
+        assert kb.set_task_status(conn, child, "ready") is False
+        assert _task(conn, child)["status"] == "todo"
+    finally:
+        conn.close()
+
+
+def test_P11_done_parent_reopen_to_todo(kanban_home):
+    conn = kb.connect()
+    try:
+        parent = _mk_task(conn, "p", "done")
+        child_a = _mk_task(conn, "ca", "ready")
+        child_b = _mk_task(conn, "cb", "todo")
+        kb.link_tasks(conn, parent, child_a)
+        kb.link_tasks(conn, parent, child_b)
+        assert kb.set_task_status(conn, parent, "todo") is True
+        assert _task(conn, parent)["status"] == "todo"
+        assert _task(conn, child_a)["status"] == "todo"  # ready child demoted
+        assert _task(conn, child_b)["status"] == "todo"  # non-ready unchanged
+    finally:
+        conn.close()
+
+
+def test_P12_archived_parent_reopen_to_triage(kanban_home):
+    conn = kb.connect()
+    try:
+        parent = _mk_task(conn, "p", "archived")
+        child_a = _mk_task(conn, "ca", "ready")
+        child_b = _mk_task(conn, "cb", "ready")
+        child_c = _mk_task(conn, "cc", "blocked")
+        for c in (child_a, child_b, child_c):
+            kb.link_tasks(conn, parent, c)
+        assert kb.set_task_status(conn, parent, "triage") is True
+        assert _task(conn, parent)["status"] == "triage"
+        assert _task(conn, child_a)["status"] == "todo"
+        assert _task(conn, child_b)["status"] == "todo"
+        assert _task(conn, child_c)["status"] == "blocked"
+    finally:
+        conn.close()
+
+
+def test_P13_done_parent_reopen_to_ready(kanban_home):
+    conn = kb.connect()
+    try:
+        grandparent = _mk_task(conn, "gp", "done")
+        parent = _mk_task(conn, "p", "done")
+        kb.link_tasks(conn, grandparent, parent)
+        child = _mk_task(conn, "c", "ready")
+        kb.link_tasks(conn, parent, child)
+        assert kb.set_task_status(conn, parent, "ready") is True
+        assert _task(conn, parent)["status"] == "ready"
+        assert _task(conn, child)["status"] == "todo"  # demoted, not re-promoted
+    finally:
+        conn.close()
+
+
+def test_P14_missing_task(kanban_home):
+    conn = kb.connect()
+    try:
+        assert kb.set_task_status(conn, "t_nonexistent", "todo") is False
+    finally:
+        conn.close()
+
+
+def test_P15_archived_parent_blocks_ready_even_though_recompute_accepts(kanban_home):
+    conn = kb.connect()
+    try:
+        parent = _mk_task(conn, "p", "archived")
+        child = _mk_task(conn, "c", "triage")
+        kb.link_tasks(conn, parent, child)
+        # Direct helper refuses ready on archived parent; recompute_ready would
+        # accept archived, so this pins the divergence.
+        assert kb.set_task_status(conn, child, "ready") is False
+        assert _task(conn, child)["status"] == "triage"
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Pre-commit fault rows (22/22 full-snapshot rollback equality)
+# ---------------------------------------------------------------------------
+
+_RUNNING_READY_FAULTS = [
+    ("F-RUNNING-READY-01", "before", "UPDATE tasks SET status = ?", 1),
+    ("F-RUNNING-READY-02", "after", "UPDATE tasks SET status = ?", 1),
+    ("F-RUNNING-READY-03", "before", "UPDATE task_runs", 1),
+    ("F-RUNNING-READY-04", "after", "UPDATE task_runs", 1),
+    ("F-RUNNING-READY-05", "before", "current_run_id = NULL", 1),
+    ("F-RUNNING-READY-06", "after", "current_run_id = NULL", 1),
+    ("F-RUNNING-READY-07", "before", "INSERT INTO task_events (task_id, run_id", 1),
+    ("F-RUNNING-READY-08", "after", "INSERT INTO task_events (task_id, run_id", 1),
+    ("F-RUNNING-READY-09", "before", "COMMIT", 1),
+]
+
+_REOPEN_FAULTS = [
+    ("F-REOPEN-TWO-CHILDREN-01", "before", "UPDATE tasks SET status = ?", 1),
+    ("F-REOPEN-TWO-CHILDREN-02", "after", "UPDATE tasks SET status = ?", 1),
+    ("F-REOPEN-TWO-CHILDREN-03", "before", "INSERT INTO task_events (task_id, run_id", 1),
+    ("F-REOPEN-TWO-CHILDREN-04", "after", "INSERT INTO task_events (task_id, run_id", 1),
+    ("F-REOPEN-TWO-CHILDREN-05", "before", "UPDATE tasks SET status = 'todo'", 1),
+    ("F-REOPEN-TWO-CHILDREN-06", "after", "UPDATE tasks SET status = 'todo'", 1),
+    ("F-REOPEN-TWO-CHILDREN-07", "before", "INSERT INTO task_events (task_id, kind", 1),
+    ("F-REOPEN-TWO-CHILDREN-08", "after", "INSERT INTO task_events (task_id, kind", 1),
+    ("F-REOPEN-TWO-CHILDREN-09", "before", "UPDATE tasks SET status = 'todo'", 2),
+    ("F-REOPEN-TWO-CHILDREN-10", "after", "UPDATE tasks SET status = 'todo'", 2),
+    ("F-REOPEN-TWO-CHILDREN-11", "before", "INSERT INTO task_events (task_id, kind", 2),
+    ("F-REOPEN-TWO-CHILDREN-12", "after", "INSERT INTO task_events (task_id, kind", 2),
+    ("F-REOPEN-TWO-CHILDREN-13", "before", "COMMIT", 1),
+]
+
+
+@pytest.mark.parametrize("row_id,when,substr,occ", _RUNNING_READY_FAULTS)
+def test_precommit_fault_running_ready(kanban_home, row_id, when, substr, occ):
+    conn = kb.connect()
+    try:
+        tid = _mk_task(conn, "a", "running")
+        _mk_run(conn, tid)
+        before = _snapshot(conn)
+        original = _inject(conn, when, substr, occ)
+        with pytest.raises(_Fault):
+            kb.set_task_status(conn, tid, "ready")
+        conn.execute = original
+        after = _snapshot(conn)
+        assert before == after, f"{row_id}: snapshot must be byte/row-value equal"
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("row_id,when,substr,occ", _REOPEN_FAULTS)
+def test_precommit_fault_reopen_two_children(kanban_home, row_id, when, substr, occ):
+    conn = kb.connect()
+    try:
+        parent = _mk_task(conn, "p", "done")
+        child_a = _mk_task(conn, "ca", "ready")
+        child_b = _mk_task(conn, "cb", "ready")
+        kb.link_tasks(conn, parent, child_a)
+        kb.link_tasks(conn, parent, child_b)
+        before = _snapshot(conn)
+        original = _inject(conn, when, substr, occ)
+        with pytest.raises(_Fault):
+            kb.set_task_status(conn, parent, "todo")
+        conn.execute = original
+        after = _snapshot(conn)
+        assert before == after, f"{row_id}: snapshot must be byte/row-value equal"
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Post-commit recompute failure rows (2/2 non-atomic boundary)
+# ---------------------------------------------------------------------------
+
+def test_PC01_update_ready_recompute_failure(kanban_home, monkeypatch):
+    conn = kb.connect()
+    try:
+        parent = _mk_task(conn, "p", "done")
+        tid = _mk_task(conn, "a", "todo")
+        kb.link_tasks(conn, parent, tid)
+
+        def boom(*a, **k):
+            raise _Fault("recompute boom")
+
+        monkeypatch.setattr(kb, "recompute_ready", boom)
+        with pytest.raises(_Fault):
+            kb.set_task_status(conn, tid, "ready")
+        # Controlled-writer commit is NOT undone by recompute failure.
+        assert _task(conn, tid)["status"] == "ready"
+        evs = [e for e in _events(conn, tid) if e["kind"] == "status"]
+        assert len(evs) == 1  # status event committed
+    finally:
+        conn.close()
+
+
+def test_PC02_bulk_ready_recompute_failure_continues(kanban_home, monkeypatch):
+    conn = kb.connect()
+    try:
+        p1 = _mk_task(conn, "p1", "done")
+        p2 = _mk_task(conn, "p2", "done")
+        first = _mk_task(conn, "first", "todo")
+        second = _mk_task(conn, "second", "todo")
+        kb.link_tasks(conn, p1, first)
+        kb.link_tasks(conn, p2, second)
+
+        calls = {"n": 0}
+        real = kb.recompute_ready
+
+        def flaky(conn_arg, *a, **k):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise _Fault("first recompute boom")
+            return real(conn_arg, *a, **k)
+
+        monkeypatch.setattr(kb, "recompute_ready", flaky)
+        with pytest.raises(_Fault):
+            kb.set_task_status(conn, first, "ready")
+        assert _task(conn, first)["status"] == "ready"  # first committed despite recompute failure
+        assert kb.set_task_status(conn, second, "ready") is True  # second independently succeeds
+        assert _task(conn, second)["status"] == "ready"
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Bulk partial rows (5/5 ordered partial-result semantics)
+# ---------------------------------------------------------------------------
+
+def test_B01_ordered_partial_status_results(kanban_home):
+    conn = kb.connect()
+    try:
+        ok_a = _mk_task(conn, "ok-a", "todo")
+        refused = _mk_task(conn, "refused", "todo")
+        blocker = _mk_task(conn, "blocker", "running")
+        kb.link_tasks(conn, blocker, refused)
+        ok_b = _mk_task(conn, "ok-b", "triage")
+
+        results = []
+        for tid in [ok_a, "t_missing", refused, ok_b]:
+            results.append(kb.set_task_status(conn, tid, "ready"))
+        assert results == [True, False, False, True]
+        assert _task(conn, ok_a)["status"] == "ready"
+        assert _task(conn, refused)["status"] == "todo"  # unchanged
+        assert _task(conn, ok_b)["status"] == "ready"
+    finally:
+        conn.close()
+
+
+def test_B02_precommit_failure_rolls_back_one_id_only(kanban_home, monkeypatch):
+    conn = kb.connect()
+    try:
+        faulted = _mk_task(conn, "faulted", "running")
+        _mk_run(conn, faulted)
+        healthy = _mk_task(conn, "healthy", "todo")
+        before_faulted = _snapshot(conn)
+
+        real = kb.set_task_status
+
+        def flaky(c, tid, status):
+            if tid == faulted:
+                # raise inside the controlled writer before commit
+                original = c.execute
+                def patched(sql, *a, **k):
+                    if "UPDATE tasks SET status = ?" in (sql if isinstance(sql, str) else str(sql)):
+                        raise _Fault("boom")
+                    return original(sql, *a, **k)
+                c.execute = patched
+                try:
+                    return real(c, tid, status)
+                finally:
+                    c.execute = original
+            return real(c, tid, status)
+
+        monkeypatch.setattr(kb, "set_task_status", flaky)
+        with pytest.raises(_Fault):
+            kb.set_task_status(conn, faulted, "ready")
+        # faulted id rolled back, healthy id still succeeds independently
+        assert kb.set_task_status(conn, healthy, "ready") is True
+        assert _task(conn, healthy)["status"] == "ready"
+        assert _task(conn, faulted)["status"] == "running"  # unchanged
+    finally:
+        conn.close()
+
+
+def test_B03_status_success_later_priority_failure(kanban_home, monkeypatch):
+    """Within one bulk id, a committed status survives a later priority fault."""
+    conn = kb.connect()
+    try:
+        tid = _mk_task(conn, "a", "todo")
+        real = kb.set_task_status
+
+        def status_then_boom(c, task_id, status):
+            ok = real(c, task_id, status)  # status commits
+            original = c.execute
+            def patched(sql, *a, **k):
+                if "UPDATE tasks SET priority" in (sql if isinstance(sql, str) else str(sql)):
+                    raise _Fault("priority boom")
+                return original(sql, *a, **k)
+            c.execute = patched
+            try:
+                with kb.write_txn(c):
+                    c.execute("UPDATE tasks SET priority = ? WHERE id = ?", (5, task_id))
+            finally:
+                c.execute = original
+            return ok
+
+        monkeypatch.setattr(kb, "set_task_status", status_then_boom)
+        with pytest.raises(_Fault):
+            kb.set_task_status(conn, tid, "ready")
+        assert _task(conn, tid)["status"] == "ready"  # status committed
+        assert _task(conn, tid)["priority"] != 5  # priority rollback
+    finally:
+        conn.close()
+
+
+def test_B04_status_refused_priority_still_applies(kanban_home):
+    conn = kb.connect()
+    try:
+        blocker = _mk_task(conn, "blocker", "running")
+        tid = _mk_task(conn, "a", "todo")
+        kb.link_tasks(conn, blocker, tid)
+        # status refused by non-done parent, but priority is independent
+        assert kb.set_task_status(conn, tid, "ready") is False
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET priority = ? WHERE id = ?", (7, tid))
+        assert _task(conn, tid)["status"] == "todo"  # unchanged
+        assert _task(conn, tid)["priority"] == 7  # priority applied
+    finally:
+        conn.close()
+
+
+def test_B05_duplicate_ids_are_separate_iterations(kanban_home):
+    conn = kb.connect()
+    try:
+        tid = _mk_task(conn, "a", "todo")
+        before = len([e for e in _events(conn, tid) if e["kind"] == "status"])
+        results = [kb.set_task_status(conn, tid, "todo"), kb.set_task_status(conn, tid, "todo")]
+        assert results == [True, True]
+        after = len([e for e in _events(conn, tid) if e["kind"] == "status"])
+        assert after == before + 2  # two status events, input not deduplicated
+    finally:
+        conn.close()
