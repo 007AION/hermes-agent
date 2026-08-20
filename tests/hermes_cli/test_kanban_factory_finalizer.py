@@ -691,4 +691,151 @@ def test_f3_fault_after_db_insert_before_event_no_residue_then_retries(
         assert _bound_receipt_doc(conn, t)["verdict"] == "OUTCOME_ACCEPTED"
         att_dir = kb.task_attachments_dir(t)
         assert len([p for p in att_dir.rglob("aion_monarch_receipt*.json") if p.is_file()]) == 1
+
+
+# ---------------------------------------------------------------------------
+# F4 — post-COMMIT/pre-promote promotion failure + hard-crash/restart (R3)
+# ---------------------------------------------------------------------------
+# The R2 audit reproduced that promoting the staged receipt only AFTER SQLite
+# COMMIT left authoritative done/sha/attachment/event state pointing at a
+# missing receipt (os.replace injected to fail), and ordinary retry died on a
+# terminal CAS miss. These tests prove the reorder: promotion now happens
+# BEFORE COMMIT, so a promotion failure rolls back to zero mutation with no
+# residue and a deterministic retry succeeds, and a hard crash in the narrow
+# promote->commit window leaves only an unreachable orphan (no DB reference)
+# that a restart recovers from cleanly.
+
+
+def test_f4_promotion_failure_rolls_back_no_residue_then_retries(
+    kanban_home, aion_gov_src, monkeypatch,
+):
+    """Promotion failure (os.replace raises on the staged file) must NOT commit
+    terminal state; the txn rolls back to zero mutation and retry is clean."""
+    real_replace = os.replace
+
+    def _fail_staged(src, dst):
+        if ".staging." in Path(src).name:
+            raise OSError("INJECTED_POST_COMMIT_PROMOTE_FAILURE")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", _fail_staged)
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn, title="factory task", factory_build_gate=1, assignee="agent007",
+        )
+        child = kb.create_task(conn, title="child", assignee="agent007", parents=[t])
+        run_id = _claim_and_run_id(conn, t)
+
+        with pytest.raises(OSError):
+            kb.complete_task(conn, t, result="done", expected_run_id=run_id)
+
+        _assert_zero_mutation_no_residue(conn, t, run_id)
+        # Child must not wake on a rolled-back completion.
+        assert kb.get_task(conn, child).status == "todo"
+
+        # Deterministic idempotent retry (fault cleared) succeeds.
+        monkeypatch.setattr(os, "replace", real_replace)
+        assert kb.complete_task(conn, t, result="done", expected_run_id=run_id)
+        assert kb.get_task(conn, t).status == "done"
+        assert _bound_receipt_doc(conn, t)["verdict"] == "OUTCOME_ACCEPTED"
+        assert kb.get_task(conn, child).status == "ready"
+        att_dir = kb.task_attachments_dir(t)
+        assert len([p for p in att_dir.rglob("aion_monarch_receipt*.json") if p.is_file()]) == 1
         assert [p for p in att_dir.rglob("*.staging.*")] == []
+
+
+_CRASH_CHILD_SCRIPT = r"""
+import os, sys
+from pathlib import Path
+sys.meta_path[:] = [
+    f for f in sys.meta_path
+    if "_Editable" not in repr(f) and "Editable" not in f.__class__.__name__
+]
+sys.path.insert(0, {candidate_repo!r})
+os.environ["HERMES_HOME"] = {hermes_home!r}
+os.environ["AION_GOVERNANCE_SOURCE_DIR"] = {aion_src!r}
+from hermes_cli import kanban_db as kb
+with kb.isolated_kanban_env(Path({worker_home!r})):
+    kb.init_db()
+    conn = kb.connect()
+    t = kb.create_task(conn, title="crash-window-task", assignee="agent007", factory_build_gate=1)
+    child = kb.create_task(conn, title="crash-child", assignee="agent007", parents=[t])
+    kb.claim_task(conn, t)
+    run_id = int(conn.execute("SELECT current_run_id FROM tasks WHERE id=?", (t,)).fetchone()[0])
+    real_replace = kb.os.replace
+    def crash_after_promote(src, dst):
+        if ".staging." in Path(src).name:
+            real_replace(src, dst)  # promotion succeeds ...
+            os._exit(99)            # ... then hard crash BEFORE COMMIT
+        return real_replace(src, dst)
+    kb.os.replace = crash_after_promote
+    kb.complete_task(conn, t, result="done", expected_run_id=run_id)
+    os._exit(0)
+"""
+
+
+def test_f4_hard_crash_restart_no_broken_terminal_state_recovers(
+    kanban_home, aion_gov_src, tmp_path,
+):
+    """A hard crash (os._exit) after promotion but before COMMIT must leave the
+    task running with no authoritative receipt/sha/attachment/event; only an
+    unreachable orphan final file (no DB reference). A restart then completes
+    deterministically and wakes the dependent child."""
+    candidate_file = Path(kb.__file__).resolve()
+    candidate_repo = candidate_file.parents[1]
+    worker_home = tmp_path / "crash_home"
+    script = _CRASH_CHILD_SCRIPT.format(
+        candidate_repo=str(candidate_repo),
+        hermes_home=str(Path(os.environ["HERMES_HOME"])),
+        aion_src=str(_aion_gov_source_dir()),
+        worker_home=str(worker_home),
+    )
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(candidate_repo) + os.pathsep + env.get("PYTHONPATH", "")
+    out = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True, text=True, timeout=120, env=env,
+    )
+    assert out.returncode == 99, f"expected crash exit 99, got {out.returncode}: {out.stderr}"
+
+    # Re-open the SAME isolated DB and assert zero authoritative terminal state.
+    with kb.isolated_kanban_env(worker_home):
+        conn = kb.connect(db_path=worker_home / "kanban.db")
+        t = conn.execute(
+            "SELECT id FROM tasks WHERE title = 'crash-window-task'"
+        ).fetchone()
+        child = conn.execute(
+            "SELECT id FROM tasks WHERE title = 'crash-child'"
+        ).fetchone()
+        assert t is not None and child is not None
+        tid, cid = t["id"], child["id"]
+
+        row = conn.execute(
+            "SELECT status, factory_terminal_receipt_sha256 FROM tasks WHERE id = ?",
+            (tid,),
+        ).fetchone()
+        assert row["status"] == "running"
+        assert row["factory_terminal_receipt_sha256"] is None
+        assert kb.list_attachments(conn, tid) == []
+        kinds = [e.kind for e in kb.list_events(conn, tid)]
+        assert "attached" not in kinds and "completed" not in kinds
+        att_dir = kb.task_attachments_dir(tid)
+        assert [p for p in att_dir.rglob("*.staging.*")] == []
+        # The only residue is an unreachable orphan final file with NO DB row.
+        orphan_files = [p for p in att_dir.rglob("aion_monarch_receipt*.json") if p.is_file()]
+        assert len(orphan_files) == 1
+        assert orphan_files[0].exists()
+
+        # Deterministic recovery: retry completes and wakes the child.
+        run_id = int(
+            conn.execute("SELECT current_run_id FROM tasks WHERE id = ?", (tid,)).fetchone()[0]
+        )
+        assert kb.complete_task(conn, tid, result="done", expected_run_id=run_id)
+        assert kb.get_task(conn, tid).status == "done"
+        assert _bound_receipt_doc(conn, tid)["verdict"] == "OUTCOME_ACCEPTED"
+        assert kb.get_task(conn, cid).status == "ready"
+        # Exactly one bound receipt attachment row, file present, no staging.
+        assert len(kb.list_attachments(conn, tid)) == 1
+        assert Path(kb.list_attachments(conn, tid)[0].stored_path).exists()
+        assert [p for p in att_dir.rglob("*.staging.*")] == []
+        conn.close()

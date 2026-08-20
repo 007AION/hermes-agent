@@ -3094,20 +3094,35 @@ def write_txn(conn: sqlite3.Connection):
         _aion_discard_staged_receipt_files(conn)
         raise
     else:
+        # AION-889 I1+I2 R3 (F4 repair): promote staged receipt files to their
+        # final paths BEFORE the transaction commits. The receipt attachment
+        # row records the FINAL path, so the file must already exist at that
+        # path when the terminal state becomes durable — otherwise a promotion
+        # failure or a hard crash in the post-COMMIT window would leave an
+        # authoritative done/sha/attachment/event state pointing at a missing
+        # receipt that ordinary retry can never heal (terminal CAS miss).
+        # Promoting first means any committed terminal state always has its
+        # receipt file present; a promotion failure (or a crash before COMMIT)
+        # leaves the transaction uncommitted, and a crash in the narrow
+        # promote→commit window can leave at most an unreachable, collision-free
+        # orphan final file with NO database reference — deterministic and
+        # retry-clean (the retry generates a fresh collision-free path).
         try:
+            _aion_promote_staged_receipt_files(conn)
             _execute_boundary_with_retry(conn, "COMMIT")
         except Exception:
-            # COMMIT exhausted retries with the txn still open; roll back so the
-            # connection isn't poisoned for the next BEGIN IMMEDIATE.
+            # Promotion or COMMIT failed while the txn is still (or already)
+            # open: roll back so the connection isn't poisoned for the next
+            # BEGIN IMMEDIATE, then unlink the just-promoted final files and
+            # any residual staging files so a failed commit never leaves residue.
             try:
                 conn.execute("ROLLBACK")
             except sqlite3.OperationalError:
+                # SQLite has already auto-rolled-back the transaction; nothing
+                # to undo — do not shadow the real exception.
                 pass
             _aion_discard_staged_receipt_files(conn)
             raise
-        # AION-889 I1+I2 R2 (F1): the transaction committed — atomically promote
-        # staged receipt files to their final paths (same-directory rename).
-        _aion_promote_staged_receipt_files(conn)
         # Post-commit file-length check: header page_count must match actual file pages.
         # A discrepancy means a torn-extend — raise now rather than silently corrupt.
         _check_file_length_invariant(conn)
@@ -5739,20 +5754,30 @@ def _load_pinned_aion_modules(task_id: str) -> tuple[Any, Any, Any]:
 
 
 # ---------------------------------------------------------------------------
-# AION-889 I1+I2 R2 — transaction-aware receipt-file staging (F1 repair)
+# AION-889 I1+I2 R2/R3 — transaction-aware receipt-file staging (F1 + F4 repair)
 # ---------------------------------------------------------------------------
 # The kernel-owned finalizer writes the receipt attachment to a STAGING path
 # inside the caller's ``write_txn``. The file is atomically promoted to its
-# final path only AFTER the transaction commits, and discarded on rollback.
-# This closes the R1 audit finding: a fault after the receipt file + DB
-# attachment INSERT but before the receipt-sha update used to leave an orphan
-# ``aion_monarch_receipt.json`` on disk after SQLite rolled back the row.
+# final path BEFORE the transaction commits (R3/F4), so any durable terminal
+# state always has its receipt file present. On rollback the staged AND
+# already-promoted files are unlinked, so a failed transaction leaves no
+# residue. This closes two audit findings:
+#   * R1/F1: a fault after the receipt file + DB attachment INSERT but before
+#     the receipt-sha update used to leave an orphan ``aion_monarch_receipt.json``
+#     on disk after SQLite rolled back the row.
+#   * R2/F4: promoting only AFTER COMMIT meant a promotion failure or a hard
+#     crash in that window committed authoritative done/sha/attachment/event
+#     state pointing at a missing receipt, and ordinary retry died on a
+#     terminal CAS miss.
 #
 # We do NOT claim cross-filesystem/SQLite atomicity: staging and final paths
 # share the same attachments directory (same filesystem), so ``os.replace`` is
-# an atomic rename. A hard crash after COMMIT but before promote can only leave
-# an unreachable ``.staging.*`` file, never a referenced receipt without a row.
+# an atomic rename. The residual crash window (after promote, before COMMIT)
+# can only leave an unreachable, collision-free orphan FINAL file with no DB
+# reference — deterministic and retry-clean, never a referenced receipt whose
+# file is missing.
 _AION_STAGED_RECEIPT_FILES: dict[int, list[tuple[Path, Path]]] = {}
+_AION_PROMOTED_RECEIPT_FILES: dict[int, list[Path]] = {}
 
 
 def _stage_receipt_file(
@@ -5761,8 +5786,9 @@ def _stage_receipt_file(
     """Write receipt bytes to a unique staging path; return the FINAL path.
 
     The ``(staging, final)`` pair is registered against ``id(conn)`` so the
-    transaction boundary (``write_txn``) can promote it on commit or discard
-    it on rollback. The final path is collision-free but NOT yet written.
+    transaction boundary (``write_txn``) can promote it before commit or
+    discard it on rollback. The final path is collision-free but NOT yet
+    written.
     """
     final_path = _collision_free_path(dest_dir, safe_name)
     staging_path = dest_dir / f".{safe_name}.staging.{os.getpid()}.{secrets.token_hex(6)}"
@@ -5774,7 +5800,13 @@ def _stage_receipt_file(
 
 
 def _aion_discard_staged_receipt_files(conn: sqlite3.Connection) -> None:
-    """Unlink any staged receipt files for ``conn`` (rollback path)."""
+    """Unlink any staged AND promoted receipt files for ``conn`` (rollback)."""
+    promoted = _AION_PROMOTED_RECEIPT_FILES.pop(id(conn), [])
+    for final_path in promoted:
+        try:
+            final_path.unlink(missing_ok=True)
+        except OSError:
+            pass
     entries = _AION_STAGED_RECEIPT_FILES.pop(id(conn), [])
     for staging_path, _final_path in entries:
         try:
@@ -5784,10 +5816,27 @@ def _aion_discard_staged_receipt_files(conn: sqlite3.Connection) -> None:
 
 
 def _aion_promote_staged_receipt_files(conn: sqlite3.Connection) -> None:
-    """Atomically rename staged receipt files to their final paths (commit)."""
+    """Atomically rename staged receipt files to their final paths (pre-commit).
+
+    Each promoted final path is tracked against ``id(conn)`` so the rollback
+    path (``write_txn`` exception) can unlink it again. A promotion failure
+    raises after re-promoting any remaining staged entries, so every file that
+    actually reached its final path is still accounted for by the rollback.
+    """
     entries = _AION_STAGED_RECEIPT_FILES.pop(id(conn), [])
-    for staging_path, final_path in entries:
-        os.replace(staging_path, final_path)
+    promoted = _AION_PROMOTED_RECEIPT_FILES.setdefault(id(conn), [])
+    attempted = 0
+    try:
+        for staging_path, final_path in entries:
+            os.replace(staging_path, final_path)
+            promoted.append(final_path)
+            attempted += 1
+    except Exception:
+        # The remaining, not-yet-promoted entries still have their staging bytes
+        # on disk. Re-register them so the rollback handler unlinks them (they
+        # are otherwise unreachable orphans — staged bytes without a reference).
+        _AION_STAGED_RECEIPT_FILES.setdefault(id(conn), []).extend(entries[attempted:])
+        raise
 
 
 def _run_kernel_finalizer(
