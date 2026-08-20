@@ -1097,3 +1097,146 @@ def test_f5_hard_crash_after_commit_restart_reconciles_dependent_wake(
         assert kb.complete_task(conn, tid, result="retry") is False
         assert Path(kb.list_attachments(conn, tid)[0].stored_path).exists()
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# F5-R6 — opaque (missing in_transaction) landed/non-landed COMMIT boundary
+# ---------------------------------------------------------------------------
+# The R5 audit (GemAION 4987252999) reproduced ``OPAQUE_LANDED_COMMIT_DELETES_
+# DURABLE_RECEIPT_AND_LOSES_IMMEDIATE_WAKE``: a connection proxy that HIDES
+# ``in_transaction`` but durably lands the COMMIT was collapsed to NOT-landed,
+# so the promoted receipt was deleted, the immediate dependent wake was lost,
+# and retry hit a terminal CAS miss. These tests prove the R6 tri-state
+# reconciliation (``_ambiguous_commit_landed``) handles BOTH opaque outcomes
+# authoritatively: landed preserves the receipt and reconciles terminal success;
+# non-landed leaves zero residue and re-raises the original OperationalError.
+
+
+class _OpaqueLandedProxy:
+    """Delegates to a real sqlite3.Connection but HIDES ``in_transaction`` and
+    durably lands the COMMIT before raising an OperationalError."""
+
+    def __init__(self, real):
+        self._real = real
+        self.armed = False
+        self.landed_then_raised = False
+
+    def __getattr__(self, name):
+        if name == "in_transaction":
+            raise AttributeError(name)
+        return getattr(self._real, name)
+
+    def execute(self, sql, *args):
+        normalized = " ".join(sql.strip().upper().split())
+        if normalized == "COMMIT" and self.armed and not self.landed_then_raised:
+            self._real.execute(sql, *args)  # durably land the transaction
+            self.landed_then_raised = True
+            raise sqlite3.OperationalError(
+                "injected opaque boundary: COMMIT landed before error"
+            )
+        return self._real.execute(sql, *args)
+
+
+class _OpaqueNonLandedProxy:
+    """Delegates to a real sqlite3.Connection but HIDES ``in_transaction`` and
+    raises on COMMIT WITHOUT landing (transaction stays open)."""
+
+    def __init__(self, real):
+        self._real = real
+        self.armed = False
+
+    def __getattr__(self, name):
+        if name == "in_transaction":
+            raise AttributeError(name)
+        return getattr(self._real, name)
+
+    def execute(self, sql, *args):
+        normalized = " ".join(sql.strip().upper().split())
+        if normalized == "COMMIT" and self.armed:
+            raise sqlite3.OperationalError(
+                "disk I/O error during commit (not landed)"
+            )
+        return self._real.execute(sql, *args)
+
+
+def test_f5_opaque_landed_commit_preserves_receipt_and_wakes_dependent(
+    kanban_home, aion_gov_src,
+):
+    """An opaque proxy hiding ``in_transaction`` that LANDS the COMMIT then
+    raises must be reconciled as landed: complete returns True, the promoted
+    receipt survives, and the child wakes immediately (no restart-only wake)."""
+    with kb.connect() as real:
+        conn = _OpaqueLandedProxy(real)
+        parent = kb.create_task(
+            conn, title="opaque-landed-parent", factory_build_gate=1,
+            assignee="agent007",
+        )
+        child = kb.create_task(
+            conn, title="opaque-landed-child", assignee="agent007",
+            parents=[parent],
+        )
+        run_id = _claim_and_run_id(conn, parent)
+        conn.armed = True
+
+        # Reconcile terminal success: no exception escapes, the durable state is
+        # preserved, and the dependent wake still runs (no restart).
+        assert kb.complete_task(conn, parent, result="done", expected_run_id=run_id)
+
+        row = conn.execute(
+            "SELECT status, factory_terminal_receipt_sha256 FROM tasks WHERE id = ?",
+            (parent,),
+        ).fetchone()
+        assert row["status"] == "done"
+        assert row["factory_terminal_receipt_sha256"]
+        atts = kb.list_attachments(conn, parent)
+        assert len(atts) == 1
+        assert Path(atts[0].stored_path).exists()  # trusted receipt preserved
+        assert "completed" in [e.kind for e in kb.list_events(conn, parent)]
+        assert kb.get_task(conn, child).status == "ready"  # immediate wake
+
+        # Idempotent retry/readback: no exception, no terminal CAS dead-end,
+        # receipt remains present.
+        assert kb.complete_task(conn, parent, result="retry", expected_run_id=run_id) is False
+        assert Path(kb.list_attachments(conn, parent)[0].stored_path).exists()
+
+
+def test_f5_opaque_nonlanded_commit_reraises_zero_residue_then_retries(
+    kanban_home, aion_gov_src,
+):
+    """An opaque proxy hiding ``in_transaction`` whose COMMIT did NOT land must
+    re-raise the original OperationalError, leave zero residue, and permit a
+    clean idempotent retry."""
+    with kb.connect() as real:
+        conn = _OpaqueNonLandedProxy(real)
+        parent = kb.create_task(
+            conn, title="opaque-noland-parent", factory_build_gate=1,
+            assignee="agent007",
+        )
+        child = kb.create_task(
+            conn, title="opaque-noland-child", assignee="agent007",
+            parents=[parent],
+        )
+        run_id = _claim_and_run_id(conn, parent)
+        conn.armed = True
+
+        with pytest.raises(sqlite3.OperationalError, match="not landed"):
+            kb.complete_task(conn, parent, result="done", expected_run_id=run_id)
+
+        # Zero mutation / zero residue.
+        assert kb.get_task(conn, parent).status == "running"
+        row = conn.execute(
+            "SELECT factory_terminal_receipt_sha256 FROM tasks WHERE id = ?",
+            (parent,),
+        ).fetchone()
+        assert row["factory_terminal_receipt_sha256"] is None
+        assert kb.list_attachments(conn, parent) == []
+        kinds = [e.kind for e in kb.list_events(conn, parent)]
+        assert "completed" not in kinds
+        assert kb.get_task(conn, child).status == "todo"
+
+        # Clean retry succeeds and wakes the dependent.
+        conn.armed = False
+        assert kb.complete_task(conn, parent, result="done", expected_run_id=run_id)
+        assert kb.get_task(conn, parent).status == "done"
+        assert kb.get_task(conn, child).status == "ready"
+        assert _bound_receipt_doc(conn, parent)["verdict"] == "OUTCOME_ACCEPTED"

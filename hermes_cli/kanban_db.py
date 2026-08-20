@@ -3065,6 +3065,59 @@ def _execute_boundary_with_retry(conn: sqlite3.Connection, sql: str) -> None:
             time.sleep(random.uniform(_BUSY_RETRY_MIN_S, _BUSY_RETRY_MAX_S))
 
 
+def _ambiguous_commit_landed(conn: sqlite3.Connection) -> bool:
+    """Authoritatively determine whether a raised COMMIT durably landed.
+
+    SQLite documents a commit-time I/O error as an indeterminate outcome: the
+    COMMIT MAY have durably landed. This helper resolves that ambiguity as a
+    TRI-STATE, never a boolean default that collapses an unknown outcome into a
+    false landed/non-landed claim:
+
+    * ``in_transaction`` is True  -> the transaction is still open, so the
+      COMMIT did NOT land. Roll back (best-effort) and return False; the caller
+      discards residue and re-raises the original error.
+    * ``in_transaction`` is False -> the transaction closed, so the COMMIT DID
+      land. Return True; the caller preserves the promoted receipt files and
+      treats the commit as complete.
+
+    When the connection does not expose ``in_transaction`` at all (an opaque
+    proxy/double), do NOT guess. Probe the real SQLite engine authoritatively by
+    attempting ROLLBACK on the same connection:
+
+    * ROLLBACK succeeds              -> the transaction was still open, so the
+      COMMIT did NOT land -> return False.
+    * ROLLBACK raises "no transaction is active" -> the transaction had already
+      closed, so the COMMIT DID land -> return True.
+    * ROLLBACK raises any other OperationalError -> cannot confirm landed, so
+      fail safe as NOT landed -> return False.
+
+    A real ``sqlite3.Connection`` always exposes ``in_transaction``; the probe
+    branch only ever applies to connection doubles/proxies that hide it.
+    """
+    try:
+        in_txn = conn.in_transaction
+    except AttributeError:
+        in_txn = None
+    if in_txn is True:
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.OperationalError:
+            # SQLite has already auto-rolled-back the transaction; nothing to
+            # undo — do not shadow the original exception.
+            pass
+        return False
+    if in_txn is False:
+        return True
+    # ``in_transaction`` unavailable (opaque proxy/double): authoritative probe.
+    try:
+        conn.execute("ROLLBACK")
+    except sqlite3.OperationalError as exc:
+        if "no transaction is active" in str(exc).lower():
+            return True
+        return False
+    return False
+
+
 @contextlib.contextmanager
 def write_txn(conn: sqlite3.Connection):
     """Context manager for an IMMEDIATE write transaction.
@@ -3128,24 +3181,19 @@ def write_txn(conn: sqlite3.Connection):
             #     files, drop only the in-memory bookkeeping, and treat the
             #     commit as complete so the caller's post-commit reconciliation
             #     (dependent wake, failure-counter reset, cleanup) still runs.
-            # AION-889 I1+I2 R5 (busy-retry contract): probe the transaction
-            # state fail-safe. A connection double/proxy that does not expose
-            # ``in_transaction`` (the established busy-retry test double) cannot
-            # prove the COMMIT landed. Treat that missing capability as "still
-            # in transaction" — the conservative, NOT-landed direction — so it
-            # ROLLBACKs, discards residue, and re-raises the original
-            # OperationalError instead of raising AttributeError or silently
-            # classifying a non-landed COMMIT as landed (which would strand
-            # durable rows pointing at an absent receipt). A real
-            # sqlite3.Connection always exposes ``in_transaction``, so the
-            # default only ever applies to connection doubles/proxies.
-            if getattr(conn, "in_transaction", True):
-                try:
-                    conn.execute("ROLLBACK")
-                except sqlite3.OperationalError:
-                    # SQLite has already auto-rolled-back the transaction;
-                    # nothing to undo — do not shadow the real exception.
-                    pass
+            # AION-889 I1+I2 R6 (opaque landed-COMMIT receipt loss): the R5
+            # fail-safe default ``getattr(conn, "in_transaction", True)``
+            # collapsed a MISSING transaction-state capability into a boolean
+            # NOT-landed claim. An opaque proxy that hides ``in_transaction``
+            # but durably landed the COMMIT was therefore misclassified: its
+            # promoted receipt file was deleted, immediate dependent wake was
+            # lost, and retry could not heal the terminal CAS miss.
+            # ``_ambiguous_commit_landed`` replaces that boolean default with an
+            # authoritative tri-state — the real ``in_transaction`` value when
+            # present, and an authoritative ROLLBACK probe ("no transaction is
+            # active" == landed) when it is not — so unknown is never collapsed
+            # into a false boolean claim.
+            if not _ambiguous_commit_landed(conn):
                 _aion_discard_staged_receipt_files(conn)
                 raise
             _aion_clear_receipt_tracking(conn)
