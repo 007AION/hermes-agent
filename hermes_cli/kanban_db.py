@@ -3128,7 +3128,18 @@ def write_txn(conn: sqlite3.Connection):
             #     files, drop only the in-memory bookkeeping, and treat the
             #     commit as complete so the caller's post-commit reconciliation
             #     (dependent wake, failure-counter reset, cleanup) still runs.
-            if conn.in_transaction:
+            # AION-889 I1+I2 R5 (busy-retry contract): probe the transaction
+            # state fail-safe. A connection double/proxy that does not expose
+            # ``in_transaction`` (the established busy-retry test double) cannot
+            # prove the COMMIT landed. Treat that missing capability as "still
+            # in transaction" — the conservative, NOT-landed direction — so it
+            # ROLLBACKs, discards residue, and re-raises the original
+            # OperationalError instead of raising AttributeError or silently
+            # classifying a non-landed COMMIT as landed (which would strand
+            # durable rows pointing at an absent receipt). A real
+            # sqlite3.Connection always exposes ``in_transaction``, so the
+            # default only ever applies to connection doubles/proxies.
+            if getattr(conn, "in_transaction", True):
                 try:
                     conn.execute("ROLLBACK")
                 except sqlite3.OperationalError:

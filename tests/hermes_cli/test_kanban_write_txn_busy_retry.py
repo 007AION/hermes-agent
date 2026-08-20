@@ -19,11 +19,17 @@ class _FakeConn:
 
     script maps an uppercased SQL prefix to a list of outcomes consumed in
     order. An outcome is either an Exception (raised) or None (success).
+
+    ``in_transaction`` mirrors a real sqlite3.Connection so write_txn's
+    ambiguous-COMMIT reconciliation can consult it: BEGIN IMMEDIATE opens the
+    transaction, a successful COMMIT/ROLLBACK closes it, and a COMMIT that
+    raises leaves it open (the commit did not land).
     """
 
     def __init__(self, script):
         self._script = {k: list(v) for k, v in script.items()}
         self.calls = []
+        self.in_transaction = False
 
     def execute(self, sql, *args):
         self.calls.append(sql)
@@ -33,6 +39,10 @@ class _FakeConn:
             outcome = outcomes.pop(0)
             if isinstance(outcome, Exception):
                 raise outcome
+        if key == "BEGIN":
+            self.in_transaction = True
+        elif key in ("COMMIT", "ROLLBACK"):
+            self.in_transaction = False
         return None
 
     def count(self, prefix):
@@ -117,6 +127,20 @@ def test_persistent_busy_at_commit_rolls_back():
     # Exhausted COMMIT leaves the txn open; write_txn must ROLLBACK before
     # re-raising so the connection isn't poisoned for the next transaction.
     conn = _FakeConn({"COMMIT": [_busy()] * 50})
+    with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+        with kb.write_txn(conn):
+            pass
+    assert conn.count("ROLLBACK") == 1
+
+
+def test_missing_in_transaction_capability_is_fail_safe_not_landed():
+    # A connection double/proxy that lacks ``in_transaction`` (an older or
+    # third-party contract) must not raise AttributeError and must not be
+    # silently classified as landed: write_txn treats the missing capability as
+    # "still in transaction", so the exhausted COMMIT still rolls back and
+    # re-raises the original sqlite3.OperationalError.
+    conn = _FakeConn({"COMMIT": [_busy()] * 50})
+    del conn.in_transaction
     with pytest.raises(sqlite3.OperationalError, match="database is locked"):
         with kb.write_txn(conn):
             pass
