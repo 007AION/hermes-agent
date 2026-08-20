@@ -1968,21 +1968,56 @@ class SessionDB:
     # Instead, we keep the SQLite timeout short (1s) and handle retries at the
     # application level with random jitter, which naturally staggers competing
     # writers and avoids the convoy.
-    _WRITE_MAX_RETRIES = 15
+    # Total wall-clock budget for acquiring the WAL write lock. This is the
+    # FAIL-CLOSED BACKSTOP for the remaining bounded writers, NOT the primary
+    # fix. The primary fix is below (_OPTIMIZE_EVERY_N_WRITES + _FTS_MERGE_
+    # SEGMENTS): the automatic write-path FTS maintenance is now a bounded
+    # `merge=N` (sub-second) instead of the full `optimize` (merge-all), which
+    # measured ~164.8s of held WAL write lock at 250K messages / 78K+225K FTS
+    # blocks (~24.5s unicode61 + ~140.4s trigram) and was the actual causal long
+    # writer in the gm2 Factory Director incident (2026-08-20). With that
+    # minutes-long writer eliminated, the remaining competing writers are all
+    # bounded and measured sub-second-to-low-seconds: `merge=N` (<50ms),
+    # compression lease refresh (single-row UPDATE), `archive_and_compact`
+    # (bounded compacted batch), dashboard `set_meta`, and capped session
+    # imports. A transcript append must survive those without silently dropping
+    # the turn, so the retry is bounded by TIME rather than a fixed attempt
+    # count: keep retrying (with jitter to break the convoy) until this budget
+    # is exhausted, then fail closed with an explicit error and zero partial
+    # rows. 30s is a ~hundredfold margin over the measured sub-second bounded
+    # writers, yet far below the minutes a full `optimize` would require — so
+    # the budget is never expected to be exhausted, and a genuinely stuck
+    # database fails closed within a turn instead of hanging the cron.
+    #
+    # A fixed 15-attempt budget at the 1s SQLite busy timeout totalled ~15s of
+    # wait. That was not enough for a 3GB+ state.db: on the gm2 Factory
+    # Director profile, a full FTS optimize held repeated
+    # "database is locked" -> session_persistence_failed -> lost cron
+    # transcript failures (execution ids 2f90559218494f2fa092b24824ccd4d0 and
+    # acc69c2afed54d02b260de7167c56b51, 2026-08-20).
+    _WRITE_LOCK_TIMEOUT_S = 30.0
     _WRITE_RETRY_MIN_S = 0.020   # 20ms
     _WRITE_RETRY_MAX_S = 0.150   # 150ms
     # Attempt a WAL checkpoint every N successful writes (PASSIVE mode).
     _CHECKPOINT_EVERY_N_WRITES = 50
     # Merge fragmented FTS5 segments every N successful writes. The message
-    # triggers append one segment per insert; left unmaintained these grow
-    # into tens of thousands of segments, so every MATCH must scan them all
-    # and every insert pays a growing automerge cost — which lengthens the
-    # write-lock hold time and starves competing writers (gateway + cron
-    # processes share one state.db), surfacing as "database is locked".
-    # 'optimize' is a no-op once the index is already merged, so an idle DB
-    # pays almost nothing; the cadence is deliberately coarse so the one-off
-    # merge cost is amortised far below the checkpoint cadence.
+    # triggers append one segment per insert; left unmaintained these
+    # accumulate so every MATCH must scan more segments and every insert pays
+    # a growing automerge cost. The maintenance must be BOUNDED, though: the
+    # full `optimize` (merge-all) command holds the WAL write lock for the
+    # entire index rewrite — measured ~24.5s for the unicode61 index and
+    # ~140.4s for the trigram index (~164.8s total) at 250K messages / 78K+225K FTS
+    # blocks — which starves every other process's transcript append into
+    # "database is locked" (gm2 Factory Director incident, 2026-08-20).
+    # Instead the cadence runs a bounded `merge=N` (see `_FTS_MERGE_SEGMENTS`)
+    # that holds the lock for milliseconds-to-seconds and defragments the
+    # index incrementally with no long blocking writer.
     _OPTIMIZE_EVERY_N_WRITES = 1000
+    # Max FTS5 segments merged per cadence tick (the `merge=N` special
+    # command). Bounded so the write-lock hold stays sub-second even on a
+    # multi-GB index (measured <0.02s at 21K+52K blocks), unlike the full
+    # `optimize` which is O(total index) and holds the lock for minutes.
+    _FTS_MERGE_SEGMENTS = 16
     # Session imports intentionally use a lower cap than exports: import holds
     # one BEGIN IMMEDIATE transaction, so bounded batches avoid starving live
     # gateway/CLI writers. The dashboard accepts one exported JSON/JSONL file
@@ -2492,10 +2527,17 @@ class SessionDB:
         random 20-150ms, and retry — breaking the convoy pattern that
         SQLite's built-in deterministic backoff creates.
 
+        Retries are bounded by WALL-CLOCK time (``_WRITE_LOCK_TIMEOUT_S``),
+        not a fixed attempt count: a competing writer (e.g. FTS5 automerge on
+        a large fragmented index) can hold the lock for many seconds, and a
+        transcript append must survive that rather than drop the turn. When
+        the budget is exhausted the write fails closed with an explicit error.
+
         Returns whatever *fn* returns.
         """
         last_err: Optional[Exception] = None
-        for attempt in range(self._WRITE_MAX_RETRIES):
+        deadline = time.monotonic() + self._WRITE_LOCK_TIMEOUT_S
+        while True:
             try:
                 with self._lock:
                     self._conn.execute("BEGIN IMMEDIATE")
@@ -2519,14 +2561,14 @@ class SessionDB:
                 err_msg = str(exc).lower()
                 if "locked" in err_msg or "busy" in err_msg:
                     last_err = exc
-                    if attempt < self._WRITE_MAX_RETRIES - 1:
+                    if time.monotonic() < deadline:
                         jitter = random.uniform(
                             self._WRITE_RETRY_MIN_S,
                             self._WRITE_RETRY_MAX_S,
                         )
                         time.sleep(jitter)
                         continue
-                # Non-lock error or retries exhausted — propagate.
+                # Non-lock error or budget exhausted — propagate.
                 raise
             except sqlite3.DatabaseError as exc:
                 # Corrupt FTS shadow tables make every write raise the
@@ -2541,9 +2583,12 @@ class SessionDB:
                 if not self._try_runtime_fts_rebuild(exc):
                     raise
                 continue
-        # Retries exhausted (shouldn't normally reach here).
+        # Unreachable: the loop only exits via ``return`` or ``raise``. The
+        # deadline guard above raises on the first "locked" error that lands
+        # past the budget, so a transcript append always resolves as either a
+        # committed write or an explicit, bounded failure (fail-closed).
         raise last_err or sqlite3.OperationalError(
-            "database is locked after max retries"
+            "database is locked after write-lock timeout"
         )
 
     @staticmethod
@@ -2642,18 +2687,23 @@ class SessionDB:
             logger.warning("WAL checkpoint (PASSIVE) failed: %s", exc)
 
     def _try_optimize_fts(self) -> None:
-        """Best-effort FTS5 segment merge. Never raises.
+        """Best-effort BOUNDED FTS5 segment merge. Never raises.
 
         Runs on the ``_OPTIMIZE_EVERY_N_WRITES`` cadence from the write hot
-        path (off the lock — ``optimize_fts`` re-acquires ``self._lock``
-        itself, mirroring ``_try_wal_checkpoint``). ``read_only`` connections
-        never reach the write path, so this is implicitly skipped for them.
-        Once the index is merged the 'optimize' command is close to free, so
-        the steady-state cost is negligible; the expensive case is only the
-        first merge of a long-neglected index.
+        path (off the lock — ``merge_fts`` re-acquires ``self._lock`` itself,
+        mirroring ``_try_wal_checkpoint``). ``read_only`` connections never
+        reach the write path, so this is implicitly skipped for them.
+
+        Uses a bounded ``merge=N`` (not the full ``optimize``): a full merge-
+        all on a fragmented multi-GB index holds the WAL write lock for the
+        entire index rewrite (measured ~24.5s main + ~140.4s trigram at 250K
+        messages), starving every other process's transcript append. A bounded
+        merge of ``_FTS_MERGE_SEGMENTS`` segments holds the lock for
+        milliseconds-to-seconds instead, defragmenting incrementally with no
+        long blocking writer.
         """
         try:
-            self.optimize_fts()
+            self.merge_fts(self._FTS_MERGE_SEGMENTS)
         except Exception:
             pass  # Best effort — never fatal.
 
@@ -10637,6 +10687,38 @@ class SessionDB:
             # e.g. a required tokenizer is missing or the table is mid-
             # teardown) — in every case the table is not queryable.
             return False
+
+    def merge_fts(self, n: Optional[int] = None) -> int:
+        """Merge a bounded number of FTS5 segments per index (incremental).
+
+        Unlike :meth:`optimize_fts` — which merges ALL segments into one and
+        holds the WAL write lock for the entire index rewrite (minutes on a
+        multi-GB fragmented index, starving concurrent transcript appends) —
+        this merges at most *n* segments per index per call via the FTS5
+        ``merge=N`` special command, bounding the write-lock hold to
+        milliseconds-to-seconds. This is the layout-only maintenance used on
+        the automatic write-path cadence; the full ``optimize`` stays available
+        for opt-in ``hermes db optimize`` / ``optimize_fts_storage``.
+
+        ``merge=N`` is a no-op once the index has fewer than N segments (and
+        on an empty index), so steady-state cost is negligible. Returns the
+        number of FTS indexes that were merged.
+        """
+        n = self._FTS_MERGE_SEGMENTS if n is None else int(n)
+        merged = 0
+        with self._lock:
+            for tbl in self._FTS_TABLES:
+                if not self._fts_table_exists(tbl):
+                    continue
+                try:
+                    # The 'merge' special command uses the (table, rank) form.
+                    self._conn.execute(
+                        f"INSERT INTO {tbl}({tbl}, rank) VALUES('merge', {n})"
+                    )
+                    merged += 1
+                except sqlite3.OperationalError as exc:
+                    logger.warning("FTS merge failed for %s: %s", tbl, exc)
+        return merged
 
     def optimize_fts(self) -> int:
         """Merge fragmented FTS5 b-tree segments into one per index.
