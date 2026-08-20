@@ -879,6 +879,97 @@ def _exited_status(code: int) -> int:
     return code << 8
 
 
+def _signaled_status(sig: int) -> int:
+    """Raw wait-status for a WIFSIGNALED child killed by ``sig``.
+
+    On POSIX ``os.waitpid`` returns the terminating signal number as the raw
+    status for a signal-killed child (``WIFSIGNALED`` reads the low 7 bits),
+    so the raw status IS the signal number.
+    """
+    return sig
+
+
+def test_detect_crashed_workers_unknown_exit_is_fail_closed(kanban_home, monkeypatch):
+    """A dead worker whose exit status was never reaped (``unknown`` kind) is
+    stamped with an explicit ``exit_kind == "unknown"`` in the ``crashed``
+    event and run metadata — the 'pid not alive' case must not collapse to a
+    generic crash with no exit attribution.
+
+    AION-RL2-CORE-01-R1 (canonical incident t_e690dcc1): run 2846 recorded
+    ``pid 405723 not alive`` with no ``exit_kind``, so the unknown exit reason
+    failed closed silently instead of explicitly.
+    """
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="unknown-exit", assignee="a")
+        pid = 424242
+        kb.claim_task(conn, tid, claimer=f"{host}:w0")
+        conn.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (pid, tid))
+        conn.commit()
+        # Deliberately no _record_worker_exit: the reap registry never saw
+        # this pid, so _classify_worker_exit returns ("unknown", None).
+
+        crashed = kb.detect_crashed_workers(conn)
+        assert tid in crashed
+
+        row = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id=? AND kind='crashed' ORDER BY id DESC LIMIT 1",
+            (tid,),
+        ).fetchone()
+        assert row is not None
+        payload = json.loads(row["payload"])
+        assert payload.get("exit_kind") == "unknown"
+        assert "exit_code" not in payload
+
+        meta = conn.execute(
+            "SELECT metadata FROM task_runs WHERE task_id=? "
+            "ORDER BY id DESC LIMIT 1",
+            (tid,),
+        ).fetchone()
+        assert meta is not None and meta["metadata"] is not None
+        run_meta = json.loads(meta["metadata"])
+        assert run_meta.get("exit_kind") == "unknown"
+
+
+def test_detect_crashed_workers_signaled_exit_attributable(kanban_home, monkeypatch):
+    """A worker killed by SIGKILL (signal 9) is attributed in the ``crashed``
+    event as ``exit_kind == "signaled"`` with ``exit_code == 9`` (the signal
+    number) — locking in the existing attribution for the run 2850 failure
+    mode (canonical incident t_e690dcc1)."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="sigkill-exit", assignee="a")
+        pid = 424243
+        kb.claim_task(conn, tid, claimer=f"{host}:w0")
+        conn.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (pid, tid))
+        conn.commit()
+        _kb._record_worker_exit(pid, _signaled_status(9))
+
+        crashed = kb.detect_crashed_workers(conn)
+        assert tid in crashed
+
+        row = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id=? AND kind='crashed' ORDER BY id DESC LIMIT 1",
+            (tid,),
+        ).fetchone()
+        assert row is not None
+        payload = json.loads(row["payload"])
+        assert payload.get("exit_kind") == "signaled"
+        assert payload.get("exit_code") == 9
+
+
 def test_classify_worker_exit_recognizes_rate_limit_sentinel(kanban_home):
     import hermes_cli.kanban_db as _kb
 

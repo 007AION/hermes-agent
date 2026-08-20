@@ -9363,9 +9363,17 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 else:
                     error_text = f"pid {pid} not alive"
                 event_kind = "crashed"
-                event_payload = {"pid": pid, "claimer": row["claim_lock"]}
-                if code is not None and kind != "unknown":
-                    event_payload["exit_kind"] = kind
+                event_payload = {
+                    "pid": pid,
+                    "claimer": row["claim_lock"],
+                    # Always stamp the exit kind so the failure reason is
+                    # attributable. ``unknown`` (worker died but the reap
+                    # registry never saw its status) must remain explicit and
+                    # fail-closed rather than collapsing to a bare crash with
+                    # no attribution. (AION-RL2-CORE-01-R1)
+                    "exit_kind": kind,
+                }
+                if code is not None:
                     event_payload["exit_code"] = code
 
             cur = conn.execute(
