@@ -44,13 +44,22 @@ from hermes_cli import kanban_db as kb
 
 @pytest.fixture
 def kanban_home(tmp_path, monkeypatch):
-    """Isolated HERMES_HOME with an empty kanban DB."""
+    """Isolated HERMES_HOME + fully rebound Native Kanban env pins.
+
+    Rebinds ``HERMES_KANBAN_*`` path pins and clears the board/worker pins via
+    :func:`kanban_db.isolated_kanban_env` so ``connect()`` and the
+    attachment/event/board paths can never resolve to the live aion-factory
+    board (the AION-RL2-CORE-01-R10 synthetic-residue class). Setting only
+    ``HERMES_HOME`` is insufficient: the dispatcher injects
+    ``HERMES_KANBAN_HOME`` / ``HERMES_KANBAN_BOARD`` with higher precedence.
+    """
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    kb.init_db()
-    return home
+    with kb.isolated_kanban_env(tmp_path):
+        kb.init_db()
+        yield home
 
 
 def _aion_gov_source_dir() -> Path | None:
@@ -454,18 +463,35 @@ import hashlib, json, os, sys
 from pathlib import Path
 os.environ["HERMES_HOME"] = {hermes_home!r}
 os.environ["AION_GOVERNANCE_SOURCE_DIR"] = {aion_src!r}
+# F2 repair: bind to the audited CANDIDATE bytes despite editable/user-site
+# import hooks. Strip every editable MetaPathFinder (setuptools _EditableFinder
+# et al.) so it cannot shadow the candidate package, then pin the candidate
+# repo to the head of sys.path BEFORE importing hermes_cli.kanban_db.
+sys.meta_path[:] = [
+    f for f in sys.meta_path
+    if "_Editable" not in repr(f) and "Editable" not in f.__class__.__name__
+]
+sys.path.insert(0, {candidate_repo!r})
 from hermes_cli import kanban_db as kb
 module_file = Path(kb.__file__).resolve()
 module_sha = hashlib.sha256(module_file.read_bytes()).hexdigest()
-conn = kb.connect(db_path=Path({db_path!r}))
-t = kb.create_task(conn, title="factory task", factory_build_gate=1, assignee="agent007")
-kb.claim_task(conn, t)
-row = conn.execute("SELECT current_run_id FROM tasks WHERE id=?", (t,)).fetchone()
-ok = kb.complete_task(conn, t, result="done", expected_run_id=int(row["current_run_id"]))
-final = conn.execute("SELECT status, factory_terminal_receipt_sha256 FROM tasks WHERE id=?", (t,)).fetchone()
-atts = kb.list_attachments(conn, t)
+candidate_file = Path({candidate_file!r}).resolve()
+path_matches_candidate = (module_file == candidate_file)
+# F2 containment: fully isolate the Native Kanban env so connect()/attachments/
+# events/claims resolve to the isolated root, never the live aion-factory board.
+with kb.isolated_kanban_env(Path({worker_home!r})):
+    conn = kb.connect(db_path=Path({db_path!r}))
+    t = kb.create_task(conn, title="factory task", factory_build_gate=1, assignee="agent007")
+    kb.claim_task(conn, t)
+    row = conn.execute("SELECT current_run_id FROM tasks WHERE id=?", (t,)).fetchone()
+    ok = kb.complete_task(conn, t, result="done", expected_run_id=int(row["current_run_id"]))
+    final = conn.execute("SELECT status, factory_terminal_receipt_sha256 FROM tasks WHERE id=?", (t,)).fetchone()
+    atts = kb.list_attachments(conn, t)
+    conn.close()
 print(json.dumps({{
     "module_file": str(module_file),
+    "candidate_file": str(candidate_file),
+    "path_matches_candidate": bool(path_matches_candidate),
     "module_sha256": module_sha,
     "has_guard": hasattr(kb, "FactoryTerminalReceiptRequiredError"),
     "complete_ok": bool(ok),
@@ -473,7 +499,6 @@ print(json.dumps({{
     "receipt_sha_present": bool(final["factory_terminal_receipt_sha256"]),
     "uploaded_by": [a.uploaded_by for a in atts],
 }}))
-conn.close()
 """
 
 
@@ -481,19 +506,25 @@ def test_t11_real_worker_subprocess_module_hash_and_finalizer(kanban_home, aion_
     """Launch a REAL worker subprocess: assert (a) its loaded kanban_db module
     sha256 equals the gateway's (this process's) module sha256 — the I1
     containment proof — (b) the receipt guard is present, and (c) the finalizer
-    path completes a gate=1 task. No live service is used (fresh tmp DB)."""
-    gateway_module_sha = hashlib.sha256(
-        Path(kb.__file__).resolve().read_bytes()
-    ).hexdigest()
+    path completes a gate=1 task. The child is pinned to the audited CANDIDATE
+    bytes despite editable/user-site import hooks (F2 repair). No live service
+    is used (fresh tmp DB)."""
+    candidate_file = Path(kb.__file__).resolve()
+    candidate_repo = candidate_file.parents[1]  # the hermes-agent checkout root
+    gateway_module_sha = hashlib.sha256(candidate_file.read_bytes()).hexdigest()
 
     db_path = tmp_path / "worker.db"
+    worker_home = tmp_path / "worker_home"
     script = _T11_WORKER_SCRIPT.format(
         hermes_home=str(Path(os.environ["HERMES_HOME"])),
         aion_src=str(_aion_gov_source_dir()),
         db_path=str(db_path),
+        worker_home=str(worker_home),
+        candidate_repo=str(candidate_repo),
+        candidate_file=str(candidate_file),
     )
     env = dict(os.environ)
-    env["PYTHONPATH"] = str(Path(kb.__file__).resolve().parents[1]) + os.pathsep + env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = str(candidate_repo) + os.pathsep + env.get("PYTHONPATH", "")
     out = subprocess.run(
         [sys.executable, "-c", script],
         capture_output=True, text=True, timeout=120, env=env,
@@ -501,6 +532,13 @@ def test_t11_real_worker_subprocess_module_hash_and_finalizer(kanban_home, aion_
     assert out.returncode == 0, f"worker subprocess failed:\n{out.stderr}"
     result = json.loads(out.stdout.strip().splitlines()[-1])
 
+    # F2 repair: the child must have loaded the exact CANDIDATE bytes despite
+    # editable/user-site import hooks — assert path AND module hash equality
+    # BEFORE trusting the behavioral results.
+    assert result["path_matches_candidate"] is True, (
+        f"child imported {result['module_file']!r}, expected candidate "
+        f"{result['candidate_file']!r} (editable/user-site hook not neutralised)"
+    )
     # I1 containment: worker and gateway load the SAME kanban_db bytes.
     assert result["module_sha256"] == gateway_module_sha
     assert result["has_guard"] is True
@@ -509,3 +547,148 @@ def test_t11_real_worker_subprocess_module_hash_and_finalizer(kanban_home, aion_
     assert result["status"] == "done"
     assert result["receipt_sha_present"] is True
     assert result["uploaded_by"] == ["aion_monarch_proof_kernel"]
+
+
+# ---------------------------------------------------------------------------
+# F3 — complete fault matrix: every transaction/file boundary + idempotent retry
+# ---------------------------------------------------------------------------
+# The R1 audit found only a pre-file-write fault was covered (T6); the omitted
+# post-file boundary (fault AFTER receipt file + DB attachment INSERT, BEFORE
+# receipt-sha update) left an orphan receipt file on SQLite rollback. These
+# tests close that gap: each boundary is faulted, the transaction rolls back to
+# zero mutation with NO on-disk residue, and a deterministic retry succeeds.
+# Boundaries: M1 terminal write (status CAS), M2 before file write,
+# M3 after file+DB insert before sha (the F1 boundary), M4 after DB insert
+# before the 'attached' event, M5 after sha before commit.
+
+
+def _receipt_residue_on_disk(conn, task_id) -> list[str]:
+    """Receipt + staging files under the task's attachments dir (must be empty)."""
+    att_dir = kb.task_attachments_dir(task_id)
+    if not att_dir.exists():
+        return []
+    out = []
+    for p in att_dir.rglob("*"):
+        if p.is_file() and (
+            "aion_monarch_receipt" in p.name or ".staging." in p.name
+        ):
+            out.append(str(p))
+    return out
+
+
+def _assert_zero_mutation_no_residue(conn, task_id, run_id) -> None:
+    assert kb.get_task(conn, task_id).status == "running"
+    row = conn.execute(
+        "SELECT factory_terminal_receipt_sha256 FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    assert row["factory_terminal_receipt_sha256"] is None
+    assert kb.list_attachments(conn, task_id) == []
+    kinds = [e.kind for e in kb.list_events(conn, task_id)]
+    assert "attached" not in kinds
+    assert "completed" not in kinds
+    # F1: no orphaned receipt or staging file may survive the rollback.
+    assert _receipt_residue_on_disk(conn, task_id) == []
+
+
+def _install_one_shot_binder_fault(monkeypatch, fault_kind):
+    """Monkeypatch the finalizer's pinned-module loader so the REAL binder
+    raises once at the named boundary, then delegates normally on retry."""
+    real_binder, real_kernel, real_adapters = kb._load_pinned_aion_modules("__fault__")
+    state = {"fired": False}
+
+    class _FaultyBinder:
+        def bind_task_terminal_in_txn(self, **kwargs):
+            if not state["fired"]:
+                state["fired"] = True
+                if fault_kind == "terminal_write":
+                    def _boom(*a, **k):
+                        raise RuntimeError("FAULT_AT_TERMINAL_WRITE")
+                    kwargs["terminal_write"] = _boom
+                elif fault_kind == "before_file":
+                    def _boom(*a, **k):
+                        raise RuntimeError("FAULT_BEFORE_FILE_WRITE")
+                    kwargs["store_attachment"] = _boom
+                elif fault_kind == "before_sha":
+                    def _boom(conn, task_id, sha):
+                        raise RuntimeError(
+                            "FAULT_AFTER_FILE_AND_DB_INSERT_BEFORE_SHA"
+                        )
+                    kwargs["set_factory_terminal_receipt_sha"] = _boom
+                elif fault_kind == "after_sha":
+                    real_binder.bind_task_terminal_in_txn(**kwargs)
+                    raise RuntimeError("FAULT_AFTER_SHA_BEFORE_COMMIT")
+            return real_binder.bind_task_terminal_in_txn(**kwargs)
+
+    monkeypatch.setattr(
+        kb, "_load_pinned_aion_modules",
+        lambda task_id: (_FaultyBinder(), real_kernel, real_adapters),
+    )
+
+
+@pytest.mark.parametrize(
+    "fault_kind",
+    ["terminal_write", "before_file", "before_sha", "after_sha"],
+)
+def test_f3_binder_boundary_fault_rolls_back_no_residue_then_retries(
+    kanban_home, aion_gov_src, monkeypatch, fault_kind,
+):
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn, title="factory task", factory_build_gate=1, assignee="agent007",
+        )
+        run_id = _claim_and_run_id(conn, t)
+
+        _install_one_shot_binder_fault(monkeypatch, fault_kind)
+        with pytest.raises(RuntimeError):
+            kb.complete_task(conn, t, result="done", expected_run_id=run_id)
+
+        _assert_zero_mutation_no_residue(conn, t, run_id)
+
+        # Deterministic idempotent retry (fault already fired once) succeeds.
+        assert kb.complete_task(conn, t, result="done", expected_run_id=run_id)
+        assert kb.get_task(conn, t).status == "done"
+        assert _bound_receipt_doc(conn, t)["verdict"] == "OUTCOME_ACCEPTED"
+        att_dir = kb.task_attachments_dir(t)
+        receipt_files = [
+            p for p in att_dir.rglob("aion_monarch_receipt*.json") if p.is_file()
+        ]
+        assert len(receipt_files) == 1
+        assert [p for p in att_dir.rglob("*.staging.*")] == []
+
+
+def test_f3_fault_after_db_insert_before_event_no_residue_then_retries(
+    kanban_home, aion_gov_src, monkeypatch,
+):
+    """M4: fault after the attachment row INSERT but before the 'attached' event.
+
+    The finalizer's _store_attachment writes the staged file, INSERTs the row,
+    then emits the 'attached' event. Faulting _append_event for that one call
+    proves the staged file is discarded and no row survives the rollback."""
+    orig_append = kb._append_event
+    state = {"fired": False}
+
+    def _one_shot_append(conn, task_id, kind, payload=None, **kwargs):
+        if kind == "attached" and not state["fired"]:
+            state["fired"] = True
+            raise RuntimeError("FAULT_AFTER_DB_INSERT_BEFORE_EVENT")
+        return orig_append(conn, task_id, kind, payload, **kwargs)
+
+    monkeypatch.setattr(kb, "_append_event", _one_shot_append)
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn, title="factory task", factory_build_gate=1, assignee="agent007",
+        )
+        run_id = _claim_and_run_id(conn, t)
+
+        with pytest.raises(RuntimeError):
+            kb.complete_task(conn, t, result="done", expected_run_id=run_id)
+
+        _assert_zero_mutation_no_residue(conn, t, run_id)
+
+        assert kb.complete_task(conn, t, result="done", expected_run_id=run_id)
+        assert kb.get_task(conn, t).status == "done"
+        assert _bound_receipt_doc(conn, t)["verdict"] == "OUTCOME_ACCEPTED"
+        att_dir = kb.task_attachments_dir(t)
+        assert len([p for p in att_dir.rglob("aion_monarch_receipt*.json") if p.is_file()]) == 1
+        assert [p for p in att_dir.rglob("*.staging.*")] == []

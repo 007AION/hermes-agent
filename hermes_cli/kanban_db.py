@@ -253,7 +253,7 @@ AION_GOVERNANCE_TYPED_ADAPTERS_SHA256 = (
     "fc36d5b6d9b0edf1148ab99e2288f02b960abb3a9ebfd6ea2ef0d4b7b494b092"
 )
 AION_GOVERNANCE_RECEIPT_BINDER_SHA256 = (
-    "a51c22e3cbfc08c50f3e9db7cd5be92f458645fbbabcef5c501b638f4b9cbf52"
+    "8099344b8d4b4096ca74e2dda885fcc070bc76108305b802c699cd94b8d4a937"
 )
 
 # Default candidate source directory for the pinned aion-governance modules
@@ -3089,6 +3089,9 @@ def write_txn(conn: sqlite3.Connection):
             # under EIO, lock contention, or corruption). Nothing to undo;
             # do not let this secondary failure shadow the real one.
             pass
+        # AION-889 I1+I2 R2 (F1): discard staged receipt files so a SQLite
+        # rollback never leaves an orphaned receipt on disk.
+        _aion_discard_staged_receipt_files(conn)
         raise
     else:
         try:
@@ -3100,7 +3103,11 @@ def write_txn(conn: sqlite3.Connection):
                 conn.execute("ROLLBACK")
             except sqlite3.OperationalError:
                 pass
+            _aion_discard_staged_receipt_files(conn)
             raise
+        # AION-889 I1+I2 R2 (F1): the transaction committed — atomically promote
+        # staged receipt files to their final paths (same-directory rename).
+        _aion_promote_staged_receipt_files(conn)
         # Post-commit file-length check: header page_count must match actual file pages.
         # A discrepancy means a torn-extend — raise now rather than silently corrupt.
         _check_file_length_invariant(conn)
@@ -5731,6 +5738,58 @@ def _load_pinned_aion_modules(task_id: str) -> tuple[Any, Any, Any]:
     return binder, kernel, adapters
 
 
+# ---------------------------------------------------------------------------
+# AION-889 I1+I2 R2 — transaction-aware receipt-file staging (F1 repair)
+# ---------------------------------------------------------------------------
+# The kernel-owned finalizer writes the receipt attachment to a STAGING path
+# inside the caller's ``write_txn``. The file is atomically promoted to its
+# final path only AFTER the transaction commits, and discarded on rollback.
+# This closes the R1 audit finding: a fault after the receipt file + DB
+# attachment INSERT but before the receipt-sha update used to leave an orphan
+# ``aion_monarch_receipt.json`` on disk after SQLite rolled back the row.
+#
+# We do NOT claim cross-filesystem/SQLite atomicity: staging and final paths
+# share the same attachments directory (same filesystem), so ``os.replace`` is
+# an atomic rename. A hard crash after COMMIT but before promote can only leave
+# an unreachable ``.staging.*`` file, never a referenced receipt without a row.
+_AION_STAGED_RECEIPT_FILES: dict[int, list[tuple[Path, Path]]] = {}
+
+
+def _stage_receipt_file(
+    dest_dir: Path, safe_name: str, data: bytes, conn: sqlite3.Connection,
+) -> Path:
+    """Write receipt bytes to a unique staging path; return the FINAL path.
+
+    The ``(staging, final)`` pair is registered against ``id(conn)`` so the
+    transaction boundary (``write_txn``) can promote it on commit or discard
+    it on rollback. The final path is collision-free but NOT yet written.
+    """
+    final_path = _collision_free_path(dest_dir, safe_name)
+    staging_path = dest_dir / f".{safe_name}.staging.{os.getpid()}.{secrets.token_hex(6)}"
+    staging_path.write_bytes(data)
+    _AION_STAGED_RECEIPT_FILES.setdefault(id(conn), []).append(
+        (staging_path, final_path)
+    )
+    return final_path
+
+
+def _aion_discard_staged_receipt_files(conn: sqlite3.Connection) -> None:
+    """Unlink any staged receipt files for ``conn`` (rollback path)."""
+    entries = _AION_STAGED_RECEIPT_FILES.pop(id(conn), [])
+    for staging_path, _final_path in entries:
+        try:
+            staging_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _aion_promote_staged_receipt_files(conn: sqlite3.Connection) -> None:
+    """Atomically rename staged receipt files to their final paths (commit)."""
+    entries = _AION_STAGED_RECEIPT_FILES.pop(id(conn), [])
+    for staging_path, final_path in entries:
+        os.replace(staging_path, final_path)
+
+
 def _run_kernel_finalizer(
     conn: sqlite3.Connection, task_id: str, run_id: str, *, board: str,
     result: Optional[str] = None,
@@ -5779,8 +5838,10 @@ def _run_kernel_finalizer(
         safe_name = _safe_attachment_name(filename)
         dest_dir = task_attachments_dir(tid, board=board)
         dest_dir.mkdir(parents=True, exist_ok=True)
-        dest_path = _collision_free_path(dest_dir, safe_name)
-        dest_path.write_bytes(data)
+        # Transaction-aware: stage the file; the write_txn boundary promotes it
+        # on commit and discards it on rollback (F1 repair). The DB row records
+        # the FINAL path so readback resolves it once the txn commits.
+        final_path = _stage_receipt_file(dest_dir, safe_name, data, c)
         try:
             if not c.execute("SELECT 1 FROM tasks WHERE id = ?", (tid,)).fetchone():
                 raise ValueError(f"unknown task {tid}")
@@ -5790,7 +5851,7 @@ def _run_kernel_finalizer(
                 "(task_id, filename, stored_path, content_type, size, "
                 " uploaded_by, created_at) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (tid, safe_name, str(dest_path.resolve()), None, len(data),
+                (tid, safe_name, str(final_path.resolve()), None, len(data),
                  uploaded_by, now),
             )
             _append_event(
@@ -5799,10 +5860,9 @@ def _run_kernel_finalizer(
             )
             return int(cur.lastrowid or 0)
         except Exception:
-            try:
-                dest_path.unlink(missing_ok=True)
-            except OSError:
-                pass
+            # Discard the staged file for this connection so neither a later
+            # rollback nor a direct (non-write_txn) call can orphan it.
+            _aion_discard_staged_receipt_files(c)
             raise
 
     def _set_sha(c: sqlite3.Connection, tid: str, sha: str) -> str:
