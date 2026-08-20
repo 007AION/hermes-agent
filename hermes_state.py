@@ -1968,7 +1968,22 @@ class SessionDB:
     # Instead, we keep the SQLite timeout short (1s) and handle retries at the
     # application level with random jitter, which naturally staggers competing
     # writers and avoids the convoy.
-    _WRITE_MAX_RETRIES = 15
+    # Total wall-clock budget for acquiring the WAL write lock. A competing
+    # writer — most commonly another process's FTS5 automerge over a
+    # multi-gigabyte, fragmented index (see _OPTIMIZE_EVERY_N_WRITES), a
+    # bounded session import, or a dashboard write — can hold the lock for
+    # many seconds. A transcript append must survive that wait without
+    # silently dropping the turn, so the retry is bounded by TIME rather than
+    # a fixed attempt count: keep retrying (with jitter to break the convoy)
+    # until this budget is exhausted, then fail closed with an explicit error.
+    #
+    # A fixed 15-attempt budget at the 1s SQLite busy timeout totalled ~15s of
+    # wait. That is not enough for a 3GB+ state.db: on the gm2 Factory
+    # Director profile, multi-second FTS automerge holds repeated
+    # "database is locked" -> session_persistence_failed -> lost cron
+    # transcript failures (execution ids 2f90559218494f2fa092b24824ccd4d0 and
+    # acc69c2afed54d02b260de7167c56b51, 2026-08-20).
+    _WRITE_LOCK_TIMEOUT_S = 30.0
     _WRITE_RETRY_MIN_S = 0.020   # 20ms
     _WRITE_RETRY_MAX_S = 0.150   # 150ms
     # Attempt a WAL checkpoint every N successful writes (PASSIVE mode).
@@ -2492,10 +2507,17 @@ class SessionDB:
         random 20-150ms, and retry — breaking the convoy pattern that
         SQLite's built-in deterministic backoff creates.
 
+        Retries are bounded by WALL-CLOCK time (``_WRITE_LOCK_TIMEOUT_S``),
+        not a fixed attempt count: a competing writer (e.g. FTS5 automerge on
+        a large fragmented index) can hold the lock for many seconds, and a
+        transcript append must survive that rather than drop the turn. When
+        the budget is exhausted the write fails closed with an explicit error.
+
         Returns whatever *fn* returns.
         """
         last_err: Optional[Exception] = None
-        for attempt in range(self._WRITE_MAX_RETRIES):
+        deadline = time.monotonic() + self._WRITE_LOCK_TIMEOUT_S
+        while True:
             try:
                 with self._lock:
                     self._conn.execute("BEGIN IMMEDIATE")
@@ -2519,14 +2541,14 @@ class SessionDB:
                 err_msg = str(exc).lower()
                 if "locked" in err_msg or "busy" in err_msg:
                     last_err = exc
-                    if attempt < self._WRITE_MAX_RETRIES - 1:
+                    if time.monotonic() < deadline:
                         jitter = random.uniform(
                             self._WRITE_RETRY_MIN_S,
                             self._WRITE_RETRY_MAX_S,
                         )
                         time.sleep(jitter)
                         continue
-                # Non-lock error or retries exhausted — propagate.
+                # Non-lock error or budget exhausted — propagate.
                 raise
             except sqlite3.DatabaseError as exc:
                 # Corrupt FTS shadow tables make every write raise the
@@ -2541,9 +2563,12 @@ class SessionDB:
                 if not self._try_runtime_fts_rebuild(exc):
                     raise
                 continue
-        # Retries exhausted (shouldn't normally reach here).
+        # Unreachable: the loop only exits via ``return`` or ``raise``. The
+        # deadline guard above raises on the first "locked" error that lands
+        # past the budget, so a transcript append always resolves as either a
+        # committed write or an explicit, bounded failure (fail-closed).
         raise last_err or sqlite3.OperationalError(
-            "database is locked after max retries"
+            "database is locked after write-lock timeout"
         )
 
     @staticmethod

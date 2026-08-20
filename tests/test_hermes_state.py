@@ -5322,15 +5322,16 @@ class TestConcurrentWriteSafety:
         assert msgs[0]["content"] == "hello after lock"
 
     def test_sqlite_timeout_is_at_least_30s(self, db):
-        """Connection timeout should be >= 30s to survive CLI/gateway contention."""
-        # Access the underlying connection timeout via sqlite3 introspection.
-        # There is no public API, so we check the kwarg via the module default.
-        import inspect
+        """The write-lock wait budget must be >= 30s to survive a competing
+        writer's multi-second FTS5 automerge on a multi-GB state.db.
+
+        Regression for the gm2 Factory Director incident where a fixed
+        15-attempt budget (~15s) was exhausted by another process's automerge,
+        surfacing as ``database is locked`` -> ``session_persistence_failed``
+        and a lost cron transcript.
+        """
         from hermes_state import SessionDB as _SessionDB
-        src = inspect.getsource(_SessionDB.__init__)
-        assert "30" in src, (
-            "SQLite timeout should be at least 30s to handle CLI/gateway lock contention"
-        )
+        assert _SessionDB._WRITE_LOCK_TIMEOUT_S >= 30.0
 
 
 # =========================================================================
