@@ -2,15 +2,21 @@
 
 Regression for the gm2 Factory Director incident (AION-SHARED-INFRA-
 GM2-STATE-DB-LOCK-FD-CRON-R1): with a 3GB+ state.db and a fragmented FTS5
-index, another process's FTS5 automerge holds the WAL write lock for many
-seconds. The previous ``_execute_write`` retried a FIXED 15 attempts (~15s of
-total wait), so a cron transcript append exhausted its budget and failed
-``database is locked`` -> ``session_persistence_failed`` -> the turn's
-transcript was lost.
+index, another process's full FTS5 ``optimize`` (automerge) held the WAL write
+lock for minutes (measured ~24.5s unicode61 + ~140.4s trigram = ~164.8s at 250K
+messages / 78K+225K FTS blocks). The previous ``_execute_write`` retried a
+FIXED 15 attempts (~15s of total wait), so a cron transcript append exhausted
+its budget and failed ``database is locked`` -> ``session_persistence_failed``
+-> the turn's transcript was lost.
 
-The fix bounds the retry by WALL-CLOCK time (``_WRITE_LOCK_TIMEOUT_S``) so an
-append waits out a legitimate competing writer, while still failing closed
-with an explicit ``sqlite3.OperationalError`` when the budget is exhausted.
+The repair has two parts:
+
+1. The automatic write-path FTS maintenance is now BOUNDED (``merge=N`` via
+   :meth:`SessionDB.merge_fts`, sub-second) instead of the full ``optimize``
+   (minutes), so no long writer starves a transcript append.
+2. The retry is bounded by WALL-CLOCK time (``_WRITE_LOCK_TIMEOUT_S``) so an
+   append waits out a legitimate competing writer, while still failing closed
+   with an explicit ``sqlite3.OperationalError`` when the budget is exhausted.
 """
 
 import sqlite3
@@ -219,3 +225,62 @@ class TestWriteLockContention:
         finally:
             a.close()
             b.close()
+
+
+class TestFtsMaintenanceWriterContention:
+    """The ACTUAL causal writer is the FTS5 merge/optimize maintenance, not a
+    bare ``BEGIN IMMEDIATE``. These tests contend a transcript append against
+    the real FTS5 maintenance writer (the bounded ``merge_fts`` the cadence
+    now runs), proving the write path no longer starves appends the way the
+    old full ``optimize`` did."""
+
+    def test_append_survives_competing_real_merge_fts(self, tmp_path):
+        """A transcript append contends with the real FTS5 merge writer and
+        still lands exactly once (no drop, no duplicate)."""
+        db_path = tmp_path / "state.db"
+        d = SessionDB(db_path=db_path)
+        try:
+            d.create_session("s1", source="test")
+            for i in range(200):
+                d.append_message("s1", "user", f"seed needle token {i} alpha bravo")
+            d._conn.execute("PRAGMA busy_timeout=40")
+            d._WRITE_LOCK_TIMEOUT_S = 5.0
+
+            # Competing writer = the actual FTS5 bounded merge (the cadence's
+            # writer), driven from a second SessionDB on the same file.
+            other = SessionDB(db_path=db_path)
+            other._conn.execute("PRAGMA busy_timeout=40")
+            other._WRITE_LOCK_TIMEOUT_S = 5.0
+
+            def _merge_writer():
+                for _ in range(10):
+                    other.merge_fts(16)
+
+            t = threading.Thread(target=_merge_writer)
+            t.start()
+            msg_id = d.append_message("s1", "user", "survives real fts merge")
+            t.join(timeout=10)
+
+            assert msg_id is not None
+            contents = [m["content"] for m in d.get_messages("s1")]
+            assert contents.count("survives real fts merge") == 1
+        finally:
+            d.close()
+
+    def test_bounded_merge_does_not_block_append_long(self, tmp_path):
+        """The bounded merge writer (merge_fts) returns in sub-second time and
+        never holds the write lock long enough to exhaust the retry budget."""
+        db_path = tmp_path / "state.db"
+        d = SessionDB(db_path=db_path)
+        try:
+            d.create_session("s1", source="test")
+            for i in range(200):
+                d.append_message("s1", "user", f"seed needle token {i} alpha bravo")
+            started = time.monotonic()
+            n = d.merge_fts(16)
+            elapsed = time.monotonic() - started
+            assert n == 2
+            # Bounded: far below the 30s budget even on a fragmented index.
+            assert elapsed < 5.0, elapsed
+        finally:
+            d.close()

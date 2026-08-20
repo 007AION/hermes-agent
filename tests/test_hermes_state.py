@@ -5322,13 +5322,17 @@ class TestConcurrentWriteSafety:
         assert msgs[0]["content"] == "hello after lock"
 
     def test_sqlite_timeout_is_at_least_30s(self, db):
-        """The write-lock wait budget must be >= 30s to survive a competing
-        writer's multi-second FTS5 automerge on a multi-GB state.db.
+        """The write-lock wait budget is a wall-clock deadline, not a fixed
+        attempt count, and must stay >= 30s as a fail-closed safety net.
 
-        Regression for the gm2 Factory Director incident where a fixed
-        15-attempt budget (~15s) was exhausted by another process's automerge,
-        surfacing as ``database is locked`` -> ``session_persistence_failed``
-        and a lost cron transcript.
+        Regression for the gm2 Factory Director incident (2026-08-20): a
+        fixed 15-attempt budget (~15s) was exhausted while another process ran
+        a full FTS5 `optimize` over a fragmented multi-GB index — measured
+        ~164.8s of held WAL write lock (~24.5s unicode61 + ~140.4s trigram) at 250K
+        messages / 78K+225K FTS blocks. The repair makes the write-path FTS
+        maintenance bounded (`merge=N`, sub-second) so no long writer starves
+        appends; the wall-clock budget remains as a bounded, explicit,
+        fail-closed backstop.
         """
         from hermes_state import SessionDB as _SessionDB
         assert _SessionDB._WRITE_LOCK_TIMEOUT_S >= 30.0
@@ -5419,19 +5423,54 @@ class TestOptimizeFts:
         # Search still works after repeated optimization.
         assert len(db.search_messages("repeat")) == 1
 
-    def test_write_path_optimizes_fts_on_cadence(self, db, monkeypatch):
-        """Writes periodically merge FTS segments so they never accumulate
-        into the tens-of-thousands that lengthen the write-lock hold and
-        starve competing writers ("database is locked")."""
+    def test_merge_fts_bounded_and_layout_only(self, db):
+        """merge_fts (bounded merge) returns the index count and, like
+        optimize, is layout-only: MATCH results + snippets are unchanged."""
+        db.create_session(session_id="s1", source="cli")
+        for i in range(50):
+            db.append_message(
+                session_id="s1", role="user",
+                content=f"needle alpha bravo charlie message {i}",
+            )
+        before = db.search_messages("needle")
+        n = db.merge_fts(16)
+        assert n == 2
+        after = db.search_messages("needle")
+        assert [r["id"] for r in after] == [r["id"] for r in before]
+        assert [r["snippet"] for r in after] == [r["snippet"] for r in before]
+
+    def test_merge_fts_respects_explicit_n(self, db, monkeypatch):
+        """merge_fts forwards the caller's segment count to the FTS5 command."""
+        db.create_session(session_id="s1", source="cli")
+        db.append_message(session_id="s1", role="user", content="hi")
+        seen = []
+        orig = db._conn.execute
+
+        def _spy(sql, *a):
+            if "merge" in sql:
+                seen.append(sql)
+            return orig(sql, *a)
+
+        monkeypatch.setattr(db._conn, "execute", _spy)
+        db.merge_fts(4)
+        assert any("'merge', 4" in s for s in seen), seen
+
+    def test_write_path_merges_fts_bounded_on_cadence(self, db, monkeypatch):
+        """Writes periodically run a BOUNDED FTS merge (not the full optimize).
+
+        The cadence keeps FTS segments defragmented with a `merge=N` that
+        holds the WAL write lock for milliseconds-to-seconds, so a transcript
+        append is never starved by a minutes-long full `optimize` (the gm2
+        Factory Director incident)."""
         db._OPTIMIZE_EVERY_N_WRITES = 5
         calls = {"n": 0}
-        real_optimize = db.optimize_fts
+        real_merge = db.merge_fts
 
-        def _counting_optimize():
+        def _counting_merge(*a, **k):
             calls["n"] += 1
-            return real_optimize()
+            return real_merge(*a, **k)
 
-        monkeypatch.setattr(db, "optimize_fts", _counting_optimize)
+        monkeypatch.setattr(db, "merge_fts", _counting_merge)
         # create_session is write #1; appends are #2.. -> #5 and #10 trigger.
         db.create_session(session_id="s1", source="cli")
         for i in range(9):
@@ -5440,14 +5479,14 @@ class TestOptimizeFts:
         # The auto-merge is layout-only: search is unaffected.
         assert len(db.search_messages("needle")) == 9
 
-    def test_write_path_optimize_failure_never_breaks_write(self, db, monkeypatch):
-        """A failing periodic optimize must not fail the surrounding write."""
+    def test_write_path_merge_failure_never_breaks_write(self, db, monkeypatch):
+        """A failing periodic merge must not fail the surrounding write."""
         db._OPTIMIZE_EVERY_N_WRITES = 2
 
-        def _boom():
-            raise sqlite3.OperationalError("simulated optimize failure")
+        def _boom(*a, **k):
+            raise sqlite3.OperationalError("simulated merge failure")
 
-        monkeypatch.setattr(db, "optimize_fts", _boom)
+        monkeypatch.setattr(db, "merge_fts", _boom)
         db.create_session(session_id="s1", source="cli")  # write #1
         # write #2 trips the cadence; the swallowed failure must not propagate.
         db.append_message(session_id="s1", role="user", content="still persists")
