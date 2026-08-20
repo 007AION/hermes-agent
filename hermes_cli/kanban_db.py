@@ -3111,21 +3111,41 @@ def write_txn(conn: sqlite3.Connection):
             _aion_promote_staged_receipt_files(conn)
             _execute_boundary_with_retry(conn, "COMMIT")
         except Exception:
-            # Promotion or COMMIT failed while the txn is still (or already)
-            # open: roll back so the connection isn't poisoned for the next
-            # BEGIN IMMEDIATE, then unlink the just-promoted final files and
-            # any residual staging files so a failed commit never leaves residue.
-            try:
-                conn.execute("ROLLBACK")
-            except sqlite3.OperationalError:
-                # SQLite has already auto-rolled-back the transaction; nothing
-                # to undo — do not shadow the real exception.
-                pass
-            _aion_discard_staged_receipt_files(conn)
-            raise
+            # AION-889 I1+I2 R4 (F5 repair): reconcile the ambiguous COMMIT
+            # outcome instead of blindly assuming rollback. SQLite documents a
+            # commit-time I/O error as an indeterminate outcome — the
+            # transaction MAY have durably landed. The authoritative signal is
+            # the connection's own transaction state (``in_transaction``):
+            #   * still in_transaction -> the COMMIT did NOT land; the writes
+            #     are not durable, so ROLLBACK truly undoes them. Discard the
+            #     staged AND promoted receipt files (zero residue) and re-raise
+            #     so a clean idempotent retry can regenerate them.
+            #   * no longer in_transaction -> the COMMIT DID durably land even
+            #     though the boundary raised. The terminal rows already
+            #     reference the promoted receipt files; discarding them would
+            #     strand a durable done/sha/attachment/event state pointing at
+            #     an absent receipt (the terminal CAS dead-end). Preserve the
+            #     files, drop only the in-memory bookkeeping, and treat the
+            #     commit as complete so the caller's post-commit reconciliation
+            #     (dependent wake, failure-counter reset, cleanup) still runs.
+            if conn.in_transaction:
+                try:
+                    conn.execute("ROLLBACK")
+                except sqlite3.OperationalError:
+                    # SQLite has already auto-rolled-back the transaction;
+                    # nothing to undo — do not shadow the real exception.
+                    pass
+                _aion_discard_staged_receipt_files(conn)
+                raise
+            _aion_clear_receipt_tracking(conn)
         # Post-commit file-length check: header page_count must match actual file pages.
         # A discrepancy means a torn-extend — raise now rather than silently corrupt.
         _check_file_length_invariant(conn)
+        # Successful commit: the promoted receipt files are now durably owned
+        # by the database. Drop the in-memory staging/promotion bookkeeping so
+        # a later rollback on this same connection can never unlink a receipt
+        # that an earlier committed transaction still references.
+        _aion_clear_receipt_tracking(conn)
 
 
 # ---------------------------------------------------------------------------
@@ -5813,6 +5833,19 @@ def _aion_discard_staged_receipt_files(conn: sqlite3.Connection) -> None:
             staging_path.unlink(missing_ok=True)
         except OSError:
             pass
+
+
+def _aion_clear_receipt_tracking(conn: sqlite3.Connection) -> None:
+    """Drop in-memory staging/promotion bookkeeping WITHOUT unlinking files.
+
+    Used when the COMMIT has durably landed (either the normal success path or
+    the ambiguous-COMMIT path): the promoted receipt files are now referenced
+    by durable terminal rows and must NOT be unlinked. Only the process-local
+    tracking maps are cleared, so a later rollback on this same connection can
+    never unlink a receipt an earlier committed transaction still references.
+    """
+    _AION_PROMOTED_RECEIPT_FILES.pop(id(conn), None)
+    _AION_STAGED_RECEIPT_FILES.pop(id(conn), None)
 
 
 def _aion_promote_staged_receipt_files(conn: sqlite3.Connection) -> None:

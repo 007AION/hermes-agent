@@ -29,6 +29,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 from pathlib import Path
@@ -838,4 +839,261 @@ def test_f4_hard_crash_restart_no_broken_terminal_state_recovers(
         assert len(kb.list_attachments(conn, tid)) == 1
         assert Path(kb.list_attachments(conn, tid)[0].stored_path).exists()
         assert [p for p in att_dir.rglob("*.staging.*")] == []
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# F5 — ambiguous COMMIT durability reconciliation (R4, R3-F5 repair)
+# ---------------------------------------------------------------------------
+# The R3 audit reproduced a P0 defect at the COMMIT boundary: when the real
+# SQLite COMMIT durably lands and only then the boundary raises, the old
+# exception path issued ROLLBACK (a no-op after a landed commit) and then
+# discarded the promoted receipt files — deleting the trusted receipt that the
+# now-durable done/sha/attachment/event rows reference, losing the dependent
+# wake, and leaving ordinary retry on a terminal CAS dead-end. These tests
+# prove the R4 reconciliation: the ambiguous COMMIT outcome is resolved
+# against the connection's own transaction state (``conn.in_transaction``), so
+# a landed commit preserves the receipt and reconciles the dependent wake,
+# while a not-landed commit leaves zero residue and retries cleanly.
+
+
+def test_f5_landed_commit_then_error_preserves_receipt_and_reconciles(
+    kanban_home, aion_gov_src, monkeypatch,
+):
+    """A COMMIT that durably lands and then raises must NOT discard the receipt.
+
+    The ambiguous outcome is reconciled via ``conn.in_transaction``: the commit
+    landed (transaction closed), so the promoted receipt is preserved, the
+    terminal rows stay consistent, the dependent child wakes, and a retry is
+    idempotent (no terminal CAS dead-end)."""
+    with kb.connect() as conn:
+        parent = kb.create_task(
+            conn, title="factory parent", factory_build_gate=1, assignee="agent007",
+        )
+        child = kb.create_task(
+            conn, title="child", assignee="agent007", parents=[parent],
+        )
+        run_id = _claim_and_run_id(conn, parent)
+
+        real = kb._execute_boundary_with_retry
+        injected = {"done": False}
+
+        def commit_then_raise(c, sql):
+            result = real(c, sql)
+            if (
+                sql.strip().upper() == "COMMIT"
+                and kb._AION_PROMOTED_RECEIPT_FILES.get(id(c))
+                and not injected["done"]
+            ):
+                injected["done"] = True
+                raise RuntimeError("INJECTED_AMBIGUOUS_COMMIT_AFTER_REAL_COMMIT")
+            return result
+
+        monkeypatch.setattr(kb, "_execute_boundary_with_retry", commit_then_raise)
+
+        # The ambiguous COMMIT is reconciled: no exception escapes, the durable
+        # terminal state is preserved, and the dependent wake still runs.
+        assert kb.complete_task(conn, parent, result="done", expected_run_id=run_id)
+
+        assert kb.get_task(conn, parent).status == "done"
+        row = conn.execute(
+            "SELECT factory_terminal_receipt_sha256 FROM tasks WHERE id = ?",
+            (parent,),
+        ).fetchone()
+        assert row["factory_terminal_receipt_sha256"]
+        atts = kb.list_attachments(conn, parent)
+        assert len(atts) == 1
+        assert Path(atts[0].stored_path).exists()  # trusted receipt preserved
+        assert "completed" in [e.kind for e in kb.list_events(conn, parent)]
+        assert kb.get_task(conn, child).status == "ready"  # dependent wake
+
+        monkeypatch.setattr(kb, "_execute_boundary_with_retry", real)
+
+        # Retry is idempotent: already-done with a valid receipt -> no exception
+        # and no terminal CAS dead-end; the receipt remains present.
+        assert kb.complete_task(conn, parent, result="retry", expected_run_id=run_id) is False
+        assert Path(kb.list_attachments(conn, parent)[0].stored_path).exists()
+
+
+def test_f5_no_land_commit_error_zero_residue_then_retries(
+    kanban_home, aion_gov_src, monkeypatch,
+):
+    """A COMMIT that fails WITHOUT landing must leave zero mutation/residue.
+
+    ``conn.in_transaction`` is still true, so ROLLBACK truly undoes the writes
+    and the staged+promoted receipt files are discarded; a clean retry then
+    regenerates them and wakes the dependent."""
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn, title="factory task", factory_build_gate=1, assignee="agent007",
+        )
+        child = kb.create_task(conn, title="child", assignee="agent007", parents=[t])
+        run_id = _claim_and_run_id(conn, t)
+
+        real = kb._execute_boundary_with_retry
+        injected = {"done": False}
+
+        def commit_fails_without_landing(c, sql):
+            if sql.strip().upper() == "COMMIT" and not injected["done"]:
+                injected["done"] = True
+                # Model a commit that fails BEFORE landing: a non-busy
+                # OperationalError (no retry) raised without executing the
+                # commit, so the transaction stays open (in_transaction True).
+                raise sqlite3.OperationalError(
+                    "disk I/O error during commit (not landed)"
+                )
+            return real(c, sql)
+
+        monkeypatch.setattr(kb, "_execute_boundary_with_retry", commit_fails_without_landing)
+
+        with pytest.raises(sqlite3.OperationalError):
+            kb.complete_task(conn, t, result="done", expected_run_id=run_id)
+
+        _assert_zero_mutation_no_residue(conn, t, run_id)
+        assert kb.get_task(conn, child).status == "todo"
+
+        monkeypatch.setattr(kb, "_execute_boundary_with_retry", real)
+
+        assert kb.complete_task(conn, t, result="done", expected_run_id=run_id)
+        assert kb.get_task(conn, t).status == "done"
+        assert _bound_receipt_doc(conn, t)["verdict"] == "OUTCOME_ACCEPTED"
+        assert kb.get_task(conn, child).status == "ready"
+        att_dir = kb.task_attachments_dir(t)
+        assert len([p for p in att_dir.rglob("aion_monarch_receipt*.json") if p.is_file()]) == 1
+        assert [p for p in att_dir.rglob("*.staging.*")] == []
+
+
+def test_f5_post_commit_invariant_error_preserves_receipt_and_retries(
+    kanban_home, aion_gov_src, monkeypatch,
+):
+    """The post-COMMIT file-length invariant raising must NOT discard the receipt.
+
+    This is the contrast-safe boundary: the rows are already committed and the
+    promoted receipt must remain present, so a retry is idempotent rather than
+    a terminal CAS dead-end."""
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn, title="factory task", factory_build_gate=1, assignee="agent007",
+        )
+        run_id = _claim_and_run_id(conn, t)
+
+        real_invariant = kb._check_file_length_invariant
+        injected = {"done": False}
+
+        def invariant_raises_once(conn_arg):
+            if not injected["done"]:
+                injected["done"] = True
+                raise sqlite3.DatabaseError("INJECTED_POST_COMMIT_TORN_EXTEND")
+            return real_invariant(conn_arg)
+
+        monkeypatch.setattr(kb, "_check_file_length_invariant", invariant_raises_once)
+
+        with pytest.raises(sqlite3.DatabaseError):
+            kb.complete_task(conn, t, result="done", expected_run_id=run_id)
+
+        # Rows committed, receipt preserved (no discard on the invariant path).
+        row = conn.execute(
+            "SELECT status, factory_terminal_receipt_sha256 FROM tasks WHERE id = ?",
+            (t,),
+        ).fetchone()
+        assert row["status"] == "done"
+        assert row["factory_terminal_receipt_sha256"]
+        atts = kb.list_attachments(conn, t)
+        assert len(atts) == 1
+        assert Path(atts[0].stored_path).exists()
+        assert "completed" in [e.kind for e in kb.list_events(conn, t)]
+
+        monkeypatch.setattr(kb, "_check_file_length_invariant", real_invariant)
+
+        # Retry is idempotent: no exception, receipt remains present.
+        assert kb.complete_task(conn, t, result="retry", expected_run_id=run_id) is False
+        assert Path(kb.list_attachments(conn, t)[0].stored_path).exists()
+
+
+_F5_CRASH_AFTER_COMMIT_SCRIPT = r"""
+import os, sys
+from pathlib import Path
+sys.meta_path[:] = [
+    f for f in sys.meta_path
+    if "_Editable" not in repr(f) and "Editable" not in f.__class__.__name__
+]
+sys.path.insert(0, {candidate_repo!r})
+os.environ["HERMES_HOME"] = {hermes_home!r}
+os.environ["AION_GOVERNANCE_SOURCE_DIR"] = {aion_src!r}
+from hermes_cli import kanban_db as kb
+with kb.isolated_kanban_env(Path({worker_home!r})):
+    kb.init_db()
+    conn = kb.connect()
+    t = kb.create_task(conn, title="crash-after-commit-task", assignee="agent007", factory_build_gate=1)
+    child = kb.create_task(conn, title="crash-after-commit-child", assignee="agent007", parents=[t])
+    kb.claim_task(conn, t)
+    run_id = int(conn.execute("SELECT current_run_id FROM tasks WHERE id=?", (t,)).fetchone()[0])
+    # Crash AFTER the completion transaction commits (durable done/receipt) but
+    # BEFORE the dependent wake (recompute_ready) runs.
+    def crash_after_commit(*args, **kwargs):
+        os._exit(99)
+    kb.recompute_ready = crash_after_commit
+    kb.complete_task(conn, t, result="done", expected_run_id=run_id)
+    os._exit(0)
+"""
+
+
+def test_f5_hard_crash_after_commit_restart_reconciles_dependent_wake(
+    kanban_home, aion_gov_src, tmp_path,
+):
+    """A hard crash after the COMMIT lands (before the dependent wake) must leave
+    a consistent terminal state — done + receipt present — and a restart must
+    reconcile the dependent wake via recompute_ready, with an idempotent retry."""
+    candidate_file = Path(kb.__file__).resolve()
+    candidate_repo = candidate_file.parents[1]
+    worker_home = tmp_path / "crash_after_commit_home"
+    script = _F5_CRASH_AFTER_COMMIT_SCRIPT.format(
+        candidate_repo=str(candidate_repo),
+        hermes_home=str(Path(os.environ["HERMES_HOME"])),
+        aion_src=str(_aion_gov_source_dir()),
+        worker_home=str(worker_home),
+    )
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(candidate_repo) + os.pathsep + env.get("PYTHONPATH", "")
+    out = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True, text=True, timeout=120, env=env,
+    )
+    assert out.returncode == 99, f"expected crash exit 99, got {out.returncode}: {out.stderr}"
+
+    with kb.isolated_kanban_env(worker_home):
+        conn = kb.connect(db_path=worker_home / "kanban.db")
+        t = conn.execute(
+            "SELECT id FROM tasks WHERE title = 'crash-after-commit-task'"
+        ).fetchone()
+        child = conn.execute(
+            "SELECT id FROM tasks WHERE title = 'crash-after-commit-child'"
+        ).fetchone()
+        assert t is not None and child is not None
+        tid, cid = t["id"], child["id"]
+
+        # The completion durably landed before the crash: consistent terminal
+        # state with the trusted receipt present.
+        row = conn.execute(
+            "SELECT status, factory_terminal_receipt_sha256 FROM tasks WHERE id = ?",
+            (tid,),
+        ).fetchone()
+        assert row["status"] == "done"
+        assert row["factory_terminal_receipt_sha256"]
+        atts = kb.list_attachments(conn, tid)
+        assert len(atts) == 1
+        assert Path(atts[0].stored_path).exists()
+        assert "completed" in [e.kind for e in kb.list_events(conn, tid)]
+
+        # The dependent wake was lost by the crash (recompute_ready never ran) ...
+        assert kb.get_task(conn, cid).status == "todo"
+        # ... but is reconciled by the dispatcher's recompute_ready on restart.
+        kb.recompute_ready(conn)
+        assert kb.get_task(conn, cid).status == "ready"
+
+        # A restart retry of the completion is idempotent: no exception and no
+        # terminal CAS dead-end (the original defect raised
+        # FactoryTerminalReceiptRequiredError here). The receipt stays present.
+        assert kb.complete_task(conn, tid, result="retry") is False
+        assert Path(kb.list_attachments(conn, tid)[0].stored_path).exists()
         conn.close()
