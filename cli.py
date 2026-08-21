@@ -16638,7 +16638,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 # Main Entry Point
 # ============================================================================
 
-def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
+def _run_kanban_goal_loop_q(cli: "HermesCLI", first_result: Any) -> None:
     """Drive a kanban goal_mode worker through the Ralph-style goal loop.
 
     Called from the quiet single-query path AFTER the worker's first turn,
@@ -16679,7 +16679,7 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
 
     max_turns = task.goal_max_turns or _DEF_TURNS
 
-    def _run_turn(prompt: str) -> str:
+    def _run_turn(prompt: str) -> Any:
         result = cli.agent.run_conversation(
             user_message=prompt,
             conversation_history=cli.conversation_history,
@@ -16693,7 +16693,10 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
         resp = result.get("final_response", "") if isinstance(result, dict) else str(result)
         if resp:
             print(resp)
-        return resp or ""
+        # Preserve ``failed`` / ``failure_reason`` for the liveness gate in
+        # run_kanban_goal_loop. Reducing this to text made provider/auth/billing
+        # failures look like empty productive turns and exhausted the card.
+        return result
 
     def _task_status() -> "str | None":
         c = _kb.connect()
@@ -16716,16 +16719,31 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
             except Exception:
                 pass
 
-    _run_loop(
+    def _transient_block(reason: str) -> None:
+        c = _kb.connect()
+        try:
+            _kb.block_task(c, task_id, reason=reason, kind="transient")
+        finally:
+            try:
+                c.close()
+            except Exception:
+                pass
+
+    loop_result = _run_loop(
         task_id=task_id,
         goal_text=goal_text,
         run_turn=_run_turn,
         task_status_fn=_task_status,
         block_fn=_block,
+        transient_block_fn=_transient_block,
         max_turns=max_turns,
-        first_response=first_response or "",
+        first_response=first_result,
         log=lambda m: logger.info("%s", m),
     )
+    if loop_result.get("outcome") == "deferred_main_failure":
+        # Preserve the dispatcher's established non-counting quota-wall path.
+        # SystemExit intentionally bypasses main's defensive Exception handler.
+        raise SystemExit(_kb.KANBAN_RATE_LIMIT_EXIT_CODE)
 
 
 def main(
@@ -17223,7 +17241,10 @@ def main(
                         # normal worker and every non-kanban `-q` run.
                         if os.environ.get("HERMES_KANBAN_GOAL_MODE") == "1":
                             try:
-                                _run_kanban_goal_loop_q(cli, response)
+                                # Pass the structured result, not only visible
+                                # text: goal-mode liveness depends on ``failed``
+                                # and ``failure_reason`` from run_conversation.
+                                _run_kanban_goal_loop_q(cli, result)
                             except Exception as _goal_exc:
                                 logger.debug("kanban goal loop failed: %s", _goal_exc)
 

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -202,6 +203,241 @@ def test_loop_stops_when_worker_already_completed(monkeypatch):
     )
     assert res["outcome"] == "completed_by_worker"
     assert turns == []  # no extra turns
+
+
+def test_loop_worker_completion_wins_when_judge_is_unavailable(monkeypatch):
+    """A completed task must never be reopened/wedged by a judge outage."""
+    monkeypatch.setattr(
+        goals,
+        "judge_goal",
+        lambda *_args, **_kwargs: pytest.fail("completed task must not be judged"),
+    )
+
+    res = goals.run_kanban_goal_loop(
+        task_id="t-complete",
+        goal_text="ship feature",
+        run_turn=lambda _p: pytest.fail("completed task must not continue"),
+        task_status_fn=lambda: "done",
+        block_fn=lambda _r: pytest.fail("completed task must not block"),
+        first_response={
+            "final_response": "",
+            "failed": True,
+            "failure_reason": "billing",
+        },
+    )
+
+    assert res["outcome"] == "completed_by_worker"
+    assert res["turns_used"] == 1
+
+
+def test_loop_defers_billing_failure_to_non_counting_worker_exit(monkeypatch):
+    """Billing is not an empty turn or a sticky task failure."""
+    monkeypatch.setattr(
+        goals,
+        "judge_goal",
+        lambda *_args, **_kwargs: pytest.fail("failed turn must not be judged"),
+    )
+
+    res = goals.run_kanban_goal_loop(
+        task_id="t-provider-failed",
+        goal_text="ship feature",
+        run_turn=lambda _p: pytest.fail("failed turn must not continue"),
+        task_status_fn=lambda: "running",
+        block_fn=lambda _reason: pytest.fail("billing must not sticky-block"),
+        transient_block_fn=lambda _reason: pytest.fail(
+            "billing must use the non-counting exit contract"
+        ),
+        max_turns=20,
+        first_response={
+            "final_response": "",
+            "failed": True,
+            "failure_reason": "billing",
+        },
+    )
+
+    assert res == {
+        "outcome": "deferred_main_failure",
+        "turns_used": 1,
+        "reason": "main model failure: billing; check provider billing/quota, then retry",
+        "error_class": "billing",
+    }
+
+
+def test_loop_stops_on_failed_continuation_without_rejudging(monkeypatch):
+    """A failure after productive work consumes one turn, not the budget."""
+    judge_calls = []
+
+    def _judge(*_args, **_kwargs):
+        judge_calls.append(True)
+        if len(judge_calls) > 1:
+            pytest.fail("failed continuation must not be judged")
+        return "continue", "more work", False, None, False
+
+    monkeypatch.setattr(goals, "judge_goal", _judge)
+    blocked = []
+    turns = []
+
+    res = goals.run_kanban_goal_loop(
+        task_id="t-auth-failed",
+        goal_text="ship feature",
+        run_turn=lambda prompt: turns.append(prompt) or {
+            "final_response": "",
+            "failed": True,
+            "failure_reason": "auth_permanent",
+        },
+        task_status_fn=lambda: "running",
+        block_fn=blocked.append,
+        max_turns=20,
+        first_response="implemented part one",
+    )
+
+    assert res["outcome"] == "blocked_main_failure"
+    assert res["turns_used"] == 2
+    assert res["error_class"] == "auth_permanent"
+    assert len(judge_calls) == 1
+    assert len(turns) == 1
+    assert len(blocked) == 1
+
+
+def test_loop_blocks_when_continuation_raises_provider_error(monkeypatch):
+    """Exception-style provider failures use the same one-turn safety gate."""
+    _patch_judge(monkeypatch, ["continue"])
+    blocked = []
+
+    class APIStatusError(Exception):
+        pass
+
+    def _failed_turn(_prompt):
+        raise APIStatusError("raw provider body must not be durable")
+
+    res = goals.run_kanban_goal_loop(
+        task_id="t-provider-raised",
+        goal_text="ship feature",
+        run_turn=_failed_turn,
+        task_status_fn=lambda: "running",
+        block_fn=lambda _reason: pytest.fail("must use transient callback"),
+        transient_block_fn=blocked.append,
+        max_turns=20,
+        first_response="implemented part one",
+    )
+
+    assert res["outcome"] == "blocked_main_failure"
+    assert res["turns_used"] == 2
+    assert res["error_class"] == "APIStatusError"
+    assert len(blocked) == 1
+    assert "raw provider body" not in blocked[0]
+
+
+def test_loop_distinguishes_judge_transport_failure_from_continue(monkeypatch):
+    """An unavailable judge is not evidence that the task is unfinished."""
+    monkeypatch.setattr(
+        goals,
+        "judge_goal",
+        lambda *_args, **_kwargs: (
+            "continue",
+            "judge error: APIStatusError",
+            False,
+            None,
+            True,
+        ),
+    )
+    blocked = []
+
+    res = goals.run_kanban_goal_loop(
+        task_id="t-judge-failed",
+        goal_text="ship feature",
+        run_turn=lambda _p: pytest.fail("judge outage must not continue"),
+        task_status_fn=lambda: "running",
+        block_fn=blocked.append,
+        max_turns=20,
+        first_response="six productive turns are durable",
+    )
+
+    assert res == {
+        "outcome": "blocked_judge_failure",
+        "turns_used": 1,
+        "reason": "judge unavailable: APIStatusError",
+        "error_class": "APIStatusError",
+    }
+    assert len(blocked) == 1
+    assert "not rejected" in blocked[0]
+    assert "auxiliary.goal_judge" in blocked[0]
+    assert "unblock/retry" in blocked[0]
+
+
+@pytest.mark.parametrize(
+    ("failure_reason", "expected_status", "expected_kind", "expected_exit"),
+    [
+        ("billing", "ready", None, kb.KANBAN_RATE_LIMIT_EXIT_CODE),
+        ("auth_permanent", "blocked", "transient", None),
+    ],
+)
+def test_quiet_adapter_preserves_failure_recovery_contract(
+    kanban_home,
+    monkeypatch,
+    failure_reason,
+    expected_status,
+    expected_kind,
+    expected_exit,
+):
+    """Billing keeps EX_TEMPFAIL; auth failures durably transient-block."""
+    import cli
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="ship feature",
+            body="verify tests",
+            assignee="worker",
+            goal_mode=True,
+            goal_max_turns=20,
+            initial_status="running",
+        )
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    fake_cli = SimpleNamespace(
+        session_id="goal-session",
+        conversation_history=[],
+        agent=SimpleNamespace(
+            session_id="goal-session",
+            run_conversation=lambda **_kwargs: pytest.fail(
+                "first failed turn must not continue"
+            ),
+        ),
+    )
+
+    first_result = {
+        "final_response": "",
+        "failed": True,
+        "failure_reason": failure_reason,
+        # Raw provider text must never be copied into durable reason.
+        "error": "sensitive provider response body",
+    }
+    if expected_exit is None:
+        getattr(cli, "_run_kanban_goal_loop_q")(fake_cli, first_result)
+    else:
+        with pytest.raises(SystemExit) as exc_info:
+            getattr(cli, "_run_kanban_goal_loop_q")(fake_cli, first_result)
+        assert exc_info.value.code == expected_exit
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+
+    assert task is not None
+    assert task.status == expected_status
+    assert task.block_kind == expected_kind
+    if expected_status == "blocked":
+        with kb.connect() as conn:
+            run = conn.execute(
+                "SELECT outcome, summary FROM task_runs "
+                "WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+        assert run is not None
+        assert run["outcome"] == "blocked"
+        assert failure_reason in run["summary"]
+        assert "unblock/retry" in run["summary"]
+        assert "sensitive provider response body" not in run["summary"]
 
 
 def test_loop_continues_then_worker_completes(monkeypatch):
