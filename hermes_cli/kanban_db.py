@@ -1598,6 +1598,39 @@ _INIT_LOCK = threading.RLock()
 _SQLITE_HEADER = b"SQLite format 3\x00"
 DEFAULT_BUSY_TIMEOUT_MS = 120_000
 
+
+@contextlib.contextmanager
+def _allow_factory_terminal_write(conn: sqlite3.Connection, task_id: str):
+    """Grant one validated task's terminal write inside the current txn.
+
+    The grant row is inserted and deleted in the same write transaction, so it
+    is never durable or visible to another connection. A stale installed
+    ``complete_task`` does not create the row and therefore fails the schema
+    trigger before repeating run3015's receipt-less terminal write.
+    """
+    conn.execute(
+        "INSERT INTO factory_terminal_write_grants (task_id) VALUES (?)",
+        (task_id,),
+    )
+    try:
+        yield
+    finally:
+        conn.execute(
+            "DELETE FROM factory_terminal_write_grants WHERE task_id = ?",
+            (task_id,),
+        )
+
+
+def _execute_factory_terminal_write(
+    conn: sqlite3.Connection,
+    task_id: str,
+    sql: str,
+    params: tuple[Any, ...],
+) -> sqlite3.Cursor:
+    """Execute one receipt-gated terminal UPDATE with a scoped DB grant."""
+    with _allow_factory_terminal_write(conn, task_id):
+        return conn.execute(sql, params)
+
 # Maximum number of ``<db>.corrupt.<hash>.bak`` quarantine files retained per
 # board DB. Content-addressing already dedupes identical corrupt bytes, but
 # repeatedly-mutating corruption (partial repairs, further damage between
@@ -2738,6 +2771,37 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         BEGIN
             SELECT RAISE(ABORT,
                 'factory_build_gate is immutable: cannot demote 1 -> 0/NULL');
+        END;
+        """
+    )
+
+    # AION-889 terminal writer fence. The Python receipt gate remains the
+    # semantic/authenticity authority; this trigger is the writer chokepoint
+    # that prevents an older installed complete_task (or a direct status
+    # writer) from skipping it. The grant row exists only inside the current
+    # completion transaction and is deleted before commit, so stale code never
+    # observes or creates one while gate=0 task behavior remains unchanged.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS factory_terminal_write_grants (
+            task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_factory_terminal_receipt_required
+        BEFORE UPDATE OF status ON tasks
+        WHEN OLD.factory_build_gate = 1
+         AND OLD.status != 'done'
+         AND NEW.status = 'done'
+         AND NOT EXISTS (
+             SELECT 1 FROM factory_terminal_write_grants
+              WHERE task_id = OLD.id
+         )
+        BEGIN
+            SELECT RAISE(ABORT,
+                'factory terminal write requires an authenticated receipt grant');
         END;
         """
     )
@@ -5949,7 +6013,9 @@ def _run_kernel_finalizer(
     binder, _kernel, _adapters = _load_pinned_aion_modules(task_id)
 
     def _terminal_write(c: sqlite3.Connection, tid: str, rid: str) -> None:
-        cur = c.execute(
+        cur = _execute_factory_terminal_write(
+            c,
+            tid,
             """
             UPDATE tasks
                SET status          = 'done',
@@ -6220,7 +6286,9 @@ def complete_task(
                 prior_status = prior["status"]
                 if prior_status not in _CONTROLLER_TERMINAL_STATUSES:
                     return False
-                cur = conn.execute(
+                cur = _execute_factory_terminal_write(
+                    conn,
+                    task_id,
                     """
                     UPDATE tasks
                        SET status       = 'done',
@@ -6241,7 +6309,9 @@ def complete_task(
                 # matching run_id. Non-running statuses (triage, todo,
                 # scheduled, review) never match because they have no
                 # current_run_id.
-                cur = conn.execute(
+                cur = _execute_factory_terminal_write(
+                    conn,
+                    task_id,
                     """
                     UPDATE tasks
                        SET status       = 'done',
