@@ -15,8 +15,10 @@ Design notes / invariants:
 - The continuation prompt is just a normal user message appended to the
   session via ``run_conversation``. No system-prompt mutation, no toolset
   swap — prompt caching stays intact.
-- Judge failures are fail-OPEN: ``continue``. A broken judge must not wedge
-  progress; the turn budget is the backstop.
+- Interactive standing-goal judge failures fail open to bounded ``continue``.
+  Headless Kanban goal-mode workers instead transient-block on the first judge
+  transport failure: an unavailable judge is not a real rejection, and feeding
+  synthetic turns into an unavailable worker can only burn the card budget.
 - When a real user message arrives mid-loop it preempts the continuation
   prompt and also pauses the goal loop for that turn (we still re-judge
   after, so if the user's message happens to complete the goal the judge
@@ -1658,6 +1660,53 @@ KANBAN_GOAL_FINALIZE_TEMPLATE = (
     "kanban_block with the reason instead."
 )
 
+# These failure classes already have a non-counting worker-exit contract:
+# cli.py exits EX_TEMPFAIL and the dispatcher requeues after its cooldown.
+# Goal mode must stop immediately without converting them into sticky blocks.
+_KANBAN_NON_COUNTING_FAILURES = frozenset({"billing", "rate_limit"})
+
+
+def _kanban_turn_result(value: Any) -> Tuple[str, bool, str]:
+    """Preserve the structured outcome of a quiet Kanban worker turn.
+
+    ``run_conversation`` returns a dict whose ``failed`` and
+    ``failure_reason`` fields distinguish provider/auth/billing failures from a
+    usable assistant response.  Legacy callback-based callers may still return
+    a plain string.  The error class is deliberately reduced to a short safe
+    token so durable task reasons never copy raw provider bodies or secrets.
+    """
+    if not isinstance(value, dict):
+        return str(value or ""), False, ""
+
+    response = str(value.get("final_response") or "")
+    if not value.get("failed"):
+        return response, False, ""
+
+    raw_class = str(value.get("failure_reason") or "provider_failure").strip()
+    raw_class = (
+        raw_class.split(":", 1)[0].split(maxsplit=1)[0]
+        if raw_class
+        else "provider_failure"
+    )
+    error_class = re.sub(r"[^A-Za-z0-9_.:-]+", "_", raw_class).strip("_.:-")
+    return response, True, error_class or "provider_failure"
+
+
+def _judge_transport_error_class(reason: str) -> str:
+    """Extract a public-safe judge failure class from ``judge_goal`` reason."""
+    raw = str(reason or "")
+    if raw.lower().startswith("judge error:"):
+        raw = raw.split(":", 1)[1].strip()
+    else:
+        raw = "transport_failure"
+    raw = (
+        raw.split(":", 1)[0].split(maxsplit=1)[0]
+        if raw
+        else "transport_failure"
+    )
+    safe = re.sub(r"[^A-Za-z0-9_.:-]+", "_", raw).strip("_.:-")
+    return safe or "transport_failure"
+
 
 def run_kanban_goal_loop(
     *,
@@ -1666,8 +1715,9 @@ def run_kanban_goal_loop(
     run_turn,
     task_status_fn,
     block_fn,
+    transient_block_fn=None,
     max_turns: int = DEFAULT_MAX_TURNS,
-    first_response: str = "",
+    first_response: Any = "",
     log=None,
 ) -> Dict[str, Any]:
     """Drive a kanban worker through a Ralph-style goal loop.
@@ -1679,10 +1729,12 @@ def run_kanban_goal_loop(
 
     1. Check whether the worker already terminated the task (called
        ``kanban_complete`` / ``kanban_block``). If so, stop — nothing to do.
-    2. Otherwise judge the latest response against ``goal_text`` (the card's
-       title + body). ``continue`` → feed a continuation prompt and run
-       another turn IN THE SAME SESSION via ``run_turn``. ``done`` but the
-       task is still open → one explicit "call kanban_complete" nudge.
+    2. Stop after one failed main-model turn, or transient-block if the judge
+       cannot be reached. Otherwise judge the latest response against
+       ``goal_text`` (the card's title + body). ``continue`` → feed a
+       continuation prompt and run another turn IN THE SAME SESSION via
+       ``run_turn``. ``done`` but the task is still open → one explicit
+       "call kanban_complete" nudge.
     3. When the turn budget is exhausted and the worker still hasn't
        terminated the task, ``block_fn`` is invoked so the card lands in a
        sticky ``blocked`` state for human review (NOT a silent exit).
@@ -1691,11 +1743,15 @@ def run_kanban_goal_loop(
     ephemeral, so the turn budget lives in a local counter. It is fully
     decoupled from the CLI for testability: callers inject ``run_turn``
     (str -> str), ``task_status_fn`` (() -> str|None), and ``block_fn``
-    (reason: str -> None).
+    (reason: str -> None). ``transient_block_fn`` has the same shape and lets
+    the Kanban adapter label provider/judge outages as transient; it falls back
+    to ``block_fn`` for legacy callers. ``run_turn`` may return the structured
+    dict from ``run_conversation``; legacy string callbacks remain supported.
 
     Returns a decision dict: ``{"outcome", "turns_used", "reason"}`` where
     outcome is one of ``"completed_by_worker"``, ``"blocked_budget"``,
-    ``"blocked_by_worker"``, or ``"stopped"``.
+    ``"blocked_by_worker"``, ``"deferred_main_failure"``,
+    ``"blocked_main_failure"``, ``"blocked_judge_failure"``, or ``"stopped"``.
     """
 
     def _log(msg: str) -> None:
@@ -1709,10 +1765,11 @@ def run_kanban_goal_loop(
     if max_turns < 1:
         max_turns = DEFAULT_MAX_TURNS
 
-    last_response = first_response or ""
+    last_turn_result = first_response
     # The first turn already consumed one unit of budget.
     turns_used = 1
     nudged_to_finalize = False
+    transient_block = transient_block_fn or block_fn
 
     while True:
         # Did the worker terminate the task itself this turn?
@@ -1733,11 +1790,76 @@ def run_kanban_goal_loop(
             _log(f"kanban goal loop: task {task_id} status={status!r}; stopping")
             return {"outcome": "stopped", "turns_used": turns_used, "reason": f"status={status}"}
 
+        # A failed worker turn is not an empty-but-productive response. Stop
+        # before consulting the judge so one provider/auth/billing failure can
+        # never become N synthetic continuation turns. The status check above
+        # intentionally wins: if the worker completed despite a late provider
+        # failure, completion remains terminal and no judge outage can wedge it.
+        last_response, turn_failed, error_class = _kanban_turn_result(last_turn_result)
+        if turn_failed:
+            if error_class in _KANBAN_NON_COUNTING_FAILURES:
+                _log(
+                    f"kanban goal loop: task {task_id} main model failed "
+                    f"({error_class}) at turn {turns_used}/{max_turns}; "
+                    "deferring to non-counting worker exit"
+                )
+                return {
+                    "outcome": "deferred_main_failure",
+                    "turns_used": turns_used,
+                    "reason": (
+                        f"main model failure: {error_class}; check provider "
+                        "billing/quota, then retry"
+                    ),
+                    "error_class": error_class,
+                }
+            block_reason = (
+                f"Goal-mode worker main model failed ({error_class}) at turn "
+                f"{turns_used}/{max_turns}. Automatic continuation stopped after "
+                "one failed turn; check the worker model provider/auth/billing "
+                "configuration, then unblock/retry."
+            )
+            _log(
+                f"kanban goal loop: task {task_id} main model failed "
+                f"({error_class}) at turn {turns_used}/{max_turns}; blocking"
+            )
+            try:
+                transient_block(block_reason)
+            except Exception as exc:
+                _log(f"kanban goal loop: transient block failed ({exc})")
+            return {
+                "outcome": "blocked_main_failure",
+                "turns_used": turns_used,
+                "reason": f"main model failure: {error_class}",
+                "error_class": error_class,
+            }
+
         # Still open — judge whether the latest response satisfies the card.
         # The kanban worker loop has no wait-barrier concept (workers finish
         # via kanban_complete / kanban_block, not by parking), so a WAIT
         # verdict is treated as CONTINUE here.
         verdict, reason, _parse_failed, _wait, _transport_failed = judge_goal(goal_text, last_response)
+        if _transport_failed:
+            error_class = _judge_transport_error_class(reason)
+            block_reason = (
+                f"Goal-mode judge unavailable ({error_class}) after turn "
+                f"{turns_used}/{max_turns}. The worker output was not rejected; "
+                "automatic continuation stopped. Check auxiliary.goal_judge "
+                "provider/auth/billing configuration, then unblock/retry."
+            )
+            _log(
+                f"kanban goal loop: task {task_id} judge unavailable "
+                f"({error_class}) after turn {turns_used}/{max_turns}; blocking"
+            )
+            try:
+                transient_block(block_reason)
+            except Exception as exc:
+                _log(f"kanban goal loop: transient block failed ({exc})")
+            return {
+                "outcome": "blocked_judge_failure",
+                "turns_used": turns_used,
+                "reason": f"judge unavailable: {error_class}",
+                "error_class": error_class,
+            }
         if verdict == "wait":
             verdict = "continue"
         _log(f"kanban goal loop: turn {turns_used}/{max_turns} verdict={verdict} reason={_truncate(reason, 120)}")
@@ -1775,10 +1897,34 @@ def run_kanban_goal_loop(
 
         # Run another turn in the same session.
         try:
-            last_response = run_turn(prompt) or ""
+            last_turn_result = run_turn(prompt)
         except Exception as exc:
-            _log(f"kanban goal loop: run_turn failed ({exc}); stopping")
-            return {"outcome": "stopped", "turns_used": turns_used, "reason": f"run_turn error: {type(exc).__name__}"}
+            # Some adapters surface provider failures as exceptions instead of
+            # the structured ``failed`` result handled at the top of the loop.
+            # Count the attempted turn once and use the same durable recovery
+            # path without copying the exception message/provider body.
+            turns_used += 1
+            error_class = type(exc).__name__
+            block_reason = (
+                f"Goal-mode worker main model failed ({error_class}) at turn "
+                f"{turns_used}/{max_turns}. Automatic continuation stopped after "
+                "one failed turn; check the worker model provider/auth/billing "
+                "configuration, then unblock/retry."
+            )
+            _log(
+                f"kanban goal loop: task {task_id} run_turn failed "
+                f"({error_class}) at turn {turns_used}/{max_turns}; blocking"
+            )
+            try:
+                transient_block(block_reason)
+            except Exception as block_exc:
+                _log(f"kanban goal loop: transient block failed ({block_exc})")
+            return {
+                "outcome": "blocked_main_failure",
+                "turns_used": turns_used,
+                "reason": f"main model failure: {error_class}",
+                "error_class": error_class,
+            }
         turns_used += 1
 
 
