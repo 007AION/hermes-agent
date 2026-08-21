@@ -2788,23 +2788,39 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         )
         """
     )
-    conn.execute(
-        """
-        CREATE TRIGGER IF NOT EXISTS trg_factory_terminal_receipt_required
-        BEFORE UPDATE OF status ON tasks
-        WHEN OLD.factory_build_gate = 1
-         AND OLD.status != 'done'
-         AND NEW.status = 'done'
-         AND NOT EXISTS (
-             SELECT 1 FROM factory_terminal_write_grants
-              WHERE task_id = OLD.id
-         )
-        BEGIN
-            SELECT RAISE(ABORT,
-                'factory terminal write requires an authenticated receipt grant');
-        END;
-        """
-    )
+    # Replace the definition on every migration pass. ``IF NOT EXISTS`` alone
+    # would leave the narrower R1 trigger installed forever on an upgraded DB.
+    # The savepoint is load-bearing: connections run in autocommit mode, so a
+    # bare DROP followed by CREATE would expose a fail-open interval (or leave
+    # the fence absent if CREATE failed). A savepoint also composes safely if a
+    # caller already wrapped the migration in a transaction.
+    _trigger_savepoint = "replace_factory_terminal_receipt_trigger"
+    conn.execute(f"SAVEPOINT {_trigger_savepoint}")
+    try:
+        conn.execute("DROP TRIGGER IF EXISTS trg_factory_terminal_receipt_required")
+        conn.execute(
+            """
+            CREATE TRIGGER trg_factory_terminal_receipt_required
+            BEFORE UPDATE OF status ON tasks
+            WHEN NEW.factory_build_gate = 1
+             AND OLD.status NOT IN ('done', 'archived')
+             AND NEW.status IN ('done', 'archived')
+             AND NOT EXISTS (
+                 SELECT 1 FROM factory_terminal_write_grants
+                  WHERE task_id = OLD.id
+             )
+            BEGIN
+                SELECT RAISE(ABORT,
+                    'factory terminal write requires an authenticated receipt grant');
+            END;
+            """
+        )
+    except Exception:
+        conn.execute(f"ROLLBACK TO {_trigger_savepoint}")
+        conn.execute(f"RELEASE {_trigger_savepoint}")
+        raise
+    else:
+        conn.execute(f"RELEASE {_trigger_savepoint}")
 
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite

@@ -16,8 +16,14 @@ def kanban_home(tmp_path, monkeypatch):
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    kb.init_db()
-    return home
+    with kb.isolated_kanban_env(home):
+        kb.init_db()
+        db_path = kb.kanban_db_path().resolve()
+        assert db_path == (home / "kanban.db").resolve()
+        assert db_path != Path(
+            "/root/.hermes/kanban/boards/aion-factory/kanban.db"
+        )
+        yield home
 
 
 def _db_path(conn: sqlite3.Connection) -> str:
@@ -112,6 +118,73 @@ def test_ungranted_current_connection_cannot_directly_terminalize_factory_task(
         task = kb.get_task(conn, task_id)
         assert task is not None
         assert task.status == "ready"
+
+
+def test_same_statement_gate_promotion_cannot_bypass_terminal_fence(kanban_home):
+    """The fence evaluates the resulting gate, not only the prior row."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="ordinary task", created_by="someone-else",
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="authenticated receipt"):
+            conn.execute(
+                "UPDATE tasks SET factory_build_gate = 1, status = 'done' "
+                "WHERE id = ?",
+                (task_id,),
+            )
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "ready"
+        row = conn.execute(
+            "SELECT factory_build_gate FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        assert row["factory_build_gate"] == 0
+
+
+def test_ungranted_factory_task_cannot_archive_from_nonterminal_state(kanban_home):
+    """Archived is terminal too and cannot bypass receipt authentication."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="factory terminal fence", factory_build_gate=1,
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="authenticated receipt"):
+            conn.execute(
+                "UPDATE tasks SET status = 'archived' WHERE id = ?",
+                (task_id,),
+            )
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "ready"
+
+
+def test_failed_trigger_upgrade_preserves_existing_fence(kanban_home):
+    """A failed CREATE must roll back its DROP instead of leaving no trigger."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="factory terminal fence", factory_build_gate=1,
+        )
+
+        def deny_trigger_create(action, _arg1, _arg2, _db_name, _trigger_name):
+            if action == sqlite3.SQLITE_CREATE_TRIGGER:
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+
+        conn.set_authorizer(deny_trigger_create)
+        try:
+            with pytest.raises(sqlite3.DatabaseError, match="not authorized"):
+                kb._migrate_add_optional_columns(conn)
+        finally:
+            conn.set_authorizer(None)
+
+        trigger = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'trigger' "
+            "AND name = 'trg_factory_terminal_receipt_required'"
+        ).fetchone()
+        assert trigger is not None
+        with pytest.raises(sqlite3.IntegrityError, match="authenticated receipt"):
+            conn.execute(
+                "UPDATE tasks SET status = 'done' WHERE id = ?", (task_id,),
+            )
 
 
 def test_stale_connection_preserves_non_factory_completion_parity(kanban_home):
