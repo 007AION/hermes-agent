@@ -39,6 +39,20 @@ import pytest
 from hermes_cli import kanban_db as kb
 
 
+_PR917_AUTHORITY_COMMIT = "15e6c82f4020c53cdba511c1e7ca31bab1bfe6bb"
+_PR917_MODULES = {
+    "scripts/aion_monarch_outcome_proof_gate.py": (
+        "402d7882786093a96826601bfa443fa24efa681b18d94f7d3e8ed1d0cc4d32dc"
+    ),
+    "scripts/aion_monarch_typed_adapters.py": (
+        "fc36d5b6d9b0edf1148ab99e2288f02b960abb3a9ebfd6ea2ef0d4b7b494b092"
+    ),
+    "scripts/aion_monarch_receipt_binder.py": (
+        "5c8e6b517a390fd2d826d464036fc4e4da3f8ed4a9d1d0313f809bac3b1682be"
+    ),
+}
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -63,8 +77,32 @@ def kanban_home(tmp_path, monkeypatch):
         yield home
 
 
-def _aion_gov_source_dir() -> Path | None:
-    """Resolve the aion-governance source dir the finalizer will pin-load."""
+def _materialize_pr917_git_object(tmp_path: Path) -> Path | None:
+    """Materialize PR #917's immutable merge object without reading its worktree."""
+    repo = Path(os.environ.get("HOME", "")) / "aion-governance"
+    if not repo.is_dir():
+        return None
+    dest = tmp_path / _PR917_AUTHORITY_COMMIT
+    for rel_path, expected_sha in _PR917_MODULES.items():
+        proc = subprocess.run(
+            ["git", "-C", str(repo), "show", f"{_PR917_AUTHORITY_COMMIT}:{rel_path}"],
+            capture_output=True,
+            timeout=30,
+        )
+        if proc.returncode != 0 or hashlib.sha256(proc.stdout).hexdigest() != expected_sha:
+            return None
+        target = dest / rel_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(proc.stdout)
+    return dest
+
+
+def _aion_gov_source_dir(tmp_path: Path | None = None) -> Path | None:
+    """Resolve only a byte-exact PR #917 authority source for integration tests."""
+    if tmp_path is not None:
+        immutable = _materialize_pr917_git_object(tmp_path)
+        if immutable is not None:
+            return immutable
     raw = os.environ.get("AION_GOVERNANCE_SOURCE_DIR")
     if raw and Path(raw).is_dir():
         return Path(raw)
@@ -77,18 +115,16 @@ def _aion_gov_source_dir() -> Path | None:
 
 
 @pytest.fixture
-def aion_gov_src(monkeypatch):
-    """Point AION_GOVERNANCE_SOURCE_DIR at the aion-governance checkout, or
-    mark the test as skipped when unavailable."""
-    src = _aion_gov_source_dir()
+def aion_gov_src(monkeypatch, tmp_path):
+    """Point the finalizer at immutable PR #917 bytes, or skip if unavailable."""
+    src = _aion_gov_source_dir(tmp_path)
     if src is None:
         pytest.skip("AION_GOVERNANCE_SOURCE_DIR not configured")
     monkeypatch.setenv("AION_GOVERNANCE_SOURCE_DIR", str(src))
-    # Assert the pinned source matches the pinned hashes so the finalizer path
-    # is genuinely testable here (fail loud rather than masking a drift).
-    kernel = (src / "scripts" / "aion_monarch_outcome_proof_gate.py").read_bytes()
-    if hashlib.sha256(kernel).hexdigest() != kb.AION_GOVERNANCE_KERNEL_SHA256:
-        pytest.skip("aion-governance kernel does not match pinned sha256")
+    for rel_path, expected_sha in _PR917_MODULES.items():
+        module_bytes = (src / rel_path).read_bytes()
+        if hashlib.sha256(module_bytes).hexdigest() != expected_sha:
+            pytest.skip(f"aion-governance module {rel_path} does not match PR #917")
     return src
 
 
@@ -171,6 +207,72 @@ def _kernel_receipt_doc(task_id: str, run_id: str) -> dict:
         },
         "acquired_at": "2026-08-18T06:00:02Z",
     }
+
+
+# ---------------------------------------------------------------------------
+# PR #917 immutable authority and source-drift fence
+# ---------------------------------------------------------------------------
+
+def test_pr917_authority_is_exact_and_mutable_checkout_is_not_a_default():
+    assert kb.AION_GOVERNANCE_AUTHORITY_PR == 917
+    assert kb.AION_GOVERNANCE_AUTHORITY_HEAD == (
+        "44d4c221468d4035e078a6bfbcd4e8a25de4850a"
+    )
+    assert kb.AION_GOVERNANCE_AUTHORITY_COMMIT == _PR917_AUTHORITY_COMMIT
+    assert kb.AION_GOVERNANCE_KERNEL_SHA256 == _PR917_MODULES[
+        "scripts/aion_monarch_outcome_proof_gate.py"
+    ]
+    assert kb.AION_GOVERNANCE_TYPED_ADAPTERS_SHA256 == _PR917_MODULES[
+        "scripts/aion_monarch_typed_adapters.py"
+    ]
+    assert kb.AION_GOVERNANCE_RECEIPT_BINDER_SHA256 == _PR917_MODULES[
+        "scripts/aion_monarch_receipt_binder.py"
+    ]
+    assert all(
+        _PR917_AUTHORITY_COMMIT in source_dir
+        for source_dir in kb.AION_GOVERNANCE_DEFAULT_SOURCE_DIRS
+    )
+    assert "/root/aion-governance" not in kb.AION_GOVERNANCE_DEFAULT_SOURCE_DIRS
+
+
+def test_pr917_module_drift_fails_closed_with_zero_mutation(
+    kanban_home, aion_gov_src, tmp_path, monkeypatch,
+):
+    drifted = tmp_path / "drifted-pr917"
+    for rel_path in _PR917_MODULES:
+        target = drifted / rel_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes((aion_gov_src / rel_path).read_bytes())
+    binder_path = drifted / "scripts" / "aion_monarch_receipt_binder.py"
+    binder_path.write_bytes(binder_path.read_bytes() + b"\n# injected drift\n")
+    monkeypatch.setenv("AION_GOVERNANCE_SOURCE_DIR", str(drifted))
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="drift-fenced", factory_build_gate=1, assignee="agent007",
+        )
+        run_id = _claim_and_run_id(conn, task_id)
+        status_before = kb.get_task(conn, task_id).status
+        events_before = [event.kind for event in kb.list_events(conn, task_id)]
+
+        with pytest.raises(
+            kb.FactoryTerminalReceiptRequiredError,
+            match="aion_monarch_receipt_binder.py sha256 mismatch",
+        ):
+            kb.complete_task(conn, task_id, result="must roll back", expected_run_id=run_id)
+
+        row = conn.execute(
+            "SELECT status, factory_terminal_receipt_sha256 FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        assert row is not None
+        assert row["status"] == status_before == "running"
+        assert row["factory_terminal_receipt_sha256"] is None
+        assert kb.list_attachments(conn, task_id) == []
+        assert [event.kind for event in kb.list_events(conn, task_id)] == events_before
+        assert conn.execute(
+            "SELECT COUNT(*) FROM factory_terminal_write_grants"
+        ).fetchone()[0] == 0
 
 
 # ---------------------------------------------------------------------------
