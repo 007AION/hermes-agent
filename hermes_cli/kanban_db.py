@@ -225,6 +225,45 @@ FACTORY_ACTOR_ROLES = frozenset({
     "merger_or_closer",
 })
 
+# ---------------------------------------------------------------------------
+# AION-889 I1+I2 — kernel-owned atomic bind-and-terminalize finalizer
+# (architecture A, Elder verdict SOLUTION_PASS_EXACT)
+# ---------------------------------------------------------------------------
+# For a factory_build_gate=1 task with NO pre-bound receipt, complete_task
+# invokes a kernel-owned finalizer INSIDE the existing write_txn instead of
+# raising immediately. The finalizer SHA-pin-loads the frozen aion-governance
+# proof-kernel, typed adapters, and binder from a single immutable source,
+# verifies each source-byte sha256 before compile/exec (TOCTOU-safe single-read),
+# verifies the kernel's self-declared FROZEN_CONTRACT_SHA256 against
+# FACTORY_CONTRACT_HASH_SHA256, then performs before-read -> terminal write ->
+# same-connection post-write readback -> in-process kernel C1-C10 evaluation ->
+# trusted receipt attachment (uploaded_by=aion_monarch_proof_kernel) -> sha
+# binding, all in ONE transaction. Non-OUTCOME_ACCEPTED or any exception rolls
+# back to zero mutation. The worker toolset can NEVER stamp the kernel identity;
+# only this host-level finalizer code does.
+
+# Pinned source-byte sha256 of the frozen aion-governance modules. These are
+# verified BEFORE compile/exec; a module merely self-declaring the expected
+# contract constant is insufficient — both the bytes and the contract hash are
+# independently verified.
+AION_GOVERNANCE_KERNEL_SHA256 = (
+    "402d7882786093a96826601bfa443fa24efa681b18d94f7d3e8ed1d0cc4d32dc"
+)
+AION_GOVERNANCE_TYPED_ADAPTERS_SHA256 = (
+    "fc36d5b6d9b0edf1148ab99e2288f02b960abb3a9ebfd6ea2ef0d4b7b494b092"
+)
+AION_GOVERNANCE_RECEIPT_BINDER_SHA256 = (
+    "8099344b8d4b4096ca74e2dda885fcc070bc76108305b802c699cd94b8d4a937"
+)
+
+# Default candidate source directory for the pinned aion-governance modules
+# (override with AION_GOVERNANCE_SOURCE_DIR). Any directory is safe because the
+# loader single-reads and sha-verifies each module before compile/exec.
+AION_GOVERNANCE_DEFAULT_SOURCE_DIRS = (
+    "/root/aion-governance",
+    "/usr/local/lib/aion-governance",
+)
+
 
 def _assert_not_delegated_child_mutation() -> None:
     """Reject Kanban state mutations from ``delegate_task`` child contexts.
@@ -3026,6 +3065,59 @@ def _execute_boundary_with_retry(conn: sqlite3.Connection, sql: str) -> None:
             time.sleep(random.uniform(_BUSY_RETRY_MIN_S, _BUSY_RETRY_MAX_S))
 
 
+def _ambiguous_commit_landed(conn: sqlite3.Connection) -> bool:
+    """Authoritatively determine whether a raised COMMIT durably landed.
+
+    SQLite documents a commit-time I/O error as an indeterminate outcome: the
+    COMMIT MAY have durably landed. This helper resolves that ambiguity as a
+    TRI-STATE, never a boolean default that collapses an unknown outcome into a
+    false landed/non-landed claim:
+
+    * ``in_transaction`` is True  -> the transaction is still open, so the
+      COMMIT did NOT land. Roll back (best-effort) and return False; the caller
+      discards residue and re-raises the original error.
+    * ``in_transaction`` is False -> the transaction closed, so the COMMIT DID
+      land. Return True; the caller preserves the promoted receipt files and
+      treats the commit as complete.
+
+    When the connection does not expose ``in_transaction`` at all (an opaque
+    proxy/double), do NOT guess. Probe the real SQLite engine authoritatively by
+    attempting ROLLBACK on the same connection:
+
+    * ROLLBACK succeeds              -> the transaction was still open, so the
+      COMMIT did NOT land -> return False.
+    * ROLLBACK raises "no transaction is active" -> the transaction had already
+      closed, so the COMMIT DID land -> return True.
+    * ROLLBACK raises any other OperationalError -> cannot confirm landed, so
+      fail safe as NOT landed -> return False.
+
+    A real ``sqlite3.Connection`` always exposes ``in_transaction``; the probe
+    branch only ever applies to connection doubles/proxies that hide it.
+    """
+    try:
+        in_txn = conn.in_transaction
+    except AttributeError:
+        in_txn = None
+    if in_txn is True:
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.OperationalError:
+            # SQLite has already auto-rolled-back the transaction; nothing to
+            # undo — do not shadow the original exception.
+            pass
+        return False
+    if in_txn is False:
+        return True
+    # ``in_transaction`` unavailable (opaque proxy/double): authoritative probe.
+    try:
+        conn.execute("ROLLBACK")
+    except sqlite3.OperationalError as exc:
+        if "no transaction is active" in str(exc).lower():
+            return True
+        return False
+    return False
+
+
 @contextlib.contextmanager
 def write_txn(conn: sqlite3.Connection):
     """Context manager for an IMMEDIATE write transaction.
@@ -3050,21 +3142,69 @@ def write_txn(conn: sqlite3.Connection):
             # under EIO, lock contention, or corruption). Nothing to undo;
             # do not let this secondary failure shadow the real one.
             pass
+        # AION-889 I1+I2 R2 (F1): discard staged receipt files so a SQLite
+        # rollback never leaves an orphaned receipt on disk.
+        _aion_discard_staged_receipt_files(conn)
         raise
     else:
+        # AION-889 I1+I2 R3 (F4 repair): promote staged receipt files to their
+        # final paths BEFORE the transaction commits. The receipt attachment
+        # row records the FINAL path, so the file must already exist at that
+        # path when the terminal state becomes durable — otherwise a promotion
+        # failure or a hard crash in the post-COMMIT window would leave an
+        # authoritative done/sha/attachment/event state pointing at a missing
+        # receipt that ordinary retry can never heal (terminal CAS miss).
+        # Promoting first means any committed terminal state always has its
+        # receipt file present; a promotion failure (or a crash before COMMIT)
+        # leaves the transaction uncommitted, and a crash in the narrow
+        # promote→commit window can leave at most an unreachable, collision-free
+        # orphan final file with NO database reference — deterministic and
+        # retry-clean (the retry generates a fresh collision-free path).
         try:
+            _aion_promote_staged_receipt_files(conn)
             _execute_boundary_with_retry(conn, "COMMIT")
         except Exception:
-            # COMMIT exhausted retries with the txn still open; roll back so the
-            # connection isn't poisoned for the next BEGIN IMMEDIATE.
-            try:
-                conn.execute("ROLLBACK")
-            except sqlite3.OperationalError:
-                pass
-            raise
+            # AION-889 I1+I2 R4 (F5 repair): reconcile the ambiguous COMMIT
+            # outcome instead of blindly assuming rollback. SQLite documents a
+            # commit-time I/O error as an indeterminate outcome — the
+            # transaction MAY have durably landed. The authoritative signal is
+            # the connection's own transaction state (``in_transaction``):
+            #   * still in_transaction -> the COMMIT did NOT land; the writes
+            #     are not durable, so ROLLBACK truly undoes them. Discard the
+            #     staged AND promoted receipt files (zero residue) and re-raise
+            #     so a clean idempotent retry can regenerate them.
+            #   * no longer in_transaction -> the COMMIT DID durably land even
+            #     though the boundary raised. The terminal rows already
+            #     reference the promoted receipt files; discarding them would
+            #     strand a durable done/sha/attachment/event state pointing at
+            #     an absent receipt (the terminal CAS dead-end). Preserve the
+            #     files, drop only the in-memory bookkeeping, and treat the
+            #     commit as complete so the caller's post-commit reconciliation
+            #     (dependent wake, failure-counter reset, cleanup) still runs.
+            # AION-889 I1+I2 R6 (opaque landed-COMMIT receipt loss): the R5
+            # fail-safe default ``getattr(conn, "in_transaction", True)``
+            # collapsed a MISSING transaction-state capability into a boolean
+            # NOT-landed claim. An opaque proxy that hides ``in_transaction``
+            # but durably landed the COMMIT was therefore misclassified: its
+            # promoted receipt file was deleted, immediate dependent wake was
+            # lost, and retry could not heal the terminal CAS miss.
+            # ``_ambiguous_commit_landed`` replaces that boolean default with an
+            # authoritative tri-state — the real ``in_transaction`` value when
+            # present, and an authoritative ROLLBACK probe ("no transaction is
+            # active" == landed) when it is not — so unknown is never collapsed
+            # into a false boolean claim.
+            if not _ambiguous_commit_landed(conn):
+                _aion_discard_staged_receipt_files(conn)
+                raise
+            _aion_clear_receipt_tracking(conn)
         # Post-commit file-length check: header page_count must match actual file pages.
         # A discrepancy means a torn-extend — raise now rather than silently corrupt.
         _check_file_length_invariant(conn)
+        # Successful commit: the promoted receipt files are now durably owned
+        # by the database. Drop the in-memory staging/promotion bookkeeping so
+        # a later rollback on this same connection can never unlink a receipt
+        # that an earlier committed transaction still references.
+        _aion_clear_receipt_tracking(conn)
 
 
 # ---------------------------------------------------------------------------
@@ -5563,6 +5703,339 @@ def _validate_factory_receipt(
         _fail("action_receipt_ref.actor_role is not a closed actor role")
 
 
+# ---------------------------------------------------------------------------
+# AION-889 I1+I2 — kernel-owned finalizer (architecture A) helpers
+# ---------------------------------------------------------------------------
+
+def _aion_factory_finalizer_enabled() -> bool:
+    """True unless ``AION_FACTORY_FINALIZER_ENABLED`` is set to a falsy value.
+
+    The finalizer path can be disabled to restore the pre-bound-receipt-only
+    fail-closed behavior (the exact rollback path of architecture A). Default
+    is enabled (the fix). Reads the env on each call so tests can toggle it.
+    """
+    raw = os.environ.get("AION_FACTORY_FINALIZER_ENABLED")
+    if raw is None:
+        return True
+    return raw.strip().lower() not in {"0", "false", "no", "off", ""}
+
+
+def _aion_governance_source_dir() -> Optional[Path]:
+    """Resolve the pinned aion-governance source directory.
+
+    ``AION_GOVERNANCE_SOURCE_DIR`` (absolute path) wins; otherwise the first
+    configured default directory that contains the kernel module. The loader
+    single-reads and sha-verifies each module before compile/exec, so even a
+    mutable checkout is safe (drift => hash mismatch => fail closed).
+    """
+    raw = os.environ.get("AION_GOVERNANCE_SOURCE_DIR")
+    if raw:
+        p = Path(raw)
+        if p.is_dir():
+            return p
+        return None
+    for candidate in AION_GOVERNANCE_DEFAULT_SOURCE_DIRS:
+        p = Path(candidate)
+        if (p / "scripts" / "aion_monarch_outcome_proof_gate.py").is_file():
+            return p
+    return None
+
+
+def _load_pinned_aion_module(
+    source_dir: Path, rel_path: str, expected_sha256: str, module_name: str,
+) -> Any:
+    """Single-read, SHA-pinned, TOCTOU-safe load of one aion-governance module.
+
+    Reads the file bytes ONCE, verifies sha256 against the pinned expected
+    value, then compiles+execs THOSE SAME bytes into a fresh module namespace.
+    The bytes are never re-read between verification and execution, so a
+    concurrent mutation of the working tree cannot swap the code we execute.
+    """
+    import types as _types
+
+    path = source_dir / rel_path
+    try:
+        data = path.read_bytes()  # single read
+    except OSError as exc:
+        raise FactoryTerminalReceiptRequiredError(
+            task_id="",
+            reason=f"aion-governance module {rel_path} unreadable: {exc}",
+        ) from exc
+    if _sha256_hex(data) != expected_sha256:
+        raise FactoryTerminalReceiptRequiredError(
+            task_id="",
+            reason=(
+                f"aion-governance module {rel_path} sha256 mismatch "
+                f"(expected {expected_sha256[:12]}…, "
+                f"got {_sha256_hex(data)[:12]}…)"
+            ),
+        )
+    module = _types.ModuleType(module_name)
+    module.__file__ = str(path)
+    code = compile(data, str(path), "exec")
+    exec(code, module.__dict__)
+    return module
+
+
+def _load_pinned_aion_modules(task_id: str) -> tuple[Any, Any, Any]:
+    """SHA-pin-load the frozen aion-governance kernel, typed adapters, binder.
+
+    Returns ``(binder, kernel, adapters)``. Each module is single-read,
+    sha256-verified against its pinned hash, then compiled+exec'd from the SAME
+    bytes. The kernel's self-declared ``FROZEN_CONTRACT_SHA256`` is additionally
+    verified against ``FACTORY_CONTRACT_HASH_SHA256``. The modules' intra-package
+    imports (``from scripts.X import ...``) are resolved to the pinned bytes via
+    a synthetic ``scripts`` package in ``sys.modules`` — never re-read from disk.
+    """
+    import types as _types
+
+    source_dir = _aion_governance_source_dir()
+    if source_dir is None:
+        raise FactoryTerminalReceiptRequiredError(
+            task_id,
+            reason="aion-governance source dir not configured "
+                   "(set AION_GOVERNANCE_SOURCE_DIR)",
+        )
+
+    scripts_pkg = _types.ModuleType("scripts")
+    scripts_pkg.__path__ = []  # never scanned on disk
+    sys.modules.setdefault("scripts", scripts_pkg)
+
+    def _load(rel_path: str, expected_sha: str, name: str) -> Any:
+        mod = _load_pinned_aion_module(source_dir, rel_path, expected_sha, name)
+        sys.modules[name] = mod
+        setattr(scripts_pkg, name.rsplit(".", 1)[-1], mod)
+        return mod
+
+    kernel = _load(
+        "scripts/aion_monarch_outcome_proof_gate.py",
+        AION_GOVERNANCE_KERNEL_SHA256,
+        "scripts.aion_monarch_outcome_proof_gate",
+    )
+    # Verify the kernel's frozen contract hash at load (the source bytes were
+    # already sha-verified above; here we assert the constant itself, since a
+    # module merely self-declaring the expected value is insufficient).
+    if getattr(kernel, "FROZEN_CONTRACT_SHA256", None) != FACTORY_CONTRACT_HASH_SHA256:
+        raise FactoryTerminalReceiptRequiredError(
+            task_id, reason="aion-governance kernel FROZEN_CONTRACT_SHA256 mismatch"
+        )
+    adapters = _load(
+        "scripts/aion_monarch_typed_adapters.py",
+        AION_GOVERNANCE_TYPED_ADAPTERS_SHA256,
+        "scripts.aion_monarch_typed_adapters",
+    )
+    binder = _load(
+        "scripts/aion_monarch_receipt_binder.py",
+        AION_GOVERNANCE_RECEIPT_BINDER_SHA256,
+        "scripts.aion_monarch_receipt_binder",
+    )
+    return binder, kernel, adapters
+
+
+# ---------------------------------------------------------------------------
+# AION-889 I1+I2 R2/R3 — transaction-aware receipt-file staging (F1 + F4 repair)
+# ---------------------------------------------------------------------------
+# The kernel-owned finalizer writes the receipt attachment to a STAGING path
+# inside the caller's ``write_txn``. The file is atomically promoted to its
+# final path BEFORE the transaction commits (R3/F4), so any durable terminal
+# state always has its receipt file present. On rollback the staged AND
+# already-promoted files are unlinked, so a failed transaction leaves no
+# residue. This closes two audit findings:
+#   * R1/F1: a fault after the receipt file + DB attachment INSERT but before
+#     the receipt-sha update used to leave an orphan ``aion_monarch_receipt.json``
+#     on disk after SQLite rolled back the row.
+#   * R2/F4: promoting only AFTER COMMIT meant a promotion failure or a hard
+#     crash in that window committed authoritative done/sha/attachment/event
+#     state pointing at a missing receipt, and ordinary retry died on a
+#     terminal CAS miss.
+#
+# We do NOT claim cross-filesystem/SQLite atomicity: staging and final paths
+# share the same attachments directory (same filesystem), so ``os.replace`` is
+# an atomic rename. The residual crash window (after promote, before COMMIT)
+# can only leave an unreachable, collision-free orphan FINAL file with no DB
+# reference — deterministic and retry-clean, never a referenced receipt whose
+# file is missing.
+_AION_STAGED_RECEIPT_FILES: dict[int, list[tuple[Path, Path]]] = {}
+_AION_PROMOTED_RECEIPT_FILES: dict[int, list[Path]] = {}
+
+
+def _stage_receipt_file(
+    dest_dir: Path, safe_name: str, data: bytes, conn: sqlite3.Connection,
+) -> Path:
+    """Write receipt bytes to a unique staging path; return the FINAL path.
+
+    The ``(staging, final)`` pair is registered against ``id(conn)`` so the
+    transaction boundary (``write_txn``) can promote it before commit or
+    discard it on rollback. The final path is collision-free but NOT yet
+    written.
+    """
+    final_path = _collision_free_path(dest_dir, safe_name)
+    staging_path = dest_dir / f".{safe_name}.staging.{os.getpid()}.{secrets.token_hex(6)}"
+    staging_path.write_bytes(data)
+    _AION_STAGED_RECEIPT_FILES.setdefault(id(conn), []).append(
+        (staging_path, final_path)
+    )
+    return final_path
+
+
+def _aion_discard_staged_receipt_files(conn: sqlite3.Connection) -> None:
+    """Unlink any staged AND promoted receipt files for ``conn`` (rollback)."""
+    promoted = _AION_PROMOTED_RECEIPT_FILES.pop(id(conn), [])
+    for final_path in promoted:
+        try:
+            final_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+    entries = _AION_STAGED_RECEIPT_FILES.pop(id(conn), [])
+    for staging_path, _final_path in entries:
+        try:
+            staging_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _aion_clear_receipt_tracking(conn: sqlite3.Connection) -> None:
+    """Drop in-memory staging/promotion bookkeeping WITHOUT unlinking files.
+
+    Used when the COMMIT has durably landed (either the normal success path or
+    the ambiguous-COMMIT path): the promoted receipt files are now referenced
+    by durable terminal rows and must NOT be unlinked. Only the process-local
+    tracking maps are cleared, so a later rollback on this same connection can
+    never unlink a receipt an earlier committed transaction still references.
+    """
+    _AION_PROMOTED_RECEIPT_FILES.pop(id(conn), None)
+    _AION_STAGED_RECEIPT_FILES.pop(id(conn), None)
+
+
+def _aion_promote_staged_receipt_files(conn: sqlite3.Connection) -> None:
+    """Atomically rename staged receipt files to their final paths (pre-commit).
+
+    Each promoted final path is tracked against ``id(conn)`` so the rollback
+    path (``write_txn`` exception) can unlink it again. A promotion failure
+    raises after re-promoting any remaining staged entries, so every file that
+    actually reached its final path is still accounted for by the rollback.
+    """
+    entries = _AION_STAGED_RECEIPT_FILES.pop(id(conn), [])
+    promoted = _AION_PROMOTED_RECEIPT_FILES.setdefault(id(conn), [])
+    attempted = 0
+    try:
+        for staging_path, final_path in entries:
+            os.replace(staging_path, final_path)
+            promoted.append(final_path)
+            attempted += 1
+    except Exception:
+        # The remaining, not-yet-promoted entries still have their staging bytes
+        # on disk. Re-register them so the rollback handler unlinks them (they
+        # are otherwise unreachable orphans — staged bytes without a reference).
+        _AION_STAGED_RECEIPT_FILES.setdefault(id(conn), []).extend(entries[attempted:])
+        raise
+
+
+def _run_kernel_finalizer(
+    conn: sqlite3.Connection, task_id: str, run_id: str, *, board: str,
+    result: Optional[str] = None,
+) -> dict:
+    """Kernel-owned finalizer for a gate=1 task with no pre-bound receipt.
+
+    Runs IN-PROCESS on the SAME connection inside the caller's write
+    transaction (architecture A): before-read -> terminal write -> same-
+    connection post-write readback -> in-process kernel C1-C10 evaluation ->
+    trusted receipt attachment -> sha binding. On success returns the bind
+    outcome; on FAIL_CLOSED or any error raises
+    :class:`FactoryTerminalReceiptRequiredError` so the caller's transaction
+    rolls back to zero mutation. Only this host-level finalizer code stamps the
+    ``aion_monarch_proof_kernel`` identity — the worker toolset cannot.
+    """
+    binder, _kernel, _adapters = _load_pinned_aion_modules(task_id)
+
+    def _terminal_write(c: sqlite3.Connection, tid: str, rid: str) -> None:
+        cur = c.execute(
+            """
+            UPDATE tasks
+               SET status          = 'done',
+                   result          = ?,
+                   completed_at    = ?,
+                   claim_lock      = NULL,
+                   claim_expires   = NULL,
+                   worker_pid      = NULL,
+                   block_kind      = NULL,
+                   block_recurrences = 0
+             WHERE id = ?
+               AND status IN ('running', 'ready', 'blocked')
+               AND current_run_id = ?
+            """,
+            (result, int(time.time()), tid, int(rid)),
+        )
+        if cur.rowcount != 1:
+            # Stale run / CAS miss -> FAIL_CLOSED (rolled back by the txn).
+            raise FactoryTerminalReceiptRequiredError(
+                task_id, reason=f"terminal CAS miss (stale run {rid})"
+            )
+
+    def _store_attachment(
+        c: sqlite3.Connection, tid: str, filename: str, data: bytes, *,
+        uploaded_by: Optional[str] = None, board: Optional[str] = None,
+    ) -> int:
+        safe_name = _safe_attachment_name(filename)
+        dest_dir = task_attachments_dir(tid, board=board)
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        # Transaction-aware: stage the file; the write_txn boundary promotes it
+        # on commit and discards it on rollback (F1 repair). The DB row records
+        # the FINAL path so readback resolves it once the txn commits.
+        final_path = _stage_receipt_file(dest_dir, safe_name, data, c)
+        try:
+            if not c.execute("SELECT 1 FROM tasks WHERE id = ?", (tid,)).fetchone():
+                raise ValueError(f"unknown task {tid}")
+            now = int(time.time())
+            cur = c.execute(
+                "INSERT INTO task_attachments "
+                "(task_id, filename, stored_path, content_type, size, "
+                " uploaded_by, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (tid, safe_name, str(final_path.resolve()), None, len(data),
+                 uploaded_by, now),
+            )
+            _append_event(
+                c, tid, "attached",
+                {"filename": safe_name, "size": len(data), "by": uploaded_by},
+            )
+            return int(cur.lastrowid or 0)
+        except Exception:
+            # Discard the staged file for this connection so neither a later
+            # rollback nor a direct (non-write_txn) call can orphan it.
+            _aion_discard_staged_receipt_files(c)
+            raise
+
+    def _set_sha(c: sqlite3.Connection, tid: str, sha: str) -> str:
+        cur = c.execute(
+            "UPDATE tasks SET factory_terminal_receipt_sha256 = ? WHERE id = ?",
+            (sha, tid),
+        )
+        if cur.rowcount == 0:
+            raise ValueError(f"unknown task {tid}")
+        return sha
+
+    outcome = binder.bind_task_terminal_in_txn(
+        conn=conn, board=board, task_id=task_id, run_id=run_id,
+        terminal_write=_terminal_write,
+        store_attachment=_store_attachment,
+        set_factory_terminal_receipt_sha=_set_sha,
+    )
+    if not outcome.get("bound"):
+        raise FactoryTerminalReceiptRequiredError(
+            task_id,
+            reason=(
+                "kernel finalizer FAIL_CLOSED: "
+                f"{outcome.get('fail_closed_class')} "
+                f"{','.join(outcome.get('failed_conditions') or [])}"
+            ),
+        )
+    # Defense-in-depth: re-run the frozen gate's r1..r8 authenticity readback on
+    # the freshly bound receipt (C1..C10 were already evaluated by the kernel).
+    _validate_factory_receipt(outcome.get("receipt_doc"), task_id, int(run_id))
+    return outcome
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5647,43 +6120,60 @@ def complete_task(
         "current_run_id FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
+    _run_finalizer = False
+    _finalizer_run_id = None
     if _gate_row is not None and _gate_row["factory_build_gate"]:
+        # Determine whether a VALID pre-bound receipt already exists (the
+        # merge / already-terminal path, preserved unchanged). Any failure
+        # below records a reason instead of raising immediately so the
+        # kernel-owned finalizer (architecture A) can bind the receipt itself.
+        _prebound_valid = False
+        _prebound_reason = "no authenticated receipt"
         _receipt = _gate_row["factory_terminal_receipt_sha256"]
-        if not (
-            isinstance(_receipt, str)
-            and re.fullmatch(r"[0-9a-fA-F]{64}", _receipt)
-        ):
-            raise FactoryTerminalReceiptRequiredError(
-                task_id, reason="receipt sha256 is missing or not 64-hex"
+        if isinstance(_receipt, str) and re.fullmatch(r"[0-9a-fA-F]{64}", _receipt):
+            _receipt_found = _find_factory_receipt_bytes(
+                conn, task_id, _receipt.lower()
             )
-        _receipt_found = _find_factory_receipt_bytes(
-            conn, task_id, _receipt.lower()
-        )
-        if _receipt_found is None:
-            raise FactoryTerminalReceiptRequiredError(
-                task_id, reason="no readable receipt attachment matches the bound sha256"
-            )
-        _receipt_bytes, _receipt_uploaded_by = _receipt_found
-        if _receipt_uploaded_by not in FACTORY_TRUSTED_RECEIPT_UPLOADERS:
-            raise FactoryTerminalReceiptRequiredError(
-                task_id,
-                reason=(
-                    "receipt attachment uploaded_by "
-                    f"{_receipt_uploaded_by!r} is not a trusted kernel-executor identity"
-                ),
-            )
-        try:
-            _receipt_doc = json.loads(_receipt_bytes.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            raise FactoryTerminalReceiptRequiredError(
-                task_id, reason="receipt file is not valid UTF-8 JSON"
-            )
-        _current_run_id = (
-            int(expected_run_id)
-            if expected_run_id is not None
-            else _gate_row["current_run_id"]
-        )
-        _validate_factory_receipt(_receipt_doc, task_id, _current_run_id)
+            if _receipt_found is None:
+                _prebound_reason = "no readable receipt attachment matches the bound sha256"
+            else:
+                _receipt_bytes, _receipt_uploaded_by = _receipt_found
+                if _receipt_uploaded_by not in FACTORY_TRUSTED_RECEIPT_UPLOADERS:
+                    _prebound_reason = (
+                        "receipt attachment uploaded_by "
+                        f"{_receipt_uploaded_by!r} is not a trusted kernel-executor identity"
+                    )
+                else:
+                    try:
+                        _receipt_doc = json.loads(_receipt_bytes.decode("utf-8"))
+                    except (UnicodeDecodeError, json.JSONDecodeError):
+                        _receipt_doc = None
+                    if _receipt_doc is None:
+                        _prebound_reason = "receipt file is not valid UTF-8 JSON"
+                    else:
+                        _current_run_id = (
+                            int(expected_run_id)
+                            if expected_run_id is not None
+                            else _gate_row["current_run_id"]
+                        )
+                        try:
+                            _validate_factory_receipt(_receipt_doc, task_id, _current_run_id)
+                            _prebound_valid = True
+                        except FactoryTerminalReceiptRequiredError as _exc:
+                            _prebound_reason = _exc.reason
+        else:
+            _prebound_reason = "receipt sha256 is missing or not 64-hex"
+
+        if not _prebound_valid:
+            # AION-889 I1+I2: with no valid pre-bound receipt, invoke the
+            # kernel-owned finalizer inside the write txn (architecture A) when
+            # enabled and this is a worker-bound completion (has a run id).
+            # Otherwise FAIL_CLOSED exactly as before (rollback path).
+            if _aion_factory_finalizer_enabled() and expected_run_id is not None:
+                _run_finalizer = True
+                _finalizer_run_id = str(expected_run_id)
+            else:
+                raise FactoryTerminalReceiptRequiredError(task_id, reason=_prebound_reason)
 
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
@@ -5710,56 +6200,66 @@ def complete_task(
     )
 
     with write_txn(conn):
-        if expected_run_id is None:
-            # Read prior status for audit event.
-            prior = conn.execute(
-                "SELECT status FROM tasks WHERE id = ?", (task_id,),
-            ).fetchone()
-            if prior is None:
-                return False
-            prior_status = prior["status"]
-            if prior_status not in _CONTROLLER_TERMINAL_STATUSES:
-                return False
-            cur = conn.execute(
-                """
-                UPDATE tasks
-                   SET status       = 'done',
-                       result       = ?,
-                       completed_at = ?,
-                       claim_lock   = NULL,
-                       claim_expires= NULL,
-                       worker_pid   = NULL,
-                       block_kind   = NULL,
-                       block_recurrences = 0
-                 WHERE id = ?
-                   AND status = ?
-                """,
-                (result, now, task_id, prior_status),
+        if _run_finalizer:
+            # AION-889 I1+I2 (architecture A): the kernel-owned finalizer owns
+            # the terminal write (running -> done) AND the receipt binding
+            # inside THIS same transaction. Any FAIL_CLOSED raises and rolls
+            # the whole txn back to zero mutation.
+            _run_kernel_finalizer(
+                conn, task_id, _finalizer_run_id, board=get_current_board(),
+                result=result,
             )
         else:
-            # Worker-bound completion: strict CAS gate — only running +
-            # matching run_id. Non-running statuses (triage, todo,
-            # scheduled, review) never match because they have no
-            # current_run_id.
-            cur = conn.execute(
-                """
-                UPDATE tasks
-                   SET status       = 'done',
-                       result       = ?,
-                       completed_at = ?,
-                       claim_lock   = NULL,
-                       claim_expires= NULL,
-                       worker_pid   = NULL,
-                       block_kind   = NULL,
-                       block_recurrences = 0
-                 WHERE id = ?
-                   AND status IN ('running', 'ready', 'blocked')
-                   AND current_run_id = ?
-                """,
-                (result, now, task_id, int(expected_run_id)),
-            )
-        if cur.rowcount != 1:
-            return False
+            if expected_run_id is None:
+                # Read prior status for audit event.
+                prior = conn.execute(
+                    "SELECT status FROM tasks WHERE id = ?", (task_id,),
+                ).fetchone()
+                if prior is None:
+                    return False
+                prior_status = prior["status"]
+                if prior_status not in _CONTROLLER_TERMINAL_STATUSES:
+                    return False
+                cur = conn.execute(
+                    """
+                    UPDATE tasks
+                       SET status       = 'done',
+                           result       = ?,
+                           completed_at = ?,
+                           claim_lock   = NULL,
+                           claim_expires= NULL,
+                           worker_pid   = NULL,
+                           block_kind   = NULL,
+                           block_recurrences = 0
+                     WHERE id = ?
+                       AND status = ?
+                    """,
+                    (result, now, task_id, prior_status),
+                )
+            else:
+                # Worker-bound completion: strict CAS gate — only running +
+                # matching run_id. Non-running statuses (triage, todo,
+                # scheduled, review) never match because they have no
+                # current_run_id.
+                cur = conn.execute(
+                    """
+                    UPDATE tasks
+                       SET status       = 'done',
+                           result       = ?,
+                           completed_at = ?,
+                           claim_lock   = NULL,
+                           claim_expires= NULL,
+                           worker_pid   = NULL,
+                           block_kind   = NULL,
+                           block_recurrences = 0
+                     WHERE id = ?
+                       AND status IN ('running', 'ready', 'blocked')
+                       AND current_run_id = ?
+                    """,
+                    (result, now, task_id, int(expected_run_id)),
+                )
+            if cur.rowcount != 1:
+                return False
         if isinstance(metadata, dict):
             _persist_scratch_completion_artifacts(conn, task_id, metadata)
             for stored_path in metadata.pop("_staged_artifacts", []):

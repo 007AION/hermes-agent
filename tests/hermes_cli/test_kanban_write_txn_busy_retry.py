@@ -19,11 +19,17 @@ class _FakeConn:
 
     script maps an uppercased SQL prefix to a list of outcomes consumed in
     order. An outcome is either an Exception (raised) or None (success).
+
+    ``in_transaction`` mirrors a real sqlite3.Connection so write_txn's
+    ambiguous-COMMIT reconciliation can consult it: BEGIN IMMEDIATE opens the
+    transaction, a successful COMMIT/ROLLBACK closes it, and a COMMIT that
+    raises leaves it open (the commit did not land).
     """
 
     def __init__(self, script):
         self._script = {k: list(v) for k, v in script.items()}
         self.calls = []
+        self.in_transaction = False
 
     def execute(self, sql, *args):
         self.calls.append(sql)
@@ -33,6 +39,10 @@ class _FakeConn:
             outcome = outcomes.pop(0)
             if isinstance(outcome, Exception):
                 raise outcome
+        if key == "BEGIN":
+            self.in_transaction = True
+        elif key in ("COMMIT", "ROLLBACK"):
+            self.in_transaction = False
         return None
 
     def count(self, prefix):
@@ -118,6 +128,87 @@ def test_persistent_busy_at_commit_rolls_back():
     # re-raising so the connection isn't poisoned for the next transaction.
     conn = _FakeConn({"COMMIT": [_busy()] * 50})
     with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+        with kb.write_txn(conn):
+            pass
+    assert conn.count("ROLLBACK") == 1
+
+
+def test_missing_in_transaction_capability_is_fail_safe_not_landed():
+    # A connection double/proxy that lacks ``in_transaction`` (an older or
+    # third-party contract) must not raise AttributeError and must not be
+    # silently classified as landed: write_txn treats the missing capability as
+    # "still in transaction", so the exhausted COMMIT still rolls back and
+    # re-raises the original sqlite3.OperationalError.
+    conn = _FakeConn({"COMMIT": [_busy()] * 50})
+    del conn.in_transaction
+    with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+        with kb.write_txn(conn):
+            pass
+    assert conn.count("ROLLBACK") == 1
+
+
+class _OpaqueTxnConn:
+    """Connection double that HIDES ``in_transaction`` (R6 opaque boundary).
+
+    Unlike ``_FakeConn`` it never exposes ``in_transaction`` (accessing it
+    raises AttributeError), so ``write_txn`` must fall back to the authoritative
+    ROLLBACK probe. It models a single underlying transaction:
+
+    * BEGIN opens the transaction.
+    * COMMIT either lands (closes the transaction) then raises, or raises
+      without landing (transaction stays open), per ``commit_lands``.
+    * ROLLBACK raises "no transaction is active" when the transaction is already
+      closed (landed), otherwise closes it and succeeds.
+    """
+
+    def __init__(self, commit_raises=None, *, commit_lands=False):
+        self.commit_raises = commit_raises
+        self.commit_lands = commit_lands
+        self.calls = []
+        self._open = False
+
+    def execute(self, sql, *args):
+        key = sql.strip().split()[0].upper()
+        self.calls.append(key)
+        if key == "BEGIN":
+            self._open = True
+        elif key == "COMMIT":
+            if self.commit_lands:
+                self._open = False
+            if self.commit_raises is not None:
+                raise self.commit_raises
+            self._open = False
+        elif key == "ROLLBACK":
+            if not self._open:
+                raise sqlite3.OperationalError("cannot rollback - no transaction is active")
+            self._open = False
+        return None
+
+    def count(self, prefix):
+        prefix = prefix.upper()
+        return sum(1 for c in self.calls if c.upper().startswith(prefix))
+
+
+def test_opaque_landed_commit_is_reconciled_as_landed():
+    # An opaque connection double that HIDES ``in_transaction`` but durably
+    # landed the COMMIT before raising must be reconciled as LANDED: write_txn
+    # must NOT re-raise (the commit is complete) and must NOT roll back the
+    # already-closed transaction. The authoritative signal is the ROLLBACK
+    # probe raising "no transaction is active".
+    err = sqlite3.OperationalError("injected: COMMIT landed then error")
+    conn = _OpaqueTxnConn(commit_raises=err, commit_lands=True)
+    with kb.write_txn(conn):  # must NOT raise
+        pass
+    assert conn.count("ROLLBACK") == 1  # the authoritative probe, not a rollback
+
+
+def test_opaque_nonlanded_commit_reraises_original():
+    # An opaque connection double that HIDES ``in_transaction`` and whose COMMIT
+    # did NOT land must be reconciled as NOT-landed: write_txn rolls back and
+    # re-raises the ORIGINAL sqlite3.OperationalError (never AttributeError).
+    err = sqlite3.OperationalError("injected: COMMIT did not land")
+    conn = _OpaqueTxnConn(commit_raises=err, commit_lands=False)
+    with pytest.raises(sqlite3.OperationalError, match="did not land"):
         with kb.write_txn(conn):
             pass
     assert conn.count("ROLLBACK") == 1
