@@ -8338,8 +8338,63 @@ def decompose_triage_task(
     return child_ids
 
 
-def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
+def archive_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: Optional[str] = None,
+    actor: Optional[str] = None,
+    source: Optional[str] = None,
+    fail_if_active_run: bool = False,
+    expected_status: Optional[str] = None,
+) -> bool:
+    """Move a task to durable, non-dispatchable ``archived`` terminality.
+
+    ``reason`` / ``actor`` / ``source`` are optional audit context for public
+    controller operations. Existing CLI and dashboard callers retain the
+    legacy empty payload when they omit all three fields.
+
+    Model-facing controller operations set ``fail_if_active_run`` and an
+    ``expected_status``.  In that mode the expected-state/active-obligation
+    checks and archive transition share one write transaction, so a dispatcher
+    claim or lifecycle transition cannot race between a preflight read and the
+    destructive transition.  Human CLI/dashboard recovery keeps the legacy
+    ability to archive other states and reclaim a live run by omitting them.
+    """
     with write_txn(conn):
+        if fail_if_active_run:
+            active = conn.execute(
+                "SELECT t.status, t.current_run_id, t.claim_lock, t.worker_pid, "
+                "       EXISTS ("
+                "           SELECT 1 FROM task_runs r "
+                "           WHERE r.task_id = t.id AND r.ended_at IS NULL"
+                "       ) AS has_open_run "
+                "FROM tasks t WHERE t.id = ?",
+                (task_id,),
+            ).fetchone()
+            if active is None:
+                return False
+            active_fields = []
+            if active["status"] == "running":
+                active_fields.append("status=running")
+            if active["current_run_id"] is not None:
+                active_fields.append(f"current_run_id={active['current_run_id']}")
+            if active["claim_lock"] is not None:
+                active_fields.append("claim_lock=set")
+            if active["worker_pid"] is not None:
+                active_fields.append(f"worker_pid={active['worker_pid']}")
+            if active["has_open_run"]:
+                active_fields.append("open_run=set")
+            if active_fields:
+                raise RuntimeError(
+                    f"refusing to archive active task {task_id}: "
+                    + ", ".join(active_fields)
+                )
+            if expected_status is not None and active["status"] != expected_status:
+                raise RuntimeError(
+                    f"refusing to archive task {task_id}: expected status "
+                    f"{expected_status}, found {active['status']}"
+                )
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
             "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
@@ -8367,7 +8422,18 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
             outcome="reclaimed",
             summary="invariant recovery on archive",
         )
-        _append_event(conn, task_id, "archived", None, run_id=run_id)
+        audit_payload = {
+            key: value
+            for key, value in (
+                ("reason", reason),
+                ("actor", actor),
+                ("source", source),
+            )
+            if value
+        }
+        _append_event(
+            conn, task_id, "archived", audit_payload or None, run_id=run_id,
+        )
     # ``archived`` parents no longer block children, same as ``done``.
     # Promote newly-unblocked dependents immediately instead of waiting
     # for a later dispatcher tick.
