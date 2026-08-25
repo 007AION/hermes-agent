@@ -20,6 +20,20 @@ import pytest
 from hermes_cli import kanban_db as kb
 
 
+@pytest.fixture(autouse=True)
+def deterministic_open_fd_scan_for_cleanup_tests(request, monkeypatch):
+    """Keep cleanup tests independent of the host runner's protected /proc.
+
+    Direct scanner tests retain the real implementation; all other tests start
+    from an explicit zero-open-FD receipt and may override it for gate cases.
+    """
+    if request.node.name.startswith("test_open_fd_scan_"):
+        return
+    monkeypatch.setattr(kb, "_workspace_open_file_pids", lambda _path: {
+        "status": "PASS", "pids": [], "reason": None,
+    })
+
+
 @pytest.fixture
 def kanban_home(tmp_path, monkeypatch):
     """Isolated HERMES_HOME with an empty kanban DB."""
@@ -3368,6 +3382,216 @@ def test_cleanup_workspace_removes_managed_scratch_dir(kanban_home):
     assert not ws.exists(), "Hermes-managed scratch dir should be cleaned up"
 
 
+def test_terminal_scratch_hygiene_persists_exact_eligible_receipt(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="receipt")
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        ws = kb.resolve_workspace(task)
+        kb.set_workspace_path(conn, tid, ws)
+        (ws / "residue.txt").write_text("1234", encoding="utf-8")
+        assert kb.complete_task(conn, tid, result="done")
+        events = [e for e in kb.list_events(conn, tid) if e.kind == "terminal_workspace_hygiene"]
+    assert len(events) == 1
+    receipt = events[0].payload or {}
+    assert receipt["classification"] == "ELIGIBLE"
+    assert receipt["action"] == "delete_exact_path"
+    assert receipt["deleted_exact_paths"] == [str(ws.resolve(strict=False))]
+    assert receipt["bytes_reclaimed"] == 4
+    assert receipt["open_file_pids"] == []
+    assert not ws.exists()
+
+
+def test_terminal_hygiene_preserves_worktree_as_unknown_without_pr_main_gate(kanban_home, tmp_path):
+    wt = tmp_path / "task-worktree"
+    wt.mkdir()
+    (wt / "unique.txt").write_text("keep", encoding="utf-8")
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="worktree", workspace_kind="worktree", workspace_path=str(wt),
+        )
+        assert kb.complete_task(conn, tid, result="done")
+        receipt = [e for e in kb.list_events(conn, tid) if e.kind == "terminal_workspace_hygiene"][-1].payload or {}
+    assert receipt["classification"] == "UNKNOWN"
+    assert receipt["reason"] == "pr_main_audit_retention_identity_not_represented"
+    assert wt.exists()
+
+
+def test_terminal_scratch_hygiene_preserves_open_fd_ambiguity(kanban_home, monkeypatch):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="open-fd")
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        ws = kb.resolve_workspace(task)
+        kb.set_workspace_path(conn, tid, ws)
+        (ws / "open.txt").write_text("keep", encoding="utf-8")
+        monkeypatch.setattr(kb, "_workspace_open_file_pids", lambda _path: {
+            "status": "PASS", "pids": [4242], "reason": None,
+        })
+        assert kb.complete_task(conn, tid, result="done")
+        receipt = [e for e in kb.list_events(conn, tid) if e.kind == "terminal_workspace_hygiene"][-1].payload or {}
+    assert receipt["classification"] == "UNKNOWN"
+    assert receipt["reason"] == "open_file_or_fd_scan_unknown"
+    assert ws.exists()
+
+
+def test_open_fd_scan_fails_closed_when_pid_fd_directory_is_unreadable(
+    tmp_path, monkeypatch,
+):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setattr(kb.os, "listdir", lambda path: ["123"] if path == "/proc" else [])
+    original_exists = Path.exists
+    original_is_dir = Path.is_dir
+
+    def exists(path):
+        if str(path) == "/proc/123":
+            return True
+        return original_exists(path)
+
+    monkeypatch.setattr(Path, "exists", exists)
+    monkeypatch.setattr(
+        Path, "is_dir",
+        lambda path: True if str(path) == "/proc/123/fd" else original_is_dir(path),
+    )
+    monkeypatch.setattr(Path, "iterdir", lambda path: (_ for _ in ()).throw(PermissionError()))
+    monkeypatch.setattr(
+        kb.os, "readlink",
+        lambda path: str(workspace) if str(path) == "/proc/123/cwd" else "",
+    )
+
+    scan = kb._workspace_open_file_pids(workspace)
+
+    assert scan["status"] == "UNKNOWN"
+    assert scan["pids"] == []
+    assert scan["reason"] == "fd_directory_PermissionError"
+
+
+def test_open_fd_scan_fails_closed_when_unreadable_fd_directory_relevance_is_unknown(
+    tmp_path, monkeypatch,
+):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setattr(kb.os, "listdir", lambda path: ["123"] if path == "/proc" else [])
+    original_is_dir = Path.is_dir
+    monkeypatch.setattr(
+        Path, "is_dir",
+        lambda path: True if str(path) == "/proc/123/fd" else original_is_dir(path),
+    )
+    monkeypatch.setattr(Path, "iterdir", lambda _path: (_ for _ in ()).throw(PermissionError()))
+    monkeypatch.setattr(kb.os, "readlink", lambda _path: (_ for _ in ()).throw(PermissionError()))
+
+    scan = kb._workspace_open_file_pids(workspace)
+
+    assert scan["status"] == "UNKNOWN"
+    assert scan["reason"] == "fd_directory_PermissionError"
+
+
+def test_open_fd_scan_ignores_unreadable_process_rooted_elsewhere(
+    tmp_path, monkeypatch,
+):
+    workspace = tmp_path / "workspace"
+    elsewhere = tmp_path / "elsewhere"
+    workspace.mkdir()
+    elsewhere.mkdir()
+    monkeypatch.setattr(kb.os, "listdir", lambda path: ["123"] if path == "/proc" else [])
+    original_is_dir = Path.is_dir
+    monkeypatch.setattr(
+        Path, "is_dir",
+        lambda path: True if str(path) == "/proc/123/fd" else original_is_dir(path),
+    )
+    monkeypatch.setattr(Path, "iterdir", lambda _path: (_ for _ in ()).throw(PermissionError()))
+    monkeypatch.setattr(
+        kb.os, "readlink",
+        lambda path: str(elsewhere) if str(path) == "/proc/123/cwd" else "",
+    )
+
+    scan = kb._workspace_open_file_pids(workspace)
+
+    assert scan == {"status": "PASS", "pids": [], "reason": None}
+
+
+def test_open_fd_scan_fails_closed_when_extant_fd_target_is_unreadable(
+    tmp_path, monkeypatch,
+):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    fd = Path("/proc/123/fd/7")
+    monkeypatch.setattr(kb.os, "listdir", lambda path: ["123"] if path == "/proc" else [])
+    monkeypatch.setattr(Path, "iterdir", lambda _path: iter([fd]))
+    monkeypatch.setattr(
+        kb.os, "readlink",
+        lambda path: (
+            str(workspace) if str(path) == "/proc/123/cwd"
+            else (_ for _ in ()).throw(PermissionError())
+        ),
+    )
+    monkeypatch.setattr(kb.os.path, "lexists", lambda path: path == fd)
+
+    scan = kb._workspace_open_file_pids(workspace)
+
+    assert scan["status"] == "UNKNOWN"
+    assert scan["pids"] == []
+    assert scan["reason"] == "fd_target_PermissionError"
+
+
+def test_open_fd_scan_fails_closed_when_extant_fd_target_relevance_is_unknown(
+    tmp_path, monkeypatch,
+):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    fd = Path("/proc/123/fd/7")
+    monkeypatch.setattr(kb.os, "listdir", lambda path: ["123"] if path == "/proc" else [])
+    monkeypatch.setattr(Path, "iterdir", lambda _path: iter([fd]))
+    monkeypatch.setattr(kb.os, "readlink", lambda _path: (_ for _ in ()).throw(PermissionError()))
+    monkeypatch.setattr(kb.os.path, "lexists", lambda path: path == fd)
+
+    scan = kb._workspace_open_file_pids(workspace)
+
+    assert scan["status"] == "UNKNOWN"
+    assert scan["reason"] == "fd_target_PermissionError"
+
+
+def test_terminal_scratch_hygiene_preserves_typed_fd_scan_ambiguity(
+    kanban_home, monkeypatch,
+):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="fd-scan-unknown")
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        ws = kb.resolve_workspace(task)
+        kb.set_workspace_path(conn, tid, ws)
+        (ws / "keep.txt").write_text("keep", encoding="utf-8")
+        monkeypatch.setattr(kb, "_workspace_open_file_pids", lambda _path: {
+            "status": "UNKNOWN", "pids": [], "reason": "fd_target_PermissionError",
+        })
+        assert kb.complete_task(conn, tid, result="done")
+        receipt = [
+            e for e in kb.list_events(conn, tid)
+            if e.kind == "terminal_workspace_hygiene"
+        ][-1].payload or {}
+    assert receipt["classification"] == "UNKNOWN"
+    assert receipt["fd_scan_status"] == "UNKNOWN"
+    assert receipt["reason"] == "open_file_or_fd_scan_unknown"
+    assert ws.exists()
+
+
+def test_terminal_scratch_hygiene_preserves_dirty_git(kanban_home, monkeypatch):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="dirty")
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        ws = kb.resolve_workspace(task)
+        kb.set_workspace_path(conn, tid, ws)
+        (ws / "unique.txt").write_text("keep", encoding="utf-8")
+        monkeypatch.setattr(kb, "_scratch_git_clean", lambda _path: False)
+        assert kb.complete_task(conn, tid, result="done")
+        receipt = [e for e in kb.list_events(conn, tid) if e.kind == "terminal_workspace_hygiene"][-1].payload or {}
+    assert receipt["classification"] == "NOT_ELIGIBLE"
+    assert receipt["reason"] == "dirty_git_or_untracked_unique_evidence"
+    assert ws.exists()
+
+
 def test_complete_task_persists_scratch_artifacts_before_cleanup(kanban_home):
     """Completion artifacts from scratch workspaces survive workspace cleanup."""
     with kb.connect() as conn:
@@ -3650,6 +3874,181 @@ def test_cleanup_workspace_swept_after_last_child_completes(kanban_home):
         "Parent scratch workspace should be swept once all children are terminal"
     )
     assert not child_ws.exists(), "Child scratch workspace should be cleaned up too"
+
+
+def test_deferred_parent_hygiene_receipt_uses_same_terminal_guards(kanban_home):
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent")
+        child = kb.create_task(conn, title="child")
+        kb.link_tasks(conn, parent, child)
+        parent_task = kb.get_task(conn, parent)
+        child_task = kb.get_task(conn, child)
+        assert parent_task is not None and child_task is not None
+        parent_ws = kb.resolve_workspace(parent_task)
+        child_ws = kb.resolve_workspace(child_task)
+        kb.set_workspace_path(conn, parent, parent_ws)
+        kb.set_workspace_path(conn, child, child_ws)
+        (parent_ws / "handoff.txt").write_text("handoff", encoding="utf-8")
+        kb.complete_task(conn, parent, result="handoff")
+        assert parent_ws.exists()
+        kb.complete_task(conn, child, result="consumed")
+        receipts = [
+            e.payload or {} for e in kb.list_events(conn, parent)
+            if e.kind == "terminal_workspace_hygiene"
+        ]
+    assert receipts[-1]["classification"] == "ELIGIBLE"
+    assert receipts[-1]["deferred_parent_sweep"] is True
+    assert receipts[-1]["reason"] == "all_deferred_terminal_guards_passed"
+    assert not parent_ws.exists()
+
+
+def test_deferred_parent_hygiene_preserves_indeterminate_fd_scan(
+    kanban_home, monkeypatch,
+):
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent")
+        child = kb.create_task(conn, title="child")
+        kb.link_tasks(conn, parent, child)
+        parent_task = kb.get_task(conn, parent)
+        child_task = kb.get_task(conn, child)
+        assert parent_task is not None and child_task is not None
+        parent_ws = kb.resolve_workspace(parent_task)
+        child_ws = kb.resolve_workspace(child_task)
+        kb.set_workspace_path(conn, parent, parent_ws)
+        kb.set_workspace_path(conn, child, child_ws)
+        (parent_ws / "handoff.txt").write_text("keep", encoding="utf-8")
+        kb.complete_task(conn, parent, result="deferred")
+        assert parent_ws.exists()
+        monkeypatch.setattr(
+            kb,
+            "_workspace_open_file_pids",
+            lambda path: (
+                {
+                    "status": "UNKNOWN", "pids": [],
+                    "reason": "fd_directory_PermissionError",
+                }
+                if path == parent_ws
+                else {"status": "PASS", "pids": [], "reason": None}
+            ),
+        )
+
+        kb.complete_task(conn, child, result="done")
+        receipt = [
+            e.payload or {} for e in kb.list_events(conn, parent)
+            if e.kind == "terminal_workspace_hygiene"
+        ][-1]
+
+    assert receipt["classification"] == "UNKNOWN"
+    assert receipt["fd_scan_status"] == "UNKNOWN"
+    assert receipt["reason"] == "open_file_or_fd_scan_unknown"
+    assert parent_ws.exists()
+
+
+def test_deferred_parent_sweep_preserves_parent_that_became_nonterminal(kanban_home):
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent")
+        child = kb.create_task(conn, title="child")
+        kb.link_tasks(conn, parent, child)
+        parent_task = kb.get_task(conn, parent)
+        child_task = kb.get_task(conn, child)
+        assert parent_task is not None and child_task is not None
+        parent_ws = kb.resolve_workspace(parent_task)
+        child_ws = kb.resolve_workspace(child_task)
+        kb.set_workspace_path(conn, parent, parent_ws)
+        kb.set_workspace_path(conn, child, child_ws)
+        (parent_ws / "handoff.txt").write_text("keep", encoding="utf-8")
+        kb.complete_task(conn, parent, result="deferred")
+        assert parent_ws.exists()
+        conn.execute("UPDATE tasks SET status = 'running' WHERE id = ?", (parent,))
+        conn.commit()
+
+        kb.complete_task(conn, child, result="done")
+        receipt = [
+            e.payload or {} for e in kb.list_events(conn, parent)
+            if e.kind == "terminal_workspace_hygiene"
+        ][-1]
+
+    assert receipt["classification"] == "NOT_ELIGIBLE"
+    assert receipt["reason"] == "deferred_parent_not_terminal"
+    assert parent_ws.exists()
+
+
+def test_deferred_parent_sweep_rereads_terminal_status_before_rmtree(
+    kanban_home, monkeypatch,
+):
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent")
+        child = kb.create_task(conn, title="child")
+        kb.link_tasks(conn, parent, child)
+        parent_task = kb.get_task(conn, parent)
+        child_task = kb.get_task(conn, child)
+        assert parent_task is not None and child_task is not None
+        parent_ws = kb.resolve_workspace(parent_task)
+        child_ws = kb.resolve_workspace(child_task)
+        kb.set_workspace_path(conn, parent, parent_ws)
+        kb.set_workspace_path(conn, child, child_ws)
+        (parent_ws / "handoff.txt").write_text("keep", encoding="utf-8")
+        kb.complete_task(conn, parent, result="deferred")
+        assert parent_ws.exists()
+        original_git_clean = kb._scratch_git_clean
+
+        def drift_status_before_actuation(workspace):
+            clean = original_git_clean(workspace)
+            if workspace == parent_ws:
+                conn.execute("UPDATE tasks SET status = 'running' WHERE id = ?", (parent,))
+                conn.commit()
+            return clean
+
+        monkeypatch.setattr(kb, "_scratch_git_clean", drift_status_before_actuation)
+        kb.complete_task(conn, child, result="done")
+        receipt = [
+            e.payload or {} for e in kb.list_events(conn, parent)
+            if e.kind == "terminal_workspace_hygiene"
+        ][-1]
+
+    assert receipt["classification"] == "NOT_ELIGIBLE"
+    assert receipt["reason"] == "deferred_parent_terminal_status_drift"
+    assert receipt["task_status_at_actuation"] == "running"
+    assert parent_ws.exists()
+
+
+def test_deferred_parent_sweep_rechecks_status_after_byte_accounting(
+    kanban_home, monkeypatch,
+):
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent")
+        child = kb.create_task(conn, title="child")
+        kb.link_tasks(conn, parent, child)
+        parent_task = kb.get_task(conn, parent)
+        child_task = kb.get_task(conn, child)
+        assert parent_task is not None and child_task is not None
+        parent_ws = kb.resolve_workspace(parent_task)
+        child_ws = kb.resolve_workspace(child_task)
+        kb.set_workspace_path(conn, parent, parent_ws)
+        kb.set_workspace_path(conn, child, child_ws)
+        (parent_ws / "handoff.txt").write_text("keep", encoding="utf-8")
+        kb.complete_task(conn, parent, result="deferred")
+        assert parent_ws.exists()
+        original_rglob = Path.rglob
+        drifted = {"done": False}
+
+        def drift_during_accounting(path, pattern):
+            if path == parent_ws and not drifted["done"]:
+                drifted["done"] = True
+                conn.execute("UPDATE tasks SET status = 'running' WHERE id = ?", (parent,))
+                conn.commit()
+            return original_rglob(path, pattern)
+
+        monkeypatch.setattr(Path, "rglob", drift_during_accounting)
+        kb.complete_task(conn, child, result="done")
+        receipt = [
+            e.payload or {} for e in kb.list_events(conn, parent)
+            if e.kind == "terminal_workspace_hygiene"
+        ][-1]
+
+    assert receipt["classification"] == "NOT_ELIGIBLE"
+    assert receipt["reason"] == "deferred_parent_terminal_status_drift"
+    assert parent_ws.exists()
 
 
 def test_dir_child_completion_unblocks_deferred_scratch_parent(kanban_home, tmp_path):

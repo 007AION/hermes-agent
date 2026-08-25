@@ -6742,10 +6742,27 @@ def complete_task(
     _clear_failure_counter(conn, task_id)
     # Recompute ready status for dependents (separate txn so children see done).
     recompute_ready(conn)
-    # Clean up the scratch workspace and any stale tmux session for the worker.
-    _cleanup_workspace(conn, task_id, captured_worker_pid=captured_worker_pid)
-    # Close workspace processes on completion (AION-CORE-PR6).
-    _cleanup_workspace_on_completion(conn, task_id)
+    # Classify and clean the exact terminal workspace, then persist the receipt.
+    # The receipt is deliberately written after the terminal CAS committed so
+    # it can describe the real post-actuation state without widening the CAS.
+    process_hygiene = _cleanup_workspace_on_completion(conn, task_id)
+    hygiene = _cleanup_workspace(
+        conn,
+        task_id,
+        captured_worker_pid=captured_worker_pid,
+        process_hygiene=process_hygiene,
+    )
+    _log.info(
+        "terminal workspace hygiene: task=%s classification=%s reason=%s "
+        "fd_scan_status=%s open_file_pids=%s",
+        task_id,
+        hygiene.get("classification"),
+        hygiene.get("reason"),
+        hygiene.get("fd_scan_status"),
+        hygiene.get("open_file_pids"),
+    )
+    with write_txn(conn):
+        _append_event(conn, task_id, "terminal_workspace_hygiene", hygiene)
     _done_task = get_task(conn, task_id)
     _fire_kanban_lifecycle_hook(
         "kanban_task_completed",
@@ -7385,16 +7402,118 @@ def terminal_workspace_write_refusal(
     return None
 
 
+def _workspace_open_file_pids(workspace: Path) -> dict:
+    """Return a typed open-FD scan receipt; ambiguity is never zero FDs."""
+    try:
+        resolved = workspace.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        return {"status": "UNKNOWN", "pids": [], "reason": exc.__class__.__name__}
+    prefix = str(resolved) + os.sep
+    pids: set[int] = set()
+    try:
+        proc_entries = os.listdir("/proc")
+    except OSError as exc:
+        return {"status": "UNKNOWN", "pids": [], "reason": exc.__class__.__name__}
+    for entry in proc_entries:
+        if not entry.isdigit():
+            continue
+        pid_dir = Path("/proc") / entry
+        fd_dir = Path("/proc") / entry / "fd"
+        try:
+            fds = list(fd_dir.iterdir())
+        except OSError as exc:
+            # A process disappearing during enumeration is harmless.  If the
+            # same-uid FD directory still exists after one retry, permission
+            # or I/O ambiguity must retain.
+            try:
+                fds = list(fd_dir.iterdir())
+            except OSError:
+                fds = []
+            if not fds and fd_dir.is_dir():
+                # A protected sibling process can be unreadable even for the
+                # same OS user (for example a non-dumpable CI helper).  Its
+                # cwd gives a relevance gate: an unreadable process rooted in
+                # this workspace is ambiguous; one rooted elsewhere is not a
+                # task-workspace holder under this cleanup contract.
+                try:
+                    cwd = os.readlink(pid_dir / "cwd").removesuffix(" (deleted)")
+                except OSError:
+                    return {
+                        "status": "UNKNOWN", "pids": sorted(pids),
+                        "reason": f"fd_directory_{exc.__class__.__name__}",
+                    }
+                if cwd == str(resolved) or (cwd is not None and cwd.startswith(prefix)):
+                    return {
+                        "status": "UNKNOWN", "pids": sorted(pids),
+                        "reason": f"fd_directory_{exc.__class__.__name__}",
+                    }
+            if not fds:
+                continue
+        for fd in fds:
+            try:
+                target = os.readlink(fd)
+            except OSError as exc:
+                # ``lexists`` distinguishes an FD that vanished in a process
+                # race from an extant FD whose target could not be inspected.
+                if os.path.lexists(fd):
+                    try:
+                        target = os.readlink(fd)
+                    except OSError:
+                        if os.path.lexists(fd):
+                            try:
+                                cwd = os.readlink(pid_dir / "cwd").removesuffix(
+                                    " (deleted)"
+                                )
+                            except OSError:
+                                return {
+                                    "status": "UNKNOWN", "pids": sorted(pids),
+                                    "reason": f"fd_target_{exc.__class__.__name__}",
+                                }
+                            if cwd == str(resolved) or (
+                                cwd is not None and cwd.startswith(prefix)
+                            ):
+                                return {
+                                    "status": "UNKNOWN", "pids": sorted(pids),
+                                    "reason": f"fd_target_{exc.__class__.__name__}",
+                                }
+                        continue
+                else:
+                    continue
+            target = target.removesuffix(" (deleted)")
+            if target == str(resolved) or target.startswith(prefix):
+                pids.add(int(entry))
+                break
+    return {"status": "PASS", "pids": sorted(pids), "reason": None}
+
+
+def _scratch_git_clean(workspace: Path) -> Optional[bool]:
+    """Return git cleanliness; None means the repository state is ambiguous."""
+    if not (workspace / ".git").exists():
+        return True
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(workspace), "status", "--porcelain", "--untracked-files=all"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    return not bool(proc.stdout.strip())
+
+
 def _cleanup_workspace(
     conn: sqlite3.Connection, task_id: str,
     *, captured_worker_pid: int | None = None,
-) -> None:
+    process_hygiene: dict | None = None,
+) -> dict:
     """Remove a task's scratch workspace dir and kill its stale tmux session.
 
     Called from :func:`complete_task` after the DB transaction commits.
-    Best-effort — any error is swallowed so cleanup never blocks task completion.
-    Only ``scratch`` workspaces are removed; ``worktree`` and ``dir`` workspaces
-    are intentionally preserved.
+    Only managed ``scratch`` paths can be ELIGIBLE. ``worktree`` and ``dir``
+    remain UNKNOWN until their PR/main/audit/retention facts are represented by
+    an authoritative source; UNKNOWN is retained. Every outcome is returned as
+    a deterministic receipt for the task event log.
 
     Before removing the workspace, close any process groups whose cwd is inside
     the workspace (all workspace kinds: scratch, dir, worktree). This prevents
@@ -7402,69 +7521,61 @@ def _cleanup_workspace(
     """
     try:
         row = conn.execute(
-            "SELECT workspace_kind, workspace_path FROM tasks WHERE id = ?",
+            "SELECT status, workspace_kind, workspace_path FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if not row:
-            return
+            return {"task_id": task_id, "classification": "UNKNOWN", "action": "retain", "reason": "unknown_task"}
+        status: Optional[str] = row["status"]
         kind: Optional[str] = row["workspace_kind"]
         path: Optional[str] = row["workspace_path"]
+        receipt: dict = {
+            "task_id": task_id,
+            "task_status": status,
+            "workspace_kind": kind,
+            "workspace": path,
+            "classification": "UNKNOWN",
+            "action": "retain",
+            "reason": None,
+            "deleted_exact_paths": [],
+            "bytes_reclaimed": 0,
+            "process_gate": process_hygiene,
+            "open_file_pids": [],
+            "dirty_git": None,
+            "active_children": None,
+            "exact_path_only": True,
+        }
 
-        # Close process groups whose cwd is inside the workspace (all kinds).
-        # Must run BEFORE rmtree for scratch workspaces so process cwd links
-        # are still resolvable. Best-effort — swallowed on any error.
-        #
-        # For shared-dir (workspace_kind=dir) workspaces, cwd containment
-        # alone is insufficient — unrelated processes (YAML LSPs, other task
-        # workers) may share the same directory.  Discover the task's owned
-        # process tree from the most recent spawn event PID and pass it as
-        # owned_pids so only the task's own child/grandchild processes are
-        # signalled, while unrelated shared-dir processes are preserved
-        # (#AION-RL2-CORE-01 runtime RED at merged head 60bf37bdb2).
-        if path:
-            try:
-                owned: set[int] | None = None
-                if kind == "dir":
-                    # For shared-dir workspaces, cwd containment alone
-                    # is insufficient — unrelated processes (YAML LSPs,
-                    # other task workers) may share the same directory.
-                    # Only a durable spawn event with BOTH a valid PID
-                    # AND a well-formed recorded /proc starttime can
-                    # prove ownership.  Missing / legacy / malformed /
-                    # unreadable starttime → fail closed: no ownership
-                    # root, no signals (#AION-RL2-CORE-04, bafuxunan
-                    # audit t_86c15b21, R3 acceptance).
-                    # No bare-PID fallback (captured_worker_pid,
-                    # tasks.worker_pid) may authorize shared-dir signals.
-                    spawn_row = conn.execute(
-                        "SELECT json_extract(payload, '$.pid') as pid,"
-                        " json_extract(payload, '$.starttime') as starttime"
-                        " FROM task_events"
-                        " WHERE task_id = ? AND kind = 'spawned'"
-                        " ORDER BY id DESC LIMIT 1",
-                        (task_id,),
-                    ).fetchone()
-                    owned = set()
-                    if (spawn_row and spawn_row["pid"] is not None
-                            and spawn_row["starttime"] is not None):
-                        spawn_pid = int(spawn_row["pid"])
-                        spawn_starttime = int(spawn_row["starttime"])
-                        discovered = _discover_descendant_pids(
-                            spawn_pid,
-                            expected_starttime=spawn_starttime,
-                        )
-                        if discovered:
-                            owned = discovered
-                close_workspace_processes(Path(path), dry_run=False, owned_pids=owned)
-            except Exception:
-                pass
-
-        if kind != "scratch" or not path:
-            # This task's own workspace isn't a removable scratch dir, but its
-            # completion may still unblock a deferred parent scratch cleanup
-            # (e.g. a 'dir' child whose scratch parent was waiting on it). #33774
+        if status not in {"done", "archived"}:
+            receipt["classification"] = "NOT_ELIGIBLE"
+            receipt["reason"] = "task_not_terminal"
+            return receipt
+        if not path:
+            receipt["reason"] = "workspace_path_unknown"
+            return receipt
+        if kind in {"dir", "worktree"}:
+            receipt["reason"] = (
+                "pr_main_audit_retention_identity_not_represented"
+                if not process_hygiene or process_hygiene.get("outcome") in {"success", "no_workspace"}
+                else "process_identity_or_closure_unknown"
+            )
             _try_cleanup_parent_workspaces(conn, task_id)
-            return
+            return receipt
+        if kind != "scratch":
+            receipt["reason"] = "workspace_kind_unknown"
+            return receipt
+
+        wp = Path(path)
+        if not _is_managed_scratch_path(wp):
+            receipt["reason"] = "outside_managed_scratch_root"
+            return receipt
+        if not wp.exists():
+            receipt["classification"] = "NOT_ELIGIBLE"
+            receipt["action"] = "noop"
+            receipt["reason"] = "already_absent"
+            _try_cleanup_parent_workspaces(conn, task_id)
+            return receipt
+
         # Check if this task has children that still need the workspace.
         # If any child is not yet done/archived, defer cleanup so the
         # child can read handoff artifacts from the scratch dir (#33774).
@@ -7475,31 +7586,55 @@ def _cleanup_workspace(
             "LIMIT 1",
             (task_id,),
         ).fetchone()
+        receipt["active_children"] = bool(_active_children)
         if _active_children:
             _log.debug(
                 "Deferring scratch workspace cleanup for task %s: "
                 "active children still need workspace at %s",
                 task_id, path,
             )
-            return
+            receipt["classification"] = "NOT_ELIGIBLE"
+            receipt["reason"] = "active_dependency_child"
+            return receipt
+
+        if not process_hygiene or process_hygiene.get("outcome") != "success":
+            receipt["reason"] = "process_gate_unknown"
+            return receipt
+        process_evidence = process_hygiene.get("evidence") or {}
+        if process_evidence.get("survivors") or process_evidence.get("skipped_identity_mismatch"):
+            receipt["reason"] = "live_or_ambiguous_process"
+            return receipt
+
+        fd_scan = _workspace_open_file_pids(wp)
+        open_pids = fd_scan["pids"]
+        receipt["fd_scan_status"] = fd_scan["status"]
+        receipt["fd_scan_reason"] = fd_scan["reason"]
+        receipt["open_file_pids"] = open_pids
+        if fd_scan["status"] != "PASS" or open_pids:
+            receipt["reason"] = "open_file_or_fd_scan_unknown"
+            return receipt
+
+        git_clean = _scratch_git_clean(wp)
+        receipt["dirty_git"] = None if git_clean is None else not git_clean
+        if git_clean is None:
+            receipt["reason"] = "git_state_unknown"
+            return receipt
+        if not git_clean:
+            receipt["classification"] = "NOT_ELIGIBLE"
+            receipt["reason"] = "dirty_git_or_untracked_unique_evidence"
+            return receipt
+
         import shutil
-        wp = Path(path)
-        if wp.is_dir():
-            # Containment guard (#28818): a board's ``default_workdir`` can
-            # pair ``workspace_kind='scratch'`` with a user-supplied path
-            # pointing at a real source tree. Without this check, task
-            # completion would unconditionally ``shutil.rmtree`` that path
-            # and silently delete the user's source data.
-            if _is_managed_scratch_path(wp):
-                shutil.rmtree(wp, ignore_errors=True)
-                _log.debug("Removed scratch workspace: %s", wp)
-            else:
-                _log.warning(
-                    "Refusing to remove out-of-scratch workspace for task %s: %s "
-                    "(workspace_kind='scratch' but path is outside any "
-                    "kanban-managed workspaces root)",
-                    task_id, wp,
-                )
+        before = sum(
+            p.stat().st_size for p in wp.rglob("*")
+            if p.is_file() and not p.is_symlink()
+        )
+        shutil.rmtree(wp, ignore_errors=False)
+        receipt["classification"] = "ELIGIBLE"
+        receipt["action"] = "delete_exact_path"
+        receipt["reason"] = "all_terminal_scratch_guards_passed"
+        receipt["deleted_exact_paths"] = [str(wp.resolve(strict=False))]
+        receipt["bytes_reclaimed"] = before
         # Also kill the tmux session for the worker that owned this task,
         # if the tmux session is now dead (worker process exited).
         _cleanup_worker_tmux(conn, task_id)
@@ -7507,8 +7642,15 @@ def _cleanup_workspace(
         # tasks now have all children done — their deferred cleanup can
         # proceed (#33774).
         _try_cleanup_parent_workspaces(conn, task_id)
-    except Exception:
-        pass  # best-effort — never block completion
+        return receipt
+    except Exception as exc:
+        return {
+            "task_id": task_id,
+            "classification": "UNKNOWN",
+            "action": "retain",
+            "reason": "internal_error",
+            "error": exc.__class__.__name__,
+        }
 
 
 def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> None:
@@ -7526,10 +7668,27 @@ def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> No
         ).fetchall()
         for (parent_id,) in parents:
             row = conn.execute(
-                "SELECT workspace_kind, workspace_path FROM tasks WHERE id = ?",
+                "SELECT status, workspace_kind, workspace_path FROM tasks WHERE id = ?",
                 (parent_id,),
             ).fetchone()
             if not row or row["workspace_kind"] != "scratch" or not row["workspace_path"]:
+                continue
+            if row["status"] not in _TERMINAL_TASK_STATUSES:
+                receipt = {
+                    "task_id": parent_id,
+                    "task_status": row["status"],
+                    "workspace_kind": "scratch",
+                    "workspace": row["workspace_path"],
+                    "classification": "NOT_ELIGIBLE",
+                    "action": "retain",
+                    "reason": "deferred_parent_not_terminal",
+                    "deleted_exact_paths": [],
+                    "bytes_reclaimed": 0,
+                    "deferred_parent_sweep": True,
+                    "exact_path_only": True,
+                }
+                with write_txn(conn):
+                    _append_event(conn, parent_id, "terminal_workspace_hygiene", receipt)
                 continue
             # Check if ALL children of this parent are terminal
             active = conn.execute(
@@ -7541,12 +7700,79 @@ def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> No
             ).fetchone()
             if active:
                 continue  # still has active children
-            # All children done — safe to clean up parent workspace
-            import shutil
+            # All children are terminal, but dependency completion alone does
+            # not authorize deletion. Re-run the same process/open-FD/git and
+            # exact-path gates used by direct terminal cleanup.
             wp = Path(row["workspace_path"])
-            if wp.is_dir() and _is_managed_scratch_path(wp):
-                shutil.rmtree(wp, ignore_errors=True)
-                _log.debug("Deferred cleanup: removed parent %s scratch workspace: %s", parent_id, wp)
+            receipt = {
+                "task_id": parent_id,
+                "task_status": row["status"],
+                "workspace_kind": "scratch",
+                "workspace": str(wp),
+                "classification": "UNKNOWN",
+                "action": "retain",
+                "reason": None,
+                "deleted_exact_paths": [],
+                "bytes_reclaimed": 0,
+                "deferred_parent_sweep": True,
+                "exact_path_only": True,
+            }
+            if not wp.is_dir() or not _is_managed_scratch_path(wp):
+                receipt["reason"] = "missing_or_outside_managed_scratch_root"
+            else:
+                process_gate = _cleanup_workspace_on_completion(conn, parent_id)
+                receipt["process_gate"] = process_gate
+                evidence = process_gate.get("evidence") or {}
+                fd_scan = _workspace_open_file_pids(wp)
+                open_pids = fd_scan["pids"]
+                receipt["fd_scan_status"] = fd_scan["status"]
+                receipt["fd_scan_reason"] = fd_scan["reason"]
+                receipt["open_file_pids"] = open_pids
+                git_clean = _scratch_git_clean(wp)
+                receipt["dirty_git"] = None if git_clean is None else not git_clean
+                if process_gate.get("outcome") != "success":
+                    receipt["reason"] = "process_gate_unknown"
+                elif evidence.get("survivors") or evidence.get("skipped_identity_mismatch"):
+                    receipt["reason"] = "live_or_ambiguous_process"
+                elif fd_scan["status"] != "PASS" or open_pids:
+                    receipt["reason"] = "open_file_or_fd_scan_unknown"
+                elif git_clean is None:
+                    receipt["reason"] = "git_state_unknown"
+                elif not git_clean:
+                    receipt["classification"] = "NOT_ELIGIBLE"
+                    receipt["reason"] = "dirty_git_or_untracked_unique_evidence"
+                else:
+                    before = sum(
+                        p.stat().st_size for p in wp.rglob("*")
+                        if p.is_file() and not p.is_symlink()
+                    )
+                    # Resource accounting may walk a large tree.  Re-read the
+                    # authoritative terminal state after that walk so the
+                    # status gate is immediately adjacent to actuation.
+                    current = conn.execute(
+                        "SELECT status FROM tasks WHERE id = ?", (parent_id,),
+                    ).fetchone()
+                    if not current or current["status"] not in _TERMINAL_TASK_STATUSES:
+                        receipt["task_status_at_actuation"] = (
+                            current["status"] if current else None
+                        )
+                        receipt["classification"] = "NOT_ELIGIBLE"
+                        receipt["reason"] = "deferred_parent_terminal_status_drift"
+                        with write_txn(conn):
+                            _append_event(
+                                conn, parent_id, "terminal_workspace_hygiene", receipt,
+                            )
+                        continue
+                    import shutil
+                    shutil.rmtree(wp, ignore_errors=False)
+                    receipt["classification"] = "ELIGIBLE"
+                    receipt["action"] = "delete_exact_path"
+                    receipt["reason"] = "all_deferred_terminal_guards_passed"
+                    receipt["deleted_exact_paths"] = [str(wp.resolve(strict=False))]
+                    receipt["bytes_reclaimed"] = before
+                    _log.debug("Deferred cleanup: removed parent %s scratch workspace: %s", parent_id, wp)
+            with write_txn(conn):
+                _append_event(conn, parent_id, "terminal_workspace_hygiene", receipt)
     except Exception:
         pass  # best-effort
 

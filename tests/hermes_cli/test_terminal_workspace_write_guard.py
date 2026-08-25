@@ -50,6 +50,14 @@ def kanban_env(tmp_path):
         yield tmp_path
 
 
+@pytest.fixture(autouse=True)
+def deterministic_open_fd_scan(monkeypatch):
+    """Write-guard tests exercise terminal state, not host /proc policy."""
+    monkeypatch.setattr(kb, "_workspace_open_file_pids", lambda _path: {
+        "status": "PASS", "pids": [], "reason": None,
+    })
+
+
 def _make_scratch_task(conn) -> tuple[str, Path]:
     tid = kb.create_task(conn, title="guard-task", assignee="w")
     task = kb.get_task(conn, tid)
