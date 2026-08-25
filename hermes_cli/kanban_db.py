@@ -7409,18 +7409,36 @@ def _workspace_open_file_pids(workspace: Path) -> dict:
         if not entry.isdigit():
             continue
         pid_dir = Path("/proc") / entry
+        try:
+            # Task workers and their descendants run as the Hermes uid. Other
+            # users' protected /proc entries are outside this ownership gate.
+            if pid_dir.stat().st_uid != os.geteuid():
+                continue
+        except OSError:
+            if pid_dir.exists():
+                return {
+                    "status": "UNKNOWN", "pids": sorted(pids),
+                    "reason": "pid_identity_unknown",
+                }
+            continue
         fd_dir = Path("/proc") / entry / "fd"
         try:
             fds = list(fd_dir.iterdir())
         except OSError as exc:
             # A process disappearing during enumeration is harmless.  If the
-            # PID still exists, permission or I/O ambiguity must retain.
-            if pid_dir.exists():
+            # same-uid FD directory still exists after one retry, permission
+            # or I/O ambiguity must retain.
+            try:
+                fds = list(fd_dir.iterdir())
+            except OSError:
+                fds = []
+            if not fds and fd_dir.is_dir():
                 return {
                     "status": "UNKNOWN", "pids": sorted(pids),
                     "reason": f"fd_directory_{exc.__class__.__name__}",
                 }
-            continue
+            if not fds:
+                continue
         for fd in fds:
             try:
                 target = os.readlink(fd)
@@ -7428,11 +7446,17 @@ def _workspace_open_file_pids(workspace: Path) -> dict:
                 # ``lexists`` distinguishes an FD that vanished in a process
                 # race from an extant FD whose target could not be inspected.
                 if os.path.lexists(fd):
-                    return {
-                        "status": "UNKNOWN", "pids": sorted(pids),
-                        "reason": f"fd_target_{exc.__class__.__name__}",
-                    }
-                continue
+                    try:
+                        target = os.readlink(fd)
+                    except OSError:
+                        if os.path.lexists(fd):
+                            return {
+                                "status": "UNKNOWN", "pids": sorted(pids),
+                                "reason": f"fd_target_{exc.__class__.__name__}",
+                            }
+                        continue
+                else:
+                    continue
             target = target.removesuffix(" (deleted)")
             if target == str(resolved) or target.startswith(prefix):
                 pids.add(int(entry))
