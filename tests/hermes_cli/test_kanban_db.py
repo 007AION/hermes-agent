@@ -3919,6 +3919,45 @@ def test_deferred_parent_sweep_rereads_terminal_status_before_rmtree(
     assert parent_ws.exists()
 
 
+def test_deferred_parent_sweep_rechecks_status_after_byte_accounting(
+    kanban_home, monkeypatch,
+):
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent")
+        child = kb.create_task(conn, title="child")
+        kb.link_tasks(conn, parent, child)
+        parent_task = kb.get_task(conn, parent)
+        child_task = kb.get_task(conn, child)
+        assert parent_task is not None and child_task is not None
+        parent_ws = kb.resolve_workspace(parent_task)
+        child_ws = kb.resolve_workspace(child_task)
+        kb.set_workspace_path(conn, parent, parent_ws)
+        kb.set_workspace_path(conn, child, child_ws)
+        (parent_ws / "handoff.txt").write_text("keep", encoding="utf-8")
+        kb.complete_task(conn, parent, result="deferred")
+        assert parent_ws.exists()
+        original_rglob = Path.rglob
+        drifted = {"done": False}
+
+        def drift_during_accounting(path, pattern):
+            if path == parent_ws and not drifted["done"]:
+                drifted["done"] = True
+                conn.execute("UPDATE tasks SET status = 'running' WHERE id = ?", (parent,))
+                conn.commit()
+            return original_rglob(path, pattern)
+
+        monkeypatch.setattr(Path, "rglob", drift_during_accounting)
+        kb.complete_task(conn, child, result="done")
+        receipt = [
+            e.payload or {} for e in kb.list_events(conn, parent)
+            if e.kind == "terminal_workspace_hygiene"
+        ][-1]
+
+    assert receipt["classification"] == "NOT_ELIGIBLE"
+    assert receipt["reason"] == "deferred_parent_terminal_status_drift"
+    assert parent_ws.exists()
+
+
 def test_dir_child_completion_unblocks_deferred_scratch_parent(kanban_home, tmp_path):
     """A non-scratch ('dir') child completing must still sweep its scratch parent.
 

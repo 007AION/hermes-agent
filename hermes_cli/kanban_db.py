@@ -7736,6 +7736,13 @@ def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> No
                     receipt["classification"] = "NOT_ELIGIBLE"
                     receipt["reason"] = "dirty_git_or_untracked_unique_evidence"
                 else:
+                    before = sum(
+                        p.stat().st_size for p in wp.rglob("*")
+                        if p.is_file() and not p.is_symlink()
+                    )
+                    # Resource accounting may walk a large tree.  Re-read the
+                    # authoritative terminal state after that walk so the
+                    # status gate is immediately adjacent to actuation.
                     current = conn.execute(
                         "SELECT status FROM tasks WHERE id = ?", (parent_id,),
                     ).fetchone()
@@ -7751,10 +7758,6 @@ def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> No
                             )
                         continue
                     import shutil
-                    before = sum(
-                        p.stat().st_size for p in wp.rglob("*")
-                        if p.is_file() and not p.is_symlink()
-                    )
                     shutil.rmtree(wp, ignore_errors=False)
                     receipt["classification"] = "ELIGIBLE"
                     receipt["action"] = "delete_exact_path"
