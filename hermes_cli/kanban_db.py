@@ -7430,7 +7430,7 @@ def _workspace_open_file_pids(workspace: Path) -> dict:
                     cwd = os.readlink(pid_dir / "cwd").removesuffix(" (deleted)")
                 except OSError:
                     cwd = None
-                if cwd is None or cwd == str(resolved) or cwd.startswith(prefix):
+                if cwd == str(resolved) or (cwd is not None and cwd.startswith(prefix)):
                     return {
                         "status": "UNKNOWN", "pids": sorted(pids),
                         "reason": f"fd_directory_{exc.__class__.__name__}",
