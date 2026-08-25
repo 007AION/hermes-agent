@@ -3453,6 +3453,26 @@ def test_open_fd_scan_fails_closed_when_pid_fd_directory_is_unreadable(
     assert scan["reason"] == "fd_directory_PermissionError"
 
 
+def test_open_fd_scan_fails_closed_when_unreadable_fd_directory_relevance_is_unknown(
+    tmp_path, monkeypatch,
+):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setattr(kb.os, "listdir", lambda path: ["123"] if path == "/proc" else [])
+    original_is_dir = Path.is_dir
+    monkeypatch.setattr(
+        Path, "is_dir",
+        lambda path: True if str(path) == "/proc/123/fd" else original_is_dir(path),
+    )
+    monkeypatch.setattr(Path, "iterdir", lambda _path: (_ for _ in ()).throw(PermissionError()))
+    monkeypatch.setattr(kb.os, "readlink", lambda _path: (_ for _ in ()).throw(PermissionError()))
+
+    scan = kb._workspace_open_file_pids(workspace)
+
+    assert scan["status"] == "UNKNOWN"
+    assert scan["reason"] == "fd_directory_PermissionError"
+
+
 def test_open_fd_scan_ignores_unreadable_process_rooted_elsewhere(
     tmp_path, monkeypatch,
 ):
@@ -3498,6 +3518,23 @@ def test_open_fd_scan_fails_closed_when_extant_fd_target_is_unreadable(
 
     assert scan["status"] == "UNKNOWN"
     assert scan["pids"] == []
+    assert scan["reason"] == "fd_target_PermissionError"
+
+
+def test_open_fd_scan_fails_closed_when_extant_fd_target_relevance_is_unknown(
+    tmp_path, monkeypatch,
+):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    fd = Path("/proc/123/fd/7")
+    monkeypatch.setattr(kb.os, "listdir", lambda path: ["123"] if path == "/proc" else [])
+    monkeypatch.setattr(Path, "iterdir", lambda _path: iter([fd]))
+    monkeypatch.setattr(kb.os, "readlink", lambda _path: (_ for _ in ()).throw(PermissionError()))
+    monkeypatch.setattr(kb.os.path, "lexists", lambda path: path == fd)
+
+    scan = kb._workspace_open_file_pids(workspace)
+
+    assert scan["status"] == "UNKNOWN"
     assert scan["reason"] == "fd_target_PermissionError"
 
 
@@ -3849,6 +3886,48 @@ def test_deferred_parent_hygiene_receipt_uses_same_terminal_guards(kanban_home):
     assert receipts[-1]["deferred_parent_sweep"] is True
     assert receipts[-1]["reason"] == "all_deferred_terminal_guards_passed"
     assert not parent_ws.exists()
+
+
+def test_deferred_parent_hygiene_preserves_indeterminate_fd_scan(
+    kanban_home, monkeypatch,
+):
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent")
+        child = kb.create_task(conn, title="child")
+        kb.link_tasks(conn, parent, child)
+        parent_task = kb.get_task(conn, parent)
+        child_task = kb.get_task(conn, child)
+        assert parent_task is not None and child_task is not None
+        parent_ws = kb.resolve_workspace(parent_task)
+        child_ws = kb.resolve_workspace(child_task)
+        kb.set_workspace_path(conn, parent, parent_ws)
+        kb.set_workspace_path(conn, child, child_ws)
+        (parent_ws / "handoff.txt").write_text("keep", encoding="utf-8")
+        kb.complete_task(conn, parent, result="deferred")
+        assert parent_ws.exists()
+        monkeypatch.setattr(
+            kb,
+            "_workspace_open_file_pids",
+            lambda path: (
+                {
+                    "status": "UNKNOWN", "pids": [],
+                    "reason": "fd_directory_PermissionError",
+                }
+                if path == parent_ws
+                else {"status": "PASS", "pids": [], "reason": None}
+            ),
+        )
+
+        kb.complete_task(conn, child, result="done")
+        receipt = [
+            e.payload or {} for e in kb.list_events(conn, parent)
+            if e.kind == "terminal_workspace_hygiene"
+        ][-1]
+
+    assert receipt["classification"] == "UNKNOWN"
+    assert receipt["fd_scan_status"] == "UNKNOWN"
+    assert receipt["reason"] == "open_file_or_fd_scan_unknown"
+    assert parent_ws.exists()
 
 
 def test_deferred_parent_sweep_preserves_parent_that_became_nonterminal(kanban_home):
