@@ -20,6 +20,20 @@ import pytest
 from hermes_cli import kanban_db as kb
 
 
+@pytest.fixture(autouse=True)
+def deterministic_open_fd_scan_for_cleanup_tests(request, monkeypatch):
+    """Keep cleanup tests independent of the host runner's protected /proc.
+
+    Direct scanner tests retain the real implementation; all other tests start
+    from an explicit zero-open-FD receipt and may override it for gate cases.
+    """
+    if request.node.name.startswith("test_open_fd_scan_"):
+        return
+    monkeypatch.setattr(kb, "_workspace_open_file_pids", lambda _path: {
+        "status": "PASS", "pids": [], "reason": None,
+    })
+
+
 @pytest.fixture
 def kanban_home(tmp_path, monkeypatch):
     """Isolated HERMES_HOME with an empty kanban DB."""
