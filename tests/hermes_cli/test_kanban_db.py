@@ -3428,7 +3428,6 @@ def test_open_fd_scan_fails_closed_when_pid_fd_directory_is_unreadable(
     workspace.mkdir()
     monkeypatch.setattr(kb.os, "listdir", lambda path: ["123"] if path == "/proc" else [])
     original_exists = Path.exists
-    original_stat = Path.stat
     original_is_dir = Path.is_dir
 
     def exists(path):
@@ -3436,24 +3435,46 @@ def test_open_fd_scan_fails_closed_when_pid_fd_directory_is_unreadable(
             return True
         return original_exists(path)
 
-    def stat_path(path, *args, **kwargs):
-        if str(path) == "/proc/123":
-            return os.stat_result((0, 0, 0, 0, os.geteuid(), 0, 0, 0, 0, 0))
-        return original_stat(path, *args, **kwargs)
-
     monkeypatch.setattr(Path, "exists", exists)
-    monkeypatch.setattr(Path, "stat", stat_path)
     monkeypatch.setattr(
         Path, "is_dir",
         lambda path: True if str(path) == "/proc/123/fd" else original_is_dir(path),
     )
     monkeypatch.setattr(Path, "iterdir", lambda path: (_ for _ in ()).throw(PermissionError()))
+    monkeypatch.setattr(
+        kb.os, "readlink",
+        lambda path: str(workspace) if str(path) == "/proc/123/cwd" else "",
+    )
 
     scan = kb._workspace_open_file_pids(workspace)
 
     assert scan["status"] == "UNKNOWN"
     assert scan["pids"] == []
     assert scan["reason"] == "fd_directory_PermissionError"
+
+
+def test_open_fd_scan_ignores_unreadable_process_rooted_elsewhere(
+    tmp_path, monkeypatch,
+):
+    workspace = tmp_path / "workspace"
+    elsewhere = tmp_path / "elsewhere"
+    workspace.mkdir()
+    elsewhere.mkdir()
+    monkeypatch.setattr(kb.os, "listdir", lambda path: ["123"] if path == "/proc" else [])
+    original_is_dir = Path.is_dir
+    monkeypatch.setattr(
+        Path, "is_dir",
+        lambda path: True if str(path) == "/proc/123/fd" else original_is_dir(path),
+    )
+    monkeypatch.setattr(Path, "iterdir", lambda _path: (_ for _ in ()).throw(PermissionError()))
+    monkeypatch.setattr(
+        kb.os, "readlink",
+        lambda path: str(elsewhere) if str(path) == "/proc/123/cwd" else "",
+    )
+
+    scan = kb._workspace_open_file_pids(workspace)
+
+    assert scan == {"status": "PASS", "pids": [], "reason": None}
 
 
 def test_open_fd_scan_fails_closed_when_extant_fd_target_is_unreadable(
@@ -3463,15 +3484,6 @@ def test_open_fd_scan_fails_closed_when_extant_fd_target_is_unreadable(
     workspace.mkdir()
     fd = Path("/proc/123/fd/7")
     monkeypatch.setattr(kb.os, "listdir", lambda path: ["123"] if path == "/proc" else [])
-    original_stat = Path.stat
-    monkeypatch.setattr(
-        Path, "stat",
-        lambda path, *args, **kwargs: (
-            os.stat_result((0, 0, 0, 0, os.geteuid(), 0, 0, 0, 0, 0))
-            if str(path) == "/proc/123"
-            else original_stat(path, *args, **kwargs)
-        ),
-    )
     monkeypatch.setattr(Path, "iterdir", lambda _path: iter([fd]))
     monkeypatch.setattr(kb.os, "readlink", lambda _path: (_ for _ in ()).throw(PermissionError()))
     monkeypatch.setattr(kb.os.path, "lexists", lambda path: path == fd)

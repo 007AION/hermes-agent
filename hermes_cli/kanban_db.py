@@ -7409,18 +7409,6 @@ def _workspace_open_file_pids(workspace: Path) -> dict:
         if not entry.isdigit():
             continue
         pid_dir = Path("/proc") / entry
-        try:
-            # Task workers and their descendants run as the Hermes uid. Other
-            # users' protected /proc entries are outside this ownership gate.
-            if pid_dir.stat().st_uid != os.geteuid():
-                continue
-        except OSError:
-            if pid_dir.exists():
-                return {
-                    "status": "UNKNOWN", "pids": sorted(pids),
-                    "reason": "pid_identity_unknown",
-                }
-            continue
         fd_dir = Path("/proc") / entry / "fd"
         try:
             fds = list(fd_dir.iterdir())
@@ -7433,10 +7421,20 @@ def _workspace_open_file_pids(workspace: Path) -> dict:
             except OSError:
                 fds = []
             if not fds and fd_dir.is_dir():
-                return {
-                    "status": "UNKNOWN", "pids": sorted(pids),
-                    "reason": f"fd_directory_{exc.__class__.__name__}",
-                }
+                # A protected sibling process can be unreadable even for the
+                # same OS user (for example a non-dumpable CI helper).  Its
+                # cwd gives a relevance gate: an unreadable process rooted in
+                # this workspace is ambiguous; one rooted elsewhere is not a
+                # task-workspace holder under this cleanup contract.
+                try:
+                    cwd = os.readlink(pid_dir / "cwd").removesuffix(" (deleted)")
+                except OSError:
+                    cwd = None
+                if cwd is None or cwd == str(resolved) or cwd.startswith(prefix):
+                    return {
+                        "status": "UNKNOWN", "pids": sorted(pids),
+                        "reason": f"fd_directory_{exc.__class__.__name__}",
+                    }
             if not fds:
                 continue
         for fd in fds:
