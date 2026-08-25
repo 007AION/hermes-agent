@@ -7393,32 +7393,51 @@ def terminal_workspace_write_refusal(
     return None
 
 
-def _workspace_open_file_pids(workspace: Path) -> list[int]:
-    """Return PIDs with an open FD below *workspace* (read-only, fail closed)."""
-    resolved = workspace.resolve()
+def _workspace_open_file_pids(workspace: Path) -> dict:
+    """Return a typed open-FD scan receipt; ambiguity is never zero FDs."""
+    try:
+        resolved = workspace.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        return {"status": "UNKNOWN", "pids": [], "reason": exc.__class__.__name__}
     prefix = str(resolved) + os.sep
     pids: set[int] = set()
     try:
         proc_entries = os.listdir("/proc")
-    except OSError:
-        return [-1]
+    except OSError as exc:
+        return {"status": "UNKNOWN", "pids": [], "reason": exc.__class__.__name__}
     for entry in proc_entries:
         if not entry.isdigit():
             continue
+        pid_dir = Path("/proc") / entry
         fd_dir = Path("/proc") / entry / "fd"
         try:
             fds = list(fd_dir.iterdir())
-        except OSError:
+        except OSError as exc:
+            # A process disappearing during enumeration is harmless.  If the
+            # PID still exists, permission or I/O ambiguity must retain.
+            if pid_dir.exists():
+                return {
+                    "status": "UNKNOWN", "pids": sorted(pids),
+                    "reason": f"fd_directory_{exc.__class__.__name__}",
+                }
             continue
         for fd in fds:
             try:
-                target = str(fd.resolve(strict=True))
-            except (OSError, RuntimeError):
+                target = os.readlink(fd)
+            except OSError as exc:
+                # ``lexists`` distinguishes an FD that vanished in a process
+                # race from an extant FD whose target could not be inspected.
+                if os.path.lexists(fd):
+                    return {
+                        "status": "UNKNOWN", "pids": sorted(pids),
+                        "reason": f"fd_target_{exc.__class__.__name__}",
+                    }
                 continue
+            target = target.removesuffix(" (deleted)")
             if target == str(resolved) or target.startswith(prefix):
                 pids.add(int(entry))
                 break
-    return sorted(pids)
+    return {"status": "PASS", "pids": sorted(pids), "reason": None}
 
 
 def _scratch_git_clean(workspace: Path) -> Optional[bool]:
@@ -7540,9 +7559,12 @@ def _cleanup_workspace(
             receipt["reason"] = "live_or_ambiguous_process"
             return receipt
 
-        open_pids = _workspace_open_file_pids(wp)
+        fd_scan = _workspace_open_file_pids(wp)
+        open_pids = fd_scan["pids"]
+        receipt["fd_scan_status"] = fd_scan["status"]
+        receipt["fd_scan_reason"] = fd_scan["reason"]
         receipt["open_file_pids"] = open_pids
-        if open_pids:
+        if fd_scan["status"] != "PASS" or open_pids:
             receipt["reason"] = "open_file_or_fd_scan_unknown"
             return receipt
 
@@ -7605,6 +7627,23 @@ def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> No
             ).fetchone()
             if not row or row["workspace_kind"] != "scratch" or not row["workspace_path"]:
                 continue
+            if row["status"] not in _TERMINAL_TASK_STATUSES:
+                receipt = {
+                    "task_id": parent_id,
+                    "task_status": row["status"],
+                    "workspace_kind": "scratch",
+                    "workspace": row["workspace_path"],
+                    "classification": "NOT_ELIGIBLE",
+                    "action": "retain",
+                    "reason": "deferred_parent_not_terminal",
+                    "deleted_exact_paths": [],
+                    "bytes_reclaimed": 0,
+                    "deferred_parent_sweep": True,
+                    "exact_path_only": True,
+                }
+                with write_txn(conn):
+                    _append_event(conn, parent_id, "terminal_workspace_hygiene", receipt)
+                continue
             # Check if ALL children of this parent are terminal
             active = conn.execute(
                 "SELECT 1 FROM task_links l "
@@ -7638,7 +7677,10 @@ def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> No
                 process_gate = _cleanup_workspace_on_completion(conn, parent_id)
                 receipt["process_gate"] = process_gate
                 evidence = process_gate.get("evidence") or {}
-                open_pids = _workspace_open_file_pids(wp)
+                fd_scan = _workspace_open_file_pids(wp)
+                open_pids = fd_scan["pids"]
+                receipt["fd_scan_status"] = fd_scan["status"]
+                receipt["fd_scan_reason"] = fd_scan["reason"]
                 receipt["open_file_pids"] = open_pids
                 git_clean = _scratch_git_clean(wp)
                 receipt["dirty_git"] = None if git_clean is None else not git_clean
@@ -7646,7 +7688,7 @@ def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> No
                     receipt["reason"] = "process_gate_unknown"
                 elif evidence.get("survivors") or evidence.get("skipped_identity_mismatch"):
                     receipt["reason"] = "live_or_ambiguous_process"
-                elif open_pids:
+                elif fd_scan["status"] != "PASS" or open_pids:
                     receipt["reason"] = "open_file_or_fd_scan_unknown"
                 elif git_clean is None:
                     receipt["reason"] = "git_state_unknown"
@@ -7654,6 +7696,20 @@ def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> No
                     receipt["classification"] = "NOT_ELIGIBLE"
                     receipt["reason"] = "dirty_git_or_untracked_unique_evidence"
                 else:
+                    current = conn.execute(
+                        "SELECT status FROM tasks WHERE id = ?", (parent_id,),
+                    ).fetchone()
+                    if not current or current["status"] not in _TERMINAL_TASK_STATUSES:
+                        receipt["task_status_at_actuation"] = (
+                            current["status"] if current else None
+                        )
+                        receipt["classification"] = "NOT_ELIGIBLE"
+                        receipt["reason"] = "deferred_parent_terminal_status_drift"
+                        with write_txn(conn):
+                            _append_event(
+                                conn, parent_id, "terminal_workspace_hygiene", receipt,
+                            )
+                        continue
                     import shutil
                     before = sum(
                         p.stat().st_size for p in wp.rglob("*")
