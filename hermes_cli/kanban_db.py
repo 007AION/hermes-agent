@@ -6752,6 +6752,15 @@ def complete_task(
         captured_worker_pid=captured_worker_pid,
         process_hygiene=process_hygiene,
     )
+    _log.info(
+        "terminal workspace hygiene: task=%s classification=%s reason=%s "
+        "fd_scan_status=%s open_file_pids=%s",
+        task_id,
+        hygiene.get("classification"),
+        hygiene.get("reason"),
+        hygiene.get("fd_scan_status"),
+        hygiene.get("open_file_pids"),
+    )
     with write_txn(conn):
         _append_event(conn, task_id, "terminal_workspace_hygiene", hygiene)
     _done_task = get_task(conn, task_id)
@@ -7448,10 +7457,19 @@ def _workspace_open_file_pids(workspace: Path) -> dict:
                         target = os.readlink(fd)
                     except OSError:
                         if os.path.lexists(fd):
-                            return {
-                                "status": "UNKNOWN", "pids": sorted(pids),
-                                "reason": f"fd_target_{exc.__class__.__name__}",
-                            }
+                            try:
+                                cwd = os.readlink(pid_dir / "cwd").removesuffix(
+                                    " (deleted)"
+                                )
+                            except OSError:
+                                cwd = None
+                            if cwd == str(resolved) or (
+                                cwd is not None and cwd.startswith(prefix)
+                            ):
+                                return {
+                                    "status": "UNKNOWN", "pids": sorted(pids),
+                                    "reason": f"fd_target_{exc.__class__.__name__}",
+                                }
                         continue
                 else:
                     continue

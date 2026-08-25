@@ -3485,7 +3485,13 @@ def test_open_fd_scan_fails_closed_when_extant_fd_target_is_unreadable(
     fd = Path("/proc/123/fd/7")
     monkeypatch.setattr(kb.os, "listdir", lambda path: ["123"] if path == "/proc" else [])
     monkeypatch.setattr(Path, "iterdir", lambda _path: iter([fd]))
-    monkeypatch.setattr(kb.os, "readlink", lambda _path: (_ for _ in ()).throw(PermissionError()))
+    monkeypatch.setattr(
+        kb.os, "readlink",
+        lambda path: (
+            str(workspace) if str(path) == "/proc/123/cwd"
+            else (_ for _ in ()).throw(PermissionError())
+        ),
+    )
     monkeypatch.setattr(kb.os.path, "lexists", lambda path: path == fd)
 
     scan = kb._workspace_open_file_pids(workspace)
