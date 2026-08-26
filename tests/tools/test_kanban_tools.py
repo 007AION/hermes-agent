@@ -57,6 +57,7 @@ def test_kanban_tools_visible_with_env_var(monkeypatch, tmp_path):
     kanban = {n for n in names if n and n.startswith("kanban_")}
     expected = {
         "kanban_show", "kanban_complete", "kanban_block", "kanban_heartbeat",
+        "kanban_request_review", "kanban_review_verdict",
         "kanban_comment", "kanban_create", "kanban_link",
         "kanban_attach", "kanban_attach_url", "kanban_attachments",
     }
@@ -138,6 +139,7 @@ def test_kanban_tools_visible_with_toolset_config(monkeypatch, tmp_path):
     expected = {
         "kanban_list",
         "kanban_show", "kanban_complete", "kanban_block", "kanban_heartbeat",
+        "kanban_request_review", "kanban_review_verdict",
         "kanban_comment", "kanban_create", "kanban_link",
         "kanban_unblock", "kanban_archive",
         "kanban_attach", "kanban_attach_url", "kanban_attachments",
@@ -156,6 +158,8 @@ def worker_env(monkeypatch, tmp_path):
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
     monkeypatch.setenv("HERMES_PROFILE", "test-worker")
     monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
     from pathlib import Path as _Path
@@ -771,6 +775,128 @@ def test_block_happy_path(worker_env):
         assert kb.get_task(conn, worker_env).status == "blocked"
     finally:
         conn.close()
+
+
+def test_request_review_happy_path(monkeypatch, worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    with kb.connect() as conn:
+        author = kb.get_task(conn, worker_env)
+        assert author is not None and author.current_run_id is not None
+        review_task = kb.create_task(
+            conn,
+            title="independent audit",
+            assignee="auditor",
+            parents=[worker_env],
+        )
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(author.current_run_id))
+
+    out = kt._handle_request_review({
+        "review_task_id": review_task,
+        "reason": "candidate frozen",
+    })
+    data = json.loads(out)
+
+    assert data["ok"] is True
+    assert data["task_id"] == worker_env
+    assert data["review_task_id"] == review_task
+    assert len(data["receipt_sha256"]) == 64
+    with kb.connect() as conn:
+        assert kb.get_task(conn, worker_env).status == "review"
+        assert kb.get_task(conn, review_task).status == "ready"
+
+
+def test_review_tool_smoke_leaves_external_board_counts_unchanged(
+    monkeypatch, tmp_path, worker_env,
+):
+    """Review smoke stays isolated from an authoritative-board sentinel.
+
+    Dispatcher workers inherit HERMES_KANBAN_DB/HERMES_KANBAN_BOARD.  The
+    worker_env fixture clears both before constructing its temporary DB; this
+    sentinel catches a regression that routes review smoke back to an external
+    board.
+    """
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    external_db = tmp_path / "authoritative" / "kanban.db"
+    external_db.parent.mkdir()
+    with kb.connect(db_path=external_db) as external:
+        sentinel = kb.create_task(
+            external, title="do not mutate", assignee="operator"
+        )
+        assert kb.claim_task(external, sentinel) is not None
+        before = tuple(
+            external.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in ("tasks", "task_runs", "task_events")
+        )
+
+    with kb.connect() as isolated:
+        author = kb.get_task(isolated, worker_env)
+        assert author is not None and author.current_run_id is not None
+        review_task = kb.create_task(
+            isolated,
+            title="isolated audit",
+            assignee="auditor",
+            parents=[worker_env],
+        )
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(author.current_run_id))
+
+    result = json.loads(kt._handle_request_review({
+        "review_task_id": review_task,
+        "reason": "isolated candidate",
+    }))
+    assert result["ok"] is True
+
+    with kb.connect(db_path=external_db) as external:
+        after = tuple(
+            external.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in ("tasks", "task_runs", "task_events")
+        )
+    assert after == before
+
+
+def test_review_verdict_request_changes_resumes_bound_author(
+    monkeypatch, worker_env,
+):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    with kb.connect() as conn:
+        author = kb.get_task(conn, worker_env)
+        assert author is not None and author.current_run_id is not None
+        review_task = kb.create_task(
+            conn,
+            title="independent audit",
+            assignee="auditor",
+            parents=[worker_env],
+        )
+        assert kb.request_review_handoff(
+            conn,
+            worker_env,
+            expected_run_id=author.current_run_id,
+            review_task_id=review_task,
+            reason="candidate frozen",
+        )
+        claimed = kb.claim_task(conn, review_task)
+        assert claimed is not None and claimed.current_run_id is not None
+        review_run_id = claimed.current_run_id
+    monkeypatch.setenv("HERMES_KANBAN_TASK", review_task)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(review_run_id))
+
+    out = kt._handle_review_verdict({
+        "author_task_id": worker_env,
+        "verdict": "request_changes",
+        "reason": "fix rollback",
+    })
+
+    assert json.loads(out)["ok"] is True
+    with kb.connect() as conn:
+        author = kb.get_task(conn, worker_env)
+        assert author is not None
+        assert author.status == "ready"
+        assert author.assignee == "test-worker"
 
 
 def test_block_rejects_empty_reason(worker_env):

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import hashlib
 import io
 import json
 import os
@@ -40,7 +41,10 @@ def kanban_home(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    kb._INITIALIZED_PATHS.clear()
     kb.init_db()
     return home
 
@@ -5432,6 +5436,650 @@ def test_dispatch_max_in_progress_none_is_unlimited(kanban_home, all_assignees_s
         kb.dispatch_once(conn, spawn_fn=fake_spawn, max_in_progress=None)
 
     assert len(spawns) == 4, f"expected 4 spawns (unlimited), got {len(spawns)}"
+
+# Role-separated review handoff
+# ---------------------------------------------------------------------------
+
+
+def _review_handoff_pair(conn, *, same_assignee=False):
+    author = kb.create_task(
+        conn,
+        title="implementation",
+        assignee="author",
+    )
+    claimed = kb.claim_task(conn, author)
+    assert claimed is not None
+    review_task = kb.create_task(
+        conn,
+        title="independent audit",
+        assignee="author" if same_assignee else "auditor",
+        parents=[author],
+    )
+    run = kb.latest_run(conn, author)
+    assert run is not None
+    return author, int(run.id), review_task
+
+
+def _review_handoff_events(conn, task_id):
+    return conn.execute(
+        "SELECT id, payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'review_handoff' ORDER BY id",
+        (task_id,),
+    ).fetchall()
+
+
+def test_request_review_handoff_atomically_binds_run_and_exact_child(kanban_home):
+    with kb.connect() as conn:
+        author, run_id, review_task = _review_handoff_pair(conn)
+        conn.execute(
+            "UPDATE tasks SET body = ? WHERE id = ?",
+            ("acceptance:\n  - exact-head audit\n", review_task),
+        )
+        conn.commit()
+        immutable_before = conn.execute(
+            "SELECT title, body, assignee, tenant, priority, factory_build_gate "
+            "FROM tasks WHERE id = ?",
+            (review_task,),
+        ).fetchone()
+        links_before = conn.execute(
+            "SELECT parent_id, child_id FROM task_links WHERE child_id = ? "
+            "ORDER BY parent_id",
+            (review_task,),
+        ).fetchall()
+
+        receipt = kb.request_review_handoff(
+            conn,
+            author,
+            expected_run_id=run_id,
+            review_task_id=review_task,
+            reason="candidate frozen",
+        )
+
+        assert receipt is not None
+        assert receipt.task_id == author
+        assert receipt.expected_run_id == run_id
+        assert receipt.review_task_id == review_task
+        assert len(receipt.receipt_sha256) == 64
+        assert kb.get_task(conn, author).status == "review"
+        assert kb.get_task(conn, author).current_run_id is None
+        assert kb.get_task(conn, review_task).status == "ready"
+        run = kb.latest_run(conn, author)
+        assert run is not None
+        assert run.outcome == "review_required"
+        assert run.summary == "candidate frozen"
+        immutable_after = conn.execute(
+            "SELECT title, body, assignee, tenant, priority, factory_build_gate "
+            "FROM tasks WHERE id = ?",
+            (review_task,),
+        ).fetchone()
+        links_after = conn.execute(
+            "SELECT parent_id, child_id FROM task_links WHERE child_id = ? "
+            "ORDER BY parent_id",
+            (review_task,),
+        ).fetchall()
+        assert tuple(immutable_after) == tuple(immutable_before)
+        assert [tuple(row) for row in links_after] == [
+            tuple(row) for row in links_before
+        ]
+
+
+@pytest.mark.parametrize("run_delta", [-1, 1])
+def test_request_review_handoff_rejects_stale_run_without_mutation(
+    kanban_home, run_delta,
+):
+    with kb.connect() as conn:
+        author, run_id, review_task = _review_handoff_pair(conn)
+        before = conn.iterdump()
+        before_sql = "\n".join(before)
+
+        receipt = kb.request_review_handoff(
+            conn,
+            author,
+            expected_run_id=run_id + run_delta,
+            review_task_id=review_task,
+            reason="stale",
+        )
+
+        assert receipt is None
+        assert "\n".join(conn.iterdump()) == before_sql
+
+
+def test_request_review_handoff_requires_one_explicit_direct_child(kanban_home):
+    with kb.connect() as conn:
+        author, run_id, review_task = _review_handoff_pair(conn)
+        sibling = kb.create_task(
+            conn, title="second child", assignee="other-auditor", parents=[author]
+        )
+        unrelated = kb.create_task(conn, title="not a child", assignee="auditor")
+
+        assert kb.request_review_handoff(
+            conn,
+            author,
+            expected_run_id=run_id,
+            review_task_id=unrelated,
+            reason="wrong child",
+        ) is None
+        receipt = kb.request_review_handoff(
+            conn,
+            author,
+            expected_run_id=run_id,
+            review_task_id=review_task,
+            reason="exact child",
+        )
+
+        assert receipt is not None
+        assert kb.get_task(conn, review_task).status == "ready"
+        assert kb.get_task(conn, sibling).status == "todo"
+
+
+def test_request_review_handoff_rejects_same_assignee(kanban_home):
+    with kb.connect() as conn:
+        author, run_id, review_task = _review_handoff_pair(
+            conn, same_assignee=True
+        )
+        assert kb.request_review_handoff(
+            conn,
+            author,
+            expected_run_id=run_id,
+            review_task_id=review_task,
+            reason="self review",
+        ) is None
+        assert kb.get_task(conn, author).status == "running"
+        assert kb.get_task(conn, review_task).status == "todo"
+
+
+def test_request_review_handoff_requires_terminal_other_parents(kanban_home):
+    with kb.connect() as conn:
+        author, run_id, review_task = _review_handoff_pair(conn)
+        other_parent = kb.create_task(
+            conn, title="other prerequisite", assignee="builder"
+        )
+        kb.link_tasks(conn, other_parent, review_task)
+
+        assert kb.request_review_handoff(
+            conn,
+            author,
+            expected_run_id=run_id,
+            review_task_id=review_task,
+            reason="other parent open",
+        ) is None
+        assert kb.get_task(conn, author).status == "running"
+        assert kb.get_task(conn, review_task).status == "todo"
+
+
+def test_request_review_handoff_rejects_active_child(kanban_home):
+    with kb.connect() as conn:
+        author, run_id, review_task = _review_handoff_pair(conn)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status = 'running', current_run_id = 999 "
+                "WHERE id = ?",
+                (review_task,),
+            )
+
+        assert kb.request_review_handoff(
+            conn,
+            author,
+            expected_run_id=run_id,
+            review_task_id=review_task,
+            reason="child active",
+        ) is None
+        assert kb.get_task(conn, author).status == "running"
+
+
+def test_request_review_handoff_replay_returns_same_receipt(kanban_home):
+    with kb.connect() as conn:
+        author, run_id, review_task = _review_handoff_pair(conn)
+        first = kb.request_review_handoff(
+            conn,
+            author,
+            expected_run_id=run_id,
+            review_task_id=review_task,
+            reason="candidate frozen",
+        )
+        second = kb.request_review_handoff(
+            conn,
+            author,
+            expected_run_id=run_id,
+            review_task_id=review_task,
+            reason="candidate frozen",
+        )
+
+        assert first == second
+        assert first is not None
+        assert len(_review_handoff_events(conn, author)) == 1
+        assert len(conn.execute(
+            "SELECT id FROM task_runs WHERE task_id = ?", (author,)
+        ).fetchall()) == 1
+
+
+def test_request_review_handoff_replay_rejects_conflicting_payload(kanban_home):
+    with kb.connect() as conn:
+        author, run_id, review_task = _review_handoff_pair(conn)
+        assert kb.request_review_handoff(
+            conn,
+            author,
+            expected_run_id=run_id,
+            review_task_id=review_task,
+            reason="candidate frozen",
+        ) is not None
+
+        assert kb.request_review_handoff(
+            conn,
+            author,
+            expected_run_id=run_id,
+            review_task_id=review_task,
+            reason="different candidate",
+        ) is None
+        assert kb.request_review_handoff(
+            conn,
+            author,
+            expected_run_id=run_id,
+            review_task_id=review_task,
+            reason="candidate frozen",
+            recovery=True,
+        ) is None
+        assert len(_review_handoff_events(conn, author)) == 1
+
+
+def test_claim_rejects_forged_review_handoff_without_run_provenance(kanban_home):
+    with kb.connect() as conn:
+        author, run_id, review_task = _review_handoff_pair(conn)
+        core = {
+            "version": 1,
+            "expected_run_id": run_id,
+            "review_task_id": review_task,
+            "reason": "forged",
+            "recovery": False,
+        }
+        digest = hashlib.sha256(
+            json.dumps(
+                {"task_id": author, **core},
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode("utf-8")
+        ).hexdigest()
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status = 'review', current_run_id = NULL "
+                "WHERE id = ?",
+                (author,),
+            )
+            conn.execute(
+                "UPDATE tasks SET status = 'ready' WHERE id = ?",
+                (review_task,),
+            )
+            conn.execute(
+                "INSERT INTO task_events(task_id, run_id, kind, payload, created_at) "
+                "VALUES (?, ?, 'review_handoff', ?, ?)",
+                (
+                    author,
+                    run_id,
+                    json.dumps({**core, "receipt_sha256": digest}),
+                    int(time.time()),
+                ),
+            )
+
+        assert kb.claim_task(conn, review_task) is None
+        assert kb.get_task(conn, review_task).status == "todo"
+
+
+@pytest.mark.parametrize(
+    ("status", "outcome"),
+    [("blocked", None), ("running", "blocked")],
+)
+def test_request_review_handoff_requires_exact_open_running_run(
+    kanban_home, status, outcome,
+):
+    with kb.connect() as conn:
+        author, run_id, review_task = _review_handoff_pair(conn)
+        conn.execute(
+            "UPDATE task_runs SET status = ?, outcome = ? WHERE id = ?",
+            (status, outcome, run_id),
+        )
+        conn.commit()
+
+        assert kb.request_review_handoff(
+            conn,
+            author,
+            expected_run_id=run_id,
+            review_task_id=review_task,
+            reason="invalid run state",
+        ) is None
+        assert kb.get_task(conn, author).status == "running"
+        assert kb.get_task(conn, review_task).status == "todo"
+
+
+def test_request_review_handoff_rolls_back_on_event_write_failure(kanban_home):
+    with kb.connect() as conn:
+        author, run_id, review_task = _review_handoff_pair(conn)
+        conn.execute(
+            "CREATE TRIGGER fail_review_handoff BEFORE INSERT ON task_events "
+            "WHEN NEW.kind = 'review_handoff' "
+            "BEGIN SELECT RAISE(ABORT, 'fault injection'); END"
+        )
+        conn.commit()
+
+        with pytest.raises(sqlite3.IntegrityError, match="fault injection"):
+            kb.request_review_handoff(
+                conn,
+                author,
+                expected_run_id=run_id,
+                review_task_id=review_task,
+                reason="candidate frozen",
+            )
+
+        assert kb.get_task(conn, author).status == "running"
+        assert kb.get_task(conn, author).current_run_id == run_id
+        assert kb.get_task(conn, review_task).status == "todo"
+        assert kb.latest_run(conn, author).status == "running"
+
+
+def test_request_review_handoff_rolls_back_when_guarded_write_is_ignored(
+    kanban_home,
+):
+    with kb.connect() as conn:
+        author, run_id, review_task = _review_handoff_pair(conn)
+        conn.execute(
+            "CREATE TRIGGER ignore_review_run BEFORE UPDATE ON task_runs "
+            "WHEN NEW.status = 'review_required' "
+            "BEGIN SELECT RAISE(IGNORE); END"
+        )
+        conn.commit()
+
+        assert kb.request_review_handoff(
+            conn,
+            author,
+            expected_run_id=run_id,
+            review_task_id=review_task,
+            reason="candidate frozen",
+        ) is None
+
+        author_row = kb.get_task(conn, author)
+        assert author_row is not None
+        assert (author_row.status, author_row.current_run_id) == ("running", run_id)
+        assert kb.get_task(conn, review_task).status == "todo"
+        assert kb.latest_run(conn, author).status == "running"
+
+
+def test_request_review_handoff_recovers_exact_historical_shape(kanban_home):
+    with kb.connect() as conn:
+        author, run_id, review_task = _review_handoff_pair(conn)
+        assert kb.block_task(
+            conn,
+            author,
+            reason="first needs input",
+            kind="needs_input",
+            expected_run_id=run_id,
+        )
+        assert kb.unblock_task(conn, author)
+        claimed = kb.claim_task(conn, author)
+        assert claimed is not None
+        historical_run_id = claimed.current_run_id
+        assert historical_run_id is not None
+        assert kb.block_task(
+            conn,
+            author,
+            reason="review-required: candidate frozen",
+            kind="needs_input",
+            expected_run_id=historical_run_id,
+        )
+        assert kb.get_task(conn, author).status == "triage"
+
+        receipt = kb.request_review_handoff(
+            conn,
+            author,
+            expected_run_id=historical_run_id,
+            review_task_id=review_task,
+            reason="review-required: candidate frozen",
+            recovery=True,
+        )
+
+        assert receipt is not None
+        assert kb.get_task(conn, author).status == "review"
+        assert kb.get_task(conn, review_task).status == "ready"
+        run = kb.latest_run(conn, author)
+        assert run.id == historical_run_id
+        assert run.outcome == "review_required"
+
+
+def test_request_review_handoff_recovery_rejects_reason_mismatch(kanban_home):
+    with kb.connect() as conn:
+        author, run_id, review_task = _review_handoff_pair(conn)
+        assert kb.block_task(
+            conn,
+            author,
+            reason="first needs input",
+            kind="needs_input",
+            expected_run_id=run_id,
+        )
+        assert kb.unblock_task(conn, author)
+        claimed = kb.claim_task(conn, author)
+        assert claimed is not None and claimed.current_run_id is not None
+        historical_run_id = claimed.current_run_id
+        assert kb.block_task(
+            conn,
+            author,
+            reason="review-required: original candidate",
+            kind="needs_input",
+            expected_run_id=historical_run_id,
+        )
+
+        assert kb.request_review_handoff(
+            conn,
+            author,
+            expected_run_id=historical_run_id,
+            review_task_id=review_task,
+            reason="review-required: different candidate",
+            recovery=True,
+        ) is None
+        assert kb.get_task(conn, author).status == "triage"
+        assert kb.get_task(conn, review_task).status == "todo"
+
+
+def test_review_handoff_child_claims_without_generic_parent_weakening(
+    kanban_home,
+):
+    with kb.connect() as conn:
+        author, run_id, review_task = _review_handoff_pair(conn)
+        ordinary_child = kb.create_task(
+            conn, title="ordinary child", assignee="worker", parents=[author]
+        )
+        assert kb.request_review_handoff(
+            conn,
+            author,
+            expected_run_id=run_id,
+            review_task_id=review_task,
+            reason="candidate frozen",
+        )
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status = 'ready' WHERE id = ?",
+                (ordinary_child,),
+            )
+
+        assert kb.claim_task(conn, review_task) is not None
+        assert kb.claim_task(conn, ordinary_child) is None
+        assert kb.get_task(conn, ordinary_child).status == "todo"
+
+
+def test_review_verdict_request_changes_resumes_same_author_task(kanban_home):
+    with kb.connect() as conn:
+        author, run_id, review_task = _review_handoff_pair(conn)
+        assert kb.request_review_handoff(
+            conn,
+            author,
+            expected_run_id=run_id,
+            review_task_id=review_task,
+            reason="candidate frozen",
+        )
+        review_claim = kb.claim_task(conn, review_task)
+        assert review_claim is not None
+        original_assignee = kb.get_task(conn, author).assignee
+
+        assert kb.record_review_verdict(
+            conn,
+            author,
+            review_task_id=review_task,
+            expected_review_run_id=review_claim.current_run_id,
+            verdict="request_changes",
+            reason="fix rollback",
+        )
+
+        resumed = kb.get_task(conn, author)
+        assert resumed.status == "ready"
+        assert resumed.assignee == original_assignee
+        assert resumed.current_run_id is None
+        review_child = kb.get_task(conn, review_task)
+        assert review_child is not None
+        assert review_child.status == "todo"
+        assert review_child.current_run_id is None
+        review_run = kb.latest_run(conn, review_task)
+        assert review_run is not None
+        assert review_run.outcome == "request_changes"
+        assert review_run.ended_at is not None
+
+        author_claim = kb.claim_task(conn, author)
+        assert author_claim is not None and author_claim.current_run_id is not None
+        assert kb.request_review_handoff(
+            conn,
+            author,
+            expected_run_id=author_claim.current_run_id,
+            review_task_id=review_task,
+            reason="revised candidate frozen",
+        )
+        second_review_claim = kb.claim_task(conn, review_task)
+        assert second_review_claim is not None
+        assert second_review_claim.current_run_id != review_claim.current_run_id
+
+
+def test_review_verdict_pass_keeps_author_nonterminal(kanban_home):
+    with kb.connect() as conn:
+        author, run_id, review_task = _review_handoff_pair(conn)
+        assert kb.request_review_handoff(
+            conn,
+            author,
+            expected_run_id=run_id,
+            review_task_id=review_task,
+            reason="candidate frozen",
+        )
+        review_claim = kb.claim_task(conn, review_task)
+        assert review_claim is not None
+
+        assert kb.record_review_verdict(
+            conn,
+            author,
+            review_task_id=review_task,
+            expected_review_run_id=review_claim.current_run_id,
+            verdict="pass",
+            reason="exact head approved",
+        )
+
+        assert kb.get_task(conn, author).status == "review"
+        events = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id = ? AND kind = 'review_verdict'",
+            (author,),
+        ).fetchall()
+        assert len(events) == 1
+        assert json.loads(events[0]["payload"])["verdict"] == "pass"
+
+
+@pytest.mark.parametrize("verdict", ["pass", "request_changes"])
+def test_review_verdict_replay_rejects_conflicting_reason(kanban_home, verdict):
+    with kb.connect() as conn:
+        author, run_id, review_task = _review_handoff_pair(conn)
+        assert kb.request_review_handoff(
+            conn,
+            author,
+            expected_run_id=run_id,
+            review_task_id=review_task,
+            reason="candidate frozen",
+        )
+        review_claim = kb.claim_task(conn, review_task)
+        assert review_claim is not None and review_claim.current_run_id is not None
+
+        assert kb.record_review_verdict(
+            conn,
+            author,
+            review_task_id=review_task,
+            expected_review_run_id=review_claim.current_run_id,
+            verdict=verdict,
+            reason="exact head A verdict",
+        )
+        assert not kb.record_review_verdict(
+            conn,
+            author,
+            review_task_id=review_task,
+            expected_review_run_id=review_claim.current_run_id,
+            verdict=verdict,
+            reason="exact head B verdict",
+        )
+        assert kb.record_review_verdict(
+            conn,
+            author,
+            review_task_id=review_task,
+            expected_review_run_id=review_claim.current_run_id,
+            verdict=verdict,
+            reason="exact head A verdict",
+        )
+
+        events = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id = ? AND kind = 'review_verdict'",
+            (author,),
+        ).fetchall()
+        assert len(events) == 1
+        assert json.loads(events[0]["payload"])["reason"] == "exact head A verdict"
+
+
+def test_review_verdict_revalidates_role_separation(kanban_home):
+    with kb.connect() as conn:
+        author, run_id, review_task = _review_handoff_pair(conn)
+        assert kb.request_review_handoff(
+            conn,
+            author,
+            expected_run_id=run_id,
+            review_task_id=review_task,
+            reason="candidate frozen",
+        )
+        review_claim = kb.claim_task(conn, review_task)
+        assert review_claim is not None and review_claim.current_run_id is not None
+        conn.execute(
+            "UPDATE tasks SET assignee = 'author' WHERE id = ?",
+            (review_task,),
+        )
+        conn.commit()
+
+        assert not kb.record_review_verdict(
+            conn,
+            author,
+            review_task_id=review_task,
+            expected_review_run_id=review_claim.current_run_id,
+            verdict="pass",
+            reason="self approval",
+        )
+
+
+def test_dispatch_skips_handoff_author_and_dispatches_bound_child(
+    kanban_home, all_assignees_spawnable,
+):
+    with kb.connect() as conn:
+        author, run_id, review_task = _review_handoff_pair(conn)
+        assert kb.request_review_handoff(
+            conn,
+            author,
+            expected_run_id=run_id,
+            review_task_id=review_task,
+            reason="candidate frozen",
+        )
+
+        result = kb.dispatch_once(conn, dry_run=True)
+
+        assert [row[0] for row in result.spawned] == [review_task]
+        assert kb.get_task(conn, author).status == "review"
+
 
 # Review column dispatch
 # ---------------------------------------------------------------------------

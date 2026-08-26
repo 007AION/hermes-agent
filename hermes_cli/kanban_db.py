@@ -1279,6 +1279,23 @@ class Task:
 
 
 @dataclass(frozen=True)
+class ReviewHandoffReceipt:
+    """Durable identity of one author-run → existing-review-child handoff."""
+
+    event_id: int
+    task_id: str
+    expected_run_id: int
+    review_task_id: str
+    reason: str
+    recovery: bool
+    receipt_sha256: str
+
+
+class _ReviewHandoffConflict(Exception):
+    """Internal sentinel that forces write_txn rollback on a failed CAS."""
+
+
+@dataclass(frozen=True)
 class NativeLifecycleRequest:
     """Closed, exact-generation request carried by a Native kanban task."""
 
@@ -5282,6 +5299,456 @@ def recompute_ready(
     return promoted
 
 
+def _review_handoff_event_for_child(
+    conn: sqlite3.Connection,
+    task_id: str,
+    review_task_id: str,
+) -> Optional[sqlite3.Row]:
+    """Return the latest typed handoff binding ``task_id`` to this child."""
+    rows = conn.execute(
+        "SELECT id, run_id, payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'review_handoff' ORDER BY id DESC",
+        (task_id,),
+    ).fetchall()
+    for row in rows:
+        receipt = _review_handoff_receipt_from_row(task_id, row)
+        if receipt is None:
+            continue
+        if receipt.review_task_id != review_task_id:
+            return None
+        provenance = conn.execute(
+            "SELECT 1 FROM tasks author "
+            "JOIN tasks child ON child.id = ? "
+            "JOIN task_links edge ON edge.parent_id = author.id "
+            " AND edge.child_id = child.id "
+            "JOIN task_runs run ON run.id = ? AND run.task_id = author.id "
+            "WHERE author.id = ? AND author.status = 'review' "
+            "AND author.current_run_id IS NULL "
+            "AND author.assignee IS NOT NULL AND child.assignee IS NOT NULL "
+            "AND author.assignee != child.assignee "
+            "AND run.status = 'review_required' "
+            "AND run.outcome = 'review_required' AND run.ended_at IS NOT NULL",
+            (review_task_id, receipt.expected_run_id, task_id),
+        ).fetchone()
+        return row if provenance is not None else None
+    return None
+
+
+def _review_handoff_parent_satisfies_child(
+    conn: sqlite3.Connection,
+    parent_id: str,
+    parent_status: str,
+    child_id: str,
+) -> bool:
+    """Keep the terminal gate, plus one exact typed review-handoff edge."""
+    if parent_status in ("done", "archived"):
+        return True
+    return (
+        parent_status == "review"
+        and _review_handoff_event_for_child(conn, parent_id, child_id) is not None
+    )
+
+
+def _review_handoff_receipt_from_row(
+    task_id: str,
+    row: sqlite3.Row,
+) -> Optional[ReviewHandoffReceipt]:
+    try:
+        payload = json.loads(row["payload"] or "{}")
+        signed = {
+            "task_id": task_id,
+            "version": payload["version"],
+            "expected_run_id": payload["expected_run_id"],
+            "review_task_id": payload["review_task_id"],
+            "reason": payload["reason"],
+            "recovery": payload["recovery"],
+        }
+        expected_hash = hashlib.sha256(
+            json.dumps(
+                signed,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode("utf-8")
+        ).hexdigest()
+        if payload["version"] != 1 or payload["receipt_sha256"] != expected_hash:
+            return None
+        if int(row["run_id"]) != int(payload["expected_run_id"]):
+            return None
+        return ReviewHandoffReceipt(
+            event_id=int(row["id"]),
+            task_id=task_id,
+            expected_run_id=int(payload["expected_run_id"]),
+            review_task_id=str(payload["review_task_id"]),
+            reason=str(payload["reason"]),
+            recovery=bool(payload["recovery"]),
+            receipt_sha256=str(payload["receipt_sha256"]),
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _request_review_handoff(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    expected_run_id: int,
+    review_task_id: str,
+    reason: str,
+    recovery: bool = False,
+) -> Optional[ReviewHandoffReceipt]:
+    """Atomically hand one author run to one existing role-separated child.
+
+    The author remains nonterminal in ``review``. Only the explicitly bound
+    direct child becomes ``ready``; all of its other parents must already be
+    terminal. ``recovery=True`` is narrowly limited to a triage task whose
+    exact last ended run produced a ``review-required:`` block-loop event.
+    Replaying the same ``(task, run, child)`` key returns the original receipt.
+    """
+    reason = str(reason or "").strip()
+    if not reason or not review_task_id:
+        return None
+    expected_run_id = int(expected_run_id)
+    with write_txn(conn):
+        existing_rows = conn.execute(
+            "SELECT id, run_id, payload FROM task_events "
+            "WHERE task_id = ? AND kind = 'review_handoff' ORDER BY id DESC",
+            (task_id,),
+        ).fetchall()
+        for existing in existing_rows:
+            receipt = _review_handoff_receipt_from_row(task_id, existing)
+            if receipt is None:
+                continue
+            if (
+                receipt.expected_run_id == expected_run_id
+                and receipt.review_task_id == review_task_id
+            ):
+                return receipt if (
+                    receipt.reason == reason and receipt.recovery == bool(recovery)
+                ) else None
+
+        author = conn.execute(
+            "SELECT status, assignee, current_run_id FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        child = conn.execute(
+            "SELECT status, assignee, current_run_id FROM tasks WHERE id = ?",
+            (review_task_id,),
+        ).fetchone()
+        if author is None or child is None:
+            return None
+        if not author["assignee"] or not child["assignee"]:
+            return None
+        if author["assignee"] == child["assignee"]:
+            return None
+        if child["status"] != "todo" or child["current_run_id"] is not None:
+            return None
+        direct = conn.execute(
+            "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ?",
+            (task_id, review_task_id),
+        ).fetchone()
+        if direct is None:
+            return None
+        other_parents = conn.execute(
+            "SELECT p.status FROM task_links l "
+            "JOIN tasks p ON p.id = l.parent_id "
+            "WHERE l.child_id = ? AND l.parent_id != ?",
+            (review_task_id, task_id),
+        ).fetchall()
+        if any(row["status"] not in ("done", "archived") for row in other_parents):
+            return None
+
+        run = conn.execute(
+            "SELECT id, status, outcome, ended_at FROM task_runs "
+            "WHERE id = ? AND task_id = ?",
+            (expected_run_id, task_id),
+        ).fetchone()
+        if run is None:
+            return None
+        if recovery:
+            if author["status"] != "triage" or author["current_run_id"] is not None:
+                return None
+            latest = conn.execute(
+                "SELECT id FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            loop = conn.execute(
+                "SELECT payload FROM task_events WHERE task_id = ? AND run_id = ? "
+                "AND kind = 'block_loop_detected' ORDER BY id DESC LIMIT 1",
+                (task_id, expected_run_id),
+            ).fetchone()
+            try:
+                loop_reason = str(json.loads(loop["payload"] or "{}").get("reason", ""))
+            except (TypeError, ValueError):
+                loop_reason = ""
+            if (
+                latest is None
+                or int(latest["id"]) != expected_run_id
+                or run["ended_at"] is None
+                or run["status"] != "blocked"
+                or run["outcome"] != "blocked"
+                or loop_reason != reason
+            ):
+                return None
+        elif (
+            author["status"] != "running"
+            or author["current_run_id"] != expected_run_id
+            or run["status"] != "running"
+            or run["outcome"] is not None
+            or run["ended_at"] is not None
+        ):
+            return None
+
+        now = int(time.time())
+        author_update = conn.execute(
+            "UPDATE tasks SET status = 'review', current_run_id = NULL, "
+            "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
+            "block_kind = NULL, block_recurrences = 0 "
+            "WHERE id = ? AND status = ?",
+            (task_id, "triage" if recovery else "running"),
+        )
+        if author_update.rowcount != 1:
+            raise _ReviewHandoffConflict
+        run_update = conn.execute(
+            "UPDATE task_runs SET status = 'review_required', "
+            "outcome = 'review_required', summary = ?, ended_at = COALESCE(ended_at, ?), "
+            "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
+            "WHERE id = ? AND task_id = ?",
+            (reason, now, expected_run_id, task_id),
+        )
+        if run_update.rowcount != 1:
+            raise _ReviewHandoffConflict
+        child_update = conn.execute(
+            "UPDATE tasks SET status = 'ready' "
+            "WHERE id = ? AND status = 'todo' AND current_run_id IS NULL",
+            (review_task_id,),
+        )
+        if child_update.rowcount != 1:
+            raise _ReviewHandoffConflict
+
+        core_payload = {
+            "version": 1,
+            "expected_run_id": expected_run_id,
+            "review_task_id": review_task_id,
+            "reason": reason,
+            "recovery": bool(recovery),
+        }
+        receipt_sha256 = hashlib.sha256(
+            json.dumps(
+                {"task_id": task_id, **core_payload},
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode("utf-8")
+        ).hexdigest()
+        payload = {**core_payload, "receipt_sha256": receipt_sha256}
+        _append_event(
+            conn, task_id, "review_handoff", payload, run_id=expected_run_id
+        )
+        event_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+        _append_event(
+            conn,
+            review_task_id,
+            "promoted",
+            {"source": "review_handoff", "parent_id": task_id},
+        )
+        return ReviewHandoffReceipt(
+            event_id=event_id,
+            task_id=task_id,
+            expected_run_id=expected_run_id,
+            review_task_id=review_task_id,
+            reason=reason,
+            recovery=bool(recovery),
+            receipt_sha256=receipt_sha256,
+        )
+
+
+def request_review_handoff(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    expected_run_id: int,
+    review_task_id: str,
+    reason: str,
+    recovery: bool = False,
+) -> Optional[ReviewHandoffReceipt]:
+    """Public fail-closed wrapper for the atomic review-handoff transaction."""
+    try:
+        return _request_review_handoff(
+            conn,
+            task_id,
+            expected_run_id=expected_run_id,
+            review_task_id=review_task_id,
+            reason=reason,
+            recovery=recovery,
+        )
+    except _ReviewHandoffConflict:
+        return None
+
+
+def _record_review_verdict(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    review_task_id: str,
+    expected_review_run_id: int,
+    verdict: str,
+    reason: str,
+) -> bool:
+    """Record a bound child verdict; only REQUEST_CHANGES resumes the author."""
+    verdict = str(verdict or "").strip().lower()
+    reason = str(reason or "").strip()
+    if verdict not in {"pass", "request_changes"} or not reason:
+        return False
+    expected_review_run_id = int(expected_review_run_id)
+    with write_txn(conn):
+        prior = conn.execute(
+            "SELECT run_id, payload FROM task_events WHERE task_id = ? "
+            "AND kind = 'review_verdict' ORDER BY id DESC",
+            (task_id,),
+        ).fetchall()
+        for row in prior:
+            try:
+                payload = json.loads(row["payload"] or "{}")
+            except (TypeError, ValueError):
+                continue
+            if (
+                payload.get("review_task_id") == review_task_id
+                and payload.get("review_run_id") == expected_review_run_id
+            ):
+                if (
+                    row["run_id"] != expected_review_run_id
+                    or payload.get("verdict") != verdict
+                    or payload.get("reason") != reason
+                ):
+                    return False
+                if verdict == "pass":
+                    replay = conn.execute(
+                        "SELECT 1 FROM tasks author JOIN tasks child ON child.id = ? "
+                        "JOIN task_runs run ON run.id = ? AND run.task_id = child.id "
+                        "WHERE author.id = ? AND author.status = 'review' "
+                        "AND child.status = 'running' "
+                        "AND child.current_run_id = run.id "
+                        "AND run.status = 'running' AND run.outcome IS NULL "
+                        "AND run.ended_at IS NULL",
+                        (review_task_id, expected_review_run_id, task_id),
+                    ).fetchone()
+                else:
+                    replay = conn.execute(
+                        "SELECT 1 FROM tasks author JOIN tasks child ON child.id = ? "
+                        "JOIN task_runs run ON run.id = ? AND run.task_id = child.id "
+                        "WHERE author.id = ? AND author.status = 'ready' "
+                        "AND child.status = 'todo' AND child.current_run_id IS NULL "
+                        "AND run.status = 'request_changes' "
+                        "AND run.outcome = 'request_changes' "
+                        "AND run.ended_at IS NOT NULL",
+                        (review_task_id, expected_review_run_id, task_id),
+                    ).fetchone()
+                return replay is not None
+        if _review_handoff_event_for_child(conn, task_id, review_task_id) is None:
+            return False
+        author = conn.execute(
+            "SELECT status, assignee FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        child = conn.execute(
+            "SELECT status, current_run_id, assignee FROM tasks WHERE id = ?",
+            (review_task_id,),
+        ).fetchone()
+        review_run = conn.execute(
+            "SELECT status, outcome, ended_at FROM task_runs "
+            "WHERE id = ? AND task_id = ?",
+            (expected_review_run_id, review_task_id),
+        ).fetchone()
+        if (
+            author is None
+            or author["status"] != "review"
+            or child is None
+            or child["status"] != "running"
+            or child["current_run_id"] != expected_review_run_id
+            or not author["assignee"]
+            or not child["assignee"]
+            or author["assignee"] == child["assignee"]
+            or review_run is None
+            or review_run["status"] != "running"
+            or review_run["outcome"] is not None
+            or review_run["ended_at"] is not None
+        ):
+            return False
+        payload = {
+            "version": 1,
+            "review_task_id": review_task_id,
+            "review_run_id": expected_review_run_id,
+            "verdict": verdict,
+            "reason": reason,
+        }
+        if verdict == "request_changes":
+            now = int(time.time())
+            child_reset = conn.execute(
+                "UPDATE tasks SET status = 'todo', current_run_id = NULL, "
+                "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
+                "block_kind = NULL, block_recurrences = 0 "
+                "WHERE id = ? AND status = 'running' AND current_run_id = ?",
+                (review_task_id, expected_review_run_id),
+            )
+            if child_reset.rowcount != 1:
+                raise _ReviewHandoffConflict
+            review_run = conn.execute(
+                "UPDATE task_runs SET status = 'request_changes', "
+                "outcome = 'request_changes', summary = ?, ended_at = ?, "
+                "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
+                "WHERE id = ? AND task_id = ? AND ended_at IS NULL",
+                (reason, now, expected_review_run_id, review_task_id),
+            )
+            if review_run.rowcount != 1:
+                raise _ReviewHandoffConflict
+            resumed = conn.execute(
+                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                "claim_expires = NULL, worker_pid = NULL, block_kind = NULL, "
+                "block_recurrences = 0 WHERE id = ? AND status = 'review'",
+                (task_id,),
+            )
+            if resumed.rowcount != 1:
+                raise _ReviewHandoffConflict
+        _append_event(
+            conn,
+            task_id,
+            "review_verdict",
+            payload,
+            run_id=expected_review_run_id,
+        )
+        _append_event(
+            conn,
+            review_task_id,
+            "review_verdict",
+            payload,
+            run_id=expected_review_run_id,
+        )
+        return True
+
+
+def record_review_verdict(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    review_task_id: str,
+    expected_review_run_id: int,
+    verdict: str,
+    reason: str,
+) -> bool:
+    """Public fail-closed wrapper for the bound review-verdict transaction."""
+    try:
+        return _record_review_verdict(
+            conn,
+            task_id,
+            review_task_id=review_task_id,
+            expected_review_run_id=expected_review_run_id,
+            verdict=verdict,
+            reason=reason,
+        )
+    except _ReviewHandoffConflict:
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Claim / complete / block
 # ---------------------------------------------------------------------------
@@ -5321,13 +5788,19 @@ def claim_task(
         # 'todo' here — recompute_ready will re-promote when the parents
         # actually finish. See RCA at
         # kanban/boards/cookai/workspaces/t_a6acd07d/root-cause.md.
-        undone = conn.execute(
-            "SELECT 1 FROM task_links l "
+        parent_rows = conn.execute(
+            "SELECT p.id, p.status FROM task_links l "
             "JOIN tasks p ON p.id = l.parent_id "
-            "WHERE l.child_id = ? AND p.status NOT IN ('done', 'archived') LIMIT 1",
+            "WHERE l.child_id = ?",
             (task_id,),
-        ).fetchone()
-        if undone:
+        ).fetchall()
+        has_unsatisfied_parent = any(
+            not _review_handoff_parent_satisfies_child(
+                conn, parent["id"], parent["status"], task_id
+            )
+            for parent in parent_rows
+        )
+        if has_unsatisfied_parent:
             conn.execute(
                 "UPDATE tasks SET status = 'todo' "
                 "WHERE id = ? AND status = 'ready'",
@@ -12026,7 +12499,10 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     rows = conn.execute(
         "SELECT DISTINCT assignee FROM tasks "
         "WHERE status = 'review' AND assignee IS NOT NULL "
-        "    AND claim_lock IS NULL"
+        "    AND claim_lock IS NULL "
+        "    AND NOT EXISTS (SELECT 1 FROM task_events e "
+        "                    WHERE e.task_id = tasks.id "
+        "                      AND e.kind = 'review_handoff')"
     ).fetchall()
     if not rows:
         return False
@@ -12984,6 +13460,9 @@ def _dispatch_once_locked(
     review_rows = conn.execute(
         "SELECT id, assignee FROM tasks "
         "WHERE status = 'review' AND claim_lock IS NULL "
+        "AND NOT EXISTS (SELECT 1 FROM task_events e "
+        "                WHERE e.task_id = tasks.id "
+        "                  AND e.kind = 'review_handoff') "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
     for row in review_rows:
