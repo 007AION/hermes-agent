@@ -3062,6 +3062,32 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "factory_terminal_receipt_sha256 TEXT",
         )
 
+    if "factory_challenge_semantic_receipt_sha256" not in cols:
+        # AION-889 P2.5 additive carrier pointer.  MIGRATED_DISABLED: no claim
+        # or admission surface reads this column.  It binds a new trusted
+        # semantic attestation while preserving factory_terminal_receipt_sha256
+        # as immutable negative/source evidence.
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "factory_challenge_semantic_receipt_sha256",
+            "factory_challenge_semantic_receipt_sha256 TEXT",
+        )
+
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_factory_challenge_semantic_receipt_immutable
+        BEFORE UPDATE OF factory_challenge_semantic_receipt_sha256 ON tasks
+        WHEN OLD.factory_challenge_semantic_receipt_sha256 IS NOT NULL
+         AND NEW.factory_challenge_semantic_receipt_sha256
+             IS NOT OLD.factory_challenge_semantic_receipt_sha256
+        BEGIN
+            SELECT RAISE(ABORT,
+                'factory challenge semantic receipt pointer is immutable');
+        END;
+        """
+    )
+
     # AION-889 Phase B REV1 — immutability (writer chokepoint guard). Once a
     # task is factory-build gated (factory_build_gate=1) it may NEVER be
     # demoted back to 0/NULL, on any update surface (dashboard direct status,
