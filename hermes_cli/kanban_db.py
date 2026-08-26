@@ -5619,6 +5619,7 @@ def _record_review_verdict(
                 if (
                     row["run_id"] != expected_review_run_id
                     or payload.get("verdict") != verdict
+                    or payload.get("reason") != reason
                 ):
                     return False
                 if verdict == "pass":

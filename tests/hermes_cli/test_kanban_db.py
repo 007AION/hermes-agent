@@ -5986,6 +5986,54 @@ def test_review_verdict_pass_keeps_author_nonterminal(kanban_home):
         assert json.loads(events[0]["payload"])["verdict"] == "pass"
 
 
+@pytest.mark.parametrize("verdict", ["pass", "request_changes"])
+def test_review_verdict_replay_rejects_conflicting_reason(kanban_home, verdict):
+    with kb.connect() as conn:
+        author, run_id, review_task = _review_handoff_pair(conn)
+        assert kb.request_review_handoff(
+            conn,
+            author,
+            expected_run_id=run_id,
+            review_task_id=review_task,
+            reason="candidate frozen",
+        )
+        review_claim = kb.claim_task(conn, review_task)
+        assert review_claim is not None and review_claim.current_run_id is not None
+
+        assert kb.record_review_verdict(
+            conn,
+            author,
+            review_task_id=review_task,
+            expected_review_run_id=review_claim.current_run_id,
+            verdict=verdict,
+            reason="exact head A verdict",
+        )
+        assert not kb.record_review_verdict(
+            conn,
+            author,
+            review_task_id=review_task,
+            expected_review_run_id=review_claim.current_run_id,
+            verdict=verdict,
+            reason="exact head B verdict",
+        )
+        assert kb.record_review_verdict(
+            conn,
+            author,
+            review_task_id=review_task,
+            expected_review_run_id=review_claim.current_run_id,
+            verdict=verdict,
+            reason="exact head A verdict",
+        )
+
+        events = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id = ? AND kind = 'review_verdict'",
+            (author,),
+        ).fetchall()
+        assert len(events) == 1
+        assert json.loads(events[0]["payload"])["reason"] == "exact head A verdict"
+
+
 def test_review_verdict_revalidates_role_separation(kanban_home):
     with kb.connect() as conn:
         author, run_id, review_task = _review_handoff_pair(conn)
