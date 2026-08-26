@@ -21,10 +21,16 @@ from hermes_cli.aion_889_preflight import (
     REQUIREMENTS_SHA256,
     SOLUTION_CONTRACT_SHA256,
     ChallengeExpectation,
+    SemanticAttestationExpectation,
+    SemanticPointerBindingError,
+    bind_semantic_attestation_in_txn,
     canonical_decision_bytes,
     check_challenge_semantic_bindings,
+    check_semantic_attestation,
     compute_scope_identity_sha256,
     strict_json_loads,
+    SEMANTIC_MIGRATION_STATE,
+    SEMANTIC_RECEIPT_SCHEMA,
 )
 
 SCOPE_IDENTITY_SHA256 = "1d89ce22d02156d562b4fe5ea9e72165068fa6d88edd9ecd17a62e2d1b01171f"
@@ -237,3 +243,168 @@ def test_in_scope_claim_without_preflight_receipt_blocks_before_run_row(
         "field": "factory_preflight_receipt_sha256",
         "evidence_ref": None,
     }
+
+
+# ---------------------------------------------------------------------------
+# P2.5 trusted-evidence carrier bootstrap (MIGRATED_DISABLED; no claim wiring)
+# ---------------------------------------------------------------------------
+
+GENERIC_SOLUTION_SHA = "d6b082eb4c14fb1003472c38d377d65ae45da12cb26dd8848a47255474bc1553"
+GOVERNANCE_BASE_SHA = "5c74e39e8f38907fbb32305ac21adb1e7b61e321"
+HERMES_P1_HEAD_SHA = "68110f5723cb3bc3d93c9bd5f9e431fa091ff6a9"
+
+
+def _semantic_expectation() -> SemanticAttestationExpectation:
+    return SemanticAttestationExpectation(
+        challenge=_expectation("SOLUTION"),
+        source_factory_terminal_receipt_sha256=GENERIC_SOLUTION_SHA,
+        governance_base_sha=GOVERNANCE_BASE_SHA,
+        hermes_checker_head_sha=HERMES_P1_HEAD_SHA,
+    )
+
+
+def _semantic_receipt() -> dict[str, object]:
+    return {
+        "schema": SEMANTIC_RECEIPT_SCHEMA,
+        "migration_state": SEMANTIC_MIGRATION_STATE,
+        **_valid_receipt("SOLUTION"),
+        "source_factory_terminal_receipt_sha256": GENERIC_SOLUTION_SHA,
+        "attested_by": "aion_monarch_proof_kernel",
+        "bootstrap_binding": {
+            "governance_base_sha": GOVERNANCE_BASE_SHA,
+            "hermes_checker_head_sha": HERMES_P1_HEAD_SHA,
+        },
+    }
+
+
+def test_future_scope_generation_is_replay_and_fails_exact_current_binding() -> None:
+    receipt = _valid_receipt("SOLUTION")
+    receipt["scope_generation"] = 1
+    result = check_challenge_semantic_bindings(receipt, _expectation("SOLUTION"))
+    assert result.decision == "BLOCK"
+    assert result.detail_code == "STALE_CURRENT_CHALLENGE"
+    assert result.field == "scope_generation"
+
+
+def test_migrated_disabled_semantic_attestation_passes_pure_readback_only() -> None:
+    result = check_semantic_attestation(_semantic_receipt(), _semantic_expectation())
+    assert result.decision == "PASS"
+
+
+@pytest.mark.parametrize(
+    ("mutate", "detail", "field"),
+    [
+        (lambda r: r.update(attested_by="agent"), "RECEIPT_PROVENANCE_INVALID", "attested_by"),
+        (lambda r: r.update(migration_state="ACTIVE"), "MIGRATION_STATE_INVALID", "migration_state"),
+        (
+            lambda r: r.update(source_factory_terminal_receipt_sha256="f" * 64),
+            "SOURCE_RECEIPT_STALE",
+            "source_factory_terminal_receipt_sha256",
+        ),
+        (
+            lambda r: r["bootstrap_binding"].update(governance_base_sha="1" * 40),
+            "BOOTSTRAP_HEAD_MISMATCH",
+            "governance_base_sha",
+        ),
+        (
+            lambda r: r["bootstrap_binding"].update(hermes_checker_head_sha="2" * 40),
+            "BOOTSTRAP_HEAD_MISMATCH",
+            "hermes_checker_head_sha",
+        ),
+    ],
+)
+def test_semantic_attestation_hostile_matrix_fails_closed(mutate, detail, field) -> None:
+    receipt = _semantic_receipt()
+    mutate(receipt)
+    result = check_semantic_attestation(receipt, _semantic_expectation())
+    assert result.decision == "BLOCK"
+    assert result.detail_code == detail
+    assert result.field == field
+
+
+def test_disabled_pointer_schema_is_additive_and_immutable(kanban_home: Path) -> None:
+    with kb.connect() as conn:
+        columns = {r[1] for r in conn.execute("PRAGMA table_info(tasks)").fetchall()}
+        assert "factory_challenge_semantic_receipt_sha256" in columns
+        task_id = kb.create_task(conn, title="semantic pointer fixture")
+        conn.execute(
+            "UPDATE tasks SET factory_challenge_semantic_receipt_sha256=? WHERE id=?",
+            ("a" * 64, task_id),
+        )
+        with pytest.raises(Exception, match="immutable"):
+            conn.execute(
+                "UPDATE tasks SET factory_challenge_semantic_receipt_sha256=? WHERE id=?",
+                ("b" * 64, task_id),
+            )
+        row = conn.execute(
+            "SELECT factory_terminal_receipt_sha256, "
+            "factory_challenge_semantic_receipt_sha256 FROM tasks WHERE id=?",
+            (task_id,),
+        ).fetchone()
+        assert row["factory_terminal_receipt_sha256"] is None
+        assert row["factory_challenge_semantic_receipt_sha256"] == "a" * 64
+
+
+def test_host_binder_is_cas_idempotent_and_never_relabels_source() -> None:
+    state = {
+        "source_sha": GENERIC_SOLUTION_SHA,
+        "semantic_sha": None,
+        "semantic_uploaded_by": None,
+        "semantic_bytes_sha": None,
+    }
+    calls: list[str] = []
+
+    def read_binding(conn, task_id):
+        return dict(state)
+
+    def store_attachment(conn, task_id, filename, raw, *, uploaded_by, board):
+        calls.append("attachment")
+        assert uploaded_by == "aion_monarch_proof_kernel"
+        return 17
+
+    def cas(conn, task_id, expected_source, expected_semantic, new_sha):
+        calls.append("cas")
+        if state["source_sha"] != expected_source or state["semantic_sha"] is not expected_semantic:
+            return False
+        state["semantic_sha"] = new_sha
+        state["semantic_uploaded_by"] = "aion_monarch_proof_kernel"
+        state["semantic_bytes_sha"] = new_sha
+        return True
+
+    def event(conn, task_id, kind, payload):
+        calls.append("event")
+
+    raw = json.dumps(_semantic_receipt(), sort_keys=True, separators=(",", ":")).encode()
+    first = bind_semantic_attestation_in_txn(
+        conn=object(), board="aion-factory", task_id="t_2f0f75e5", raw=raw,
+        expected=_semantic_expectation(), read_binding=read_binding,
+        store_attachment=store_attachment, compare_and_swap_pointer=cas,
+        append_event=event,
+    )
+    second = bind_semantic_attestation_in_txn(
+        conn=object(), board="aion-factory", task_id="t_2f0f75e5", raw=raw,
+        expected=_semantic_expectation(), read_binding=read_binding,
+        store_attachment=store_attachment, compare_and_swap_pointer=cas,
+        append_event=event,
+    )
+    assert first["idempotent"] is False and second["idempotent"] is True
+    assert calls == ["attachment", "cas", "event"]
+    assert state["source_sha"] == GENERIC_SOLUTION_SHA
+
+
+def test_host_binder_rejects_pointer_collision_without_write() -> None:
+    state = {
+        "source_sha": GENERIC_SOLUTION_SHA,
+        "semantic_sha": "e" * 64,
+        "semantic_uploaded_by": "aion_monarch_proof_kernel",
+        "semantic_bytes_sha": "e" * 64,
+    }
+    raw = json.dumps(_semantic_receipt(), sort_keys=True, separators=(",", ":")).encode()
+    with pytest.raises(SemanticPointerBindingError, match="SEMANTIC_POINTER_COLLISION"):
+        bind_semantic_attestation_in_txn(
+            conn=object(), board="aion-factory", task_id="t_2f0f75e5", raw=raw,
+            expected=_semantic_expectation(), read_binding=lambda *_: dict(state),
+            store_attachment=lambda *a, **k: pytest.fail("must not write"),
+            compare_and_swap_pointer=lambda *a: pytest.fail("must not CAS"),
+            append_event=lambda *a: pytest.fail("must not emit"),
+        )
