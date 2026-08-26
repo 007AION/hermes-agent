@@ -818,6 +818,113 @@ def _handle_block(args: dict, **kw) -> str:
         return tool_error(f"kanban_block: {e}")
 
 
+def _handle_request_review(args: dict, **kw) -> str:
+    """Atomically hand this worker run to one existing independent child."""
+    delegated_err = _reject_delegated_child_mutation("kanban_request_review")
+    if delegated_err:
+        return delegated_err
+    tid = _default_task_id(args.get("task_id"))
+    if not tid:
+        return tool_error(
+            "task_id is required (or set HERMES_KANBAN_TASK in the env)"
+        )
+    ownership_err = _enforce_worker_task_ownership(tid)
+    if ownership_err:
+        return ownership_err
+    review_task_id = str(args.get("review_task_id") or "").strip()
+    reason = str(args.get("reason") or "").strip()
+    run_id = _worker_run_id(tid)
+    if not review_task_id:
+        return tool_error("review_task_id is required")
+    if not reason:
+        return tool_error("reason is required")
+    if run_id is None:
+        return tool_error("current dispatcher run id is required")
+    reason = redact_sensitive_text(reason, force=True)
+    try:
+        kb, conn = _connect(board=args.get("board"))
+        try:
+            receipt = kb.request_review_handoff(
+                conn,
+                tid,
+                expected_run_id=run_id,
+                review_task_id=review_task_id,
+                reason=reason,
+            )
+            if receipt is None:
+                return tool_error(
+                    "review handoff refused: stale run, invalid/direct-child "
+                    "binding, role collision, active child, or unmet other parent"
+                )
+            return _ok(
+                task_id=tid,
+                run_id=run_id,
+                review_task_id=review_task_id,
+                event_id=receipt.event_id,
+                receipt_sha256=receipt.receipt_sha256,
+            )
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.exception("kanban_request_review failed")
+        return tool_error(f"kanban_request_review: {e}")
+
+
+def _handle_review_verdict(args: dict, **kw) -> str:
+    """Record this auditor child's PASS or REQUEST_CHANGES verdict."""
+    delegated_err = _reject_delegated_child_mutation("kanban_review_verdict")
+    if delegated_err:
+        return delegated_err
+    review_task_id = _default_task_id(args.get("task_id"))
+    if not review_task_id:
+        return tool_error(
+            "task_id is required (or set HERMES_KANBAN_TASK in the env)"
+        )
+    ownership_err = _enforce_worker_task_ownership(review_task_id)
+    if ownership_err:
+        return ownership_err
+    author_task_id = str(args.get("author_task_id") or "").strip()
+    verdict = str(args.get("verdict") or "").strip().lower()
+    reason = str(args.get("reason") or "").strip()
+    review_run_id = _worker_run_id(review_task_id)
+    if not author_task_id:
+        return tool_error("author_task_id is required")
+    if verdict not in {"pass", "request_changes"}:
+        return tool_error("verdict must be 'pass' or 'request_changes'")
+    if not reason:
+        return tool_error("reason is required")
+    if review_run_id is None:
+        return tool_error("current dispatcher run id is required")
+    reason = redact_sensitive_text(reason, force=True)
+    try:
+        kb, conn = _connect(board=args.get("board"))
+        try:
+            ok = kb.record_review_verdict(
+                conn,
+                author_task_id,
+                review_task_id=review_task_id,
+                expected_review_run_id=review_run_id,
+                verdict=verdict,
+                reason=reason,
+            )
+            if not ok:
+                return tool_error(
+                    "review verdict refused: the author/child/run binding is "
+                    "missing, stale, or conflicts with an existing verdict"
+                )
+            return _ok(
+                author_task_id=author_task_id,
+                review_task_id=review_task_id,
+                review_run_id=review_run_id,
+                verdict=verdict,
+            )
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.exception("kanban_review_verdict failed")
+        return tool_error(f"kanban_review_verdict: {e}")
+
+
 def _handle_heartbeat(args: dict, **kw) -> str:
     """Signal that the worker is still alive during a long operation.
 
@@ -1760,6 +1867,57 @@ KANBAN_BLOCK_SCHEMA = {
     },
 }
 
+KANBAN_REQUEST_REVIEW_SCHEMA = {
+    "name": "kanban_request_review",
+    "description": (
+        "Atomically end your current author run as review_required, keep the "
+        "author task nonterminal in review, and ready one explicit existing "
+        "role-separated direct child for independent audit."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {"type": "string", "description": _DESC_TASK_ID_DEFAULT},
+            "review_task_id": {
+                "type": "string",
+                "description": "Existing direct child task assigned to the independent reviewer.",
+            },
+            "reason": {
+                "type": "string",
+                "description": "Concise review handoff reason and candidate identity.",
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": ["review_task_id", "reason"],
+    },
+}
+
+KANBAN_REVIEW_VERDICT_SCHEMA = {
+    "name": "kanban_review_verdict",
+    "description": (
+        "Record this auditor child's bound PASS or REQUEST_CHANGES verdict. "
+        "REQUEST_CHANGES resumes the same author task; PASS leaves it "
+        "nonterminal pending the existing merge/runtime receipt gate."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {"type": "string", "description": _DESC_TASK_ID_DEFAULT},
+            "author_task_id": {
+                "type": "string",
+                "description": "The nonterminal author task that handed off to this child.",
+            },
+            "verdict": {
+                "type": "string",
+                "enum": ["pass", "request_changes"],
+            },
+            "reason": {"type": "string", "description": "Concrete verdict evidence or findings."},
+            "board": _board_schema_prop(),
+        },
+        "required": ["author_task_id", "verdict", "reason"],
+    },
+}
+
 KANBAN_HEARTBEAT_SCHEMA = {
     "name": "kanban_heartbeat",
     "description": (
@@ -2208,6 +2366,24 @@ registry.register(
     handler=_handle_block,
     check_fn=_check_kanban_mode,
     emoji="⏸",
+)
+
+registry.register(
+    name="kanban_request_review",
+    toolset="kanban",
+    schema=KANBAN_REQUEST_REVIEW_SCHEMA,
+    handler=_handle_request_review,
+    check_fn=_check_kanban_mode,
+    emoji="🔎",
+)
+
+registry.register(
+    name="kanban_review_verdict",
+    toolset="kanban",
+    schema=KANBAN_REVIEW_VERDICT_SCHEMA,
+    handler=_handle_review_verdict,
+    check_fn=_check_kanban_mode,
+    emoji="⚖",
 )
 
 registry.register(
