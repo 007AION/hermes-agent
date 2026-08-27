@@ -78,6 +78,7 @@ import re
 import random
 import secrets
 import shutil
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -4887,6 +4888,13 @@ _TERMINAL_TASK_STATUSES = ("done", "archived")
 # (AION-RL2-CORE-01-R16 audit repair.)
 _TERMINAL_REPAIR_OUTCOME = "reclaimed"
 
+# Durable event and receipt schema for the even narrower residue shape where
+# the task row itself is gone but one exact task_runs row remains open. This is
+# deliberately separate from ``repair_terminal_orphan_runs``: that operation
+# requires a present terminal task and must continue to refuse unknown tasks.
+_MISSING_TASK_RUN_REPAIR_EVENT = "missing_task_orphan_run_repaired"
+_MISSING_TASK_RUN_REPAIR_SCHEMA = "hermes.kanban.missing-task-run-repair.v1"
+
 
 def _ambiguous_ownership(claim_lock, claim_expires, worker_pid, now: int) -> bool:
     """Return True when task/run ownership evidence is ambiguous and must fail
@@ -4905,6 +4913,247 @@ def _ambiguous_ownership(claim_lock, claim_expires, worker_pid, now: int) -> boo
     if claim_expires is not None and int(claim_expires) > now:
         return True
     return False
+
+
+def _claim_lock_process_is_live(claim_lock: str) -> bool:
+    """Safely check canonical local ``hostname:pid`` ownership.
+
+    Remote or malformed identities fail closed. ``psutil`` is the canonical
+    non-signalling cross-platform probe. If it is unavailable, POSIX may safely
+    fall back to ``os.kill(pid, 0)``; Windows must refuse rather than use that
+    API because CPython maps signal 0 to ``CTRL_C_EVENT`` there (bpo-14484).
+    """
+    try:
+        host, pid_text = claim_lock.rsplit(":", 1)
+        pid = int(pid_text)
+    except (AttributeError, TypeError, ValueError):
+        return True
+    if host != socket.gethostname() or pid <= 0:
+        return True
+    try:
+        import psutil  # type: ignore
+
+        try:
+            process = psutil.Process(pid)
+            if process.status() == psutil.STATUS_ZOMBIE:
+                return False
+            return bool(process.is_running())
+        except psutil.NoSuchProcess:
+            return False
+        except (psutil.AccessDenied, OSError):
+            return True
+    except ImportError:
+        if os.name == "nt":
+            return True
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except (PermissionError, OSError):
+            return True
+        return True
+
+
+def _missing_task_run_refusal(
+    run_id: int,
+    expected_task_id: str,
+    expected_profile: str,
+    expected_claim_lock: str,
+    reason: str,
+) -> dict:
+    """Return the stable no-write receipt shape for a refused exact repair."""
+    return {
+        "schema": _MISSING_TASK_RUN_REPAIR_SCHEMA,
+        "run_id": int(run_id),
+        "task_id": expected_task_id,
+        "profile": expected_profile,
+        "claim_lock": expected_claim_lock,
+        "outcome": None,
+        "repaired": False,
+        "refused": reason,
+        "receipt_sha256": None,
+    }
+
+
+def _repair_missing_task_orphan_run_in_txn(
+    conn: sqlite3.Connection,
+    run_id: int,
+    *,
+    expected_task_id: str,
+    expected_profile: str,
+    expected_claim_lock: str,
+) -> dict:
+    """Close one exact open run whose task row is missing.
+
+    This is an incident-repair path, not a scanner. Callers must bind all
+    immutable run identity available on the row (run id, task id, profile and
+    original claim lock). The operation additionally requires positive dead /
+    unowned evidence: the task is absent, the claim is expired, the canonical
+    local claim-lock PID is absent, and both worker_pid and heartbeat ownership
+    are NULL. Any ambiguity is refused without mutation.
+
+    The first successful repair stores its complete deterministic receipt in a
+    task_events row. Replays return that exact stored receipt. Existing history
+    is preserved; only the exact run is closed and one repair event is appended.
+    """
+    try:
+        exact_run_id = int(run_id)
+    except (TypeError, ValueError):
+        return _missing_task_run_refusal(
+            0, expected_task_id, expected_profile, expected_claim_lock,
+            "invalid_run_id",
+        )
+
+    row = conn.execute(
+        "SELECT id, task_id, profile, status, outcome, ended_at, claim_lock, "
+        "claim_expires, worker_pid, last_heartbeat_at FROM task_runs WHERE id = ?",
+        (exact_run_id,),
+    ).fetchone()
+    if row is None:
+        return _missing_task_run_refusal(
+            exact_run_id, expected_task_id, expected_profile, expected_claim_lock,
+            "unknown_run",
+        )
+    if row["task_id"] != expected_task_id:
+        return _missing_task_run_refusal(
+            exact_run_id, expected_task_id, expected_profile, expected_claim_lock,
+            "task_identity_mismatch",
+        )
+    if row["profile"] != expected_profile:
+        return _missing_task_run_refusal(
+            exact_run_id, expected_task_id, expected_profile, expected_claim_lock,
+            "profile_identity_mismatch",
+        )
+    if row["claim_lock"] != expected_claim_lock and row["ended_at"] is None:
+        return _missing_task_run_refusal(
+            exact_run_id, expected_task_id, expected_profile, expected_claim_lock,
+            "claim_identity_mismatch",
+        )
+    # A successful prior repair cleared claim_lock, so replay identity is bound
+    # by the durable receipt rather than by the now-cleared mutable run field.
+    if row["ended_at"] is not None:
+        events = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND run_id = ? "
+            "AND kind = ? ORDER BY id DESC",
+            (expected_task_id, exact_run_id, _MISSING_TASK_RUN_REPAIR_EVENT),
+        ).fetchall()
+        for event in events:
+            try:
+                receipt = json.loads(event["payload"] or "null")
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if (
+                isinstance(receipt, dict)
+                and receipt.get("schema") == _MISSING_TASK_RUN_REPAIR_SCHEMA
+                and receipt.get("run_id") == exact_run_id
+                and receipt.get("task_id") == expected_task_id
+                and receipt.get("profile") == expected_profile
+                and receipt.get("claim_lock") == expected_claim_lock
+            ):
+                return receipt
+        return _missing_task_run_refusal(
+            exact_run_id, expected_task_id, expected_profile, expected_claim_lock,
+            "run_already_ended",
+        )
+
+    # Only an OPEN run is eligible for a new repair. Successful idempotent
+    # replay above is read-only and remains stable even if the historical task
+    # identity is later restored for unrelated recovery work.
+    if conn.execute(
+        "SELECT 1 FROM tasks WHERE id = ?", (expected_task_id,)
+    ).fetchone() is not None:
+        return _missing_task_run_refusal(
+            exact_run_id, expected_task_id, expected_profile, expected_claim_lock,
+            "task_present",
+        )
+
+    now = int(time.time())
+    if (
+        not expected_claim_lock
+        or row["worker_pid"] is not None
+        or row["last_heartbeat_at"] is not None
+        or row["claim_expires"] is None
+        or int(row["claim_expires"]) > now
+        or _claim_lock_process_is_live(expected_claim_lock)
+    ):
+        return _missing_task_run_refusal(
+            exact_run_id, expected_task_id, expected_profile, expected_claim_lock,
+            "ambiguous_live_ownership",
+        )
+
+    receipt_base = {
+        "schema": _MISSING_TASK_RUN_REPAIR_SCHEMA,
+        "run_id": exact_run_id,
+        "task_id": expected_task_id,
+        "profile": expected_profile,
+        "claim_lock": expected_claim_lock,
+        "outcome": _TERMINAL_REPAIR_OUTCOME,
+        "ended_at": now,
+        "repaired": True,
+        "refused": None,
+    }
+    digest_input = json.dumps(
+        receipt_base, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    receipt = {
+        **receipt_base,
+        "receipt_sha256": hashlib.sha256(digest_input).hexdigest(),
+    }
+
+    cur = conn.execute(
+        "UPDATE task_runs SET status = ?, outcome = ?, "
+        "summary = COALESCE(summary, ?), ended_at = ?, "
+        "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
+        "WHERE id = ? AND task_id = ? AND profile = ? AND claim_lock = ? "
+        "AND ended_at IS NULL AND worker_pid IS NULL "
+        "AND last_heartbeat_at IS NULL AND claim_expires <= ?",
+        (
+            _TERMINAL_REPAIR_OUTCOME,
+            _TERMINAL_REPAIR_OUTCOME,
+            "exact missing-task orphan run reclaimed by supported repair",
+            now,
+            exact_run_id,
+            expected_task_id,
+            expected_profile,
+            expected_claim_lock,
+            now,
+        ),
+    )
+    if int(cur.rowcount or 0) != 1:
+        raise RuntimeError("missing-task run repair lost exact-row CAS")
+    _append_event(
+        conn,
+        expected_task_id,
+        _MISSING_TASK_RUN_REPAIR_EVENT,
+        receipt,
+        run_id=exact_run_id,
+    )
+    return receipt
+
+
+def repair_missing_task_orphan_run(
+    conn: sqlite3.Connection,
+    run_id: int,
+    *,
+    expected_task_id: str,
+    expected_profile: str,
+    expected_claim_lock: str,
+) -> dict:
+    """Serialize all missing-task checks and the exact repair in one txn.
+
+    The IMMEDIATE transaction is part of the safety boundary: without it, a
+    concurrent writer could restore the task after the absence check but before
+    the run CAS. The single transaction preserves rollback for the mutation and
+    event while fencing the complete check-to-write interval.
+    """
+    with write_txn(conn):
+        return _repair_missing_task_orphan_run_in_txn(
+            conn,
+            run_id,
+            expected_task_id=expected_task_id,
+            expected_profile=expected_profile,
+            expected_claim_lock=expected_claim_lock,
+        )
 
 
 def repair_terminal_orphan_runs(

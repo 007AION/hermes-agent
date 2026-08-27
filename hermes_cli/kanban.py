@@ -972,6 +972,29 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Emit the repair receipt as JSON (default)",
     )
 
+    # --- reconcile-missing-task-run ---
+    p_missing_run = sub.add_parser(
+        "reconcile-missing-task-run",
+        help="Repair one exact open run whose task row is missing",
+        description=(
+            "Close one exact task_runs row only when its task row is absent and "
+            "its full run/task/profile/claim identity matches. Requires an "
+            "expired claim, absent local claim-lock PID, and no worker PID or "
+            "heartbeat ownership. Refuses ambiguity without mutation; preserves "
+            "history and emits a deterministic idempotent JSON receipt."
+        ),
+    )
+    p_missing_run.add_argument("run_id", type=int, help="Exact task_runs.id")
+    p_missing_run.add_argument("task_id", help="Expected exact task id on the run")
+    p_missing_run.add_argument(
+        "--expected-profile", required=True,
+        help="Expected exact task_runs.profile",
+    )
+    p_missing_run.add_argument(
+        "--expected-claim-lock", required=True,
+        help="Expected original canonical hostname:pid claim lock",
+    )
+
     kanban_parser.set_defaults(_kanban_parser=kanban_parser)
     return kanban_parser
 
@@ -1107,6 +1130,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "decompose":  _cmd_decompose,
             "gc":       _cmd_gc,
             "reconcile-terminal-runs": _cmd_reconcile_terminal_runs,
+            "reconcile-missing-task-run": _cmd_reconcile_missing_task_run,
         }
         handler = handlers.get(action)
         if not handler:
@@ -2456,6 +2480,27 @@ def _cmd_reconcile_terminal_runs(args: argparse.Namespace) -> int:
             f"{receipt['closed_count']} open run(s)",
             file=sys.stderr,
         )
+    return 0
+
+
+def _cmd_reconcile_missing_task_run(args: argparse.Namespace) -> int:
+    """Repair one exact missing-task orphan run; print the JSON receipt."""
+    with kb.connect_closing() as conn:
+        receipt = kb.repair_missing_task_orphan_run(
+            conn,
+            args.run_id,
+            expected_task_id=args.task_id,
+            expected_profile=args.expected_profile,
+            expected_claim_lock=args.expected_claim_lock,
+        )
+    print(json.dumps(receipt, sort_keys=True))
+    if receipt.get("refused") is not None:
+        print(
+            f"kanban: reconcile-missing-task-run refused run {args.run_id} "
+            f"({receipt['refused']})",
+            file=sys.stderr,
+        )
+        return 1
     return 0
 
 
