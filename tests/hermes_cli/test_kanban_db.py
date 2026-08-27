@@ -5876,6 +5876,50 @@ def test_request_review_handoff_recovery_replay_conflicts_fail_closed(
         assert "\n".join(conn.iterdump()) == before
 
 
+@pytest.mark.parametrize("identity_owner", ["author", "child"])
+@pytest.mark.parametrize(
+    "identity_kind",
+    ["claim", "live_worker", "fence"],
+)
+def test_request_review_handoff_recovery_replay_rejects_persisted_identity(
+    kanban_home, identity_owner, identity_kind,
+):
+    """Reconciliation must not clear or release persisted worker ownership."""
+    with kb.connect() as conn:
+        author, run_id, review_task, reason, _ = _drift_committed_review_handoff(conn)
+        identity_task = author if identity_owner == "author" else review_task
+        if identity_kind == "claim":
+            identity_columns = ("claim_lock", "claim_expires")
+            identity_values = ("host:worker", 1)
+        elif identity_kind == "live_worker":
+            pid = os.getpid()
+            starttime = int(
+                Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").split()[21]
+            )
+            identity_columns = ("worker_pid", "worker_starttime")
+            identity_values = (pid, starttime)
+        else:
+            identity_columns = ("fence_lineage", "fence_disposition")
+            identity_values = ("[]", "ready")
+        conn.execute(
+            f"UPDATE tasks SET {identity_columns[0]} = ?, "
+            f"{identity_columns[1]} = ? WHERE id = ?",
+            (*identity_values, identity_task),
+        )
+        conn.commit()
+        before = "\n".join(conn.iterdump())
+
+        assert kb.request_review_handoff(
+            conn,
+            author,
+            expected_run_id=run_id,
+            review_task_id=review_task,
+            reason=reason,
+            recovery=True,
+        ) is None
+        assert "\n".join(conn.iterdump()) == before
+
+
 def test_request_review_handoff_concurrent_recovery_replay_is_idempotent(
     kanban_home,
 ):
