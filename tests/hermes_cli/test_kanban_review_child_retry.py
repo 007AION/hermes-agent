@@ -238,6 +238,43 @@ def test_recompute_ready_rejects_invalid_review_parent_without_mutation(
         assert tuple(old_run) == ("blocked", "blocked")
 
 
+@pytest.mark.parametrize("identity", ("author", "child"))
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("current_run_id", 999999),
+        ("claim_lock", "host:unexpected-active"),
+        ("claim_expires", 9999999999),
+        ("worker_pid", 424242),
+        ("worker_starttime", 31337),
+        ("fence_lineage", "unexpected-lineage"),
+        ("fence_disposition", "unexpected-disposition"),
+    ),
+)
+def test_recompute_ready_rejects_each_persisted_execution_identity(
+    kanban_home, identity, field, value,
+):
+    """No single stale execution/fence field may create a runnable duplicate."""
+    with kb.connect() as conn:
+        author, _, review_task, first_run_id, _ = (
+            _review_child_after_legal_unblock(conn)
+        )
+        target = author if identity == "author" else review_task
+        conn.execute(f"UPDATE tasks SET {field} = ? WHERE id = ?", (value, target))
+        conn.commit()
+
+        before = "\n".join(conn.iterdump())
+        assert kb.recompute_ready(conn) == 0
+        assert _task(conn, review_task).status == "todo"
+        assert "\n".join(conn.iterdump()) == before
+        assert kb.claim_task(conn, review_task) is None
+        assert _task(conn, review_task).status == "todo"
+        old_run = conn.execute(
+            "SELECT status, outcome FROM task_runs WHERE id = ?", (first_run_id,)
+        ).fetchone()
+        assert tuple(old_run) == ("blocked", "blocked")
+
+
 def test_review_child_retry_is_concurrent_safe_and_recurrence_bounded(kanban_home):
     with kb.connect() as conn:
         author, _, review_task, first_run_id, _ = _review_child_after_legal_unblock(conn)

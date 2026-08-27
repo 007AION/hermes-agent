@@ -5498,7 +5498,8 @@ def recompute_ready(
     with write_txn(conn):
         todo_rows = conn.execute(
             "SELECT id, status, consecutive_failures, max_retries, "
-            "current_run_id, claim_lock, claim_expires, worker_pid "
+            "current_run_id, claim_lock, claim_expires, worker_pid, "
+            "worker_starttime, fence_lineage, fence_disposition "
             "FROM tasks WHERE status IN ('todo', 'blocked')"
         ).fetchall()
         for row in todo_rows:
@@ -5509,7 +5510,13 @@ def recompute_ready(
             if any(
                 row[field] is not None
                 for field in (
-                    "current_run_id", "claim_lock", "claim_expires", "worker_pid"
+                    "current_run_id",
+                    "claim_lock",
+                    "claim_expires",
+                    "worker_pid",
+                    "worker_starttime",
+                    "fence_lineage",
+                    "fence_disposition",
                 )
             ):
                 continue
@@ -5588,6 +5595,9 @@ def _review_handoff_event_for_child(
             "JOIN task_runs run ON run.id = ? AND run.task_id = author.id "
             "WHERE author.id = ? AND author.status = 'review' "
             "AND author.current_run_id IS NULL "
+            "AND author.claim_lock IS NULL AND author.claim_expires IS NULL "
+            "AND author.worker_pid IS NULL AND author.worker_starttime IS NULL "
+            "AND author.fence_lineage IS NULL AND author.fence_disposition IS NULL "
             "AND author.assignee IS NOT NULL AND child.assignee IS NOT NULL "
             "AND author.assignee != child.assignee "
             "AND run.status = 'review_required' "
