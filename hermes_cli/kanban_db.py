@@ -5464,7 +5464,7 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
 def recompute_ready(
     conn: sqlite3.Connection, failure_limit: int = None,
 ) -> int:
-    """Promote ``todo`` tasks to ``ready`` when all parents are ``done`` or ``archived``.
+    """Promote tasks whose terminal or typed-review parents are satisfied.
 
     Returns the number of tasks promoted.  Safe to call inside or outside
     an existing transaction; it opens its own IMMEDIATE txn.
@@ -5497,12 +5497,22 @@ def recompute_ready(
     promoted = 0
     with write_txn(conn):
         todo_rows = conn.execute(
-            "SELECT id, status, consecutive_failures, max_retries "
+            "SELECT id, status, consecutive_failures, max_retries, "
+            "current_run_id, claim_lock, claim_expires, worker_pid "
             "FROM tasks WHERE status IN ('todo', 'blocked')"
         ).fetchall()
         for row in todo_rows:
             task_id = row["id"]
             cur_status = row["status"]
+            # A queued status with persisted execution ownership is drift, not
+            # permission to create a second runnable obligation.
+            if any(
+                row[field] is not None
+                for field in (
+                    "current_run_id", "claim_lock", "claim_expires", "worker_pid"
+                )
+            ):
+                continue
             if cur_status == "blocked" and _has_sticky_block(conn, task_id):
                 # Worker / operator asked for human review — do not
                 # silently auto-recover.  ``unblock_task`` is the only
@@ -5510,12 +5520,17 @@ def recompute_ready(
                 # this predicate back).
                 continue
             parents = conn.execute(
-                "SELECT t.status FROM tasks t "
+                "SELECT t.id, t.status FROM tasks t "
                 "JOIN task_links l ON l.parent_id = t.id "
                 "WHERE l.child_id = ?",
                 (task_id,),
             ).fetchall()
-            if all(p["status"] in ("done", "archived") for p in parents):
+            if all(
+                _review_handoff_parent_satisfies_child(
+                    conn, parent["id"], parent["status"], task_id
+                )
+                for parent in parents
+            ):
                 if cur_status == "blocked":
                     # Don't auto-recover tasks that have hit the
                     # circuit-breaker failure limit.  Without this
