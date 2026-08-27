@@ -4946,7 +4946,7 @@ def _claim_lock_process_is_live(claim_lock: str) -> bool:
         if os.name == "nt":
             return True
         try:
-            os.kill(pid, 0)
+            os.kill(pid, 0)  # windows-footgun: ok — os.name == "nt" returned above
         except ProcessLookupError:
             return False
         except (PermissionError, OSError):
