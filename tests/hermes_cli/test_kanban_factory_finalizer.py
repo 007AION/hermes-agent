@@ -370,7 +370,7 @@ def _reviewed_author_chain(conn):
         author,
         expected_run_id=author_run,
         review_task_id=reviewer,
-        reason="PR frozen at exact head " + "1" * 40,
+        reason="PR #49 frozen at exact head " + "1" * 40,
     )
     assert handoff is not None
 
@@ -417,6 +417,7 @@ def _reviewed_author_chain(conn):
             "tree_sha": "2" * 40,
             "audited_base_sha": "3" * 40,
             "merge_commit_sha": "4" * 40,
+            "merged_by": "kiddhu",
             "review_id": 12345,
             "author": "007AION",
             "auditor": "GemAION",
@@ -497,9 +498,14 @@ def _rewrite_latest_run_metadata(conn, task_id, mutate):
         "stale_author_run",
         "active_author_run",
         "wrong_reviewer_identity",
+        "nonmatching_reviewer_identity",
+        "nonmatching_merger_identity",
         "multiple_reviewers",
         "review_head",
         "merge_review",
+        "merge_actor",
+        "merge_repository",
+        "merge_pr_number",
         "runtime_tree",
         "runtime_receipt_authenticator",
     ],
@@ -527,6 +533,26 @@ def test_reviewed_author_evidence_drift_fails_closed_zero_mutation(
                 (reviewer,),
             )
             conn.commit()
+        elif drift == "nonmatching_reviewer_identity":
+            conn.execute(
+                "UPDATE tasks SET assignee = 'intruder-reviewer' WHERE id = ?",
+                (reviewer,),
+            )
+            conn.execute(
+                "UPDATE task_runs SET profile = 'intruder-reviewer' WHERE task_id = ?",
+                (reviewer,),
+            )
+            conn.commit()
+        elif drift == "nonmatching_merger_identity":
+            conn.execute(
+                "UPDATE tasks SET assignee = 'intruder-merger' WHERE id = ?",
+                (merger,),
+            )
+            conn.execute(
+                "UPDATE task_runs SET profile = 'intruder-merger' WHERE task_id = ?",
+                (merger,),
+            )
+            conn.commit()
         elif drift == "multiple_reviewers":
             event = conn.execute(
                 "SELECT run_id, payload FROM task_events "
@@ -546,6 +572,19 @@ def test_reviewed_author_evidence_drift_fails_closed_zero_mutation(
         elif drift == "merge_review":
             _rewrite_latest_run_metadata(
                 conn, merger, lambda md: md.__setitem__("review_id", 99999),
+            )
+        elif drift == "merge_actor":
+            _rewrite_latest_run_metadata(
+                conn, merger, lambda md: md.__setitem__("merged_by", "attacker"),
+            )
+        elif drift == "merge_repository":
+            _rewrite_latest_run_metadata(
+                conn, merger,
+                lambda md: md.__setitem__("repository", "attacker/other-repo"),
+            )
+        elif drift == "merge_pr_number":
+            _rewrite_latest_run_metadata(
+                conn, merger, lambda md: md.__setitem__("pr_number", 999),
             )
         elif drift == "runtime_tree":
             _rewrite_latest_run_metadata(

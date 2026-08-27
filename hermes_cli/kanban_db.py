@@ -195,6 +195,18 @@ FACTORY_SEMANTIC_FIELDS = (
 # prose/title marker can never yield gate=0 for an official factory admission.
 FACTORY_PROFILES = frozenset({"agent007", "gm2", "merger", "bafuxunan", "elder-senate"})
 
+# The reviewed-author finalizer is deliberately narrower than generic factory
+# completion.  These are the authenticated Hermes profiles and corresponding
+# GitHub actors used by the existing AION exact-head review/merge lane.  Do not
+# accept arbitrary distinct profiles plus self-asserted role metadata.
+FACTORY_REVIEW_AUTHOR_PROFILE = "agent007"
+FACTORY_REVIEW_AUTHOR_ACTOR = "007AION"
+FACTORY_REVIEW_AUDITOR_PROFILE = "bafuxunan"
+FACTORY_REVIEW_AUDITOR_ACTOR = "GemAION"
+FACTORY_REVIEW_MERGER_PROFILE = "merger"
+FACTORY_REVIEW_MERGER_ACTOR = "kiddhu"
+FACTORY_REVIEW_REPOSITORY = "kiddhu/hermes-agent"
+
 # REV2 — trusted kernel-executor uploader identity(ies). A proof-kernel
 # OUTCOME_ACCEPTED receipt is only accepted when bound as a task attachment
 # whose ``uploaded_by`` is one of these trusted kernel-executor identities. The
@@ -7115,7 +7127,7 @@ def _reviewed_author_finalizer_run_id(
     if (
         author is None
         or author["status"] != "review"
-        or not author["assignee"]
+        or author["assignee"] != FACTORY_REVIEW_AUTHOR_PROFILE
         or author["current_run_id"] is not None
         or any(
             author[field] is not None
@@ -7153,6 +7165,10 @@ def _reviewed_author_finalizer_run_id(
     handoff = _review_handoff_receipt_from_row(task_id, handoff_rows[0])
     if handoff is None or handoff.expected_run_id != author_run_id:
         return None
+    source_prs = re.findall(r"\bPR\s+#([1-9][0-9]*)\b", handoff.reason, re.IGNORECASE)
+    if len(source_prs) != 1:
+        return None
+    source_pr_number = int(source_prs[0])
     reviewer_id = handoff.review_task_id
     if conn.execute(
         "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ?",
@@ -7185,7 +7201,7 @@ def _reviewed_author_finalizer_run_id(
     if reviewer is None or reviewer[0] != int(verdict_row["run_id"]):
         return None
     _reviewer_run_id, reviewer_profile, review_md = reviewer
-    if reviewer_profile == author["assignee"]:
+    if reviewer_profile != FACTORY_REVIEW_AUDITOR_PROFILE:
         return None
     head = review_md.get("head_sha")
     tree = review_md.get("tree_sha")
@@ -7212,17 +7228,15 @@ def _reviewed_author_finalizer_run_id(
     if merger is None:
         return None
     _merger_run_id, merger_profile, merge_md = merger
-    if merger_profile in {author["assignee"], reviewer_profile}:
+    if merger_profile != FACTORY_REVIEW_MERGER_PROFILE:
         return None
     role_sep = merge_md.get("role_separation")
     merge_sha = merge_md.get("merge_commit_sha")
     repository = merge_md.get("repository")
     pr_number = merge_md.get("pr_number")
     if (
-        not isinstance(repository, str)
-        or re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository) is None
-        or not isinstance(pr_number, int)
-        or pr_number <= 0
+        repository != FACTORY_REVIEW_REPOSITORY
+        or pr_number != source_pr_number
         or merge_md.get("head_sha") != head
         or merge_md.get("tree_sha") != tree
         or merge_md.get("audited_base_sha") != base
@@ -7238,6 +7252,10 @@ def _reviewed_author_finalizer_run_id(
         or len({role_sep.get("author"), role_sep.get("auditor"), role_sep.get("merger")}) != 3
         or merge_md.get("author") != role_sep.get("author")
         or merge_md.get("auditor") != role_sep.get("auditor")
+        or role_sep.get("author") != FACTORY_REVIEW_AUTHOR_ACTOR
+        or role_sep.get("auditor") != FACTORY_REVIEW_AUDITOR_ACTOR
+        or role_sep.get("merger") != FACTORY_REVIEW_MERGER_ACTOR
+        or merge_md.get("merged_by") != FACTORY_REVIEW_MERGER_ACTOR
         or merge_md.get("forbidden_actions_performed") != []
         or merge_md.get("secret_exposure") != "none"
     ):
