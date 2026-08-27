@@ -7016,9 +7016,259 @@ def _aion_promote_staged_receipt_files(conn: sqlite3.Connection) -> None:
         raise
 
 
+def _authenticated_factory_run_metadata(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> Optional[tuple[int, str, dict]]:
+    """Return one completed run whose task terminal receipt is kernel-authentic."""
+    task = conn.execute(
+        "SELECT status, assignee, current_run_id, claim_lock, claim_expires, "
+        "worker_pid, worker_starttime, fence_lineage, fence_disposition, "
+        "factory_build_gate, factory_terminal_receipt_sha256 "
+        "FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if (
+        task is None
+        or task["status"] != "done"
+        or not task["assignee"]
+        or task["current_run_id"] is not None
+        or not task["factory_build_gate"]
+        or any(
+            task[field] is not None
+            for field in (
+                "claim_lock", "claim_expires", "worker_pid", "worker_starttime",
+                "fence_lineage", "fence_disposition",
+            )
+        )
+    ):
+        return None
+    runs = conn.execute(
+        "SELECT id, profile, status, outcome, metadata, ended_at "
+        "FROM task_runs WHERE task_id = ? ORDER BY id DESC",
+        (task_id,),
+    ).fetchall()
+    if not runs or any(row["ended_at"] is None for row in runs):
+        return None
+    run = runs[0]
+    if (
+        run["status"] != "done"
+        or run["outcome"] != "completed"
+        or run["profile"] != task["assignee"]
+    ):
+        return None
+    try:
+        metadata = json.loads(run["metadata"] or "{}")
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(metadata, dict):
+        return None
+    receipt_sha = task["factory_terminal_receipt_sha256"]
+    if not isinstance(receipt_sha, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", receipt_sha):
+        return None
+    found = _find_factory_receipt_bytes(conn, task_id, receipt_sha.lower())
+    if found is None or found[1] not in FACTORY_TRUSTED_RECEIPT_UPLOADERS:
+        return None
+    try:
+        receipt_doc = json.loads(found[0].decode("utf-8"))
+        _validate_factory_receipt(receipt_doc, task_id, int(run["id"]))
+    except (UnicodeDecodeError, json.JSONDecodeError, FactoryTerminalReceiptRequiredError):
+        return None
+    return int(run["id"]), str(task["assignee"]), metadata
+
+
+def _one_direct_child(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    rows = conn.execute(
+        "SELECT child_id FROM task_links WHERE parent_id = ? ORDER BY child_id",
+        (task_id,),
+    ).fetchall()
+    return str(rows[0]["child_id"]) if len(rows) == 1 else None
+
+
+def _all_other_parents_terminal(
+    conn: sqlite3.Connection, child_id: str, direct_parent_id: str,
+) -> bool:
+    rows = conn.execute(
+        "SELECT parent.status FROM task_links link "
+        "JOIN tasks parent ON parent.id = link.parent_id "
+        "WHERE link.child_id = ? AND link.parent_id != ?",
+        (child_id, direct_parent_id),
+    ).fetchall()
+    return all(row["status"] in ("done", "archived") for row in rows)
+
+
+def _reviewed_author_finalizer_run_id(
+    conn: sqlite3.Connection, task_id: str,
+) -> Optional[int]:
+    """Resolve one exact reviewed author chain, or fail closed on any drift.
+
+    The caller supplies no evidence. This resolver reads the immutable typed
+    handoff/verdict events plus kernel-authenticated terminal runs for the exact
+    reviewer -> merger -> runtime chain and cross-binds their structured facts.
+    """
+    author = conn.execute(
+        "SELECT status, assignee, current_run_id, claim_lock, claim_expires, "
+        "worker_pid, worker_starttime, fence_lineage, fence_disposition "
+        "FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if (
+        author is None
+        or author["status"] != "review"
+        or not author["assignee"]
+        or author["current_run_id"] is not None
+        or any(
+            author[field] is not None
+            for field in (
+                "claim_lock", "claim_expires", "worker_pid", "worker_starttime",
+                "fence_lineage", "fence_disposition",
+            )
+        )
+    ):
+        return None
+    runs = conn.execute(
+        "SELECT id, status, outcome, ended_at FROM task_runs "
+        "WHERE task_id = ? ORDER BY id DESC",
+        (task_id,),
+    ).fetchall()
+    if not runs:
+        return None
+    latest = runs[0]
+    if (
+        latest["status"] != "review_required"
+        or latest["outcome"] != "review_required"
+        or latest["ended_at"] is None
+        or any(row["ended_at"] is None for row in runs)
+    ):
+        return None
+    author_run_id = int(latest["id"])
+
+    handoff_rows = conn.execute(
+        "SELECT id, run_id, payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'review_handoff' AND run_id = ?",
+        (task_id, author_run_id),
+    ).fetchall()
+    if len(handoff_rows) != 1:
+        return None
+    handoff = _review_handoff_receipt_from_row(task_id, handoff_rows[0])
+    if handoff is None or handoff.expected_run_id != author_run_id:
+        return None
+    reviewer_id = handoff.review_task_id
+    if conn.execute(
+        "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ?",
+        (task_id, reviewer_id),
+    ).fetchone() is None:
+        return None
+
+    verdicts = []
+    for row in conn.execute(
+        "SELECT run_id, payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'review_verdict' ORDER BY id",
+        (task_id,),
+    ).fetchall():
+        try:
+            payload = json.loads(row["payload"] or "{}")
+        except (TypeError, ValueError):
+            return None
+        if payload.get("review_task_id") == reviewer_id:
+            verdicts.append((row, payload))
+    if len(verdicts) != 1:
+        return None
+    verdict_row, verdict = verdicts[0]
+    if (
+        verdict.get("verdict") != "pass"
+        or verdict.get("review_run_id") != verdict_row["run_id"]
+    ):
+        return None
+
+    reviewer = _authenticated_factory_run_metadata(conn, reviewer_id)
+    if reviewer is None or reviewer[0] != int(verdict_row["run_id"]):
+        return None
+    _reviewer_run_id, reviewer_profile, review_md = reviewer
+    if reviewer_profile == author["assignee"]:
+        return None
+    head = review_md.get("head_sha")
+    tree = review_md.get("tree_sha")
+    base = review_md.get("base_sha")
+    review_id = review_md.get("github_review_id")
+    changed_files = review_md.get("changed_files")
+    if (
+        review_md.get("author_task") != task_id
+        or review_md.get("review_outcome") != "APPROVE_EXACT_HEAD"
+        or any(not isinstance(value, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", value)
+               for value in (head, tree, base))
+        or not isinstance(review_id, int)
+        or review_id <= 0
+        or not isinstance(changed_files, list)
+        or not changed_files
+        or any(not isinstance(path, str) or not path for path in changed_files)
+    ):
+        return None
+
+    merger_id = _one_direct_child(conn, reviewer_id)
+    if merger_id is None or not _all_other_parents_terminal(conn, merger_id, reviewer_id):
+        return None
+    merger = _authenticated_factory_run_metadata(conn, merger_id)
+    if merger is None:
+        return None
+    _merger_run_id, merger_profile, merge_md = merger
+    if merger_profile in {author["assignee"], reviewer_profile}:
+        return None
+    role_sep = merge_md.get("role_separation")
+    merge_sha = merge_md.get("merge_commit_sha")
+    repository = merge_md.get("repository")
+    pr_number = merge_md.get("pr_number")
+    if (
+        not isinstance(repository, str)
+        or re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository) is None
+        or not isinstance(pr_number, int)
+        or pr_number <= 0
+        or merge_md.get("head_sha") != head
+        or merge_md.get("tree_sha") != tree
+        or merge_md.get("audited_base_sha") != base
+        or merge_md.get("review_id") != review_id
+        or not isinstance(merge_sha, str)
+        or not re.fullmatch(r"[0-9a-fA-F]{40}", merge_sha)
+        or not isinstance(role_sep, dict)
+        or role_sep.get("distinct") is not True
+        or any(
+            not isinstance(role_sep.get(role), str) or not role_sep.get(role)
+            for role in ("author", "auditor", "merger")
+        )
+        or len({role_sep.get("author"), role_sep.get("auditor"), role_sep.get("merger")}) != 3
+        or merge_md.get("author") != role_sep.get("author")
+        or merge_md.get("auditor") != role_sep.get("auditor")
+        or merge_md.get("forbidden_actions_performed") != []
+        or merge_md.get("secret_exposure") != "none"
+    ):
+        return None
+
+    runtime_id = _one_direct_child(conn, merger_id)
+    if runtime_id is None or not _all_other_parents_terminal(conn, runtime_id, merger_id):
+        return None
+    runtime = _authenticated_factory_run_metadata(conn, runtime_id)
+    if runtime is None:
+        return None
+    runtime_run_id, runtime_profile, runtime_md = runtime
+    install = runtime_md.get("install")
+    if (
+        runtime_profile in {author["assignee"], reviewer_profile, merger_profile}
+        or runtime_md.get("canonical_run_id") != runtime_run_id
+        or not isinstance(install, dict)
+        or install.get("head") != merge_sha
+        or install.get("tree") != tree
+        or install.get("changed_paths") != changed_files
+        or runtime_md.get("forbidden_actions_performed") != []
+        or runtime_md.get("secret_exposure") != "none"
+    ):
+        return None
+    return author_run_id
+
+
 def _run_kernel_finalizer(
     conn: sqlite3.Connection, task_id: str, run_id: str, *, board: str,
     result: Optional[str] = None,
+    reviewed_author: bool = False,
 ) -> dict:
     """Kernel-owned finalizer for a gate=1 task with no pre-bound receipt.
 
@@ -7034,10 +7284,29 @@ def _run_kernel_finalizer(
     binder, _kernel, _adapters = _load_pinned_aion_modules(task_id)
 
     def _terminal_write(c: sqlite3.Connection, tid: str, rid: str) -> None:
+        if reviewed_author:
+            resolved_run_id = _reviewed_author_finalizer_run_id(c, tid)
+            if resolved_run_id is None or resolved_run_id != int(rid):
+                raise FactoryTerminalReceiptRequiredError(
+                    task_id, reason="reviewed-author evidence drift"
+                )
+            status_cas = (
+                "AND status = 'review' AND current_run_id IS NULL "
+                "AND claim_lock IS NULL AND claim_expires IS NULL "
+                "AND worker_pid IS NULL AND worker_starttime IS NULL "
+                "AND fence_lineage IS NULL AND fence_disposition IS NULL"
+            )
+            params = (result, int(time.time()), tid)
+        else:
+            status_cas = (
+                "AND status IN ('running', 'ready', 'blocked') "
+                "AND current_run_id = ?"
+            )
+            params = (result, int(time.time()), tid, int(rid))
         cur = _execute_factory_terminal_write(
             c,
             tid,
-            """
+            f"""
             UPDATE tasks
                SET status          = 'done',
                    result          = ?,
@@ -7048,10 +7317,9 @@ def _run_kernel_finalizer(
                    block_kind      = NULL,
                    block_recurrences = 0
              WHERE id = ?
-               AND status IN ('running', 'ready', 'blocked')
-               AND current_run_id = ?
+               {status_cas}
             """,
-            (result, int(time.time()), tid, int(rid)),
+            params,
         )
         if cur.rowcount != 1:
             # Stale run / CAS miss -> FAIL_CLOSED (rolled back by the txn).
@@ -7204,11 +7472,12 @@ def complete_task(
     # presence + provenance + authenticity + structural binding.
     _gate_row = conn.execute(
         "SELECT factory_build_gate, factory_terminal_receipt_sha256, "
-        "current_run_id FROM tasks WHERE id = ?",
+        "current_run_id, status FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     _run_finalizer = False
     _finalizer_run_id = None
+    _reviewed_author_finalizer = False
     if _gate_row is not None and _gate_row["factory_build_gate"]:
         # Determine whether a VALID pre-bound receipt already exists (the
         # merge / already-terminal path, preserved unchanged). Any failure
@@ -7251,15 +7520,29 @@ def complete_task(
         else:
             _prebound_reason = "receipt sha256 is missing or not 64-hex"
 
+        # A detached reviewed author is never terminalized by a merely
+        # pre-bound receipt. Its exact review/merge/runtime chain must be
+        # resolved now and revalidated inside the finalizer transaction.
+        if expected_run_id is None and _gate_row["status"] == "review":
+            _prebound_valid = False
+            _prebound_reason = "reviewed-author evidence is not authenticated"
+
         if not _prebound_valid:
             # AION-889 I1+I2: with no valid pre-bound receipt, invoke the
             # kernel-owned finalizer inside the write txn (architecture A) when
             # enabled and this is a worker-bound completion (has a run id).
             # Otherwise FAIL_CLOSED exactly as before (rollback path).
-            if _aion_factory_finalizer_enabled() and expected_run_id is not None:
-                _run_finalizer = True
-                _finalizer_run_id = str(expected_run_id)
-            else:
+            if _aion_factory_finalizer_enabled():
+                if expected_run_id is not None:
+                    _run_finalizer = True
+                    _finalizer_run_id = str(expected_run_id)
+                elif _gate_row["status"] == "review":
+                    _reviewed_run_id = _reviewed_author_finalizer_run_id(conn, task_id)
+                    if _reviewed_run_id is not None:
+                        _run_finalizer = True
+                        _reviewed_author_finalizer = True
+                        _finalizer_run_id = str(_reviewed_run_id)
+            if not _run_finalizer:
                 raise FactoryTerminalReceiptRequiredError(task_id, reason=_prebound_reason)
 
     metadata = _merge_completion_prose_artifacts(
@@ -7285,6 +7568,9 @@ def complete_task(
         if _captured_pid_row and _captured_pid_row["worker_pid"] is not None
         else None
     )
+    prior_status: Optional[str] = (
+        "review" if _reviewed_author_finalizer else None
+    )
 
     with write_txn(conn):
         if _run_finalizer:
@@ -7295,6 +7581,7 @@ def complete_task(
             _run_kernel_finalizer(
                 conn, task_id, _finalizer_run_id, board=get_current_board(),
                 result=result,
+                reviewed_author=_reviewed_author_finalizer,
             )
         else:
             if expected_run_id is None:
@@ -7383,7 +7670,12 @@ def complete_task(
         # blocked → done with no run in flight), synthesize a
         # zero-duration run so the handoff fields are persisted in
         # attempt history instead of silently lost.
-        if run_id is None and (summary or metadata or result):
+        if run_id is None and _reviewed_author_finalizer:
+            # Preserve the exact ended review_required author run as the
+            # terminal event binding. Do not synthesize a replacement attempt.
+            assert _finalizer_run_id is not None
+            run_id = int(_finalizer_run_id)
+        elif run_id is None and (summary or metadata or result):
             run_id = _synthesize_ended_run(
                 conn, task_id,
                 outcome="completed",

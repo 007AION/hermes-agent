@@ -32,6 +32,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -343,6 +344,361 @@ def test_t2_finalizer_completes_atomically_child_wakes(kanban_home, aion_gov_src
 
         # Child wakes (dependency promotion).
         assert kb.get_task(conn, child).status == "ready"
+
+
+def _reviewed_author_chain(conn):
+    """Create one exact reviewed author -> auditor -> merger -> runtime chain."""
+    author = kb.create_task(
+        conn, title="reviewed author", factory_build_gate=1, assignee="agent007",
+    )
+    reviewer = kb.create_task(
+        conn, title="exact-head audit", factory_build_gate=1,
+        assignee="bafuxunan", parents=[author],
+    )
+    merger = kb.create_task(
+        conn, title="role-separated merge", factory_build_gate=1,
+        assignee="merger", parents=[reviewer],
+    )
+    runtime = kb.create_task(
+        conn, title="runtime readback", factory_build_gate=1,
+        assignee="gm", parents=[merger],
+    )
+
+    author_run = _claim_and_run_id(conn, author)
+    handoff = kb.request_review_handoff(
+        conn,
+        author,
+        expected_run_id=author_run,
+        review_task_id=reviewer,
+        reason="PR frozen at exact head " + "1" * 40,
+    )
+    assert handoff is not None
+
+    reviewer_run = _claim_and_run_id(conn, reviewer)
+    review_reason = (
+        "APPROVE_EXACT_HEAD head=" + "1" * 40
+        + " tree=" + "2" * 40
+        + " review=12345"
+    )
+    assert kb.record_review_verdict(
+        conn,
+        author,
+        review_task_id=reviewer,
+        expected_review_run_id=reviewer_run,
+        verdict="pass",
+        reason=review_reason,
+    )
+    assert kb.complete_task(
+        conn,
+        reviewer,
+        expected_run_id=reviewer_run,
+        summary="independent exact-head audit passed",
+        metadata={
+            "author_task": author,
+            "review_outcome": "APPROVE_EXACT_HEAD",
+            "head_sha": "1" * 40,
+            "tree_sha": "2" * 40,
+            "base_sha": "3" * 40,
+            "github_review_id": 12345,
+            "changed_files": ["hermes_cli/kanban_db.py"],
+        },
+    )
+
+    merger_run = _claim_and_run_id(conn, merger)
+    assert kb.complete_task(
+        conn,
+        merger,
+        expected_run_id=merger_run,
+        summary="role-separated merge readback passed",
+        metadata={
+            "repository": "kiddhu/hermes-agent",
+            "pr_number": 49,
+            "head_sha": "1" * 40,
+            "tree_sha": "2" * 40,
+            "audited_base_sha": "3" * 40,
+            "merge_commit_sha": "4" * 40,
+            "review_id": 12345,
+            "author": "007AION",
+            "auditor": "GemAION",
+            "role_separation": {
+                "author": "007AION",
+                "auditor": "GemAION",
+                "merger": "kiddhu",
+                "distinct": True,
+            },
+            "forbidden_actions_performed": [],
+            "secret_exposure": "none",
+        },
+    )
+
+    runtime_run = _claim_and_run_id(conn, runtime)
+    assert kb.complete_task(
+        conn,
+        runtime,
+        expected_run_id=runtime_run,
+        summary="exact runtime installed and read back",
+        metadata={
+            "canonical_run_id": runtime_run,
+            "install": {
+                "head": "4" * 40,
+                "tree": "2" * 40,
+                "changed_paths": ["hermes_cli/kanban_db.py"],
+            },
+            "forbidden_actions_performed": [],
+            "secret_exposure": "none",
+        },
+    )
+    return author, author_run, reviewer, merger, runtime
+
+
+def test_reviewed_author_controller_completion_uses_exact_ended_run(
+    kanban_home, aion_gov_src,
+):
+    """RED: reviewed authors currently cannot enter the trusted finalizer."""
+    with kb.connect() as conn:
+        author, author_run, *_ = _reviewed_author_chain(conn)
+        run_count = conn.execute(
+            "SELECT COUNT(*) FROM task_runs WHERE task_id = ?", (author,),
+        ).fetchone()[0]
+
+        assert kb.complete_task(
+            conn,
+            author,
+            summary="reviewed candidate terminalized",
+        )
+        assert kb.get_task(conn, author).status == "done"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_runs WHERE task_id = ?", (author,),
+        ).fetchone()[0] == run_count
+        completed = conn.execute(
+            "SELECT run_id FROM task_events WHERE task_id = ? AND kind = 'completed'",
+            (author,),
+        ).fetchone()
+        assert completed is not None and completed["run_id"] == author_run
+
+
+def _rewrite_latest_run_metadata(conn, task_id, mutate):
+    row = conn.execute(
+        "SELECT id, metadata FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    metadata = json.loads(row["metadata"])
+    mutate(metadata)
+    conn.execute(
+        "UPDATE task_runs SET metadata = ? WHERE id = ?",
+        (json.dumps(metadata), row["id"]),
+    )
+    conn.commit()
+
+
+@pytest.mark.parametrize(
+    "drift",
+    [
+        "stale_author_run",
+        "active_author_run",
+        "wrong_reviewer_identity",
+        "multiple_reviewers",
+        "review_head",
+        "merge_review",
+        "runtime_tree",
+        "runtime_receipt_authenticator",
+    ],
+)
+def test_reviewed_author_evidence_drift_fails_closed_zero_mutation(
+    kanban_home, aion_gov_src, drift,
+):
+    with kb.connect() as conn:
+        author, author_run, reviewer, merger, runtime = _reviewed_author_chain(conn)
+
+        if drift == "stale_author_run":
+            conn.execute(
+                "UPDATE task_runs SET outcome = 'completed' WHERE id = ?",
+                (author_run,),
+            )
+            conn.commit()
+        elif drift == "active_author_run":
+            conn.execute(
+                "UPDATE task_runs SET ended_at = NULL WHERE id = ?", (author_run,),
+            )
+            conn.commit()
+        elif drift == "wrong_reviewer_identity":
+            conn.execute(
+                "UPDATE task_runs SET profile = 'agent007' WHERE task_id = ?",
+                (reviewer,),
+            )
+            conn.commit()
+        elif drift == "multiple_reviewers":
+            event = conn.execute(
+                "SELECT run_id, payload FROM task_events "
+                "WHERE task_id = ? AND kind = 'review_verdict'",
+                (author,),
+            ).fetchone()
+            conn.execute(
+                "INSERT INTO task_events(task_id, run_id, kind, payload, created_at) "
+                "VALUES (?, ?, 'review_verdict', ?, ?)",
+                (author, event["run_id"], event["payload"], int(time.time())),
+            )
+            conn.commit()
+        elif drift == "review_head":
+            _rewrite_latest_run_metadata(
+                conn, reviewer, lambda md: md.__setitem__("head_sha", "9" * 40),
+            )
+        elif drift == "merge_review":
+            _rewrite_latest_run_metadata(
+                conn, merger, lambda md: md.__setitem__("review_id", 99999),
+            )
+        elif drift == "runtime_tree":
+            _rewrite_latest_run_metadata(
+                conn, runtime,
+                lambda md: md["install"].__setitem__("tree", "9" * 40),
+            )
+        elif drift == "runtime_receipt_authenticator":
+            conn.execute(
+                "UPDATE task_attachments SET uploaded_by = 'agent' WHERE task_id = ?",
+                (runtime,),
+            )
+            conn.commit()
+
+        before_task = dict(conn.execute(
+            "SELECT status, current_run_id, completed_at, "
+            "factory_terminal_receipt_sha256 FROM tasks WHERE id = ?",
+            (author,),
+        ).fetchone())
+        before_runs = [tuple(row) for row in conn.execute(
+            "SELECT id, status, outcome, ended_at FROM task_runs "
+            "WHERE task_id = ? ORDER BY id",
+            (author,),
+        ).fetchall()]
+        before_events = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id = ?", (author,),
+        ).fetchone()[0]
+
+        with pytest.raises(kb.FactoryTerminalReceiptRequiredError):
+            kb.complete_task(conn, author, summary="must not terminalize")
+
+        assert dict(conn.execute(
+            "SELECT status, current_run_id, completed_at, "
+            "factory_terminal_receipt_sha256 FROM tasks WHERE id = ?",
+            (author,),
+        ).fetchone()) == before_task
+        assert [tuple(row) for row in conn.execute(
+            "SELECT id, status, outcome, ended_at FROM task_runs "
+            "WHERE task_id = ? ORDER BY id",
+            (author,),
+        ).fetchall()] == before_runs
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id = ?", (author,),
+        ).fetchone()[0] == before_events
+        assert kb.list_attachments(conn, author) == []
+
+
+@pytest.mark.parametrize("sabotage", ["false_verdict", "signer_failure", "cas_miss"])
+def test_reviewed_author_finalizer_sabotage_rolls_back_zero_mutation(
+    kanban_home, aion_gov_src, monkeypatch, sabotage,
+):
+    with kb.connect() as conn:
+        author, author_run, *_ = _reviewed_author_chain(conn)
+        before_events = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id = ?", (author,),
+        ).fetchone()[0]
+        before_run = tuple(conn.execute(
+            "SELECT status, outcome, ended_at FROM task_runs WHERE id = ?",
+            (author_run,),
+        ).fetchone())
+
+        if sabotage in {"false_verdict", "signer_failure"}:
+            real_binder, real_kernel, real_adapters = kb._load_pinned_aion_modules(
+                author
+            )
+
+            class _SabotagedBinder:
+                def bind_task_terminal_in_txn(self, **kwargs):
+                    kwargs["terminal_write"](
+                        kwargs["conn"], kwargs["task_id"], kwargs["run_id"]
+                    )
+                    if sabotage == "signer_failure":
+                        raise RuntimeError("simulated signer/authenticator failure")
+                    return {
+                        "bound": False,
+                        "verdict": "FAIL_CLOSED",
+                        "failed_conditions": ["C8"],
+                    }
+
+            monkeypatch.setattr(
+                kb,
+                "_load_pinned_aion_modules",
+                lambda _task_id: (_SabotagedBinder(), real_kernel, real_adapters),
+            )
+        else:
+            real_resolver = getattr(kb, "_reviewed_author_finalizer_run_id")
+            calls = {"count": 0}
+
+            def _cas_miss(c, task_id):
+                calls["count"] += 1
+                if calls["count"] == 1:
+                    return real_resolver(c, task_id)
+                return None
+
+            monkeypatch.setattr(kb, "_reviewed_author_finalizer_run_id", _cas_miss)
+
+        with pytest.raises((kb.FactoryTerminalReceiptRequiredError, RuntimeError)):
+            kb.complete_task(conn, author, summary="must roll back")
+
+        row = conn.execute(
+            "SELECT status, current_run_id, completed_at, "
+            "factory_terminal_receipt_sha256 FROM tasks WHERE id = ?",
+            (author,),
+        ).fetchone()
+        assert tuple(row) == ("review", None, None, None)
+        assert tuple(conn.execute(
+            "SELECT status, outcome, ended_at FROM task_runs WHERE id = ?",
+            (author_run,),
+        ).fetchone()) == before_run
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id = ?", (author,),
+        ).fetchone()[0] == before_events
+        assert kb.list_attachments(conn, author) == []
+        assert _receipt_residue_on_disk(conn, author) == []
+
+
+def test_reviewed_author_prebound_receipt_cannot_bypass_evidence_drift(
+    kanban_home, aion_gov_src,
+):
+    with kb.connect() as conn:
+        author, author_run, _reviewer, _merger, runtime = _reviewed_author_chain(conn)
+        _rewrite_latest_run_metadata(
+            conn, runtime,
+            lambda md: md["install"].__setitem__("head", "9" * 40),
+        )
+        receipt = _kernel_receipt_doc(author, str(author_run))
+        raw = json.dumps(receipt, sort_keys=True).encode("utf-8")
+        kb.store_attachment_bytes(
+            conn,
+            author,
+            "prebound.json",
+            raw,
+            uploaded_by="aion_monarch_proof_kernel",
+        )
+        conn.execute(
+            "UPDATE tasks SET factory_terminal_receipt_sha256 = ? WHERE id = ?",
+            (hashlib.sha256(raw).hexdigest(), author),
+        )
+        conn.commit()
+        before_events = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id = ?", (author,),
+        ).fetchone()[0]
+
+        with pytest.raises(kb.FactoryTerminalReceiptRequiredError):
+            kb.complete_task(conn, author, summary="must not bypass evidence")
+
+        row = conn.execute(
+            "SELECT status, current_run_id, completed_at FROM tasks WHERE id = ?",
+            (author,),
+        ).fetchone()
+        assert tuple(row) == ("review", None, None)
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id = ?", (author,),
+        ).fetchone()[0] == before_events
 
 
 # ---------------------------------------------------------------------------
