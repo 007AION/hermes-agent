@@ -5388,6 +5388,120 @@ def _review_handoff_receipt_from_row(
         return None
 
 
+def _reconcile_review_handoff_replay(
+    conn: sqlite3.Connection,
+    receipt: ReviewHandoffReceipt,
+    *,
+    event_rows: list[sqlite3.Row],
+) -> bool:
+    """Restore only the exact committed recovery handoff's drifted task state.
+
+    The receipt and original author run are immutable. Reconciliation is
+    intentionally narrower than initial recovery: it accepts either the
+    already-correct review/ready state or the proven blocked/todo drift shape,
+    and never creates another event, run, edge, or runnable obligation.
+    """
+    parsed = [
+        _review_handoff_receipt_from_row(receipt.task_id, row)
+        for row in event_rows
+    ]
+    if any(item is None for item in parsed) or parsed != [receipt]:
+        return False
+
+    author = conn.execute(
+        "SELECT status, assignee, current_run_id, claim_lock, claim_expires, "
+        "worker_pid, worker_starttime, fence_lineage, fence_disposition "
+        "FROM tasks WHERE id = ?",
+        (receipt.task_id,),
+    ).fetchone()
+    child = conn.execute(
+        "SELECT status, assignee, current_run_id, claim_lock, claim_expires, "
+        "worker_pid, worker_starttime, fence_lineage, fence_disposition "
+        "FROM tasks WHERE id = ?",
+        (receipt.review_task_id,),
+    ).fetchone()
+    run = conn.execute(
+        "SELECT status, outcome, ended_at FROM task_runs "
+        "WHERE id = ? AND task_id = ?",
+        (receipt.expected_run_id, receipt.task_id),
+    ).fetchone()
+    if author is None or child is None or run is None:
+        return False
+    identity_fields = (
+        "claim_lock",
+        "claim_expires",
+        "worker_pid",
+        "worker_starttime",
+        "fence_lineage",
+        "fence_disposition",
+    )
+    if (
+        not author["assignee"]
+        or not child["assignee"]
+        or author["assignee"] == child["assignee"]
+        or author["current_run_id"] is not None
+        or child["current_run_id"] is not None
+        or any(row[field] is not None for row in (author, child) for field in identity_fields)
+        or run["status"] != "review_required"
+        or run["outcome"] != "review_required"
+        or run["ended_at"] is None
+    ):
+        return False
+
+    direct_children = conn.execute(
+        "SELECT child_id FROM task_links WHERE parent_id = ?",
+        (receipt.task_id,),
+    ).fetchall()
+    if [row["child_id"] for row in direct_children] != [receipt.review_task_id]:
+        return False
+    other_parents = conn.execute(
+        "SELECT p.status FROM task_links l "
+        "JOIN tasks p ON p.id = l.parent_id "
+        "WHERE l.child_id = ? AND l.parent_id != ?",
+        (receipt.review_task_id, receipt.task_id),
+    ).fetchall()
+    if any(row["status"] not in ("done", "archived") for row in other_parents):
+        return False
+    if conn.execute(
+        "SELECT 1 FROM task_runs WHERE task_id = ? LIMIT 1",
+        (receipt.review_task_id,),
+    ).fetchone() is not None:
+        return False
+    if conn.execute(
+        "SELECT 1 FROM task_runs WHERE task_id = ? "
+        "AND id != ? AND (status = 'running' OR ended_at IS NULL) LIMIT 1",
+        (receipt.task_id, receipt.expected_run_id),
+    ).fetchone() is not None:
+        return False
+
+    state = (author["status"], child["status"])
+    if state == ("review", "ready"):
+        return True
+    if state != ("blocked", "todo"):
+        return False
+
+    author_update = conn.execute(
+        "UPDATE tasks SET status = 'review', block_kind = NULL, "
+        "block_recurrences = 0 WHERE id = ? AND status = 'blocked' "
+        "AND current_run_id IS NULL AND claim_lock IS NULL "
+        "AND claim_expires IS NULL AND worker_pid IS NULL "
+        "AND worker_starttime IS NULL AND fence_lineage IS NULL "
+        "AND fence_disposition IS NULL",
+        (receipt.task_id,),
+    )
+    child_update = conn.execute(
+        "UPDATE tasks SET status = 'ready' WHERE id = ? AND status = 'todo' "
+        "AND current_run_id IS NULL AND claim_lock IS NULL "
+        "AND claim_expires IS NULL AND worker_pid IS NULL "
+        "AND worker_starttime IS NULL AND fence_lineage IS NULL "
+        "AND fence_disposition IS NULL",
+        (receipt.review_task_id,),
+    )
+    if author_update.rowcount != 1 or child_update.rowcount != 1:
+        raise _ReviewHandoffConflict
+    return True
+
+
 def _request_review_handoff(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5423,9 +5537,13 @@ def _request_review_handoff(
                 receipt.expected_run_id == expected_run_id
                 and receipt.review_task_id == review_task_id
             ):
-                return receipt if (
-                    receipt.reason == reason and receipt.recovery == bool(recovery)
-                ) else None
+                if receipt.reason != reason or receipt.recovery != bool(recovery):
+                    return None
+                if receipt.recovery and not _reconcile_review_handoff_replay(
+                    conn, receipt, event_rows=existing_rows
+                ):
+                    return None
+                return receipt
 
         author = conn.execute(
             "SELECT status, assignee, current_run_id FROM tasks WHERE id = ?",

@@ -5653,6 +5653,338 @@ def test_request_review_handoff_replay_returns_same_receipt(kanban_home):
         ).fetchall()) == 1
 
 
+def _drift_committed_review_handoff(conn):
+    """Create the exact matching-receipt + blocked/todo post-commit shape."""
+    author, run_id, review_task = _review_handoff_pair(conn)
+    reason = "review-required: candidate frozen"
+    receipt = kb.request_review_handoff(
+        conn,
+        author,
+        expected_run_id=run_id,
+        review_task_id=review_task,
+        reason=reason,
+        recovery=True,
+    )
+    assert receipt is None
+
+    # A recovery receipt must first be created from the bounded historical
+    # triage shape, then a legacy dispatcher may drift only task state.
+    conn.execute(
+        "UPDATE tasks SET status = 'triage', current_run_id = NULL WHERE id = ?",
+        (author,),
+    )
+    conn.execute(
+        "UPDATE task_runs SET status = 'blocked', outcome = 'blocked', ended_at = ? "
+        "WHERE id = ?",
+        (int(time.time()), run_id),
+    )
+    kb._append_event(
+        conn,
+        author,
+        "block_loop_detected",
+        {"reason": reason},
+        run_id=run_id,
+    )
+    conn.commit()
+    receipt = kb.request_review_handoff(
+        conn,
+        author,
+        expected_run_id=run_id,
+        review_task_id=review_task,
+        reason=reason,
+        recovery=True,
+    )
+    assert receipt is not None
+
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET status = 'blocked', block_kind = 'needs_input', "
+            "block_recurrences = 1 WHERE id = ?",
+            (author,),
+        )
+        conn.execute(
+            "UPDATE tasks SET status = 'todo' WHERE id = ?",
+            (review_task,),
+        )
+        conn.execute(
+            "INSERT INTO task_runs(task_id, profile, status, started_at, ended_at, "
+            "outcome) VALUES (?, 'author', 'blocked', ?, ?, 'blocked')",
+            (author, int(time.time()), int(time.time())),
+        )
+    return author, run_id, review_task, reason, receipt
+
+
+def test_request_review_handoff_recovery_replay_reconciles_post_commit_drift(
+    kanban_home,
+):
+    """A matching recovery receipt repairs state without duplicating identity."""
+    with kb.connect() as conn:
+        author, run_id, review_task, reason, first = (
+            _drift_committed_review_handoff(conn)
+        )
+        before_counts = tuple(
+            conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in ("tasks", "task_runs", "task_events")
+        )
+        before_failures = kb.get_task(conn, author).consecutive_failures
+
+        replay = kb.request_review_handoff(
+            conn,
+            author,
+            expected_run_id=run_id,
+            review_task_id=review_task,
+            reason=reason,
+            recovery=True,
+        )
+
+        assert replay == first
+        assert kb.get_task(conn, author).status == "review"
+        assert kb.get_task(conn, author).current_run_id is None
+        assert kb.get_task(conn, review_task).status == "ready"
+        exact_run = conn.execute(
+            "SELECT status, outcome FROM task_runs WHERE id = ?", (run_id,)
+        ).fetchone()
+        assert tuple(exact_run) == ("review_required", "review_required")
+        assert kb.get_task(conn, author).consecutive_failures == before_failures
+        assert tuple(
+            conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in ("tasks", "task_runs", "task_events")
+        ) == before_counts
+
+
+def test_request_review_handoff_matching_replay_correct_state_is_zero_mutation(
+    kanban_home,
+):
+    with kb.connect() as conn:
+        author, run_id, review_task = _review_handoff_pair(conn)
+        first = kb.request_review_handoff(
+            conn,
+            author,
+            expected_run_id=run_id,
+            review_task_id=review_task,
+            reason="candidate frozen",
+        )
+        before = "\n".join(conn.iterdump())
+
+        replay = kb.request_review_handoff(
+            conn,
+            author,
+            expected_run_id=run_id,
+            review_task_id=review_task,
+            reason="candidate frozen",
+        )
+
+        assert replay == first
+        assert "\n".join(conn.iterdump()) == before
+
+
+@pytest.mark.parametrize(
+    "conflict",
+    [
+        "wrong_run",
+        "wrong_child",
+        "wrong_reason",
+        "wrong_receipt",
+        "multiple_child",
+        "self_review",
+        "unsatisfied_parent",
+        "terminal_source",
+        "active_author_run",
+        "active_child_run",
+        "ambiguous_event",
+    ],
+)
+def test_request_review_handoff_recovery_replay_conflicts_fail_closed(
+    kanban_home, conflict,
+):
+    with kb.connect() as conn:
+        author, run_id, review_task, reason, _ = _drift_committed_review_handoff(conn)
+        call_run = run_id
+        call_child = review_task
+        call_reason = reason
+
+        if conflict == "wrong_run":
+            call_run += 1
+        elif conflict == "wrong_child":
+            call_child = kb.create_task(conn, title="wrong", assignee="auditor")
+        elif conflict == "wrong_reason":
+            call_reason += " changed"
+        elif conflict == "wrong_receipt":
+            row = _review_handoff_events(conn, author)[0]
+            payload = json.loads(row["payload"])
+            payload["receipt_sha256"] = "0" * 64
+            conn.execute(
+                "UPDATE task_events SET payload = ? WHERE id = ?",
+                (json.dumps(payload), row["id"]),
+            )
+            conn.commit()
+        elif conflict == "multiple_child":
+            kb.create_task(
+                conn, title="second child", assignee="other-auditor", parents=[author]
+            )
+        elif conflict == "self_review":
+            conn.execute(
+                "UPDATE tasks SET assignee = 'author' WHERE id = ?", (review_task,)
+            )
+            conn.commit()
+        elif conflict == "unsatisfied_parent":
+            parent = kb.create_task(conn, title="open prerequisite", assignee="builder")
+            kb.link_tasks(conn, parent, review_task)
+        elif conflict == "terminal_source":
+            conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (author,))
+            conn.commit()
+        elif conflict == "active_author_run":
+            active = conn.execute(
+                "INSERT INTO task_runs(task_id, profile, status, started_at) "
+                "VALUES (?, 'author', 'running', ?) RETURNING id",
+                (author, int(time.time())),
+            ).fetchone()[0]
+            conn.execute(
+                "UPDATE tasks SET status = 'running', current_run_id = ? WHERE id = ?",
+                (active, author),
+            )
+            conn.commit()
+        elif conflict == "active_child_run":
+            active = conn.execute(
+                "INSERT INTO task_runs(task_id, profile, status, started_at) "
+                "VALUES (?, 'auditor', 'running', ?) RETURNING id",
+                (review_task, int(time.time())),
+            ).fetchone()[0]
+            conn.execute(
+                "UPDATE tasks SET status = 'running', current_run_id = ? WHERE id = ?",
+                (active, review_task),
+            )
+            conn.commit()
+        elif conflict == "ambiguous_event":
+            row = _review_handoff_events(conn, author)[0]
+            conn.execute(
+                "INSERT INTO task_events(task_id, run_id, kind, payload, created_at) "
+                "VALUES (?, ?, 'review_handoff', ?, ?)",
+                (author, run_id, row["payload"], int(time.time())),
+            )
+            conn.commit()
+
+        before = "\n".join(conn.iterdump())
+        assert kb.request_review_handoff(
+            conn,
+            author,
+            expected_run_id=call_run,
+            review_task_id=call_child,
+            reason=call_reason,
+            recovery=True,
+        ) is None
+        assert "\n".join(conn.iterdump()) == before
+
+
+@pytest.mark.parametrize("identity_owner", ["author", "child"])
+@pytest.mark.parametrize(
+    "identity_kind",
+    ["claim", "live_worker", "fence"],
+)
+def test_request_review_handoff_recovery_replay_rejects_persisted_identity(
+    kanban_home, identity_owner, identity_kind,
+):
+    """Reconciliation must not clear or release persisted worker ownership."""
+    with kb.connect() as conn:
+        author, run_id, review_task, reason, _ = _drift_committed_review_handoff(conn)
+        identity_task = author if identity_owner == "author" else review_task
+        if identity_kind == "claim":
+            identity_columns = ("claim_lock", "claim_expires")
+            identity_values = ("host:worker", 1)
+        elif identity_kind == "live_worker":
+            pid = os.getpid()
+            starttime = int(
+                Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").split()[21]
+            )
+            identity_columns = ("worker_pid", "worker_starttime")
+            identity_values = (pid, starttime)
+        else:
+            identity_columns = ("fence_lineage", "fence_disposition")
+            identity_values = ("[]", "ready")
+        conn.execute(
+            f"UPDATE tasks SET {identity_columns[0]} = ?, "
+            f"{identity_columns[1]} = ? WHERE id = ?",
+            (*identity_values, identity_task),
+        )
+        conn.commit()
+        before = "\n".join(conn.iterdump())
+
+        assert kb.request_review_handoff(
+            conn,
+            author,
+            expected_run_id=run_id,
+            review_task_id=review_task,
+            reason=reason,
+            recovery=True,
+        ) is None
+        assert "\n".join(conn.iterdump()) == before
+
+
+def test_request_review_handoff_concurrent_recovery_replay_is_idempotent(
+    kanban_home,
+):
+    with kb.connect() as conn:
+        author, run_id, review_task, reason, receipt = (
+            _drift_committed_review_handoff(conn)
+        )
+        before_counts = tuple(
+            conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in ("tasks", "task_runs", "task_events")
+        )
+
+    barrier = __import__("threading").Barrier(2)
+
+    def replay():
+        with kb.connect() as thread_conn:
+            barrier.wait()
+            return kb.request_review_handoff(
+                thread_conn,
+                author,
+                expected_run_id=run_id,
+                review_task_id=review_task,
+                reason=reason,
+                recovery=True,
+            )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda _: replay(), range(2)))
+
+    assert results == [receipt, receipt]
+    with kb.connect() as conn:
+        assert kb.get_task(conn, author).status == "review"
+        assert kb.get_task(conn, review_task).status == "ready"
+        assert tuple(
+            conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in ("tasks", "task_runs", "task_events")
+        ) == before_counts
+
+
+def test_request_review_handoff_recovery_replay_rolls_back_partial_cas(
+    kanban_home,
+):
+    with kb.connect() as conn:
+        author, run_id, review_task, reason, _ = _drift_committed_review_handoff(conn)
+        conn.execute(
+            "CREATE TRIGGER ignore_reconciled_child BEFORE UPDATE ON tasks "
+            "WHEN NEW.status = 'ready' BEGIN SELECT RAISE(IGNORE); END"
+        )
+        conn.commit()
+        before = "\n".join(conn.iterdump())
+
+        assert kb.request_review_handoff(
+            conn,
+            author,
+            expected_run_id=run_id,
+            review_task_id=review_task,
+            reason=reason,
+            recovery=True,
+        ) is None
+
+        assert "\n".join(conn.iterdump()) == before
+        assert kb.get_task(conn, author).status == "blocked"
+        assert kb.get_task(conn, review_task).status == "todo"
+
+
 def test_request_review_handoff_replay_rejects_conflicting_payload(kanban_home):
     with kb.connect() as conn:
         author, run_id, review_task = _review_handoff_pair(conn)
