@@ -346,7 +346,9 @@ def test_t2_finalizer_completes_atomically_child_wakes(kanban_home, aion_gov_src
         assert kb.get_task(conn, child).status == "ready"
 
 
-def _reviewed_author_chain(conn, *, canonical_merger_receipt=False, source_pr=49):
+def _reviewed_author_chain(
+    conn, *, canonical_merger_receipt=False, source_pr=49, live_multi_child_shape=False,
+):
     """Create one exact reviewed author -> auditor -> merger -> runtime chain."""
     head = (
         "d622fcf38da613ce25bf4eaf37c54a94053d5e70"
@@ -407,20 +409,30 @@ def _reviewed_author_chain(conn, *, canonical_merger_receipt=False, source_pr=49
         verdict="pass",
         reason=review_reason,
     )
+    reviewer_metadata = {
+        "author_task": author,
+        "review_outcome": "APPROVE_EXACT_HEAD",
+        "head_sha": head,
+        "tree_sha": tree,
+        "base_sha": base,
+        "github_review_id": review_id,
+        "changed_files": changed_files,
+    }
+    if canonical_merger_receipt:
+        # Exact immutable t_463814e3/run3382 shape: author identity is bound by
+        # the typed handoff/direct edge/verdict, not duplicated in metadata.
+        reviewer_metadata.pop("author_task")
+        reviewer_metadata.update({
+            "ci_run": 33150562165,
+            "tests": {"factory_finalizer": "43 passed"},
+            "worker_session_id": "sanitized-review-session",
+        })
     assert kb.complete_task(
         conn,
         reviewer,
         expected_run_id=reviewer_run,
         summary="independent exact-head audit passed",
-        metadata={
-            "author_task": author,
-            "review_outcome": "APPROVE_EXACT_HEAD",
-            "head_sha": head,
-            "tree_sha": tree,
-            "base_sha": base,
-            "github_review_id": review_id,
-            "changed_files": changed_files,
-        },
+        metadata=reviewer_metadata,
     )
 
     merger_run = _claim_and_run_id(conn, merger)
@@ -499,6 +511,30 @@ def _reviewed_author_chain(conn, *, canonical_merger_receipt=False, source_pr=49
             "secret_exposure": "none",
         },
     )
+    if live_multi_child_shape:
+        # The Monarch-named live author has historical/dependency children and
+        # its handoff-selected reviewer has an unrelated historical child.
+        # Neither is evidence for this exact reviewed-finalizer chain.
+        for index in range(5):
+            kb.create_task(
+                conn,
+                title=f"unrelated author child {index}",
+                assignee="gm2",
+                parents=[author],
+            )
+        historical = kb.create_task(
+            conn,
+            title="unrelated completed reviewer child",
+            assignee="gm2",
+            parents=[reviewer],
+        )
+        historical_run = _claim_and_run_id(conn, historical)
+        assert kb.complete_task(
+            conn,
+            historical,
+            expected_run_id=historical_run,
+            summary="historical lane completed",
+        )
     return author, author_run, reviewer, merger, runtime
 
 
@@ -508,7 +544,10 @@ def test_reviewed_author_accepts_canonical_immutable_merger_receipt(
     """The real merger lane's immutable canonical schema authenticates exactly."""
     with kb.connect() as conn:
         author, author_run, *_ = _reviewed_author_chain(
-            conn, canonical_merger_receipt=True, source_pr=50,
+            conn,
+            canonical_merger_receipt=True,
+            source_pr=50,
+            live_multi_child_shape=True,
         )
 
         assert kb._reviewed_author_finalizer_run_id(conn, author) == author_run
@@ -638,6 +677,7 @@ def _rewrite_latest_run_metadata(conn, task_id, mutate):
         "nonmatching_reviewer_identity",
         "nonmatching_merger_identity",
         "multiple_reviewers",
+        "review_author_task",
         "review_head",
         "merge_review",
         "merge_actor",
@@ -645,6 +685,7 @@ def _rewrite_latest_run_metadata(conn, task_id, mutate):
         "merge_pr_number",
         "runtime_tree",
         "runtime_receipt_authenticator",
+        "ambiguous_canonical_merger",
     ],
 )
 def test_reviewed_author_evidence_drift_fails_closed_zero_mutation(
@@ -702,6 +743,12 @@ def test_reviewed_author_evidence_drift_fails_closed_zero_mutation(
                 (author, event["run_id"], event["payload"], int(time.time())),
             )
             conn.commit()
+        elif drift == "review_author_task":
+            _rewrite_latest_run_metadata(
+                conn,
+                reviewer,
+                lambda md: md.__setitem__("author_task", "t_forged"),
+            )
         elif drift == "review_head":
             _rewrite_latest_run_metadata(
                 conn, reviewer, lambda md: md.__setitem__("head_sha", "9" * 40),
@@ -732,6 +779,24 @@ def test_reviewed_author_evidence_drift_fails_closed_zero_mutation(
             conn.execute(
                 "UPDATE task_attachments SET uploaded_by = 'agent' WHERE task_id = ?",
                 (runtime,),
+            )
+            conn.commit()
+        elif drift == "ambiguous_canonical_merger":
+            conn.execute(
+                "INSERT INTO task_links(parent_id, child_id) VALUES (?, ?)",
+                (reviewer, runtime),
+            )
+            conn.execute(
+                "UPDATE tasks SET assignee = ? WHERE id = ?",
+                (kb.FACTORY_REVIEW_MERGER_PROFILE, runtime),
+            )
+            conn.execute(
+                "UPDATE task_runs SET profile = ?, metadata = ? WHERE task_id = ?",
+                (
+                    kb.FACTORY_REVIEW_MERGER_PROFILE,
+                    json.dumps({"audit_task_id": reviewer}),
+                    runtime,
+                ),
             )
             conn.commit()
 

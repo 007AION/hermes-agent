@@ -7483,7 +7483,7 @@ def _reviewed_author_finalizer_run_id(
     review_id = review_md.get("github_review_id")
     changed_files = review_md.get("changed_files")
     if (
-        review_md.get("author_task") != task_id
+        ("author_task" in review_md and review_md.get("author_task") != task_id)
         or review_md.get("review_outcome") != "APPROVE_EXACT_HEAD"
         or any(not isinstance(value, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", value)
                for value in (head, tree, base))
@@ -7495,15 +7495,6 @@ def _reviewed_author_finalizer_run_id(
     ):
         return None
 
-    merger_id = _one_direct_child(conn, reviewer_id)
-    if merger_id is None or not _all_other_parents_terminal(conn, merger_id, reviewer_id):
-        return None
-    merger = _authenticated_factory_run_metadata(conn, merger_id)
-    if merger is None:
-        return None
-    merger_run_id, merger_profile, merge_md = merger
-    if merger_profile != FACTORY_REVIEW_MERGER_PROFILE:
-        return None
     legacy_keys = {
         "head_sha", "tree_sha", "audited_base_sha", "review_id", "author",
         "auditor", "role_separation", "forbidden_actions_performed",
@@ -7516,6 +7507,43 @@ def _reviewed_author_finalizer_run_id(
         "auditor_actor", "native_task_id", "native_run_id", "native_profile",
         "gate_verdict", "merge_performed", "production_or_runtime_mutation",
     }
+    canonical_mergers = []
+    for child in conn.execute(
+        "SELECT child_id FROM task_links WHERE parent_id = ? ORDER BY child_id",
+        (reviewer_id,),
+    ).fetchall():
+        child_id = str(child["child_id"])
+        candidate = _authenticated_factory_run_metadata(conn, child_id)
+        if candidate is None:
+            continue
+        candidate_run_id, candidate_profile, candidate_md = candidate
+        if (
+            candidate_profile == FACTORY_REVIEW_MERGER_PROFILE
+            and canonical_keys.intersection(candidate_md)
+        ):
+            canonical_mergers.append(
+                (child_id, candidate_run_id, candidate_profile, candidate_md)
+            )
+
+    if canonical_mergers:
+        if len(canonical_mergers) != 1:
+            return None
+        merger_id, merger_run_id, merger_profile, merge_md = canonical_mergers[0]
+    else:
+        # Legacy receipts carry no authenticated task/run provenance, so retain
+        # the old single-child fence rather than guessing among siblings.
+        merger_id = _one_direct_child(conn, reviewer_id)
+        if merger_id is None:
+            return None
+        merger = _authenticated_factory_run_metadata(conn, merger_id)
+        if merger is None:
+            return None
+        merger_run_id, merger_profile, merge_md = merger
+    if (
+        merger_profile != FACTORY_REVIEW_MERGER_PROFILE
+        or not _all_other_parents_terminal(conn, merger_id, reviewer_id)
+    ):
+        return None
     has_legacy_schema = bool(legacy_keys.intersection(merge_md))
     has_canonical_schema = bool(canonical_keys.intersection(merge_md))
     if has_legacy_schema == has_canonical_schema:
