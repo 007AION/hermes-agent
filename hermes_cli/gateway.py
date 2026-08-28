@@ -7283,7 +7283,16 @@ def _gateway_command_inner(args):
                 print_error("Refusing cross-profile gateway restart: identity changed.")
                 sys.exit(1)
             try:
-                systemd_restart(system=True)
+                # This is deliberately narrower than ``systemd_restart``:
+                # identity is already bound and revalidated, so submit exactly
+                # that unit without refreshing it, signalling a PID, resetting
+                # state, or recomputing the active profile.
+                _run_systemctl(
+                    ["restart", f"{restart_identity.target_service}.service"],
+                    system=True,
+                    check=True,
+                    timeout=90,
+                )
             except subprocess.CalledProcessError:
                 print_error(
                     f"Failed to restart exact target service "

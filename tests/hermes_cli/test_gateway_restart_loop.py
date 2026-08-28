@@ -258,7 +258,26 @@ class TestGatewaySelfTargetingGuard:
             raising=False,
         )
         monkeypatch.setattr(
-            gw, "systemd_restart", lambda *, system: calls.append(("systemd", system))
+            gw,
+            "_run_systemctl",
+            lambda args, **kwargs: calls.append((args, kwargs)),
+        )
+        monkeypatch.setattr(
+            gw,
+            "systemd_restart",
+            lambda **_k: (_ for _ in ()).throw(
+                AssertionError("general restart helper reached")
+            ),
+        )
+        monkeypatch.setattr(
+            gw,
+            "refresh_systemd_unit_if_needed",
+            lambda **_k: (_ for _ in ()).throw(AssertionError("unit refresh reached")),
+        )
+        monkeypatch.setattr(
+            gw,
+            "_graceful_restart_via_sigusr1",
+            lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("signal reached")),
         )
         monkeypatch.setattr(
             gw,
@@ -275,7 +294,12 @@ class TestGatewaySelfTargetingGuard:
             Namespace(gateway_command="restart", all=False, system=True)
         )
 
-        assert calls == [("systemd", True)]
+        assert calls == [
+            (
+                ["restart", "hermes-gateway-gm.service"],
+                {"system": True, "check": True, "timeout": 90},
+            )
+        ]
 
     @pytest.mark.parametrize(
         "command_args",
