@@ -88,9 +88,18 @@ def _aion889_evidence_matches(evidence: dict) -> bool:
 
 
 def _read_aion889_comment_evidence() -> dict:
+    # The frozen governance record is private.  Reuse the existing GitHub
+    # authentication resolver (env token -> gh CLI -> GitHub App) rather than
+    # inventing another credential path or exposing a token in subprocess
+    # arguments/logs.  Anonymous fallback is not authoritative for this bridge.
+    from tools.skills_hub import GitHubAuth
+
+    headers = GitHubAuth().get_headers()
+    if "Authorization" not in headers:
+        raise RuntimeError("authenticated GitHub readback unavailable")
     request = urllib.request.Request(
         f"https://api.github.com/repos/kiddhu/aion-governance/issues/comments/{_AION889_COMMENT_ID}",
-        headers={"Accept": "application/vnd.github+json", "User-Agent": "hermes-agent"},
+        headers={**headers, "User-Agent": "hermes-agent"},
     )
     with urllib.request.urlopen(request, timeout=5) as response:  # nosec B310: fixed HTTPS URL
         payload = json.loads(response.read().decode("utf-8"))

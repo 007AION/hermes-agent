@@ -4,6 +4,7 @@ import copy
 import json
 import sqlite3
 import threading
+from io import BytesIO
 from unittest.mock import patch
 
 import pytest
@@ -84,6 +85,60 @@ def test_runtime_generation_drift_fails_closed(field):
 
 def test_exact_evidence_matches():
     assert approval._aion889_evidence_matches(_valid_evidence()) is True
+
+
+def test_comment_readback_uses_existing_authenticated_github_substrate(monkeypatch):
+    payload = {
+        "user": {"login": "kiddhu"},
+        "author_association": "OWNER",
+        "id": approval._AION889_COMMENT_ID,
+        "html_url": approval._AION889_COMMENT_URL,
+        "body": "frozen body",
+        "created_at": "2026-08-28T07:08:20Z",
+        "updated_at": "2026-08-28T07:08:20Z",
+    }
+    captured = {}
+
+    class Auth:
+        def get_headers(self):
+            return {
+                "Accept": "application/vnd.github.v3+json",
+                "Authorization": "token secret-never-returned",
+            }
+
+    class Response(BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            self.close()
+
+    def urlopen(request, timeout):
+        captured["headers"] = dict(request.header_items())
+        captured["timeout"] = timeout
+        return Response(json.dumps(payload).encode())
+
+    monkeypatch.setattr("tools.skills_hub.GitHubAuth", Auth)
+    monkeypatch.setattr(approval.urllib.request, "urlopen", urlopen)
+
+    evidence = approval._read_aion889_comment_evidence()
+
+    assert captured["headers"]["Authorization"] == "token secret-never-returned"
+    assert captured["timeout"] == 5
+    assert evidence["actor"] == "kiddhu"
+    assert evidence["comment_sha256"] == approval.hashlib.sha256(b"frozen body").hexdigest()
+
+
+def test_comment_readback_refuses_anonymous_github_fallback(monkeypatch):
+    class AnonymousAuth:
+        def get_headers(self):
+            return {"Accept": "application/vnd.github.v3+json"}
+
+    monkeypatch.setattr("tools.skills_hub.GitHubAuth", AnonymousAuth)
+    with patch.object(approval.urllib.request, "urlopen") as urlopen:
+        with pytest.raises(RuntimeError, match="authenticated GitHub readback unavailable"):
+            approval._read_aion889_comment_evidence()
+    urlopen.assert_not_called()
 
 
 @patch("tools.tirith_security.check_command_security", return_value={"action": "allow"})
