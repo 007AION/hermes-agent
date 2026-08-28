@@ -235,6 +235,135 @@ class TestGatewaySelfTargetingGuard:
             gateway_command(args)
         assert exc_info.value.code == 1
 
+    def test_cross_profile_system_restart_reaches_exact_service_only(self, monkeypatch):
+        """A dual-bound sibling-profile restart may reach systemd, never fallback."""
+        monkeypatch.setenv("_HERMES_GATEWAY", "1")
+        import hermes_cli.gateway as gw
+
+        # ``raising=False`` keeps this public-path regression executable against
+        # the pre-fix source, where no target-aware resolver existed: RED exits
+        # at the blanket marker guard, while GREEN reaches only exact systemd.
+        identity = Namespace(
+            caller_profile="gm2",
+            target_profile="gm",
+            caller_pid=200,
+            caller_start_time=123,
+            target_service="hermes-gateway-gm",
+        )
+        calls = []
+        monkeypatch.setattr(
+            gw,
+            "_resolve_cross_profile_system_restart",
+            lambda: identity,
+            raising=False,
+        )
+        monkeypatch.setattr(
+            gw,
+            "_run_systemctl",
+            lambda args, **kwargs: calls.append((args, kwargs)),
+        )
+        monkeypatch.setattr(
+            gw,
+            "systemd_restart",
+            lambda **_k: (_ for _ in ()).throw(
+                AssertionError("general restart helper reached")
+            ),
+        )
+        monkeypatch.setattr(
+            gw,
+            "refresh_systemd_unit_if_needed",
+            lambda **_k: (_ for _ in ()).throw(AssertionError("unit refresh reached")),
+        )
+        monkeypatch.setattr(
+            gw,
+            "_graceful_restart_via_sigusr1",
+            lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("signal reached")),
+        )
+        monkeypatch.setattr(
+            gw,
+            "_dispatch_via_service_manager_if_s6",
+            lambda *_a, **_k: calls.append(("s6", None)),
+        )
+        monkeypatch.setattr(
+            gw,
+            "stop_profile_gateway",
+            lambda: (_ for _ in ()).throw(AssertionError("fallback reached")),
+        )
+
+        gw.gateway_command(
+            Namespace(gateway_command="restart", all=False, system=True)
+        )
+
+        assert calls == [
+            (
+                ["restart", "hermes-gateway-gm.service"],
+                {"system": True, "check": True, "timeout": 90},
+            )
+        ]
+
+    @pytest.mark.parametrize(
+        "command_args",
+        [
+            Namespace(gateway_command="restart", all=True, system=True),
+            Namespace(gateway_command="restart", all=False, system=False),
+        ],
+        ids=["all", "non-system"],
+    )
+    def test_cross_profile_restart_scope_mismatch_stays_blocked(
+        self, monkeypatch, command_args
+    ):
+        monkeypatch.setenv("_HERMES_GATEWAY", "1")
+        import hermes_cli.gateway as gw
+
+        identity = gw.CrossProfileRestartIdentity(
+            caller_profile="gm2",
+            target_profile="gm",
+            caller_pid=200,
+            caller_start_time=123,
+            target_service="hermes-gateway-gm",
+        )
+        monkeypatch.setattr(
+            gw, "_resolve_cross_profile_system_restart", lambda: identity
+        )
+        monkeypatch.setattr(
+            gw,
+            "systemd_restart",
+            lambda **_k: (_ for _ in ()).throw(AssertionError("restart reached")),
+        )
+
+        with pytest.raises(SystemExit) as exc_info:
+            gw.gateway_command(command_args)
+        assert exc_info.value.code == 1
+
+    def test_cross_profile_restart_dispatch_identity_drift_stays_blocked(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("_HERMES_GATEWAY", "1")
+        import hermes_cli.gateway as gw
+
+        identity = gw.CrossProfileRestartIdentity(
+            caller_profile="gm2",
+            target_profile="gm",
+            caller_pid=200,
+            caller_start_time=123,
+            target_service="hermes-gateway-gm",
+        )
+        resolutions = iter([identity, None])
+        monkeypatch.setattr(
+            gw, "_resolve_cross_profile_system_restart", lambda: next(resolutions)
+        )
+        monkeypatch.setattr(
+            gw,
+            "systemd_restart",
+            lambda **_k: (_ for _ in ()).throw(AssertionError("restart reached")),
+        )
+
+        with pytest.raises(SystemExit) as exc_info:
+            gw.gateway_command(
+                Namespace(gateway_command="restart", all=False, system=True)
+            )
+        assert exc_info.value.code == 1
+
     def test_stop_allows_outside_gateway(self, monkeypatch):
         # With the gateway marker unset, the self-targeting guard must NOT
         # fire. Prove control reaches the real stop path (rather than driving
@@ -273,6 +402,209 @@ class TestGatewaySelfTargetingGuard:
         args = Namespace(gateway_command="restart", all=False, system=False)
         with pytest.raises(_Reached):
             gw.gateway_command(args)
+
+
+class TestCrossProfileRestartIdentity:
+    """Dual authority proof for the narrow Linux system-service exception."""
+
+    @staticmethod
+    def _process(profile, path, pid):
+        from hermes_cli.gateway import ProfileGatewayProcess
+
+        return ProfileGatewayProcess(profile=profile, path=path, pid=pid)
+
+    def test_cgroup_parser_returns_only_exact_gateway_service_components(
+        self, monkeypatch
+    ):
+        import hermes_cli.gateway as gw
+
+        monkeypatch.setattr(
+            gw.Path,
+            "read_text",
+            lambda *_a, **_k: (
+                "0::/system.slice/hermes-gateway-gm2.service/subprocess\n"
+                "1:name=systemd:/system.slice/hermes-gateway-gm2.service\n"
+                "2:cpu:/system.slice/hermes-gateway-helper.scope\n"
+            ),
+        )
+
+        assert gw._read_process_cgroup_units(300) == {
+            "hermes-gateway-gm2.service"
+        }
+
+    def _patch_caller_proofs(
+        self,
+        monkeypatch,
+        tmp_path,
+        *,
+        cgroup_units=("hermes-gateway-gm2.service",),
+        processes=None,
+        identities=None,
+        starts=None,
+        parents=None,
+    ):
+        import hermes_cli.gateway as gw
+        from gateway import status
+
+        gm2 = tmp_path / "gm2"
+        gm3 = tmp_path / "gm3"
+        processes = processes if processes is not None else [
+            self._process("gm2", gm2, 200)
+        ]
+        identities = identities if identities is not None else {
+            gm2: (200, 123),
+            gm3: (100, 456),
+        }
+        starts = starts if starts is not None else {200: 123, 100: 456}
+        parents = parents if parents is not None else {300: 200, 200: 1, 100: 1}
+
+        monkeypatch.setattr(gw.os, "getpid", lambda: 300)
+        monkeypatch.setattr(
+            gw, "_read_process_cgroup_units", lambda _pid: set(cgroup_units)
+        )
+        monkeypatch.setattr(
+            gw,
+            "_known_profile_service_names",
+            lambda: {
+                "gm2": "hermes-gateway-gm2.service",
+                "gm3": "hermes-gateway-gm3.service",
+            },
+        )
+        monkeypatch.setattr(
+            gw,
+            "find_profile_gateway_processes",
+            lambda *, deduplicate_pids: processes
+            if not deduplicate_pids
+            else list({process.pid: process for process in processes}.values()),
+        )
+        monkeypatch.setattr(
+            gw, "_read_profile_gateway_pid_identity", lambda path: identities.get(path)
+        )
+        monkeypatch.setattr(
+            status, "get_process_start_time", lambda pid: starts.get(pid)
+        )
+        monkeypatch.setattr(gw, "_get_parent_pid", lambda pid: parents.get(pid))
+        return gw
+
+    def test_cgroup_and_pid_starttime_ancestor_agree(self, monkeypatch, tmp_path):
+        gw = self._patch_caller_proofs(monkeypatch, tmp_path)
+        assert gw._resolve_authoritative_gateway_caller() == ("gm2", 200, 123)
+
+    @pytest.mark.parametrize(
+        "case",
+        [
+            "cgroup_only",
+            "ancestor_only",
+            "proof_mismatch",
+            "stale_starttime",
+            "nested",
+            "detached",
+            "escaped",
+            "duplicate_pid_binding",
+        ],
+    )
+    def test_incomplete_or_ambiguous_caller_proof_fails_closed(
+        self, monkeypatch, tmp_path, case
+    ):
+        gm2 = tmp_path / "gm2"
+        gm3 = tmp_path / "gm3"
+        kwargs = {}
+        if case == "cgroup_only":
+            kwargs["processes"] = []
+        elif case == "ancestor_only":
+            kwargs["cgroup_units"] = ()
+        elif case == "proof_mismatch":
+            kwargs["cgroup_units"] = ("hermes-gateway-gm3.service",)
+        elif case == "stale_starttime":
+            kwargs["starts"] = {200: 124}
+        elif case == "nested":
+            kwargs["processes"] = [
+                self._process("gm3", gm3, 100),
+                self._process("gm2", gm2, 200),
+            ]
+            kwargs["parents"] = {300: 100, 100: 200, 200: 1}
+        elif case == "detached":
+            kwargs["parents"] = {300: 1, 200: 1}
+        elif case == "escaped":
+            kwargs["cgroup_units"] = ()
+        elif case == "duplicate_pid_binding":
+            kwargs["processes"] = [
+                self._process("gm2", gm2, 200),
+                self._process("gm3", gm3, 200),
+            ]
+            kwargs["identities"] = {gm2: (200, 123), gm3: (200, 123)}
+            kwargs["starts"] = {200: 123}
+
+        gw = self._patch_caller_proofs(monkeypatch, tmp_path, **kwargs)
+        assert gw._resolve_authoritative_gateway_caller() is None
+
+    def test_environment_or_argv_spoof_does_not_supply_authority(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("HERMES_CALLER_PROFILE", "gm2")
+        monkeypatch.setenv("HERMES_PROFILE", "gm2")
+        import sys
+
+        monkeypatch.setattr(sys, "argv", ["hermes", "--profile", "gm2"])
+        gw = self._patch_caller_proofs(
+            monkeypatch, tmp_path, cgroup_units=(), processes=[]
+        )
+        assert gw._resolve_authoritative_gateway_caller() is None
+
+    @pytest.mark.parametrize(
+        ("target", "service", "unit_present", "expected"),
+        [
+            ("gm", "hermes-gateway-gm", True, ("gm", "hermes-gateway-gm")),
+            ("gm", "hermes-gateway-other", True, None),
+            ("gm", "hermes-gateway-gm", False, None),
+            ("missing", "hermes-gateway-missing", True, None),
+            ("custom", "hermes-gateway-deadbeef", True, None),
+        ],
+    )
+    def test_target_requires_canonical_profile_and_exact_installed_system_unit(
+        self, monkeypatch, target, service, unit_present, expected
+    ):
+        import hermes_cli.gateway as gw
+        import hermes_cli.profiles as profiles
+
+        known = [Namespace(name="gm")]
+        monkeypatch.setattr(profiles, "get_active_profile_name", lambda: target)
+        monkeypatch.setattr(profiles, "list_profiles", lambda: known)
+        monkeypatch.setattr(gw, "supports_systemd_services", lambda: True)
+        monkeypatch.setattr(gw, "get_service_name", lambda: service)
+        unit_path = gw.Path("/etc/systemd/system") / f"{service}.service"
+        monkeypatch.setattr(gw, "get_systemd_unit_path", lambda *, system: unit_path)
+        monkeypatch.setattr(gw.Path, "is_file", lambda _path: unit_present)
+
+        assert gw._resolve_exact_system_restart_target() == expected
+
+    @pytest.mark.parametrize(
+        ("caller", "target", "service", "expected"),
+        [
+            ("gm2", "gm", "hermes-gateway-gm", True),
+            ("gm", "gm", "hermes-gateway-gm", False),
+            ("gm2", "custom", "hermes-gateway-deadbeef", False),
+            ("gm2", None, None, False),
+        ],
+    )
+    def test_only_exact_distinct_caller_and_canonical_target_are_authorized(
+        self, monkeypatch, caller, target, service, expected
+    ):
+        import hermes_cli.gateway as gw
+
+        monkeypatch.setattr(
+            gw,
+            "_resolve_authoritative_gateway_caller",
+            lambda: (caller, 200, 123) if caller else None,
+        )
+        monkeypatch.setattr(
+            gw,
+            "_resolve_exact_system_restart_target",
+            lambda: (target, service) if target else None,
+        )
+
+        result = gw._resolve_cross_profile_system_restart()
+        assert (result is not None) is expected
 
 
 # ---------------------------------------------------------------------------
