@@ -7553,17 +7553,21 @@ def _reviewed_author_finalizer_run_id(
         "merge_performed", "production_or_runtime_mutation",
         "forbidden_actions_performed", "secret_exposure",
     }
-    legacy_discriminators = {
-        "head_sha", "tree_sha", "audited_base_sha", "review_id", "role_separation",
+    legacy_family_keys = legacy_keys | {
+        "repository", "pr_number", "merge_commit_sha", "merged_by",
     }
-    canonical_discriminators = {
-        "expected_head", "audited_base", "implementation_task_id", "audit_task_id",
-        "native_task_id", "gate_verdict", "canonical_main_sha",
+    canonical_family_keys = canonical_keys | {
+        "verdict", "repository", "pr_number", "merge_commit_sha", "merged_by",
+        "canonical_main_sha", "canonical_main_parents",
+        "audited_head_is_main_parent", "main_equals_merge_commit",
     }
-    immutable_discriminators = {
-        "audited_head", "base_at_audit", "merge_commit", "canonical_main",
-        "merge_parents", "native_audit_task", "native_audit_verdict", "merger_identity",
-    }
+    # Detect a family from every key exclusive to its accepted shape, not a
+    # hand-picked subset.  Otherwise an immutable receipt can be enriched with
+    # a non-discriminator alias such as canonical ``audit_run_id`` or legacy
+    # ``author`` and still pass as a pure immutable receipt.
+    legacy_discriminators = legacy_family_keys - canonical_family_keys - immutable_keys
+    canonical_discriminators = canonical_family_keys - legacy_family_keys - immutable_keys
+    immutable_discriminators = immutable_keys - legacy_family_keys - canonical_family_keys
     canonical_mergers = []
     for child in conn.execute(
         "SELECT child_id FROM task_links WHERE parent_id = ? ORDER BY child_id",

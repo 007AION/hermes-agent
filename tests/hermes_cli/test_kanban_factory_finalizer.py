@@ -663,7 +663,8 @@ def test_reviewed_author_ignores_unrelated_terminal_runtime_child(
     [
         "review_missing_head", "review_mixed_schema", "review_outcome",
         "review_pr", "review_role_collision", "merger_missing_head",
-        "merger_mixed_schema", "merger_audit_task", "merger_audit_run",
+        "merger_mixed_schema", "merger_mixed_canonical_alias",
+        "merger_mixed_legacy_alias", "merger_audit_task", "merger_audit_run",
         "merger_review", "merger_ancestry", "merger_tree", "merger_blob",
         "runtime_zero", "runtime_two", "runtime_partial_competitor",
         "runtime_self_role", "runtime_tree", "runtime_path",
@@ -710,6 +711,18 @@ def test_immutable_pr54_drift_fails_closed_zero_author_mutation(
             _rewrite_latest_run_metadata(
                 conn, merger,
                 lambda md: md.__setitem__("expected_head", md["audited_head"]),
+            )
+        elif drift == "merger_mixed_canonical_alias":
+            # audit_run_id belongs only to the canonical receipt family but
+            # was omitted from the original discriminator subset.
+            _rewrite_latest_run_metadata(
+                conn, merger, lambda md: md.__setitem__("audit_run_id", 999),
+            )
+        elif drift == "merger_mixed_legacy_alias":
+            # author belongs only to the legacy receipt family but is not one
+            # of that family's head/tree/base discriminator fields.
+            _rewrite_latest_run_metadata(
+                conn, merger, lambda md: md.__setitem__("author", "007AION"),
             )
         elif drift == "merger_audit_task":
             _rewrite_latest_run_metadata(
