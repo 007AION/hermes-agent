@@ -94,6 +94,165 @@ class ProfileGatewayProcess:
     pid: int
 
 
+@dataclass(frozen=True)
+class CrossProfileRestartIdentity:
+    """Authoritative identity bound to one cross-profile system restart."""
+
+    caller_profile: str
+    target_profile: str
+    caller_pid: int
+    caller_start_time: int
+    target_service: str
+
+
+def _known_profile_service_names() -> dict[str, str]:
+    """Map canonical profiles to their exact systemd unit basenames."""
+    try:
+        from hermes_cli.profiles import list_profiles
+
+        profiles = list_profiles()
+    except Exception:
+        return {}
+    return {
+        profile.name: (
+            f"{_SERVICE_BASE}.service"
+            if profile.name == "default"
+            else f"{_SERVICE_BASE}-{profile.name}.service"
+        )
+        for profile in profiles
+        if profile.name != "custom"
+    }
+
+
+def _read_process_cgroup_units(pid: int) -> set[str]:
+    """Return Hermes gateway systemd units named by the kernel cgroup."""
+    try:
+        text = Path(f"/proc/{pid}/cgroup").read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return set()
+
+    units: set[str] = set()
+    for line in text.splitlines():
+        _hierarchy, separator, remainder = line.partition(":")
+        if not separator:
+            continue
+        _controllers, separator, path = remainder.partition(":")
+        if not separator:
+            continue
+        for component in Path(path).parts:
+            if (
+                component.startswith(f"{_SERVICE_BASE}-")
+                or component == f"{_SERVICE_BASE}.service"
+            ):
+                if component.endswith(".service"):
+                    units.add(component)
+    return units
+
+
+def _read_profile_gateway_pid_identity(path: Path) -> tuple[int, int] | None:
+    """Read the PID/start-time claim validated by profile gateway discovery."""
+    try:
+        payload = json.loads((path / "gateway.pid").read_text(encoding="utf-8"))
+        pid = payload.get("pid")
+        start_time = payload.get("start_time")
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, AttributeError):
+        return None
+    if (
+        not isinstance(pid, int)
+        or isinstance(pid, bool)
+        or pid <= 0
+        or not isinstance(start_time, int)
+        or isinstance(start_time, bool)
+    ):
+        return None
+    return pid, start_time
+
+
+def _resolve_authoritative_gateway_caller() -> tuple[str, int, int] | None:
+    """Bind the caller using agreeing cgroup and PID/start-time ancestry proofs."""
+    from gateway.status import get_process_start_time
+
+    service_names = _known_profile_service_names()
+    cgroup_units = _read_process_cgroup_units(os.getpid())
+    cgroup_profiles = [
+        profile for profile, unit in service_names.items() if unit in cgroup_units
+    ]
+    if len(cgroup_units) != 1 or len(cgroup_profiles) != 1:
+        return None
+
+    ancestor_pids: set[int] = set()
+    pid = os.getpid()
+    while pid > 0 and pid not in ancestor_pids:
+        ancestor_pids.add(pid)
+        pid = _get_parent_pid(pid) or 0
+
+    matches: list[tuple[str, int, int]] = []
+    for process in find_profile_gateway_processes(deduplicate_pids=False):
+        if process.pid not in ancestor_pids:
+            continue
+        recorded = _read_profile_gateway_pid_identity(process.path)
+        if recorded is None or recorded[0] != process.pid:
+            continue
+        live_start_time = get_process_start_time(process.pid)
+        if live_start_time is None or live_start_time != recorded[1]:
+            continue
+        matches.append((process.profile, process.pid, live_start_time))
+
+    # Multiple matches means a nested gateway or duplicate profile binding.
+    if len(matches) != 1 or matches[0][0] != cgroup_profiles[0]:
+        return None
+    profile, gateway_pid, start_time = matches[0]
+    if get_process_start_time(gateway_pid) != start_time:
+        return None
+    return profile, gateway_pid, start_time
+
+
+def _resolve_exact_system_restart_target() -> tuple[str, str] | None:
+    """Bind the canonical active profile to its exact installed system unit."""
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+
+        if not supports_systemd_services():
+            return None
+        target_profile = get_active_profile_name()
+        expected_unit = _known_profile_service_names().get(target_profile)
+        if expected_unit is None:
+            return None
+        target_service = get_service_name()
+        target_path = get_systemd_unit_path(system=True)
+    except Exception:
+        return None
+    if (
+        target_profile == "custom"
+        or expected_unit != f"{target_service}.service"
+        or target_path != Path("/etc/systemd/system") / expected_unit
+        or not target_path.is_file()
+    ):
+        return None
+    return target_profile, target_service
+
+
+def _resolve_cross_profile_system_restart() -> CrossProfileRestartIdentity | None:
+    """Resolve the only gateway-owned restart allowed past the loop guard."""
+    caller = _resolve_authoritative_gateway_caller()
+    target = _resolve_exact_system_restart_target()
+    if (
+        caller is None
+        or target is None
+        or caller[0] == "custom"
+        or target[0] == "custom"
+        or caller[0] == target[0]
+    ):
+        return None
+    return CrossProfileRestartIdentity(
+        caller_profile=caller[0],
+        caller_pid=caller[1],
+        caller_start_time=caller[2],
+        target_profile=target[0],
+        target_service=target[1],
+    )
+
+
 def _get_service_pids() -> set:
     """Return PIDs currently managed by systemd or launchd gateway services.
 
@@ -627,6 +786,8 @@ def find_gateway_pids(
 
 def find_profile_gateway_processes(
     exclude_pids: set | None = None,
+    *,
+    deduplicate_pids: bool = True,
 ) -> list[ProfileGatewayProcess]:
     """Return running gateway PIDs mapped to Hermes profiles via PID files."""
     _exclude = set(exclude_pids or set())
@@ -643,7 +804,12 @@ def find_profile_gateway_processes(
             pid = get_running_pid(profile.path / "gateway.pid", cleanup_stale=False)
         except Exception:
             continue
-        if pid is None or pid <= 0 or pid in _exclude or pid in seen:
+        if (
+            pid is None
+            or pid <= 0
+            or pid in _exclude
+            or (deduplicate_pids and pid in seen)
+        ):
             continue
         seen.add(pid)
         processes.append(
@@ -7095,18 +7261,39 @@ def _gateway_command_inner(args):
     elif subcmd == "restart":
         # Defense: refuse self-targeting gateway restart from inside the gateway.
         # Prevents agent-initiated kill loops when combined with supervisor KeepAlive.
+        system = getattr(args, "system", False)
+        restart_all = getattr(args, "all", False)
         if os.getenv("_HERMES_GATEWAY") == "1":
-            print_error(
-                "Refusing to restart the gateway from inside the gateway process.\n"
-                "This command was blocked to prevent restart loops.\n"
-                "Use `hermes gateway restart` from a shell outside the running gateway."
+            restart_identity = (
+                _resolve_cross_profile_system_restart()
+                if system and not restart_all
+                else None
             )
-            sys.exit(1)
+            if restart_identity is None:
+                print_error(
+                    "Refusing to restart the gateway from inside the gateway process.\n"
+                    "This command was blocked to prevent restart loops.\n"
+                    "Use `hermes gateway restart` from a shell outside the running gateway."
+                )
+                sys.exit(1)
+
+            # Re-resolve immediately at the mutation boundary. Never let this
+            # narrow exception fall through to s6 or manual kill/start fallback.
+            if _resolve_cross_profile_system_restart() != restart_identity:
+                print_error("Refusing cross-profile gateway restart: identity changed.")
+                sys.exit(1)
+            try:
+                systemd_restart(system=True)
+            except subprocess.CalledProcessError:
+                print_error(
+                    f"Failed to restart exact target service "
+                    f"{restart_identity.target_service}.service."
+                )
+                sys.exit(1)
+            return
 
         # Try service first, fall back to killing and restarting
         service_available = False
-        system = getattr(args, "system", False)
-        restart_all = getattr(args, "all", False)
         service_configured = False
 
         # Phase 4: inside a container with s6, dispatch via the service
