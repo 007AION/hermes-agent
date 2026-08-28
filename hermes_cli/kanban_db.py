@@ -7618,6 +7618,14 @@ def _reviewed_author_finalizer_run_id(
         # ambiguous.  Never let caller-authored aliases complete a receipt.
         return None
     has_legacy_schema, has_canonical_schema, has_immutable_schema = schema_families
+    family_keys = (legacy_family_keys, canonical_family_keys, immutable_keys)
+    selected_family_keys = family_keys[schema_families.index(True)]
+    foreign_aliases = set().union(*family_keys) - selected_family_keys
+    if foreign_aliases.intersection(merge_md):
+        # Some aliases are shared by two foreign families, so they cannot act
+        # as an exclusive discriminator.  Once the family is selected, still
+        # reject every recognized key that does not belong to that family.
+        return None
 
     merge_sha = merge_md.get("merge_commit_sha")
     repository = merge_md.get("repository")
