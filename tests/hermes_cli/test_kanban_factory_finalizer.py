@@ -806,9 +806,8 @@ def test_reviewed_author_accepts_authenticated_gm_merger_and_role_separated_merg
 
 
 def test_reviewed_author_accepts_historical_pr54_source_on_authenticated_current_descendant_runtime(
-    kanban_home, aion_gov_src, monkeypatch,
+    kanban_home, aion_gov_src,
 ):
-    monkeypatch.setattr(kb, "_historical_source_preserved_in_installed_git", lambda **_kw: True)
     with kb.connect() as conn:
         author, author_run, *_ = _reviewed_author_chain(
             conn, immutable_pr54_receipts=True, current_descendant_runtime=True,
@@ -977,20 +976,21 @@ def test_reviewed_author_rejects_multiple_authenticated_runtime_witness_candidat
 @pytest.mark.parametrize(
     "drift",
     [
-        None, "repo_head", "dirty_repo", "installed_head", "missing_commit", "missing_tree", "source_tree",
+        None, "invalid_repo_head", "dirty_repo", "installed_head", "missing_commit", "missing_tree", "source_tree",
         "merge_tree", "first_parent", "second_parent", "third_parent",
-        "not_ancestor", "path_set", "blob",
+        "source_not_installed_ancestor", "installed_not_current_ancestor",
+        "path_set", "installed_blob", "current_blob",
     ],
 )
 def test_historical_source_git_proof_gates_every_immutable_relationship(monkeypatch, drift):
-    installed_head, installed_tree = "a" * 40, "b" * 40
+    current_head, installed_head, installed_tree = "0" * 40, "a" * 40, "b" * 40
     source_head, source_tree = "c" * 40, "d" * 40
     source_base, source_merge = "e" * 40, "f" * 40
     paths = ["alpha.py", "tests/test_alpha.py"]
 
     def fake_git(_repo, *args):
         if args == ("rev-parse", "HEAD"):
-            return "0" * 40 if drift == "repo_head" else installed_head
+            return "invalid" if drift == "invalid_repo_head" else current_head
         if args == ("status", "--porcelain", "--untracked-files=no"):
             return " M alpha.py" if drift == "dirty_repo" else ""
         if args[0:2] == ("cat-file", "-e"):
@@ -1011,12 +1011,16 @@ def test_historical_source_git_proof_gates_every_immutable_relationship(monkeypa
             third = f" {'0' * 40}" if drift == "third_parent" else ""
             return f"{source_merge} {first} {second}{third}"
         if args == ("merge-base", "--is-ancestor", source_merge, installed_head):
-            return None if drift == "not_ancestor" else ""
+            return None if drift == "source_not_installed_ancestor" else ""
+        if args == ("merge-base", "--is-ancestor", installed_head, current_head):
+            return None if drift == "installed_not_current_ancestor" else ""
         if args == ("diff", "--name-only", "--no-renames", source_base, source_head):
             return "alpha.py\nextra.py" if drift == "path_set" else "\n".join(paths)
         if args[0] == "rev-parse" and ":" in args[1]:
             commit, path = args[1].split(":", 1)
-            if drift == "blob" and commit == installed_head and path == paths[0]:
+            if drift == "installed_blob" and commit == installed_head and path == paths[0]:
+                return "2" * 40
+            if drift == "current_blob" and commit == current_head and path == paths[0]:
                 return "2" * 40
             return "1" * 40
         raise AssertionError(f"unexpected git args: {args}")

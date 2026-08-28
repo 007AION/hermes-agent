@@ -7400,30 +7400,32 @@ def _historical_source_preserved_in_installed_git(
     *, install: dict, source_head: Optional[str], source_tree: Optional[str],
     source_base: Optional[str], source_merge: Optional[str], source_paths: list[str],
 ) -> bool:
-    """Prove a historical reviewed diff is byte-preserved in installed HEAD."""
+    """Prove a historical reviewed diff survives into the clean executing descendant."""
     repo = Path(__file__).resolve().parents[1]
+    current_head = _git_output(repo, "rev-parse", "HEAD")
     installed_head = install.get("head")
     installed_tree = install.get("tree")
-    object_ids = (installed_head, installed_tree, source_head, source_tree, source_base, source_merge)
+    object_ids = (
+        current_head, installed_head, installed_tree, source_head, source_tree,
+        source_base, source_merge,
+    )
     if any(
         not isinstance(value, str) or re.fullmatch(r"[0-9a-fA-F]{40}", value) is None
         for value in object_ids
     ):
         return False
+    assert isinstance(current_head, str)
     assert isinstance(installed_head, str)
     assert isinstance(installed_tree, str)
     assert isinstance(source_head, str)
     assert isinstance(source_tree, str)
     assert isinstance(source_base, str)
     assert isinstance(source_merge, str)
-    if (
-        _git_output(repo, "rev-parse", "HEAD") != installed_head
-        or _git_output(repo, "status", "--porcelain", "--untracked-files=no") != ""
-    ):
+    if _git_output(repo, "status", "--porcelain", "--untracked-files=no") != "":
         return False
     if any(
         _git_output(repo, "cat-file", "-e", f"{commit}^{{commit}}") is None
-        for commit in (installed_head, source_head, source_base, source_merge)
+        for commit in (current_head, installed_head, source_head, source_base, source_merge)
     ) or any(
         _git_output(repo, "cat-file", "-e", f"{tree}^{{tree}}") is None
         for tree in (installed_tree, source_tree)
@@ -7438,7 +7440,10 @@ def _historical_source_preserved_in_installed_git(
     parents = (_git_output(repo, "rev-list", "--parents", "-n", "1", source_merge) or "").split()
     if parents != [source_merge, source_base, source_head]:
         return False
-    if _git_output(repo, "merge-base", "--is-ancestor", source_merge, installed_head) is None:
+    if (
+        _git_output(repo, "merge-base", "--is-ancestor", source_merge, installed_head) is None
+        or _git_output(repo, "merge-base", "--is-ancestor", installed_head, current_head) is None
+    ):
         return False
     actual_paths = (_git_output(
         repo, "diff", "--name-only", "--no-renames", source_base, source_head,
@@ -7448,7 +7453,8 @@ def _historical_source_preserved_in_installed_git(
     for path in source_paths:
         source_blob = _git_output(repo, "rev-parse", f"{source_merge}:{path}")
         installed_blob = _git_output(repo, "rev-parse", f"{installed_head}:{path}")
-        if source_blob is None or installed_blob != source_blob:
+        current_blob = _git_output(repo, "rev-parse", f"{current_head}:{path}")
+        if source_blob is None or installed_blob != source_blob or current_blob != source_blob:
             return False
     return True
 
