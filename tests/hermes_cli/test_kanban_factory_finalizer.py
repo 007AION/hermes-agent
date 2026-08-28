@@ -346,8 +346,31 @@ def test_t2_finalizer_completes_atomically_child_wakes(kanban_home, aion_gov_src
         assert kb.get_task(conn, child).status == "ready"
 
 
-def _reviewed_author_chain(conn):
+def _reviewed_author_chain(
+    conn, *, canonical_merger_receipt=False, source_pr=49, live_multi_child_shape=False,
+):
     """Create one exact reviewed author -> auditor -> merger -> runtime chain."""
+    head = (
+        "d622fcf38da613ce25bf4eaf37c54a94053d5e70"
+        if canonical_merger_receipt else "1" * 40
+    )
+    tree = (
+        "1e5e822f33c5fe227982ff9e4e1de320cb862c42"
+        if canonical_merger_receipt else "2" * 40
+    )
+    base = (
+        "f6dfcb6d50f512e0944cd8f56367ccb0eac6ace8"
+        if canonical_merger_receipt else "3" * 40
+    )
+    merge_sha = (
+        "9920fd369b4b0c14bc292b7585431f16a4028f31"
+        if canonical_merger_receipt else "4" * 40
+    )
+    review_id = 5037761833 if canonical_merger_receipt else 12345
+    changed_files = (
+        ["hermes_cli/kanban_db.py", "tests/hermes_cli/test_kanban_factory_finalizer.py"]
+        if canonical_merger_receipt else ["hermes_cli/kanban_db.py"]
+    )
     author = kb.create_task(
         conn, title="reviewed author", factory_build_gate=1, assignee="agent007",
     )
@@ -370,15 +393,13 @@ def _reviewed_author_chain(conn):
         author,
         expected_run_id=author_run,
         review_task_id=reviewer,
-        reason="PR #49 frozen at exact head " + "1" * 40,
+        reason=f"PR #{source_pr} frozen at exact head {head}",
     )
     assert handoff is not None
 
     reviewer_run = _claim_and_run_id(conn, reviewer)
     review_reason = (
-        "APPROVE_EXACT_HEAD head=" + "1" * 40
-        + " tree=" + "2" * 40
-        + " review=12345"
+        f"APPROVE_EXACT_HEAD head={head} tree={tree} review={review_id}"
     )
     assert kb.record_review_verdict(
         conn,
@@ -388,48 +409,89 @@ def _reviewed_author_chain(conn):
         verdict="pass",
         reason=review_reason,
     )
+    reviewer_metadata = {
+        "author_task": author,
+        "review_outcome": "APPROVE_EXACT_HEAD",
+        "head_sha": head,
+        "tree_sha": tree,
+        "base_sha": base,
+        "github_review_id": review_id,
+        "changed_files": changed_files,
+    }
+    if canonical_merger_receipt:
+        # Exact immutable t_463814e3/run3382 shape: author identity is bound by
+        # the typed handoff/direct edge/verdict, not duplicated in metadata.
+        reviewer_metadata.pop("author_task")
+        reviewer_metadata.update({
+            "ci_run": 33150562165,
+            "tests": {"factory_finalizer": "43 passed"},
+            "worker_session_id": "sanitized-review-session",
+        })
     assert kb.complete_task(
         conn,
         reviewer,
         expected_run_id=reviewer_run,
         summary="independent exact-head audit passed",
-        metadata={
-            "author_task": author,
-            "review_outcome": "APPROVE_EXACT_HEAD",
-            "head_sha": "1" * 40,
-            "tree_sha": "2" * 40,
-            "base_sha": "3" * 40,
-            "github_review_id": 12345,
-            "changed_files": ["hermes_cli/kanban_db.py"],
-        },
+        metadata=reviewer_metadata,
     )
 
     merger_run = _claim_and_run_id(conn, merger)
+    merger_metadata = {
+        "repository": "kiddhu/hermes-agent",
+        "pr_number": source_pr,
+        "head_sha": head,
+        "tree_sha": tree,
+        "audited_base_sha": base,
+        "merge_commit_sha": merge_sha,
+        "merged_by": "kiddhu",
+        "review_id": review_id,
+        "author": "007AION",
+        "auditor": "GemAION",
+        "role_separation": {
+            "author": "007AION",
+            "auditor": "GemAION",
+            "merger": "kiddhu",
+            "distinct": True,
+        },
+        "forbidden_actions_performed": [],
+        "secret_exposure": "none",
+    }
+    if canonical_merger_receipt:
+        merger_metadata = {
+            "verdict": "EXACT_HEAD_MERGED_MAIN_READBACK",
+            "native_profile": "merger",
+            "native_task_id": merger,
+            "native_run_id": merger_run,
+            "repository": "kiddhu/hermes-agent",
+            "pr_number": source_pr,
+            "expected_head": head,
+            "audited_tree": tree,
+            "audited_base": base,
+            "merge_commit_sha": merge_sha,
+            "merged_by": "kiddhu",
+            "canonical_main_sha": merge_sha,
+            "canonical_main_parents": ["6" * 40, head],
+            "audited_head_is_main_parent": True,
+            "main_equals_merge_commit": True,
+            "implementation_task_id": author,
+            "implementation_run_id": author_run,
+            "implementation_profile": "agent007",
+            "implementation_actor": "007AION",
+            "audit_task_id": reviewer,
+            "audit_run_id": reviewer_run,
+            "audit_profile": "bafuxunan",
+            "auditor_actor": "GemAION",
+            "github_review_id": review_id,
+            "gate_verdict": "PASS",
+            "merge_performed": True,
+            "production_or_runtime_mutation": False,
+        }
     assert kb.complete_task(
         conn,
         merger,
         expected_run_id=merger_run,
         summary="role-separated merge readback passed",
-        metadata={
-            "repository": "kiddhu/hermes-agent",
-            "pr_number": 49,
-            "head_sha": "1" * 40,
-            "tree_sha": "2" * 40,
-            "audited_base_sha": "3" * 40,
-            "merge_commit_sha": "4" * 40,
-            "merged_by": "kiddhu",
-            "review_id": 12345,
-            "author": "007AION",
-            "auditor": "GemAION",
-            "role_separation": {
-                "author": "007AION",
-                "auditor": "GemAION",
-                "merger": "kiddhu",
-                "distinct": True,
-            },
-            "forbidden_actions_performed": [],
-            "secret_exposure": "none",
-        },
+        metadata=merger_metadata,
     )
 
     runtime_run = _claim_and_run_id(conn, runtime)
@@ -441,15 +503,129 @@ def _reviewed_author_chain(conn):
         metadata={
             "canonical_run_id": runtime_run,
             "install": {
-                "head": "4" * 40,
-                "tree": "2" * 40,
-                "changed_paths": ["hermes_cli/kanban_db.py"],
+                "head": merge_sha,
+                "tree": tree,
+                "changed_paths": changed_files,
             },
             "forbidden_actions_performed": [],
             "secret_exposure": "none",
         },
     )
+    if live_multi_child_shape:
+        # The Monarch-named live author has historical/dependency children and
+        # its handoff-selected reviewer has an unrelated historical child.
+        # Neither is evidence for this exact reviewed-finalizer chain.
+        for index in range(5):
+            kb.create_task(
+                conn,
+                title=f"unrelated author child {index}",
+                assignee="gm2",
+                parents=[author],
+            )
+        historical = kb.create_task(
+            conn,
+            title="unrelated completed reviewer child",
+            assignee="gm2",
+            parents=[reviewer],
+        )
+        historical_run = _claim_and_run_id(conn, historical)
+        assert kb.complete_task(
+            conn,
+            historical,
+            expected_run_id=historical_run,
+            summary="historical lane completed",
+        )
     return author, author_run, reviewer, merger, runtime
+
+
+def test_reviewed_author_accepts_canonical_immutable_merger_receipt(
+    kanban_home, aion_gov_src,
+):
+    """The real merger lane's immutable canonical schema authenticates exactly."""
+    with kb.connect() as conn:
+        author, author_run, *_ = _reviewed_author_chain(
+            conn,
+            canonical_merger_receipt=True,
+            source_pr=50,
+            live_multi_child_shape=True,
+        )
+
+        assert kb._reviewed_author_finalizer_run_id(conn, author) == author_run
+        assert kb.complete_task(conn, author, summary="canonical chain terminalized")
+        assert kb.get_task(conn, author).status == "done"
+
+
+@pytest.mark.parametrize(
+    ("drift", "mutate"),
+    [
+        ("stale_head", lambda md: md.__setitem__("expected_head", "9" * 40)),
+        ("stale_tree", lambda md: md.__setitem__("audited_tree", "9" * 40)),
+        ("stale_base", lambda md: md.__setitem__("audited_base", "9" * 40)),
+        ("mixed_schema", lambda md: md.__setitem__("head_sha", md["expected_head"])),
+        ("partial_schema", lambda md: md.pop("audited_base")),
+        ("implementation_task", lambda md: md.__setitem__("implementation_task_id", "t_forged")),
+        ("implementation_run", lambda md: md.__setitem__("implementation_run_id", -1)),
+        ("implementation_profile", lambda md: md.__setitem__("implementation_profile", "intruder")),
+        ("implementation_actor", lambda md: md.__setitem__("implementation_actor", "GemAION")),
+        ("audit_task", lambda md: md.__setitem__("audit_task_id", "t_forged")),
+        ("audit_run", lambda md: md.__setitem__("audit_run_id", -1)),
+        ("audit_profile", lambda md: md.__setitem__("audit_profile", "intruder")),
+        ("auditor_actor", lambda md: md.__setitem__("auditor_actor", "007AION")),
+        ("native_task", lambda md: md.__setitem__("native_task_id", "t_forged")),
+        ("native_run", lambda md: md.__setitem__("native_run_id", -1)),
+        ("native_profile", lambda md: md.__setitem__("native_profile", "gm")),
+        ("repository", lambda md: md.__setitem__("repository", "attacker/repo")),
+        ("pr_number", lambda md: md.__setitem__("pr_number", 999)),
+        ("review", lambda md: md.__setitem__("github_review_id", 99999)),
+        ("canonical_main", lambda md: md.__setitem__("canonical_main_sha", "9" * 40)),
+        ("main_parent", lambda md: md.__setitem__("canonical_main_parents", ["6" * 40])),
+        ("gate_verdict", lambda md: md.__setitem__("gate_verdict", "FAIL")),
+        ("merge_performed", lambda md: md.__setitem__("merge_performed", False)),
+        (
+            "runtime_mutation",
+            lambda md: md.__setitem__("production_or_runtime_mutation", True),
+        ),
+    ],
+)
+def test_canonical_merger_receipt_drift_fails_closed_zero_author_mutation(
+    kanban_home, aion_gov_src, drift, mutate,
+):
+    with kb.connect() as conn:
+        author, _author_run, _reviewer, merger, _runtime = _reviewed_author_chain(
+            conn, canonical_merger_receipt=True, source_pr=50,
+        )
+        _rewrite_latest_run_metadata(conn, merger, mutate)
+        before_task = dict(conn.execute(
+            "SELECT status, current_run_id, completed_at, "
+            "factory_terminal_receipt_sha256 FROM tasks WHERE id = ?",
+            (author,),
+        ).fetchone())
+        before_runs = [tuple(row) for row in conn.execute(
+            "SELECT id, status, outcome, ended_at FROM task_runs "
+            "WHERE task_id = ? ORDER BY id",
+            (author,),
+        ).fetchall()]
+        before_events = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id = ?", (author,),
+        ).fetchone()[0]
+
+        with pytest.raises(kb.FactoryTerminalReceiptRequiredError):
+            kb.complete_task(conn, author, summary=f"reject {drift}")
+
+        assert dict(conn.execute(
+            "SELECT status, current_run_id, completed_at, "
+            "factory_terminal_receipt_sha256 FROM tasks WHERE id = ?",
+            (author,),
+        ).fetchone()) == before_task
+        assert [tuple(row) for row in conn.execute(
+            "SELECT id, status, outcome, ended_at FROM task_runs "
+            "WHERE task_id = ? ORDER BY id",
+            (author,),
+        ).fetchall()] == before_runs
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id = ?", (author,),
+        ).fetchone()[0] == before_events
+        assert kb.list_attachments(conn, author) == []
 
 
 def test_reviewed_author_controller_completion_uses_exact_ended_run(
@@ -501,6 +677,7 @@ def _rewrite_latest_run_metadata(conn, task_id, mutate):
         "nonmatching_reviewer_identity",
         "nonmatching_merger_identity",
         "multiple_reviewers",
+        "review_author_task",
         "review_head",
         "merge_review",
         "merge_actor",
@@ -508,6 +685,7 @@ def _rewrite_latest_run_metadata(conn, task_id, mutate):
         "merge_pr_number",
         "runtime_tree",
         "runtime_receipt_authenticator",
+        "ambiguous_canonical_merger",
     ],
 )
 def test_reviewed_author_evidence_drift_fails_closed_zero_mutation(
@@ -565,6 +743,12 @@ def test_reviewed_author_evidence_drift_fails_closed_zero_mutation(
                 (author, event["run_id"], event["payload"], int(time.time())),
             )
             conn.commit()
+        elif drift == "review_author_task":
+            _rewrite_latest_run_metadata(
+                conn,
+                reviewer,
+                lambda md: md.__setitem__("author_task", "t_forged"),
+            )
         elif drift == "review_head":
             _rewrite_latest_run_metadata(
                 conn, reviewer, lambda md: md.__setitem__("head_sha", "9" * 40),
@@ -595,6 +779,24 @@ def test_reviewed_author_evidence_drift_fails_closed_zero_mutation(
             conn.execute(
                 "UPDATE task_attachments SET uploaded_by = 'agent' WHERE task_id = ?",
                 (runtime,),
+            )
+            conn.commit()
+        elif drift == "ambiguous_canonical_merger":
+            conn.execute(
+                "INSERT INTO task_links(parent_id, child_id) VALUES (?, ?)",
+                (reviewer, runtime),
+            )
+            conn.execute(
+                "UPDATE tasks SET assignee = ? WHERE id = ?",
+                (kb.FACTORY_REVIEW_MERGER_PROFILE, runtime),
+            )
+            conn.execute(
+                "UPDATE task_runs SET profile = ?, metadata = ? WHERE task_id = ?",
+                (
+                    kb.FACTORY_REVIEW_MERGER_PROFILE,
+                    json.dumps({"audit_task_id": reviewer}),
+                    runtime,
+                ),
             )
             conn.commit()
 

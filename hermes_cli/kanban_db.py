@@ -7483,7 +7483,7 @@ def _reviewed_author_finalizer_run_id(
     review_id = review_md.get("github_review_id")
     changed_files = review_md.get("changed_files")
     if (
-        review_md.get("author_task") != task_id
+        ("author_task" in review_md and review_md.get("author_task") != task_id)
         or review_md.get("review_outcome") != "APPROVE_EXACT_HEAD"
         or any(not isinstance(value, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", value)
                for value in (head, tree, base))
@@ -7495,43 +7495,134 @@ def _reviewed_author_finalizer_run_id(
     ):
         return None
 
-    merger_id = _one_direct_child(conn, reviewer_id)
-    if merger_id is None or not _all_other_parents_terminal(conn, merger_id, reviewer_id):
+    legacy_keys = {
+        "head_sha", "tree_sha", "audited_base_sha", "review_id", "author",
+        "auditor", "role_separation", "forbidden_actions_performed",
+        "secret_exposure",
+    }
+    canonical_keys = {
+        "expected_head", "audited_tree", "audited_base", "github_review_id",
+        "implementation_task_id", "implementation_run_id", "implementation_profile",
+        "implementation_actor", "audit_task_id", "audit_run_id", "audit_profile",
+        "auditor_actor", "native_task_id", "native_run_id", "native_profile",
+        "gate_verdict", "merge_performed", "production_or_runtime_mutation",
+    }
+    canonical_mergers = []
+    for child in conn.execute(
+        "SELECT child_id FROM task_links WHERE parent_id = ? ORDER BY child_id",
+        (reviewer_id,),
+    ).fetchall():
+        child_id = str(child["child_id"])
+        candidate = _authenticated_factory_run_metadata(conn, child_id)
+        if candidate is None:
+            continue
+        candidate_run_id, candidate_profile, candidate_md = candidate
+        if (
+            candidate_profile == FACTORY_REVIEW_MERGER_PROFILE
+            and canonical_keys.intersection(candidate_md)
+        ):
+            canonical_mergers.append(
+                (child_id, candidate_run_id, candidate_profile, candidate_md)
+            )
+
+    if canonical_mergers:
+        if len(canonical_mergers) != 1:
+            return None
+        merger_id, merger_run_id, merger_profile, merge_md = canonical_mergers[0]
+    else:
+        # Legacy receipts carry no authenticated task/run provenance, so retain
+        # the old single-child fence rather than guessing among siblings.
+        merger_id = _one_direct_child(conn, reviewer_id)
+        if merger_id is None:
+            return None
+        merger = _authenticated_factory_run_metadata(conn, merger_id)
+        if merger is None:
+            return None
+        merger_run_id, merger_profile, merge_md = merger
+    if (
+        merger_profile != FACTORY_REVIEW_MERGER_PROFILE
+        or not _all_other_parents_terminal(conn, merger_id, reviewer_id)
+    ):
         return None
-    merger = _authenticated_factory_run_metadata(conn, merger_id)
-    if merger is None:
+    has_legacy_schema = bool(legacy_keys.intersection(merge_md))
+    has_canonical_schema = bool(canonical_keys.intersection(merge_md))
+    if has_legacy_schema == has_canonical_schema:
+        # Missing, partial-without-a-discriminator, and mixed alias schemas are
+        # ambiguous.  Never let caller-authored aliases complete a receipt.
         return None
-    _merger_run_id, merger_profile, merge_md = merger
-    if merger_profile != FACTORY_REVIEW_MERGER_PROFILE:
-        return None
-    role_sep = merge_md.get("role_separation")
+
     merge_sha = merge_md.get("merge_commit_sha")
     repository = merge_md.get("repository")
     pr_number = merge_md.get("pr_number")
+    if has_canonical_schema:
+        canonical_main_parents = merge_md.get("canonical_main_parents")
+        if (
+            not canonical_keys.issubset(merge_md)
+            or merge_md.get("verdict") != "EXACT_HEAD_MERGED_MAIN_READBACK"
+            or merge_md.get("expected_head") != head
+            or merge_md.get("audited_tree") != tree
+            or merge_md.get("audited_base") != base
+            or merge_md.get("github_review_id") != review_id
+            or merge_md.get("implementation_task_id") != task_id
+            or merge_md.get("implementation_run_id") != author_run_id
+            or merge_md.get("implementation_profile") != FACTORY_REVIEW_AUTHOR_PROFILE
+            or merge_md.get("implementation_actor") != FACTORY_REVIEW_AUTHOR_ACTOR
+            or merge_md.get("audit_task_id") != reviewer_id
+            or merge_md.get("audit_run_id") != _reviewer_run_id
+            or merge_md.get("audit_profile") != reviewer_profile
+            or merge_md.get("auditor_actor") != FACTORY_REVIEW_AUDITOR_ACTOR
+            or merge_md.get("native_task_id") != merger_id
+            or merge_md.get("native_run_id") != merger_run_id
+            or merge_md.get("native_profile") != merger_profile
+            or merge_md.get("merged_by") != FACTORY_REVIEW_MERGER_ACTOR
+            or merge_md.get("gate_verdict") != "PASS"
+            or merge_md.get("merge_performed") is not True
+            or merge_md.get("production_or_runtime_mutation") is not False
+            or merge_md.get("canonical_main_sha") != merge_sha
+            or merge_md.get("main_equals_merge_commit") is not True
+            or merge_md.get("audited_head_is_main_parent") is not True
+            or not isinstance(canonical_main_parents, list)
+            or head not in canonical_main_parents
+            or len({
+                merge_md.get("implementation_actor"),
+                merge_md.get("auditor_actor"),
+                merge_md.get("merged_by"),
+            }) != 3
+        ):
+            return None
+    else:
+        role_sep = merge_md.get("role_separation")
+        if (
+            not legacy_keys.issubset(merge_md)
+            or merge_md.get("head_sha") != head
+            or merge_md.get("tree_sha") != tree
+            or merge_md.get("audited_base_sha") != base
+            or merge_md.get("review_id") != review_id
+            or not isinstance(role_sep, dict)
+            or role_sep.get("distinct") is not True
+            or any(
+                not isinstance(role_sep.get(role), str) or not role_sep.get(role)
+                for role in ("author", "auditor", "merger")
+            )
+            or len({
+                role_sep.get("author"), role_sep.get("auditor"), role_sep.get("merger"),
+            }) != 3
+            or merge_md.get("author") != role_sep.get("author")
+            or merge_md.get("auditor") != role_sep.get("auditor")
+            or role_sep.get("author") != FACTORY_REVIEW_AUTHOR_ACTOR
+            or role_sep.get("auditor") != FACTORY_REVIEW_AUDITOR_ACTOR
+            or role_sep.get("merger") != FACTORY_REVIEW_MERGER_ACTOR
+            or merge_md.get("merged_by") != FACTORY_REVIEW_MERGER_ACTOR
+            or merge_md.get("forbidden_actions_performed") != []
+            or merge_md.get("secret_exposure") != "none"
+        ):
+            return None
+
     if (
         repository != FACTORY_REVIEW_REPOSITORY
         or pr_number != source_pr_number
-        or merge_md.get("head_sha") != head
-        or merge_md.get("tree_sha") != tree
-        or merge_md.get("audited_base_sha") != base
-        or merge_md.get("review_id") != review_id
         or not isinstance(merge_sha, str)
         or not re.fullmatch(r"[0-9a-fA-F]{40}", merge_sha)
-        or not isinstance(role_sep, dict)
-        or role_sep.get("distinct") is not True
-        or any(
-            not isinstance(role_sep.get(role), str) or not role_sep.get(role)
-            for role in ("author", "auditor", "merger")
-        )
-        or len({role_sep.get("author"), role_sep.get("auditor"), role_sep.get("merger")}) != 3
-        or merge_md.get("author") != role_sep.get("author")
-        or merge_md.get("auditor") != role_sep.get("auditor")
-        or role_sep.get("author") != FACTORY_REVIEW_AUTHOR_ACTOR
-        or role_sep.get("auditor") != FACTORY_REVIEW_AUDITOR_ACTOR
-        or role_sep.get("merger") != FACTORY_REVIEW_MERGER_ACTOR
-        or merge_md.get("merged_by") != FACTORY_REVIEW_MERGER_ACTOR
-        or merge_md.get("forbidden_actions_performed") != []
-        or merge_md.get("secret_exposure") != "none"
     ):
         return None
 
