@@ -367,9 +367,12 @@ def _reviewed_author_chain(
     conn, *, canonical_merger_receipt=False, source_pr=49, live_multi_child_shape=False,
     immutable_pr54_receipts=False, activation_cycle=False, terminal_runtime=True,
     runtime_assignee="gm", current_pr56_receipts=False,
-    current_descendant_runtime=False,
+    current_descendant_runtime=False, handoff_reason=None,
+    terminal_typed_audit=False,
 ):
     """Create one exact reviewed author -> auditor -> merger -> runtime chain."""
+    if terminal_typed_audit:
+        current_pr56_receipts = True
     if current_pr56_receipts:
         source_pr = 56
         runtime_assignee = "merger"
@@ -455,7 +458,10 @@ def _reviewed_author_chain(
         author,
         expected_run_id=author_run,
         review_task_id=reviewer,
-        reason=f"PR #{source_pr} frozen at exact head {head}",
+        reason=(
+            f"PR #{source_pr} frozen at exact head {head}"
+            if handoff_reason is None else handoff_reason
+        ),
     )
     assert handoff is not None
 
@@ -469,7 +475,10 @@ def _reviewed_author_chain(
         author_run = _claim_and_run_id(conn, author)
         assert kb.request_review_handoff(
             conn, author, expected_run_id=author_run, review_task_id=reviewer,
-            reason=f"PR #{source_pr} repaired at exact head {head}",
+            reason=(
+                f"PR #{source_pr} repaired at exact head {head}"
+                if handoff_reason is None else handoff_reason
+            ),
         ) is not None
         reviewer_run = _claim_and_run_id(conn, reviewer)
     review_reason = (
@@ -486,6 +495,7 @@ def _reviewed_author_chain(
     reviewer_metadata = {
         "author_task": author,
         "review_outcome": "APPROVE_EXACT_HEAD",
+        "source_pr": source_pr,
         "head_sha": head,
         "tree_sha": tree,
         "base_sha": base,
@@ -522,6 +532,22 @@ def _reviewed_author_chain(
             "repository": "kiddhu/hermes-agent",
             "secret_exposure": "none",
             "tree": tree,
+        }
+    if terminal_typed_audit:
+        reviewer_metadata = {
+            "verdict": "PASS_EXACT_HEAD",
+            "native_review_run": reviewer_run,
+            "commit_bound_review": (
+                f"https://github.com/kiddhu/hermes-agent/pull/{source_pr}"
+                f"#pullrequestreview-{review_id}"
+            ),
+            "head": head,
+            "tree": tree,
+            "base": base,
+            "changed_files": changed_files,
+            "merge_allowed": True,
+            "forbidden_actions_performed": [],
+            "secret_exposure": "none",
         }
     if canonical_merger_receipt:
         # Exact immutable t_463814e3/run3382 shape: author identity is bound by
@@ -637,6 +663,38 @@ def _reviewed_author_chain(
             "author_finalizer_performed": False,
             "forbidden_actions_performed": [], "secret_exposure": "none",
         }
+    if terminal_typed_audit:
+        merger_metadata = {
+            "audit_verdict": "PASS_EXACT_HEAD",
+            "audited_head": head,
+            "audited_tree": tree,
+            "base_main_before": base,
+            "canonical_main_after": merge_sha,
+            "cas_merge_count": 1,
+            "changed_files": changed_files,
+            "commit_bound_review": (
+                f"https://github.com/kiddhu/hermes-agent/pull/{source_pr}"
+                f"#pullrequestreview-{review_id}"
+            ),
+            "exact_audit_run": reviewer_run,
+            "exact_audit_task": reviewer,
+            "implementation_author": "007AION",
+            "implementation_run": author_run,
+            "implementation_task": author,
+            "independent_auditor": "GemAION/bafuxunan",
+            "merge_commit": merge_sha,
+            "merge_parents": [base, head],
+            "merge_tree": tree,
+            "merger_role": "AION-GM",
+            "native_run_id": merger_run,
+            "pr": f"https://github.com/kiddhu/hermes-agent/pull/{source_pr}",
+            "pr_state": "MERGED",
+            "reviewed_author_finalizer_performed": False,
+            "runtime_install_performed": False,
+            "typed_runtime_witness_performed": False,
+            "forbidden_actions_performed": [],
+            "secret_exposure": "none",
+        }
     assert kb.complete_task(
         conn,
         merger,
@@ -657,7 +715,7 @@ def _reviewed_author_chain(
             "forbidden_actions_performed": [],
             "secret_exposure": "none",
         }
-        if immutable_pr54_receipts:
+        if immutable_pr54_receipts or terminal_typed_audit:
             runtime_metadata.update({
                 "witness_type": "RUNTIME_INSTALL_READBACK",
                 "source_pr": source_pr,
@@ -763,7 +821,10 @@ def test_reviewed_author_accepts_immutable_pr54_receipts_and_runtime_witness(
     """Exact live shape resolves without rewriting immutable receipts."""
     with kb.connect() as conn:
         author, author_run, *_ = _reviewed_author_chain(
-            conn, immutable_pr54_receipts=True, activation_cycle=True,
+            conn,
+            immutable_pr54_receipts=True,
+            activation_cycle=True,
+            handoff_reason="exact immutable audit frozen without prose authority",
         )
 
         assert kb._reviewed_author_finalizer_run_id(conn, author) == author_run
@@ -786,6 +847,111 @@ def test_reviewed_author_accepts_repaired_same_reviewer_request_changes_then_pas
             if json.loads(row["payload"])["review_task_id"] == reviewer
         ]
         assert verdicts == ["request_changes", "pass"]
+        assert kb._reviewed_author_finalizer_run_id(conn, author) == author_run
+
+
+@pytest.mark.parametrize(
+    "handoff_reason",
+    [
+        "exact head frozen for independent audit",
+        "PR #56 exact head frozen for independent audit",
+    ],
+)
+def test_reviewed_author_uses_typed_audit_pr_with_optional_matching_handoff_corroboration(
+    kanban_home, aion_gov_src, handoff_reason,
+):
+    with kb.connect() as conn:
+        author, author_run, *_ = _reviewed_author_chain(
+            conn,
+            terminal_typed_audit=True,
+            handoff_reason=handoff_reason,
+        )
+        assert kb._reviewed_author_finalizer_run_id(conn, author) == author_run
+
+
+@pytest.mark.parametrize(
+    "handoff_reason",
+    [
+        "PR #55 exact head frozen for independent audit",
+        "PR #56 supersedes PR #55 at the exact audited head",
+    ],
+)
+def test_reviewed_author_rejects_mismatched_or_multiple_handoff_pr_tokens(
+    kanban_home, aion_gov_src, handoff_reason,
+):
+    with kb.connect() as conn:
+        author, *_ = _reviewed_author_chain(
+            conn,
+            terminal_typed_audit=True,
+            handoff_reason=handoff_reason,
+        )
+        assert kb._reviewed_author_finalizer_run_id(conn, author) is None
+
+
+@pytest.mark.parametrize("typed_pr", [None, "56", [56], 0, -1])
+def test_reviewed_author_rejects_missing_or_malformed_typed_audit_source_pr(
+    kanban_home, aion_gov_src, typed_pr,
+):
+    with kb.connect() as conn:
+        author, _, reviewer, *_ = _reviewed_author_chain(
+            conn,
+            current_pr56_receipts=True,
+            handoff_reason="forged prose omits an authoritative PR token",
+        )
+        _rewrite_latest_run_metadata(
+            conn,
+            reviewer,
+            lambda md: md.pop("pr") if typed_pr is None else md.__setitem__("pr", typed_pr),
+        )
+        assert kb._reviewed_author_finalizer_run_id(conn, author) is None
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda md: md.pop("commit_bound_review"),
+        lambda md: md.__setitem__(
+            "commit_bound_review",
+            "https://github.com/attacker/repo/pull/56#pullrequestreview-5053786034",
+        ),
+        lambda md: md.__setitem__(
+            "commit_bound_review",
+            "https://github.com/kiddhu/hermes-agent/pull/56/pull/57#pullrequestreview-5053786034",
+        ),
+        lambda md: md.__setitem__("audit_outcome", "PASS_EXACT_HEAD"),
+    ],
+)
+def test_reviewed_author_rejects_missing_ambiguous_or_mixed_terminal_audit_source_pr(
+    kanban_home, aion_gov_src, mutate,
+):
+    with kb.connect() as conn:
+        author, _, reviewer, *_ = _reviewed_author_chain(
+            conn,
+            terminal_typed_audit=True,
+            handoff_reason="exact head frozen without prose authority",
+        )
+        _rewrite_latest_run_metadata(conn, reviewer, mutate)
+        assert kb._reviewed_author_finalizer_run_id(conn, author) is None
+
+
+def test_reviewed_author_ignores_forged_task_and_comment_pr_prose(
+    kanban_home, aion_gov_src,
+):
+    with kb.connect() as conn:
+        author, author_run, *_ = _reviewed_author_chain(
+            conn,
+            terminal_typed_audit=True,
+            handoff_reason="exact head frozen for independent audit",
+        )
+        conn.execute(
+            "UPDATE tasks SET title = ?, body = ? WHERE id = ?",
+            ("forged PR #999 title", "forged PR #998 body", author),
+        )
+        conn.execute(
+            "INSERT INTO task_comments(task_id, author, body, created_at) VALUES (?, ?, ?, ?)",
+            (author, "worker", "forged PR #997 comment", int(time.time())),
+        )
+        conn.commit()
         assert kb._reviewed_author_finalizer_run_id(conn, author) == author_run
 
 
