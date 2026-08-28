@@ -7477,21 +7477,58 @@ def _reviewed_author_finalizer_run_id(
     _reviewer_run_id, reviewer_profile, review_md = reviewer
     if reviewer_profile != FACTORY_REVIEW_AUDITOR_PROFILE:
         return None
-    head = review_md.get("head_sha")
-    tree = review_md.get("tree_sha")
-    base = review_md.get("base_sha")
-    review_id = review_md.get("github_review_id")
-    changed_files = review_md.get("changed_files")
-    if (
-        ("author_task" in review_md and review_md.get("author_task") != task_id)
-        or review_md.get("review_outcome") != "APPROVE_EXACT_HEAD"
-        or any(not isinstance(value, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", value)
-               for value in (head, tree, base))
-        or not isinstance(review_id, int)
-        or review_id <= 0
-        or not isinstance(changed_files, list)
-        or not changed_files
-        or any(not isinstance(path, str) or not path for path in changed_files)
+    canonical_review_keys = {
+        "head_sha", "tree_sha", "base_sha", "github_review_id", "changed_files",
+    }
+    immutable_review_keys = {
+        "head", "tree", "base", "review_comment_id", "author_identity",
+        "auditor_identity",
+    }
+    has_canonical_review = bool(canonical_review_keys.intersection(review_md))
+    has_immutable_review = bool(immutable_review_keys.intersection(review_md))
+    if has_canonical_review == has_immutable_review:
+        return None
+    if has_canonical_review:
+        head = review_md.get("head_sha")
+        tree = review_md.get("tree_sha")
+        base = review_md.get("base_sha")
+        review_id = review_md.get("github_review_id")
+        changed_files = review_md.get("changed_files")
+        if (
+            not canonical_review_keys.issubset(review_md)
+            or ("author_task" in review_md and review_md.get("author_task") != task_id)
+            or review_md.get("review_outcome") != "APPROVE_EXACT_HEAD"
+            or not isinstance(review_id, int)
+            or review_id <= 0
+            or not isinstance(changed_files, list)
+            or not changed_files
+            or any(not isinstance(path, str) or not path for path in changed_files)
+        ):
+            return None
+    else:
+        head = review_md.get("head")
+        tree = review_md.get("tree")
+        base = review_md.get("base")
+        review_comment_id = review_md.get("review_comment_id")
+        review_id = None
+        changed_files = None
+        if (
+            not immutable_review_keys.issubset(review_md)
+            or "author_task" in review_md
+            or review_md.get("review_outcome") != "PASS_EXACT_HEAD"
+            or review_md.get("pr")
+            != f"https://github.com/{FACTORY_REVIEW_REPOSITORY}/pull/{source_pr_number}"
+            or review_md.get("author_identity") != FACTORY_REVIEW_AUTHOR_ACTOR
+            or review_md.get("auditor_identity") != FACTORY_REVIEW_AUDITOR_ACTOR
+            or not isinstance(review_comment_id, int)
+            or review_comment_id <= 0
+            or review_md.get("forbidden_actions_performed") != []
+            or review_md.get("secret_exposure") != "none"
+        ):
+            return None
+    if any(
+        not isinstance(value, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", value)
+        for value in (head, tree, base)
     ):
         return None
 
@@ -7507,6 +7544,30 @@ def _reviewed_author_finalizer_run_id(
         "auditor_actor", "native_task_id", "native_run_id", "native_profile",
         "gate_verdict", "merge_performed", "production_or_runtime_mutation",
     }
+    immutable_keys = {
+        "verdict", "repo", "pr", "audited_head", "audited_tree", "base_at_audit",
+        "merge_commit", "canonical_main", "canonical_main_tree", "merge_parents",
+        "merger_identity", "auditor_identity", "github_review_id",
+        "native_audit_task", "native_audit_run", "native_audit_verdict",
+        "tools_approval_blob_candidate", "tools_approval_blob_main",
+        "merge_performed", "production_or_runtime_mutation",
+        "forbidden_actions_performed", "secret_exposure",
+    }
+    legacy_family_keys = legacy_keys | {
+        "repository", "pr_number", "merge_commit_sha", "merged_by",
+    }
+    canonical_family_keys = canonical_keys | {
+        "verdict", "repository", "pr_number", "merge_commit_sha", "merged_by",
+        "canonical_main_sha", "canonical_main_parents",
+        "audited_head_is_main_parent", "main_equals_merge_commit",
+    }
+    # Detect a family from every key exclusive to its accepted shape, not a
+    # hand-picked subset.  Otherwise an immutable receipt can be enriched with
+    # a non-discriminator alias such as canonical ``audit_run_id`` or legacy
+    # ``author`` and still pass as a pure immutable receipt.
+    legacy_discriminators = legacy_family_keys - canonical_family_keys - immutable_keys
+    canonical_discriminators = canonical_family_keys - legacy_family_keys - immutable_keys
+    immutable_discriminators = immutable_keys - legacy_family_keys - canonical_family_keys
     canonical_mergers = []
     for child in conn.execute(
         "SELECT child_id FROM task_links WHERE parent_id = ? ORDER BY child_id",
@@ -7519,7 +7580,10 @@ def _reviewed_author_finalizer_run_id(
         candidate_run_id, candidate_profile, candidate_md = candidate
         if (
             candidate_profile == FACTORY_REVIEW_MERGER_PROFILE
-            and canonical_keys.intersection(candidate_md)
+            and (
+                canonical_discriminators.intersection(candidate_md)
+                or immutable_discriminators.intersection(candidate_md)
+            )
         ):
             canonical_mergers.append(
                 (child_id, candidate_run_id, candidate_profile, candidate_md)
@@ -7544,11 +7608,23 @@ def _reviewed_author_finalizer_run_id(
         or not _all_other_parents_terminal(conn, merger_id, reviewer_id)
     ):
         return None
-    has_legacy_schema = bool(legacy_keys.intersection(merge_md))
-    has_canonical_schema = bool(canonical_keys.intersection(merge_md))
-    if has_legacy_schema == has_canonical_schema:
+    schema_families = (
+        bool(legacy_discriminators.intersection(merge_md)),
+        bool(canonical_discriminators.intersection(merge_md)),
+        bool(immutable_discriminators.intersection(merge_md)),
+    )
+    if sum(schema_families) != 1:
         # Missing, partial-without-a-discriminator, and mixed alias schemas are
         # ambiguous.  Never let caller-authored aliases complete a receipt.
+        return None
+    has_legacy_schema, has_canonical_schema, has_immutable_schema = schema_families
+    family_keys = (legacy_family_keys, canonical_family_keys, immutable_keys)
+    selected_family_keys = family_keys[schema_families.index(True)]
+    foreign_aliases = set().union(*family_keys) - selected_family_keys
+    if foreign_aliases.intersection(merge_md):
+        # Some aliases are shared by two foreign families, so they cannot act
+        # as an exclusive discriminator.  Once the family is selected, still
+        # reject every recognized key that does not belong to that family.
         return None
 
     merge_sha = merge_md.get("merge_commit_sha")
@@ -7590,7 +7666,7 @@ def _reviewed_author_finalizer_run_id(
             }) != 3
         ):
             return None
-    else:
+    elif has_legacy_schema:
         role_sep = merge_md.get("role_separation")
         if (
             not legacy_keys.issubset(merge_md)
@@ -7617,6 +7693,48 @@ def _reviewed_author_finalizer_run_id(
             or merge_md.get("secret_exposure") != "none"
         ):
             return None
+    else:
+        merge_sha = merge_md.get("merge_commit")
+        repository = merge_md.get("repo")
+        pr_number = merge_md.get("pr")
+        merge_parents = merge_md.get("merge_parents")
+        immutable_review_id = merge_md.get("github_review_id")
+        candidate_blob = merge_md.get("tools_approval_blob_candidate")
+        main_blob = merge_md.get("tools_approval_blob_main")
+        if (
+            not has_immutable_schema
+            or not immutable_keys.issubset(merge_md)
+            or merge_md.get("verdict") != "EXACT_HEAD_MERGED_MAIN_READBACK"
+            or merge_md.get("audited_head") != head
+            or merge_md.get("audited_tree") != tree
+            or merge_md.get("base_at_audit") != base
+            or merge_md.get("canonical_main") != merge_sha
+            or merge_md.get("canonical_main_tree") != tree
+            or not isinstance(merge_parents, list)
+            or head not in merge_parents
+            or base not in merge_parents
+            or not isinstance(immutable_review_id, int)
+            or immutable_review_id <= 0
+            or merge_md.get("native_audit_task") != reviewer_id
+            or merge_md.get("native_audit_run") != _reviewer_run_id
+            or merge_md.get("native_audit_verdict") != "PASS_EXACT_HEAD"
+            or not isinstance(candidate_blob, str)
+            or not re.fullmatch(r"[0-9a-fA-F]{40}", candidate_blob)
+            or main_blob != candidate_blob
+            or merge_md.get("auditor_identity") != FACTORY_REVIEW_AUDITOR_ACTOR
+            or merge_md.get("merger_identity") != FACTORY_REVIEW_MERGER_ACTOR
+            or len({
+                FACTORY_REVIEW_AUTHOR_ACTOR,
+                merge_md.get("auditor_identity"),
+                merge_md.get("merger_identity"),
+            }) != 3
+            or merge_md.get("merge_performed") is not True
+            or merge_md.get("production_or_runtime_mutation") is not False
+            or merge_md.get("forbidden_actions_performed") != []
+            or merge_md.get("secret_exposure") != "none"
+        ):
+            return None
+        review_id = immutable_review_id
 
     if (
         repository != FACTORY_REVIEW_REPOSITORY
@@ -7626,23 +7744,55 @@ def _reviewed_author_finalizer_run_id(
     ):
         return None
 
-    runtime_id = _one_direct_child(conn, merger_id)
-    if runtime_id is None or not _all_other_parents_terminal(conn, runtime_id, merger_id):
+    runtime_witnesses = []
+    runtime_discriminators = {
+        "canonical_run_id", "install", "witness_type", "source_pr",
+        "source_head", "source_tree", "source_merge", "source_changed_paths",
+    }
+    for child in conn.execute(
+        "SELECT child_id FROM task_links WHERE parent_id = ? ORDER BY child_id",
+        (merger_id,),
+    ).fetchall():
+        child_id = str(child["child_id"])
+        candidate = _authenticated_factory_run_metadata(conn, child_id)
+        if candidate is None:
+            # Nonterminal activation children carry no authenticated terminal
+            # provenance and cannot satisfy or compete with a runtime witness.
+            continue
+        candidate_run_id, candidate_profile, candidate_md = candidate
+        if runtime_discriminators.intersection(candidate_md):
+            runtime_witnesses.append(
+                (child_id, candidate_run_id, candidate_profile, candidate_md)
+            )
+    if len(runtime_witnesses) != 1:
         return None
-    runtime = _authenticated_factory_run_metadata(conn, runtime_id)
-    if runtime is None:
+    runtime_id, runtime_run_id, runtime_profile, runtime_md = runtime_witnesses[0]
+    if not _all_other_parents_terminal(conn, runtime_id, merger_id):
         return None
-    runtime_run_id, runtime_profile, runtime_md = runtime
     install = runtime_md.get("install")
+    runtime_changed_paths = install.get("changed_paths") if isinstance(install, dict) else None
     if (
         runtime_profile in {author["assignee"], reviewer_profile, merger_profile}
         or runtime_md.get("canonical_run_id") != runtime_run_id
         or not isinstance(install, dict)
         or install.get("head") != merge_sha
         or install.get("tree") != tree
-        or install.get("changed_paths") != changed_files
+        or not isinstance(runtime_changed_paths, list)
+        or not runtime_changed_paths
+        or any(not isinstance(path, str) or not path for path in runtime_changed_paths)
+        or (changed_files is not None and runtime_changed_paths != changed_files)
         or runtime_md.get("forbidden_actions_performed") != []
         or runtime_md.get("secret_exposure") != "none"
+    ):
+        return None
+    if has_immutable_review and (
+        runtime_md.get("witness_type") != "RUNTIME_INSTALL_READBACK"
+        or runtime_md.get("source_pr") != source_pr_number
+        or runtime_md.get("source_head") != head
+        or runtime_md.get("source_tree") != tree
+        or runtime_md.get("source_merge") != merge_sha
+        or runtime_md.get("github_review_id") != review_id
+        or runtime_md.get("source_changed_paths") != runtime_changed_paths
     ):
         return None
     return author_run_id

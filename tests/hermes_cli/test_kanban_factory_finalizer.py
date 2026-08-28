@@ -348,28 +348,41 @@ def test_t2_finalizer_completes_atomically_child_wakes(kanban_home, aion_gov_src
 
 def _reviewed_author_chain(
     conn, *, canonical_merger_receipt=False, source_pr=49, live_multi_child_shape=False,
+    immutable_pr54_receipts=False, activation_cycle=False, terminal_runtime=True,
+    runtime_assignee="gm",
 ):
     """Create one exact reviewed author -> auditor -> merger -> runtime chain."""
+    if immutable_pr54_receipts:
+        source_pr = 54
     head = (
-        "d622fcf38da613ce25bf4eaf37c54a94053d5e70"
+        "b4cf71fffbeeea2446fe3060b2ee283d09d12014"
+        if immutable_pr54_receipts else "d622fcf38da613ce25bf4eaf37c54a94053d5e70"
         if canonical_merger_receipt else "1" * 40
     )
     tree = (
-        "1e5e822f33c5fe227982ff9e4e1de320cb862c42"
+        "00aca8ed67457e0b0bdccb7ea07343da1031bbc4"
+        if immutable_pr54_receipts else "1e5e822f33c5fe227982ff9e4e1de320cb862c42"
         if canonical_merger_receipt else "2" * 40
     )
     base = (
-        "f6dfcb6d50f512e0944cd8f56367ccb0eac6ace8"
+        "d153fadd9fac7a321d728254e3136cd3e717bbf6"
+        if immutable_pr54_receipts else "f6dfcb6d50f512e0944cd8f56367ccb0eac6ace8"
         if canonical_merger_receipt else "3" * 40
     )
     merge_sha = (
-        "9920fd369b4b0c14bc292b7585431f16a4028f31"
+        "6b521c8637d477a76451d0d029cc24026d01cf61"
+        if immutable_pr54_receipts else "9920fd369b4b0c14bc292b7585431f16a4028f31"
         if canonical_merger_receipt else "4" * 40
     )
-    review_id = 5037761833 if canonical_merger_receipt else 12345
+    review_id = (
+        5050442013 if immutable_pr54_receipts else
+        5037761833 if canonical_merger_receipt else 12345
+    )
     changed_files = (
         ["hermes_cli/kanban_db.py", "tests/hermes_cli/test_kanban_factory_finalizer.py"]
-        if canonical_merger_receipt else ["hermes_cli/kanban_db.py"]
+        if canonical_merger_receipt else
+        ["tools/approval.py", "tests/tools/test_aion889_prior_authorization.py"]
+        if immutable_pr54_receipts else ["hermes_cli/kanban_db.py"]
     )
     author = kb.create_task(
         conn, title="reviewed author", factory_build_gate=1, assignee="agent007",
@@ -382,9 +395,14 @@ def _reviewed_author_chain(
         conn, title="role-separated merge", factory_build_gate=1,
         assignee="merger", parents=[reviewer],
     )
+    if activation_cycle:
+        kb.create_task(
+            conn, title="author-gated activation", factory_build_gate=1,
+            assignee="gm", parents=[merger, author],
+        )
     runtime = kb.create_task(
-        conn, title="runtime readback", factory_build_gate=1,
-        assignee="gm", parents=[merger],
+        conn, title="runtime install witness", factory_build_gate=1,
+        assignee=runtime_assignee, parents=[merger],
     )
 
     author_run = _claim_and_run_id(conn, author)
@@ -418,6 +436,21 @@ def _reviewed_author_chain(
         "github_review_id": review_id,
         "changed_files": changed_files,
     }
+    if immutable_pr54_receipts:
+        # Exact sanitized t_68fee4c0/run3434 immutable metadata shape.  The
+        # historical receipt cannot be enriched with canonical aliases.
+        reviewer_metadata = {
+            "review_outcome": "PASS_EXACT_HEAD",
+            "pr": "https://github.com/kiddhu/hermes-agent/pull/54",
+            "head": head,
+            "tree": tree,
+            "base": base,
+            "author_identity": "007AION",
+            "auditor_identity": "GemAION",
+            "review_comment_id": 4798,
+            "forbidden_actions_performed": [],
+            "secret_exposure": "none",
+        }
     if canonical_merger_receipt:
         # Exact immutable t_463814e3/run3382 shape: author identity is bound by
         # the typed handoff/direct edge/verdict, not duplicated in metadata.
@@ -486,6 +519,33 @@ def _reviewed_author_chain(
             "merge_performed": True,
             "production_or_runtime_mutation": False,
         }
+    if immutable_pr54_receipts:
+        # Exact sanitized t_e404f7ab/run3438 immutable metadata shape.  Keep
+        # audited_head/audited_tree/base_at_audit and native_audit_* as-is.
+        merger_metadata = {
+            "verdict": "EXACT_HEAD_MERGED_MAIN_READBACK",
+            "repo": "kiddhu/hermes-agent",
+            "pr": 54,
+            "audited_head": head,
+            "audited_tree": tree,
+            "base_at_audit": base,
+            "merge_commit": merge_sha,
+            "canonical_main": merge_sha,
+            "canonical_main_tree": tree,
+            "merge_parents": [base, head],
+            "merger_identity": "kiddhu",
+            "auditor_identity": "GemAION",
+            "github_review_id": review_id,
+            "native_audit_task": reviewer,
+            "native_audit_run": reviewer_run,
+            "native_audit_verdict": "PASS_EXACT_HEAD",
+            "tools_approval_blob_candidate": "badb5ef99e71334fc7c0d38555c9f2f2011df7cb",
+            "tools_approval_blob_main": "badb5ef99e71334fc7c0d38555c9f2f2011df7cb",
+            "merge_performed": True,
+            "production_or_runtime_mutation": False,
+            "forbidden_actions_performed": [],
+            "secret_exposure": "none",
+        }
     assert kb.complete_task(
         conn,
         merger,
@@ -494,13 +554,9 @@ def _reviewed_author_chain(
         metadata=merger_metadata,
     )
 
-    runtime_run = _claim_and_run_id(conn, runtime)
-    assert kb.complete_task(
-        conn,
-        runtime,
-        expected_run_id=runtime_run,
-        summary="exact runtime installed and read back",
-        metadata={
+    if terminal_runtime:
+        runtime_run = _claim_and_run_id(conn, runtime)
+        runtime_metadata = {
             "canonical_run_id": runtime_run,
             "install": {
                 "head": merge_sha,
@@ -509,8 +565,24 @@ def _reviewed_author_chain(
             },
             "forbidden_actions_performed": [],
             "secret_exposure": "none",
-        },
-    )
+        }
+        if immutable_pr54_receipts:
+            runtime_metadata.update({
+                "witness_type": "RUNTIME_INSTALL_READBACK",
+                "source_pr": source_pr,
+                "source_head": head,
+                "source_tree": tree,
+                "source_merge": merge_sha,
+                "github_review_id": review_id,
+                "source_changed_paths": changed_files,
+            })
+        assert kb.complete_task(
+            conn,
+            runtime,
+            expected_run_id=runtime_run,
+            summary="exact runtime installed and read back",
+            metadata=runtime_metadata,
+        )
     if live_multi_child_shape:
         # The Monarch-named live author has historical/dependency children and
         # its handoff-selected reviewer has an unrelated historical child.
@@ -553,6 +625,231 @@ def test_reviewed_author_accepts_canonical_immutable_merger_receipt(
         assert kb._reviewed_author_finalizer_run_id(conn, author) == author_run
         assert kb.complete_task(conn, author, summary="canonical chain terminalized")
         assert kb.get_task(conn, author).status == "done"
+
+
+def test_reviewed_author_accepts_immutable_pr54_receipts_and_runtime_witness(
+    kanban_home, aion_gov_src,
+):
+    """Exact live shape resolves without rewriting immutable receipts."""
+    with kb.connect() as conn:
+        author, author_run, *_ = _reviewed_author_chain(
+            conn, immutable_pr54_receipts=True, activation_cycle=True,
+        )
+
+        assert kb._reviewed_author_finalizer_run_id(conn, author) == author_run
+
+
+def test_reviewed_author_ignores_unrelated_terminal_runtime_child(
+    kanban_home, aion_gov_src,
+):
+    with kb.connect() as conn:
+        author, author_run, _reviewer, merger, _runtime = _reviewed_author_chain(
+            conn, immutable_pr54_receipts=True, activation_cycle=True,
+        )
+        unrelated = kb.create_task(
+            conn, title="historical non-runtime child", factory_build_gate=1,
+            assignee="gm2", parents=[merger],
+        )
+        unrelated_run = _claim_and_run_id(conn, unrelated)
+        assert kb.complete_task(
+            conn, unrelated, expected_run_id=unrelated_run,
+            summary="unrelated historical receipt", metadata={"kind": "history"},
+        )
+        assert kb._reviewed_author_finalizer_run_id(conn, author) == author_run
+
+
+@pytest.mark.parametrize(
+    "drift",
+    [
+        "review_missing_head", "review_mixed_schema", "review_outcome",
+        "review_pr", "review_role_collision", "merger_missing_head",
+        "merger_mixed_schema", "merger_mixed_canonical_alias",
+        "merger_mixed_legacy_alias", "merger_mixed_shared_alias",
+        "merger_audit_task", "merger_audit_run",
+        "merger_review", "merger_ancestry", "merger_tree", "merger_blob",
+        "runtime_zero", "runtime_two", "runtime_partial_competitor",
+        "runtime_self_role", "runtime_tree", "runtime_path",
+        "runtime_source_head", "runtime_source_review", "runtime_witness_type",
+        "runtime_wrong_ancestry", "runtime_unauthenticated",
+    ],
+)
+def test_immutable_pr54_drift_fails_closed_zero_author_mutation(
+    kanban_home, aion_gov_src, drift,
+):
+    terminal_runtime = drift not in {"runtime_zero", "runtime_unauthenticated"}
+    runtime_assignee = "agent007" if drift == "runtime_self_role" else "gm"
+    with kb.connect() as conn:
+        author, _author_run, reviewer, merger, runtime = _reviewed_author_chain(
+            conn, immutable_pr54_receipts=True, activation_cycle=True,
+            terminal_runtime=terminal_runtime, runtime_assignee=runtime_assignee,
+        )
+        if drift == "review_missing_head":
+            _rewrite_latest_run_metadata(conn, reviewer, lambda md: md.pop("head"))
+        elif drift == "review_mixed_schema":
+            _rewrite_latest_run_metadata(
+                conn, reviewer, lambda md: md.__setitem__("head_sha", md["head"]),
+            )
+        elif drift == "review_outcome":
+            _rewrite_latest_run_metadata(
+                conn, reviewer,
+                lambda md: md.__setitem__("review_outcome", "APPROVE_EXACT_HEAD"),
+            )
+        elif drift == "review_pr":
+            _rewrite_latest_run_metadata(
+                conn, reviewer,
+                lambda md: md.__setitem__(
+                    "pr", "https://github.com/attacker/repo/pull/54"
+                ),
+            )
+        elif drift == "review_role_collision":
+            _rewrite_latest_run_metadata(
+                conn, reviewer,
+                lambda md: md.__setitem__("auditor_identity", "007AION"),
+            )
+        elif drift == "merger_missing_head":
+            _rewrite_latest_run_metadata(conn, merger, lambda md: md.pop("audited_head"))
+        elif drift == "merger_mixed_schema":
+            _rewrite_latest_run_metadata(
+                conn, merger,
+                lambda md: md.__setitem__("expected_head", md["audited_head"]),
+            )
+        elif drift == "merger_mixed_canonical_alias":
+            # audit_run_id belongs only to the canonical receipt family but
+            # was omitted from the original discriminator subset.
+            _rewrite_latest_run_metadata(
+                conn, merger, lambda md: md.__setitem__("audit_run_id", 999),
+            )
+        elif drift == "merger_mixed_legacy_alias":
+            # author belongs only to the legacy receipt family but is not one
+            # of that family's head/tree/base discriminator fields.
+            _rewrite_latest_run_metadata(
+                conn, merger, lambda md: md.__setitem__("author", "007AION"),
+            )
+        elif drift == "merger_mixed_shared_alias":
+            # repository is shared by canonical and legacy receipts, so it
+            # cannot identify either family by itself but is still foreign to
+            # the immutable family and must fail closed when present.
+            _rewrite_latest_run_metadata(
+                conn, merger,
+                lambda md: md.__setitem__("repository", "kiddhu/hermes-agent"),
+            )
+        elif drift == "merger_audit_task":
+            _rewrite_latest_run_metadata(
+                conn, merger,
+                lambda md: md.__setitem__("native_audit_task", "t_forged"),
+            )
+        elif drift == "merger_audit_run":
+            _rewrite_latest_run_metadata(
+                conn, merger, lambda md: md.__setitem__("native_audit_run", -1),
+            )
+        elif drift == "merger_review":
+            _rewrite_latest_run_metadata(
+                conn, merger, lambda md: md.__setitem__("github_review_id", 999),
+            )
+        elif drift == "merger_ancestry":
+            _rewrite_latest_run_metadata(
+                conn, merger,
+                lambda md: md.__setitem__("merge_parents", [md["base_at_audit"]]),
+            )
+        elif drift == "merger_tree":
+            _rewrite_latest_run_metadata(
+                conn, merger,
+                lambda md: md.__setitem__("canonical_main_tree", "9" * 40),
+            )
+        elif drift == "merger_blob":
+            _rewrite_latest_run_metadata(
+                conn, merger,
+                lambda md: md.__setitem__("tools_approval_blob_main", "9" * 40),
+            )
+        elif drift in {"runtime_two", "runtime_partial_competitor"}:
+            competitor = kb.create_task(
+                conn, title="competing runtime witness", factory_build_gate=1,
+                assignee="gm2", parents=[merger],
+            )
+            competitor_run = _claim_and_run_id(conn, competitor)
+            install = {} if drift == "runtime_partial_competitor" else {
+                "head": "6b521c8637d477a76451d0d029cc24026d01cf61",
+                "tree": "00aca8ed67457e0b0bdccb7ea07343da1031bbc4",
+                "changed_paths": [
+                    "tools/approval.py",
+                    "tests/tools/test_aion889_prior_authorization.py",
+                ],
+            }
+            assert kb.complete_task(
+                conn, competitor, expected_run_id=competitor_run,
+                metadata={
+                    "canonical_run_id": competitor_run, "install": install,
+                    "forbidden_actions_performed": [], "secret_exposure": "none",
+                },
+            )
+        elif drift == "runtime_tree":
+            _rewrite_latest_run_metadata(
+                conn, runtime,
+                lambda md: md["install"].__setitem__("tree", "9" * 40),
+            )
+        elif drift == "runtime_path":
+            _rewrite_latest_run_metadata(
+                conn, runtime,
+                lambda md: md["install"].__setitem__(
+                    "changed_paths", ["attacker.py"]
+                ),
+            )
+        elif drift == "runtime_source_head":
+            _rewrite_latest_run_metadata(
+                conn, runtime, lambda md: md.__setitem__("source_head", "9" * 40),
+            )
+        elif drift == "runtime_source_review":
+            _rewrite_latest_run_metadata(
+                conn, runtime, lambda md: md.__setitem__("github_review_id", 999),
+            )
+        elif drift == "runtime_witness_type":
+            _rewrite_latest_run_metadata(
+                conn, runtime,
+                lambda md: md.__setitem__("witness_type", "ACTIVATION"),
+            )
+        elif drift == "runtime_wrong_ancestry":
+            unrelated_parent = kb.create_task(conn, title="unrelated parent", assignee="gm2")
+            conn.execute(
+                "INSERT INTO task_links (parent_id, child_id) VALUES (?, ?)",
+                (unrelated_parent, runtime),
+            )
+            conn.commit()
+        elif drift == "runtime_unauthenticated":
+            unauthenticated = kb.create_task(
+                conn, title="unauthenticated runtime claim", factory_build_gate=0,
+                assignee="gm2", parents=[merger],
+            )
+            unauthenticated_run = _claim_and_run_id(conn, unauthenticated)
+            assert kb.complete_task(
+                conn, unauthenticated, expected_run_id=unauthenticated_run,
+                metadata={
+                    "canonical_run_id": unauthenticated_run,
+                    "install": {
+                        "head": "6b521c8637d477a76451d0d029cc24026d01cf61",
+                        "tree": "00aca8ed67457e0b0bdccb7ea07343da1031bbc4",
+                        "changed_paths": ["tools/approval.py"],
+                    },
+                    "forbidden_actions_performed": [], "secret_exposure": "none",
+                },
+            )
+
+        before_task = dict(conn.execute(
+            "SELECT status, current_run_id, completed_at, "
+            "factory_terminal_receipt_sha256 FROM tasks WHERE id = ?", (author,),
+        ).fetchone())
+        before_events = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id = ?", (author,),
+        ).fetchone()[0]
+        with pytest.raises(kb.FactoryTerminalReceiptRequiredError):
+            kb.complete_task(conn, author, summary=f"reject {drift}")
+        assert dict(conn.execute(
+            "SELECT status, current_run_id, completed_at, "
+            "factory_terminal_receipt_sha256 FROM tasks WHERE id = ?", (author,),
+        ).fetchone()) == before_task
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id = ?", (author,),
+        ).fetchone()[0] == before_events
+        assert kb.list_attachments(conn, author) == []
 
 
 @pytest.mark.parametrize(
