@@ -368,10 +368,12 @@ def _reviewed_author_chain(
     immutable_pr54_receipts=False, activation_cycle=False, terminal_runtime=True,
     runtime_assignee="gm", current_pr56_receipts=False,
     current_descendant_runtime=False, handoff_reason=None,
-    terminal_typed_audit=False,
+    terminal_typed_audit=False, terminal_audit_verdict="PASS_EXACT_HEAD",
+    durable_terminal_gm_receipt=False,
 ):
     """Create one exact reviewed author -> auditor -> merger -> runtime chain."""
-    if terminal_typed_audit:
+    if terminal_typed_audit or durable_terminal_gm_receipt:
+        terminal_typed_audit = True
         current_pr56_receipts = True
     if current_pr56_receipts:
         source_pr = 56
@@ -535,7 +537,7 @@ def _reviewed_author_chain(
         }
     if terminal_typed_audit:
         reviewer_metadata = {
-            "verdict": "PASS_EXACT_HEAD",
+            "verdict": terminal_audit_verdict,
             "native_review_run": reviewer_run,
             "commit_bound_review": (
                 f"https://github.com/kiddhu/hermes-agent/pull/{source_pr}"
@@ -665,7 +667,7 @@ def _reviewed_author_chain(
         }
     if terminal_typed_audit:
         merger_metadata = {
-            "audit_verdict": "PASS_EXACT_HEAD",
+            "audit_verdict": terminal_audit_verdict,
             "audited_head": head,
             "audited_tree": tree,
             "base_main_before": base,
@@ -694,6 +696,68 @@ def _reviewed_author_chain(
             "typed_runtime_witness_performed": False,
             "forbidden_actions_performed": [],
             "secret_exposure": "none",
+        }
+    if durable_terminal_gm_receipt:
+        merger_metadata = {
+            "outcome": "ROLE_SEPARATED_CAS_MERGE_AND_MAIN_READBACK_COMPLETE",
+            "canonical_run_id": merger_run,
+            "project_id": "AION-889 / AION-RL2-CORE-01",
+            "source_pr": source_pr,
+            "source_pr_url": f"https://github.com/kiddhu/hermes-agent/pull/{source_pr}",
+            "implementation_task": author,
+            "implementation_run": author_run,
+            "implementation_profile": "agent007",
+            "implementation_github_actor": "007AION",
+            "exact_audit_task": reviewer,
+            "exact_audit_run": reviewer_run,
+            "audit_profile": "bafuxunan",
+            "audit_github_actor": "GemAION",
+            "audit_verdict": terminal_audit_verdict,
+            "github_review_id": review_id,
+            "commit_bound_review": (
+                f"https://github.com/kiddhu/hermes-agent/pull/{source_pr}"
+                f"#pullrequestreview-{review_id}"
+            ),
+            "audited_head": head,
+            "audited_tree": tree,
+            "audited_base": base,
+            "base_ref": "main",
+            "changed_files": changed_files,
+            "native_collision_readback": {"other_nonterminal_exact_merge_owners": 0},
+            "hosted_checks": {
+                "total": 37, "terminal": 37, "pending": 0, "failing": 0,
+                "required_aggregate": "All required checks pass",
+                "required_aggregate_conclusion": "success",
+                "required_aggregate_url": "https://github.com/example/check",
+            },
+            "cas_merge": {
+                "attempts": 1, "method": "merge", "expected_head": head,
+                "api_result": "Pull Request successfully merged",
+            },
+            "merge_profile": "gm",
+            "merge_github_actor": "kiddhu",
+            "roles_distinct": True,
+            "pr_state": "MERGED",
+            "merge_commit": merge_sha,
+            "merge_tree": tree,
+            "merge_parents": [base, head],
+            "canonical_main": merge_sha,
+            "audited_head_containment": {
+                "status": "ahead", "ahead_by": 1, "behind_by": 0,
+                "exact_second_parent": True,
+            },
+            "public_receipts": ["https://github.com/example/receipt"],
+            "runtime_install_performed": False,
+            "typed_runtime_witness_performed": False,
+            "reviewed_author_finalizer_performed": False,
+            "source_edit_performed": False,
+            "forbidden_actions_performed": [],
+            "secret_exposure": "none",
+            "new_control_plane_count": 0,
+            "not_true_done_for": ["reviewed-author finalization"],
+            "next_machine_transition": "separate typed runtime witness",
+            "artifacts": ["/tmp/sanitized-public-receipt.md"],
+            "worker_session_id": "sanitized-merger-session",
         }
     assert kb.complete_task(
         conn,
@@ -867,6 +931,136 @@ def test_reviewed_author_uses_typed_audit_pr_with_optional_matching_handoff_corr
             handoff_reason=handoff_reason,
         )
         assert kb._reviewed_author_finalizer_run_id(conn, author) == author_run
+
+
+def test_reviewed_author_accepts_authenticated_terminal_approve_exact_head_verdict(
+    kanban_home, aion_gov_src,
+):
+    """Model the sanitized affected terminal evidence family without live IDs."""
+    with kb.connect() as conn:
+        author, author_run, *_ = _reviewed_author_chain(
+            conn,
+            terminal_typed_audit=True,
+            terminal_audit_verdict="APPROVE_EXACT_HEAD",
+            durable_terminal_gm_receipt=True,
+            handoff_reason="PR #56 frozen for independent exact-head audit",
+        )
+        assert kb._reviewed_author_finalizer_run_id(conn, author) == author_run
+
+
+@pytest.mark.parametrize(
+    "verdict",
+    [
+        "APPROVED_EXACT_HEAD",
+        "approve_exact_head",
+        " APPROVE_EXACT_HEAD",
+        "APPROVE_EXACT_HEAD ",
+        "APPROVE EXACT HEAD",
+        "APPROVE_EXACT_HEAD_WITH_NOTES",
+        "audit verdict: APPROVE_EXACT_HEAD",
+        "PASS_EXACT_HEAD|APPROVE_EXACT_HEAD",
+        "REQUEST_CHANGES_EXACT_HEAD",
+        "APPROVE",
+        "pass",
+        "",
+        None,
+        True,
+    ],
+)
+def test_reviewed_author_rejects_non_enumerated_terminal_audit_verdicts(
+    kanban_home, aion_gov_src, verdict,
+):
+    with kb.connect() as conn:
+        author, *_ = _reviewed_author_chain(
+            conn,
+            terminal_typed_audit=True,
+            terminal_audit_verdict=verdict,
+            durable_terminal_gm_receipt=True,
+        )
+        assert kb._reviewed_author_finalizer_run_id(conn, author) is None
+
+
+def test_reviewed_author_rejects_conflicting_enumerated_terminal_audit_verdicts(
+    kanban_home, aion_gov_src,
+):
+    with kb.connect() as conn:
+        author, _, _, merger, _ = _reviewed_author_chain(
+            conn,
+            terminal_typed_audit=True,
+            terminal_audit_verdict="PASS_EXACT_HEAD",
+        )
+        _rewrite_latest_run_metadata(
+            conn,
+            merger,
+            lambda md: md.__setitem__("audit_verdict", "APPROVE_EXACT_HEAD"),
+        )
+        assert kb._reviewed_author_finalizer_run_id(conn, author) is None
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda md: md.pop("canonical_run_id"),
+        lambda md: md.__setitem__("implementation_task", "t_wrong"),
+        lambda md: md.__setitem__("implementation_run", -1),
+        lambda md: md.__setitem__("implementation_profile", "gm"),
+        lambda md: md.__setitem__("implementation_github_actor", "kiddhu"),
+        lambda md: md.__setitem__("exact_audit_task", "t_wrong"),
+        lambda md: md.__setitem__("exact_audit_run", -1),
+        lambda md: md.__setitem__("audit_profile", "agent007"),
+        lambda md: md.__setitem__("audit_github_actor", "007AION"),
+        lambda md: md.__setitem__("github_review_id", -1),
+        lambda md: md.__setitem__("source_pr", 57),
+        lambda md: md.__setitem__("source_pr_url", "https://github.com/attacker/repo/pull/56"),
+        lambda md: md.__setitem__("audited_head", "f" * 40),
+        lambda md: md.__setitem__("audited_tree", "f" * 40),
+        lambda md: md.__setitem__("audited_base", "f" * 40),
+        lambda md: md.__setitem__("changed_files", ["unexpected.py"]),
+        lambda md: md["native_collision_readback"].__setitem__(
+            "other_nonterminal_exact_merge_owners", 1,
+        ),
+        lambda md: md["native_collision_readback"].__setitem__(
+            "other_nonterminal_exact_merge_owners", False,
+        ),
+        lambda md: md["hosted_checks"].__setitem__("failing", 1),
+        lambda md: md["hosted_checks"].__setitem__("pending", False),
+        lambda md: md["cas_merge"].__setitem__("attempts", 2),
+        lambda md: md["cas_merge"].__setitem__("attempts", True),
+        lambda md: md.__setitem__("merge_profile", "merger"),
+        lambda md: md.__setitem__("merge_github_actor", "007AION"),
+        lambda md: md.__setitem__("roles_distinct", False),
+        lambda md: md.__setitem__("pr_state", "OPEN"),
+        lambda md: md.__setitem__("merge_commit", "f" * 40),
+        lambda md: md.__setitem__("merge_tree", "f" * 40),
+        lambda md: md.__setitem__("merge_parents", list(reversed(md["merge_parents"]))),
+        lambda md: md.__setitem__("canonical_main", "f" * 40),
+        lambda md: md["audited_head_containment"].__setitem__("exact_second_parent", False),
+        lambda md: md["audited_head_containment"].__setitem__("ahead_by", True),
+        lambda md: md.__setitem__("runtime_install_performed", True),
+        lambda md: md.__setitem__("typed_runtime_witness_performed", True),
+        lambda md: md.__setitem__("reviewed_author_finalizer_performed", True),
+        lambda md: md.__setitem__("source_edit_performed", True),
+        lambda md: md.__setitem__("new_control_plane_count", 1),
+        lambda md: md.__setitem__("new_control_plane_count", False),
+        lambda md: md.__setitem__("forbidden_actions_performed", ["rewrite"]),
+        lambda md: md.__setitem__("secret_exposure", "unknown"),
+        lambda md: md.__setitem__("expected_head", md["audited_head"]),
+    ],
+)
+def test_reviewed_author_rejects_durable_terminal_gm_receipt_drift_and_mixed_schema(
+    kanban_home, aion_gov_src, mutate,
+):
+    with kb.connect() as conn:
+        author, _, _, merger, _ = _reviewed_author_chain(
+            conn,
+            terminal_typed_audit=True,
+            terminal_audit_verdict="APPROVE_EXACT_HEAD",
+            durable_terminal_gm_receipt=True,
+        )
+        _rewrite_latest_run_metadata(conn, merger, mutate)
+        before = conn.total_changes
+        assert kb._reviewed_author_finalizer_run_id(conn, author) is None
+        assert conn.total_changes == before
 
 
 @pytest.mark.parametrize(

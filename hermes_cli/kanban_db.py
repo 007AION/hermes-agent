@@ -207,6 +207,12 @@ FACTORY_REVIEW_AUDITOR_ACTOR = "GemAION"
 FACTORY_REVIEW_MERGER_PROFILE = "merger"
 FACTORY_REVIEW_MERGER_ACTOR = "kiddhu"
 FACTORY_REVIEW_REPOSITORY = "kiddhu/hermes-agent"
+# Closed typed success tokens emitted by authenticated terminal exact-head
+# audits.  Do not normalize case, spacing, substrings, or prose aliases here.
+FACTORY_TERMINAL_AUDIT_SUCCESS_VERDICTS = frozenset({
+    "PASS_EXACT_HEAD",
+    "APPROVE_EXACT_HEAD",
+})
 
 # REV2 — trusted kernel-executor uploader identity(ies). A proof-kernel
 # OUTCOME_ACCEPTED receipt is only accepted when bound as a task attachment
@@ -7725,7 +7731,7 @@ def _reviewed_author_finalizer_run_id(
         if (
             not has_terminal_review
             or not terminal_review_keys.issubset(review_md)
-            or review_md.get("verdict") != "PASS_EXACT_HEAD"
+            or review_md.get("verdict") not in FACTORY_TERMINAL_AUDIT_SUCCESS_VERDICTS
             or review_md.get("native_review_run") != _reviewer_run_id
             or not isinstance(review_id, int) or review_id <= 0
             or not isinstance(changed_files, list) or not changed_files
@@ -7791,13 +7797,28 @@ def _reviewed_author_finalizer_run_id(
         "typed_runtime_witness_performed", "forbidden_actions_performed",
         "secret_exposure",
     }
+    durable_terminal_gm_keys = {
+        "outcome", "canonical_run_id", "project_id", "source_pr", "source_pr_url",
+        "implementation_task", "implementation_run", "implementation_profile",
+        "implementation_github_actor", "exact_audit_task", "exact_audit_run",
+        "audit_profile", "audit_github_actor", "audit_verdict", "github_review_id",
+        "commit_bound_review", "audited_head", "audited_tree", "audited_base",
+        "base_ref", "changed_files", "native_collision_readback", "hosted_checks",
+        "cas_merge", "merge_profile", "merge_github_actor", "roles_distinct",
+        "pr_state", "merge_commit", "merge_tree", "merge_parents", "canonical_main",
+        "audited_head_containment", "public_receipts", "runtime_install_performed",
+        "typed_runtime_witness_performed", "reviewed_author_finalizer_performed",
+        "source_edit_performed", "forbidden_actions_performed", "secret_exposure",
+        "new_control_plane_count", "not_true_done_for", "next_machine_transition",
+        "artifacts", "worker_session_id",
+    }
     # Detect a family from every key exclusive to its accepted shape, not a
     # hand-picked subset.  Otherwise an immutable receipt can be enriched with
     # a non-discriminator alias such as canonical ``audit_run_id`` or legacy
     # ``author`` and still pass as a pure immutable receipt.
     merger_family_keys = (
         legacy_family_keys, canonical_family_keys, immutable_keys, current_gm_keys,
-        terminal_gm_keys,
+        terminal_gm_keys, durable_terminal_gm_keys,
     )
     merger_discriminators = tuple(
         keys - set().union(*(other for other in merger_family_keys if other is not keys))
@@ -7806,7 +7827,18 @@ def _reviewed_author_finalizer_run_id(
     (
         legacy_discriminators, canonical_discriminators, immutable_discriminators,
         current_gm_discriminators, terminal_gm_discriminators,
+        durable_terminal_gm_discriminators,
     ) = merger_discriminators
+    # The durable completion packet carries descriptive keys also present as
+    # non-authoritative extras on historical receipts.  Its closed structural
+    # discriminator is the nested CAS result; descriptive extras alone must
+    # not reclassify an older accepted family.
+    durable_terminal_gm_discriminators = {"cas_merge"}
+    merger_discriminators = (
+        legacy_discriminators, canonical_discriminators, immutable_discriminators,
+        current_gm_discriminators, terminal_gm_discriminators,
+        durable_terminal_gm_discriminators,
+    )
     canonical_mergers = []
     for child in conn.execute(
         "SELECT child_id FROM task_links WHERE parent_id = ? ORDER BY child_id",
@@ -7850,6 +7882,7 @@ def _reviewed_author_finalizer_run_id(
         bool(immutable_discriminators.intersection(merge_md)),
         bool(current_gm_discriminators.intersection(merge_md)),
         bool(terminal_gm_discriminators.intersection(merge_md)),
+        bool(durable_terminal_gm_discriminators.intersection(merge_md)),
     )
     if sum(schema_families) != 1:
         # Missing, partial-without-a-discriminator, and mixed alias schemas are
@@ -7857,11 +7890,17 @@ def _reviewed_author_finalizer_run_id(
         return None
     (
         has_legacy_schema, has_canonical_schema, has_immutable_schema,
-        has_current_gm_schema, has_terminal_gm_schema,
+        has_current_gm_schema, has_terminal_gm_schema, has_durable_terminal_gm_schema,
     ) = schema_families
     family_keys = merger_family_keys
     selected_family_keys = family_keys[schema_families.index(True)]
-    foreign_aliases = set().union(*family_keys) - selected_family_keys
+    historical_family_keys = family_keys[:-1]
+    if has_durable_terminal_gm_schema:
+        foreign_aliases = set().union(*historical_family_keys) - selected_family_keys
+    else:
+        foreign_aliases = (
+            set().union(*historical_family_keys) - selected_family_keys
+        ) | durable_terminal_gm_discriminators
     if foreign_aliases.intersection(merge_md):
         # Some aliases are shared by two foreign families, so they cannot act
         # as an exclusive discriminator.  Once the family is selected, still
@@ -8013,7 +8052,7 @@ def _reviewed_author_finalizer_run_id(
             or merge_md.get("secret_exposure") != "none"
         ):
             return None
-    else:
+    elif has_terminal_gm_schema:
         merge_sha = merge_md.get("merge_commit")
         repository = FACTORY_REVIEW_REPOSITORY
         pr_number = source_pr_number
@@ -8023,7 +8062,11 @@ def _reviewed_author_finalizer_run_id(
             or not terminal_gm_keys.issubset(merge_md)
             or merger_profile != "gm"
             or merge_md.get("native_run_id") != merger_run_id
-            or merge_md.get("audit_verdict") != "PASS_EXACT_HEAD"
+            or merge_md.get("audit_verdict") not in FACTORY_TERMINAL_AUDIT_SUCCESS_VERDICTS
+            or (
+                has_terminal_review
+                and merge_md.get("audit_verdict") != review_md.get("verdict")
+            )
             or merge_md.get("exact_audit_task") != reviewer_id
             or merge_md.get("exact_audit_run") != _reviewer_run_id
             or merge_md.get("commit_bound_review")
@@ -8052,6 +8095,98 @@ def _reviewed_author_finalizer_run_id(
             or merge_md.get("reviewed_author_finalizer_performed") is not False
             or merge_md.get("forbidden_actions_performed") != []
             or merge_md.get("secret_exposure") != "none"
+        ):
+            return None
+    else:
+        merge_sha = merge_md.get("merge_commit")
+        repository = FACTORY_REVIEW_REPOSITORY
+        pr_number = merge_md.get("source_pr")
+        merge_parents = merge_md.get("merge_parents")
+        cas_merge = merge_md.get("cas_merge")
+        hosted_checks = merge_md.get("hosted_checks")
+        collision_readback = merge_md.get("native_collision_readback")
+        head_containment = merge_md.get("audited_head_containment")
+        hosted_total = hosted_checks.get("total") if isinstance(hosted_checks, dict) else None
+        if (
+            not has_durable_terminal_gm_schema
+            or not durable_terminal_gm_keys.issubset(merge_md)
+            or merger_profile != "gm"
+            or merge_md.get("outcome")
+            != "ROLE_SEPARATED_CAS_MERGE_AND_MAIN_READBACK_COMPLETE"
+            or merge_md.get("canonical_run_id") != merger_run_id
+            or merge_md.get("source_pr") != source_pr_number
+            or merge_md.get("source_pr_url")
+            != f"https://github.com/{FACTORY_REVIEW_REPOSITORY}/pull/{source_pr_number}"
+            or merge_md.get("implementation_task") != task_id
+            or merge_md.get("implementation_run") != author_run_id
+            or merge_md.get("implementation_profile") != FACTORY_REVIEW_AUTHOR_PROFILE
+            or merge_md.get("implementation_github_actor") != FACTORY_REVIEW_AUTHOR_ACTOR
+            or merge_md.get("exact_audit_task") != reviewer_id
+            or merge_md.get("exact_audit_run") != _reviewer_run_id
+            or merge_md.get("audit_profile") != reviewer_profile
+            or merge_md.get("audit_github_actor") != FACTORY_REVIEW_AUDITOR_ACTOR
+            or merge_md.get("audit_verdict") not in FACTORY_TERMINAL_AUDIT_SUCCESS_VERDICTS
+            or merge_md.get("audit_verdict") != review_md.get("verdict")
+            or merge_md.get("github_review_id") != review_id
+            or merge_md.get("commit_bound_review")
+            != (
+                f"https://github.com/{FACTORY_REVIEW_REPOSITORY}/pull/"
+                f"{source_pr_number}#pullrequestreview-{review_id}"
+            )
+            or merge_md.get("audited_head") != head
+            or merge_md.get("audited_tree") != tree
+            or merge_md.get("audited_base") != base
+            or merge_md.get("base_ref") != "main"
+            or merge_md.get("changed_files") != changed_files
+            or not isinstance(collision_readback, dict)
+            or type(collision_readback.get("other_nonterminal_exact_merge_owners")) is not int
+            or collision_readback.get("other_nonterminal_exact_merge_owners") != 0
+            or not isinstance(hosted_checks, dict)
+            or type(hosted_total) is not int
+            or hosted_total <= 0
+            or type(hosted_checks.get("terminal")) is not int
+            or hosted_checks.get("terminal") != hosted_total
+            or type(hosted_checks.get("pending")) is not int
+            or hosted_checks.get("pending") != 0
+            or type(hosted_checks.get("failing")) is not int
+            or hosted_checks.get("failing") != 0
+            or hosted_checks.get("required_aggregate") != "All required checks pass"
+            or hosted_checks.get("required_aggregate_conclusion") != "success"
+            or not isinstance(hosted_checks.get("required_aggregate_url"), str)
+            or not hosted_checks.get("required_aggregate_url")
+            or not isinstance(cas_merge, dict)
+            or type(cas_merge.get("attempts")) is not int
+            or cas_merge.get("attempts") != 1
+            or cas_merge.get("method") != "merge"
+            or cas_merge.get("expected_head") != head
+            or cas_merge.get("api_result") != "Pull Request successfully merged"
+            or merge_md.get("merge_profile") != merger_profile
+            or merge_md.get("merge_github_actor") != FACTORY_REVIEW_MERGER_ACTOR
+            or merge_md.get("roles_distinct") is not True
+            or len({
+                merge_md.get("implementation_github_actor"),
+                merge_md.get("audit_github_actor"),
+                merge_md.get("merge_github_actor"),
+            }) != 3
+            or merge_md.get("pr_state") != "MERGED"
+            or merge_md.get("merge_tree") != tree
+            or merge_parents != [base, head]
+            or merge_md.get("canonical_main") != merge_sha
+            or not isinstance(head_containment, dict)
+            or head_containment.get("status") != "ahead"
+            or type(head_containment.get("ahead_by")) is not int
+            or head_containment.get("ahead_by") != 1
+            or type(head_containment.get("behind_by")) is not int
+            or head_containment.get("behind_by") != 0
+            or head_containment.get("exact_second_parent") is not True
+            or merge_md.get("runtime_install_performed") is not False
+            or merge_md.get("typed_runtime_witness_performed") is not False
+            or merge_md.get("reviewed_author_finalizer_performed") is not False
+            or merge_md.get("source_edit_performed") is not False
+            or merge_md.get("forbidden_actions_performed") != []
+            or merge_md.get("secret_exposure") != "none"
+            or type(merge_md.get("new_control_plane_count")) is not int
+            or merge_md.get("new_control_plane_count") != 0
         ):
             return None
 
