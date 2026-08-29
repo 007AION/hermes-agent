@@ -374,6 +374,207 @@ def test_recompute_ready_promotes_blocked_with_done_parents(kanban_home):
         assert task.last_failure_error is None
 
 
+def test_dependency_promotion_waits_for_exact_predecessor_process_exit(
+    kanban_home, monkeypatch,
+):
+    """A dependency wake must not overlap the worker from the ended run."""
+    predecessor_pid = 424242
+    predecessor_starttime = 111
+
+    def exact_predecessor(pid):
+        assert pid == predecessor_pid
+        return {
+            "starttime": predecessor_starttime,
+            "cwd": "/tmp/predecessor",
+            "pgid": predecessor_pid,
+        }
+
+    monkeypatch.setattr(kb, "_read_process_identity", exact_predecessor)
+    monkeypatch.setattr(kb, "_pid_alive", lambda pid: pid == predecessor_pid)
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="dependency", assignee="a")
+        task_id = kb.create_task(conn, title="worker", assignee="a")
+        claimed = kb.claim_task(conn, task_id, claimer="host:predecessor")
+        assert claimed is not None
+        predecessor_run_id = claimed.current_run_id
+        kb._set_worker_pid(conn, task_id, predecessor_pid)
+        kb.link_tasks(conn, parent, task_id)
+
+        assert kb.block_task(
+            conn,
+            task_id,
+            reason="waiting for dependency",
+            kind="dependency",
+            expected_run_id=predecessor_run_id,
+        )
+        kb.complete_task(conn, parent, summary="dependency complete")
+
+        assert kb.recompute_ready(conn) == 0
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "todo"
+        assert not any(
+            event.kind == "predecessor_exited"
+            for event in kb.list_events(conn, task_id)
+        )
+
+
+@pytest.mark.parametrize("current_starttime", [None, 222])
+def test_dependency_promotion_accepts_absent_or_reused_predecessor_pid(
+    kanban_home, monkeypatch, current_starttime,
+):
+    """An absent PID or a starttime mismatch is exact process-exit proof."""
+    predecessor_pid = 424243
+    predecessor_starttime = 111
+    identities = iter(
+        [
+            {
+                "starttime": predecessor_starttime,
+                "cwd": "/tmp/predecessor",
+                "pgid": predecessor_pid,
+            },
+            (
+                None
+                if current_starttime is None
+                else {
+                    "starttime": current_starttime,
+                    "cwd": "/tmp/reused",
+                    "pgid": predecessor_pid,
+                }
+            ),
+        ]
+    )
+    monkeypatch.setattr(kb, "_read_process_identity", lambda _pid: next(identities))
+    monkeypatch.setattr(
+        kb,
+        "_pid_alive",
+        lambda pid: pid == predecessor_pid and current_starttime is not None,
+    )
+
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="dependency", assignee="a")
+        task_id = kb.create_task(conn, title="worker", assignee="a")
+        claimed = kb.claim_task(conn, task_id, claimer="host:predecessor")
+        assert claimed is not None
+        predecessor_run_id = claimed.current_run_id
+        kb._set_worker_pid(conn, task_id, predecessor_pid)
+        kb.link_tasks(conn, parent, task_id)
+        assert kb.block_task(
+            conn,
+            task_id,
+            reason="waiting for dependency",
+            kind="dependency",
+            expected_run_id=predecessor_run_id,
+        )
+        kb.complete_task(conn, parent, summary="dependency complete")
+
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "ready"
+        signal = next(
+            event
+            for event in reversed(kb.list_events(conn, task_id))
+            if event.kind == "predecessor_exited"
+        )
+        assert signal.run_id == predecessor_run_id
+        assert signal.payload == {
+            "task_id": task_id,
+            "run_id": predecessor_run_id,
+            "pid": predecessor_pid,
+            "starttime": predecessor_starttime,
+            "proof": "absent" if current_starttime is None else "starttime_mismatch",
+        }
+        successor = kb.claim_task(conn, task_id, claimer="host:successor")
+        assert successor is not None
+        assert successor.current_run_id != predecessor_run_id
+        assert not kb.block_task(
+            conn,
+            task_id,
+            reason="stale predecessor write",
+            kind="dependency",
+            expected_run_id=predecessor_run_id,
+        )
+        assert sum(
+            event.kind == "predecessor_exited"
+            for event in kb.list_events(conn, task_id)
+        ) == 1
+
+
+def test_direct_claim_waits_for_live_predecessor_after_manual_unblock(
+    kanban_home, monkeypatch,
+):
+    """The claim CAS is a second barrier when a writer makes a task ready."""
+    predecessor_pid = 424244
+    predecessor_starttime = 333
+    identity = {
+        "starttime": predecessor_starttime,
+        "cwd": "/tmp/predecessor",
+        "pgid": predecessor_pid,
+    }
+    monkeypatch.setattr(kb, "_read_process_identity", lambda _pid: identity)
+    monkeypatch.setattr(kb, "_pid_alive", lambda pid: pid == predecessor_pid)
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="worker", assignee="a")
+        claimed = kb.claim_task(conn, task_id, claimer="host:predecessor")
+        assert claimed is not None
+        kb._set_worker_pid(conn, task_id, predecessor_pid)
+        assert kb.block_task(conn, task_id, reason="human decision", kind="needs_input")
+        assert kb.unblock_task(conn, task_id)
+
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "ready"
+        assert kb.claim_task(conn, task_id, claimer="host:successor") is None
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "ready"
+
+
+def test_predecessor_identity_probe_failure_fails_closed_while_pid_exists(
+    kanban_home, monkeypatch,
+):
+    """An unreadable /proc identity is not process-exit evidence."""
+    predecessor_pid = 424245
+    predecessor_starttime = 444
+    identities = iter(
+        [
+            {
+                "starttime": predecessor_starttime,
+                "cwd": "/tmp/predecessor",
+                "pgid": predecessor_pid,
+            },
+            None,
+        ]
+    )
+    monkeypatch.setattr(kb, "_read_process_identity", lambda _pid: next(identities))
+    monkeypatch.setattr(kb, "_pid_alive", lambda pid: pid == predecessor_pid)
+
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="dependency", assignee="a")
+        task_id = kb.create_task(conn, title="worker", assignee="a")
+        claimed = kb.claim_task(conn, task_id, claimer="host:predecessor")
+        assert claimed is not None
+        kb._set_worker_pid(conn, task_id, predecessor_pid)
+        kb.link_tasks(conn, parent, task_id)
+        assert kb.block_task(
+            conn,
+            task_id,
+            reason="waiting for dependency",
+            kind="dependency",
+            expected_run_id=claimed.current_run_id,
+        )
+
+        kb.complete_task(conn, parent, summary="dependency complete")
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "todo"
+        assert not any(
+            event.kind == "predecessor_exited"
+            for event in kb.list_events(conn, task_id)
+        )
+
+
 def test_recompute_ready_fan_in_waits_for_all_parents(kanban_home):
     with kb.connect() as conn:
         a = kb.create_task(conn, title="a")
