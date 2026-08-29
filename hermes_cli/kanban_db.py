@@ -5687,6 +5687,8 @@ def recompute_ready(
                 )
             ):
                 continue
+            if not _predecessor_process_exited(conn, task_id):
+                continue
             if cur_status == "blocked" and _has_sticky_block(conn, task_id):
                 # Worker / operator asked for human review — do not
                 # silently auto-recover.  ``unblock_task`` is the only
@@ -5735,6 +5737,101 @@ def recompute_ready(
                 _append_event(conn, task_id, "promoted", None)
                 promoted += 1
     return promoted
+
+
+def _predecessor_process_exited(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> bool:
+    """Prove the latest spawned process is absent or has a reused PID.
+
+    A task transition may end its run and clear logical ownership before the
+    worker process actually returns.  The immutable ``spawned`` event retains
+    the exact run/PID/starttime identity needed to prevent the next promotion
+    or claim from overlapping that predecessor.  Unreadable identity while a
+    PID still exists fails closed.
+    """
+    spawned = conn.execute(
+        "SELECT id, run_id, payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'spawned' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if spawned is None:
+        return True
+    payload: dict[str, Any] = {}
+    try:
+        payload = json.loads(spawned["payload"] or "{}")
+        run_id = int(spawned["run_id"])
+        pid = int(payload["pid"])
+        starttime = int(payload["starttime"])
+        if run_id <= 0 or pid <= 0 or starttime < 0:
+            return False
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        # A live process with incomplete legacy identity cannot be proved to be
+        # the predecessor rather than a recycled PID.  Permit only positive
+        # absence; otherwise keep the task non-runnable.
+        try:
+            legacy_pid = payload.get("pid")
+            if legacy_pid is None:
+                return False
+            pid = int(legacy_pid)
+        except (AttributeError, TypeError, ValueError):
+            return False
+        if _pid_alive(pid):
+            return False
+        return True
+
+    prior_signal = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'predecessor_exited' AND id > ? "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id, int(spawned["id"])),
+    ).fetchone()
+    if prior_signal is not None:
+        try:
+            signal = json.loads(prior_signal["payload"] or "{}")
+            if (
+                signal["task_id"] == task_id
+                and int(signal["run_id"]) == run_id
+                and int(signal["pid"]) == pid
+                and int(signal["starttime"]) == starttime
+                and signal["proof"] in {"absent", "starttime_mismatch"}
+            ):
+                return True
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            pass
+
+    if not _pid_alive(pid):
+        proof = "absent"
+    else:
+        current = _read_process_identity(pid)
+        if current is None:
+            # The PID exists but its starttime is unreadable.  Do not turn
+            # probe ambiguity into false exit proof.
+            return False
+        try:
+            current_starttime = int(current["starttime"])
+        except (KeyError, TypeError, ValueError):
+            return False
+        if current_starttime == starttime:
+            return False
+        proof = "starttime_mismatch"
+
+    _append_event(
+        conn,
+        task_id,
+        "predecessor_exited",
+        {
+            "task_id": task_id,
+            "run_id": run_id,
+            "pid": pid,
+            "starttime": starttime,
+            "proof": proof,
+        },
+        run_id=run_id,
+    )
+    return True
 
 
 def _review_handoff_event_for_child(
@@ -6734,6 +6831,8 @@ def claim_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        if not _predecessor_process_exited(conn, task_id):
+            return None
         if not _enforce_factory_preflight_before_claim(conn, task_id, "ready"):
             return None
         # Lifecycle control requests use this stronger CAS: the ready->running
@@ -6881,6 +6980,8 @@ def claim_review_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        if not _predecessor_process_exited(conn, task_id):
+            return None
         if not _enforce_factory_preflight_before_claim(conn, task_id, "review"):
             return None
         cur = conn.execute(
