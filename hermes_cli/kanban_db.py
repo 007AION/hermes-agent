@@ -215,6 +215,49 @@ FACTORY_TERMINAL_AUDIT_SUCCESS_VERDICTS = frozenset({
     "APPROVE_EXACT_HEAD",
 })
 
+# AION-889 exact consumed-authorization lineage.  This is deliberately one
+# closed incident tuple, matching the prior-authorization bridge in
+# tools/approval.py; it is not a generic prose-driven controller bypass.
+AION889_ATOMIC_FINALIZER_TASK_ID = "t_420d4177"
+AION889_ATOMIC_FINALIZER_CHILD_ID = "t_8091a35d"
+AION889_ATOMIC_FINALIZER_REPAIR_PARENT_ID = "t_3a6a0184"
+AION889_ATOMIC_FINALIZER_SOURCE_RUN_ID = 3426
+AION889_ATOMIC_FINALIZER_ACTION_RUN_ID = 3500
+AION889_ATOMIC_FINALIZER_EVENT_KIND = "prior_terminal_authorization_consumed"
+AION889_ATOMIC_FINALIZER_PENDING_COMMAND_ID = 51021
+AION889_ATOMIC_FINALIZER_COMMAND_SHA256 = (
+    "23bd25b3242bf9d65a1770e139d3726ab8e137a25b2fa35cb254084cd672e668"
+)
+AION889_ATOMIC_FINALIZER_FORMAL_RECORD = (
+    "https://github.com/kiddhu/aion-governance/issues/889#issuecomment-5449539635"
+)
+AION889_ATOMIC_FINALIZER_FORMAL_RECORD_SHA256 = (
+    "b23aa82cf94fbfe3a06432db6d66553c9fb24a0c938690d74c635019a33b20e7"
+)
+AION889_ATOMIC_FINALIZER_CONSUME_NONCE = (
+    "aion-889:t_420d4177:run3426:approval51021:"
+    "b23aa82cf94fbfe3a06432db6d66553c9fb24a0c938690d74c635019a33b20e7"
+)
+AION889_ATOMIC_FINALIZER_PRE_RUNTIME = {
+    "service": "hermes-gateway-gm.service",
+    "MainPID": "1292448",
+    "ExecMainStartTimestamp": "Fri 2026-08-21 22:27:46 CST",
+    "NRestarts": "0",
+}
+
+
+def _aion889_atomic_finalizer_event_payload() -> dict:
+    """Return the exact immutable payload emitted by the approval bridge."""
+    return {
+        "consume_nonce": AION889_ATOMIC_FINALIZER_CONSUME_NONCE,
+        "source_run_id": AION889_ATOMIC_FINALIZER_SOURCE_RUN_ID,
+        "pending_command_id": AION889_ATOMIC_FINALIZER_PENDING_COMMAND_ID,
+        "command_sha256": AION889_ATOMIC_FINALIZER_COMMAND_SHA256,
+        "formal_record": AION889_ATOMIC_FINALIZER_FORMAL_RECORD,
+        "formal_record_sha256": AION889_ATOMIC_FINALIZER_FORMAL_RECORD_SHA256,
+        "runtime_generation": dict(AION889_ATOMIC_FINALIZER_PRE_RUNTIME),
+    }
+
 # REV2 — trusted kernel-executor uploader identity(ies). A proof-kernel
 # OUTCOME_ACCEPTED receipt is only accepted when bound as a task attachment
 # whose ``uploaded_by`` is one of these trusted kernel-executor identities. The
@@ -1842,6 +1885,14 @@ _STRICT_ORCHESTRATOR_ARCHIVE_AUTH = ContextVar(
     "kanban_strict_orchestrator_archive_auth", default=False,
 )
 
+# Tracks write boundaries owned by this context even when a connection proxy
+# deliberately hides ``sqlite3.Connection.in_transaction``.  Values are object
+# identities, scoped to the synchronous call chain and reset before the outer
+# owner commits or rolls back.
+_WRITE_TXN_CONNECTION_IDS: ContextVar[tuple[int, ...]] = ContextVar(
+    "kanban_write_txn_connection_ids", default=(),
+)
+
 
 @contextlib.contextmanager
 def _authenticated_strict_orchestrator_archive():
@@ -3464,9 +3515,24 @@ def write_txn(conn: sqlite3.Connection):
     shadow the original exception with a spurious rollback error.
     """
     _assert_not_delegated_child_mutation()
+    connection_id = id(conn)
+    active_connections = _WRITE_TXN_CONNECTION_IDS.get()
+    if connection_id in active_connections or getattr(conn, "in_transaction", False):
+        # Preserve the caller's atomic boundary.  The outermost write_txn owns
+        # commit/rollback and staged-receipt promotion; nested public mutators
+        # participate in that same transaction.  The ContextVar is authoritative
+        # when an opaque proxy hides sqlite3.Connection.in_transaction.
+        yield conn
+        return
     _execute_boundary_with_retry(conn, "BEGIN IMMEDIATE")
     try:
-        yield conn
+        token = _WRITE_TXN_CONNECTION_IDS.set(
+            active_connections + (connection_id,)
+        )
+        try:
+            yield conn
+        finally:
+            _WRITE_TXN_CONNECTION_IDS.reset(token)
     except Exception:
         try:
             conn.execute("ROLLBACK")
@@ -8507,10 +8573,188 @@ def _reviewed_author_finalizer_run_id(
     return author_run_id
 
 
+def _read_aion889_atomic_finalizer_runtime(service: str) -> dict[str, str]:
+    """Read the one fixed system unit without a shell or mutable profile lookup."""
+    if service != AION889_ATOMIC_FINALIZER_PRE_RUNTIME["service"]:
+        return {}
+    try:
+        proc = subprocess.run(
+            [
+                "systemctl", "show", service, "--no-pager", "--property",
+                "ActiveState,SubState,Result,MainPID,ExecMainStartTimestamp,NRestarts",
+            ],
+            check=False, capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+    if proc.returncode != 0:
+        return {}
+    result: dict[str, str] = {}
+    for line in proc.stdout.splitlines():
+        if "=" in line:
+            key, value = line.split("=", 1)
+            result[key] = value.strip()
+    return result
+
+
+def _aion889_atomic_finalizer_run_id(
+    conn: sqlite3.Connection, task_id: str,
+) -> Optional[int]:
+    """Resolve the exact detached controller action, or fail closed."""
+    if task_id != AION889_ATOMIC_FINALIZER_TASK_ID:
+        return None
+    task = conn.execute(
+        "SELECT status, assignee, factory_build_gate, current_run_id, claim_lock, "
+        "claim_expires, worker_pid, worker_starttime, fence_lineage, fence_disposition "
+        "FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    execution_fields = (
+        "current_run_id", "claim_lock", "claim_expires", "worker_pid",
+        "worker_starttime", "fence_lineage", "fence_disposition",
+    )
+    if (
+        task is None or task["status"] != "blocked" or task["assignee"] != "gm"
+        or not task["factory_build_gate"]
+        or any(task[field] is not None for field in execution_fields)
+    ):
+        return None
+
+    runs = conn.execute(
+        "SELECT id, profile, status, outcome, ended_at FROM task_runs "
+        "WHERE task_id = ? ORDER BY id DESC", (task_id,),
+    ).fetchall()
+    if not runs or any(row["ended_at"] is None for row in runs):
+        return None
+    latest = runs[0]
+    if (
+        int(latest["id"]) != AION889_ATOMIC_FINALIZER_ACTION_RUN_ID
+        or latest["profile"] != "gm" or latest["status"] != "blocked"
+        or latest["outcome"] != "blocked"
+    ):
+        return None
+    source = next(
+        (row for row in runs if int(row["id"]) == AION889_ATOMIC_FINALIZER_SOURCE_RUN_ID),
+        None,
+    )
+    if (
+        source is None or source["profile"] != "gm"
+        or source["status"] != "blocked" or source["outcome"] != "blocked"
+    ):
+        return None
+
+    events = conn.execute(
+        "SELECT run_id, payload FROM task_events WHERE task_id = ? AND kind = ?",
+        (task_id, AION889_ATOMIC_FINALIZER_EVENT_KIND),
+    ).fetchall()
+    if (
+        len(events) != 1
+        or events[0]["run_id"] != AION889_ATOMIC_FINALIZER_ACTION_RUN_ID
+    ):
+        return None
+    try:
+        payload = json.loads(events[0]["payload"] or "{}")
+    except (TypeError, ValueError):
+        return None
+    if payload != _aion889_atomic_finalizer_event_payload():
+        return None
+
+    parents = conn.execute(
+        "SELECT p.id, p.status FROM task_links l JOIN tasks p ON p.id = l.parent_id "
+        "WHERE l.child_id = ?", (task_id,),
+    ).fetchall()
+    if (
+        not parents
+        or AION889_ATOMIC_FINALIZER_REPAIR_PARENT_ID
+        not in {row["id"] for row in parents}
+        or any(
+            not _review_handoff_parent_satisfies_child(
+                conn, row["id"], row["status"], task_id,
+            )
+            for row in parents
+        )
+        or _authenticated_factory_run_metadata(
+            conn, AION889_ATOMIC_FINALIZER_REPAIR_PARENT_ID,
+        ) is None
+    ):
+        return None
+
+    children = conn.execute(
+        "SELECT c.id, c.status, c.current_run_id, c.claim_lock, c.claim_expires, "
+        "c.worker_pid, c.worker_starttime, c.fence_lineage, c.fence_disposition "
+        "FROM task_links l JOIN tasks c ON c.id = l.child_id "
+        "WHERE l.parent_id = ?", (task_id,),
+    ).fetchall()
+    if len(children) != 1 or children[0]["id"] != AION889_ATOMIC_FINALIZER_CHILD_ID:
+        return None
+    child = children[0]
+    if child["status"] != "todo" or any(child[field] is not None for field in execution_fields):
+        return None
+    child_parents = conn.execute(
+        "SELECT p.id FROM task_links l JOIN tasks p ON p.id = l.parent_id "
+        "WHERE l.child_id = ?", (child["id"],),
+    ).fetchall()
+    if task_id not in {row["id"] for row in child_parents}:
+        return None
+
+    before = AION889_ATOMIC_FINALIZER_PRE_RUNTIME
+    live = _read_aion889_atomic_finalizer_runtime(before["service"])
+    try:
+        live_pid = int(live.get("MainPID", "0") or "0")
+    except (TypeError, ValueError):
+        return None
+    if (
+        live.get("ActiveState") != "active" or live.get("SubState") != "running"
+        or live.get("Result") != "success" or live_pid <= 0
+        or live.get("MainPID") == before["MainPID"]
+        or not live.get("ExecMainStartTimestamp")
+        or live.get("ExecMainStartTimestamp") == before["ExecMainStartTimestamp"]
+        or live.get("NRestarts") != before["NRestarts"]
+    ):
+        return None
+    return AION889_ATOMIC_FINALIZER_ACTION_RUN_ID
+
+
+def _aion889_recompute_exact_child_in_txn(conn: sqlite3.Connection) -> None:
+    """Run ordinary recompute in-txn and verify the exact child's natural result."""
+    child_id = AION889_ATOMIC_FINALIZER_CHILD_ID
+    recompute_ready(conn)
+    child = conn.execute(
+        "SELECT status, current_run_id, claim_lock, claim_expires, worker_pid, "
+        "worker_starttime, fence_lineage, fence_disposition FROM tasks WHERE id = ?",
+        (child_id,),
+    ).fetchone()
+    parents = conn.execute(
+        "SELECT p.id, p.status FROM task_links l JOIN tasks p ON p.id = l.parent_id "
+        "WHERE l.child_id = ?", (child_id,),
+    ).fetchall()
+    all_satisfied = bool(parents) and all(
+        _review_handoff_parent_satisfies_child(
+            conn, row["id"], row["status"], child_id,
+        )
+        for row in parents
+    )
+    expected_status = "ready" if all_satisfied else "todo"
+    execution_fields = (
+        "current_run_id", "claim_lock", "claim_expires", "worker_pid",
+        "worker_starttime", "fence_lineage", "fence_disposition",
+    )
+    if (
+        child is None or child["status"] != expected_status
+        or any(child[field] is not None for field in execution_fields)
+    ):
+        raise FactoryTerminalReceiptRequiredError(
+            AION889_ATOMIC_FINALIZER_TASK_ID,
+            reason="ordinary dependent recompute result drift",
+        )
+
+
 def _run_kernel_finalizer(
     conn: sqlite3.Connection, task_id: str, run_id: str, *, board: str,
     result: Optional[str] = None,
     reviewed_author: bool = False,
+    detached_controller: bool = False,
 ) -> dict:
     """Kernel-owned finalizer for a gate=1 task with no pre-bound receipt.
 
@@ -8526,7 +8770,20 @@ def _run_kernel_finalizer(
     binder, _kernel, _adapters = _load_pinned_aion_modules(task_id)
 
     def _terminal_write(c: sqlite3.Connection, tid: str, rid: str) -> None:
-        if reviewed_author:
+        if detached_controller:
+            resolved_run_id = _aion889_atomic_finalizer_run_id(c, tid)
+            if resolved_run_id is None or resolved_run_id != int(rid):
+                raise FactoryTerminalReceiptRequiredError(
+                    task_id, reason="detached controller action evidence drift"
+                )
+            status_cas = (
+                "AND status = 'blocked' AND current_run_id IS NULL "
+                "AND claim_lock IS NULL AND claim_expires IS NULL "
+                "AND worker_pid IS NULL AND worker_starttime IS NULL "
+                "AND fence_lineage IS NULL AND fence_disposition IS NULL"
+            )
+            params = (result, int(time.time()), tid)
+        elif reviewed_author:
             resolved_run_id = _reviewed_author_finalizer_run_id(c, tid)
             if resolved_run_id is None or resolved_run_id != int(rid):
                 raise FactoryTerminalReceiptRequiredError(
@@ -8720,6 +8977,7 @@ def complete_task(
     _run_finalizer = False
     _finalizer_run_id = None
     _reviewed_author_finalizer = False
+    _detached_controller_finalizer = False
     if _gate_row is not None and _gate_row["factory_build_gate"]:
         # Determine whether a VALID pre-bound receipt already exists (the
         # merge / already-terminal path, preserved unchanged). Any failure
@@ -8784,6 +9042,12 @@ def complete_task(
                         _run_finalizer = True
                         _reviewed_author_finalizer = True
                         _finalizer_run_id = str(_reviewed_run_id)
+                elif _gate_row["status"] == "blocked":
+                    _controller_run_id = _aion889_atomic_finalizer_run_id(conn, task_id)
+                    if _controller_run_id is not None:
+                        _run_finalizer = True
+                        _detached_controller_finalizer = True
+                        _finalizer_run_id = str(_controller_run_id)
             if not _run_finalizer:
                 raise FactoryTerminalReceiptRequiredError(task_id, reason=_prebound_reason)
 
@@ -8811,7 +9075,9 @@ def complete_task(
         else None
     )
     prior_status: Optional[str] = (
-        "review" if _reviewed_author_finalizer else None
+        "review" if _reviewed_author_finalizer
+        else "blocked" if _detached_controller_finalizer
+        else None
     )
 
     with write_txn(conn):
@@ -8824,6 +9090,7 @@ def complete_task(
                 conn, task_id, _finalizer_run_id, board=get_current_board(),
                 result=result,
                 reviewed_author=_reviewed_author_finalizer,
+                detached_controller=_detached_controller_finalizer,
             )
         else:
             if expected_run_id is None:
@@ -8912,9 +9179,11 @@ def complete_task(
         # blocked → done with no run in flight), synthesize a
         # zero-duration run so the handoff fields are persisted in
         # attempt history instead of silently lost.
-        if run_id is None and _reviewed_author_finalizer:
-            # Preserve the exact ended review_required author run as the
-            # terminal event binding. Do not synthesize a replacement attempt.
+        if run_id is None and (
+            _reviewed_author_finalizer or _detached_controller_finalizer
+        ):
+            # Preserve the exact ended review/controller run as the terminal
+            # event binding. Do not synthesize a replacement attempt.
             assert _finalizer_run_id is not None
             run_id = int(_finalizer_run_id)
         elif run_id is None and (summary or metadata or result):
@@ -8960,6 +9229,10 @@ def complete_task(
             completed_payload,
             run_id=run_id,
         )
+        if _detached_controller_finalizer:
+            # The exact controller repair requires parent terminality and the
+            # ordinary dependency promotion to commit (or roll back) together.
+            _aion889_recompute_exact_child_in_txn(conn)
     # Prose-scan the summary + result for t_<hex> references that do
     # not resolve. Advisory — does not block the completion. Runs in
     # its own txn so the completion itself is already durable by the
@@ -8986,8 +9259,10 @@ def complete_task(
     # just tracks "is there a current pathology the breaker should
     # care about", and a success resets that question.
     _clear_failure_counter(conn, task_id)
-    # Recompute ready status for dependents (separate txn so children see done).
-    recompute_ready(conn)
+    # Ordinary completions preserve the historical post-commit recompute. The
+    # detached controller path already performed it inside the terminal txn.
+    if not _detached_controller_finalizer:
+        recompute_ready(conn)
     # Classify and clean the exact terminal workspace, then persist the receipt.
     # The receipt is deliberately written after the terminal CAS committed so
     # it can describe the real post-actuation state without widening the CAS.

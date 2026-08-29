@@ -34,6 +34,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -344,6 +345,333 @@ def test_t2_finalizer_completes_atomically_child_wakes(kanban_home, aion_gov_src
 
         # Child wakes (dependency promotion).
         assert kb.get_task(conn, child).status == "ready"
+
+
+def _authorized_detached_controller_chain(
+    conn, monkeypatch, *, child_parent_satisfied=True,
+):
+    """Build the machine-authenticated action shape from t_420d4177/run3500."""
+    repair = kb.create_task(
+        conn, title="authenticated controller repair", factory_build_gate=1,
+        assignee="gm2",
+    )
+    repair_run = _claim_and_run_id(conn, repair)
+    assert kb.complete_task(
+        conn, repair, expected_run_id=repair_run,
+        summary="controller repair authenticated",
+    )
+    upstream = kb.create_task(conn, title="satisfied upstream", assignee="gm2")
+    upstream_run = _claim_and_run_id(conn, upstream)
+    assert kb.complete_task(conn, upstream, expected_run_id=upstream_run)
+
+    parent = kb.create_task(
+        conn, title="authorized activation", factory_build_gate=1, assignee="gm",
+        parents=[repair, upstream],
+    )
+    source_run = _claim_and_run_id(conn, parent)
+    assert kb.block_task(
+        conn, parent, reason="prior approval boundary", kind="needs_input",
+        expected_run_id=source_run,
+    )
+    assert kb.unblock_task(conn, parent)
+    conn.execute(
+        "UPDATE tasks SET block_recurrences = 0 WHERE id = ?", (parent,),
+    )
+    conn.commit()
+    action_run = _claim_and_run_id(conn, parent)
+
+    other_parent = kb.create_task(conn, title="satisfied child parent", assignee="gm2")
+    if child_parent_satisfied:
+        other_run = _claim_and_run_id(conn, other_parent)
+        assert kb.complete_task(conn, other_parent, expected_run_id=other_run)
+    child = kb.create_task(
+        conn, title="natural dependent", assignee="elder-senate",
+        parents=[parent, other_parent],
+    )
+
+    monkeypatch.setattr(kb, "AION889_ATOMIC_FINALIZER_TASK_ID", parent)
+    monkeypatch.setattr(kb, "AION889_ATOMIC_FINALIZER_CHILD_ID", child)
+    monkeypatch.setattr(kb, "AION889_ATOMIC_FINALIZER_REPAIR_PARENT_ID", repair)
+    monkeypatch.setattr(kb, "AION889_ATOMIC_FINALIZER_SOURCE_RUN_ID", source_run)
+    monkeypatch.setattr(kb, "AION889_ATOMIC_FINALIZER_ACTION_RUN_ID", action_run)
+    with kb.write_txn(conn):
+        kb._append_event(
+            conn, parent, kb.AION889_ATOMIC_FINALIZER_EVENT_KIND,
+            kb._aion889_atomic_finalizer_event_payload(), run_id=action_run,
+        )
+    assert kb.block_task(
+        conn, parent, reason="goal judge circular postcondition", kind="needs_input",
+        expected_run_id=action_run,
+    )
+    monkeypatch.setattr(
+        kb,
+        "_read_aion889_atomic_finalizer_runtime",
+        lambda _service: {
+            "ActiveState": "active", "SubState": "running", "Result": "success",
+            "MainPID": "930317", "ExecMainStartTimestamp": "fresh", "NRestarts": "0",
+        },
+        raising=False,
+    )
+    return parent, action_run, child
+
+
+def test_detached_controller_finalizes_and_recomputes_child_atomically(
+    kanban_home, aion_gov_src, monkeypatch,
+):
+    """A consumed action receipt closes its parent before natural child wake."""
+    with kb.connect() as conn:
+        parent, action_run, child = _authorized_detached_controller_chain(conn, monkeypatch)
+        parent_row = kb.get_task(conn, parent)
+        child_row = kb.get_task(conn, child)
+        assert parent_row is not None and parent_row.status == "blocked"
+        assert child_row is not None and child_row.status == "todo"
+
+        assert kb.complete_task(conn, parent, summary="authorized action completed")
+
+        parent_row = kb.get_task(conn, parent)
+        assert parent_row is not None and parent_row.status == "done"
+        child_row = kb.get_task(conn, child)
+        assert child_row is not None
+        assert child_row.status == "ready"
+        assert child_row.current_run_id is None
+        completed = conn.execute(
+            "SELECT run_id FROM task_events WHERE task_id = ? AND kind = 'completed'",
+            (parent,),
+        ).fetchone()
+        assert completed is not None and completed["run_id"] == action_run
+
+
+def test_detached_controller_requires_frozen_terminal_action_run(
+    kanban_home, aion_gov_src, monkeypatch,
+):
+    """A valid receipt chain cannot authorize any run except the frozen action."""
+    with kb.connect() as conn:
+        parent, action_run, _child = _authorized_detached_controller_chain(
+            conn, monkeypatch,
+        )
+        assert kb._aion889_atomic_finalizer_run_id(conn, parent) == action_run
+
+        monkeypatch.setattr(
+            kb, "AION889_ATOMIC_FINALIZER_ACTION_RUN_ID", action_run + 1,
+        )
+        assert kb._aion889_atomic_finalizer_run_id(conn, parent) is None
+
+
+def test_detached_controller_rejects_later_run_receipt_substitution(
+    kanban_home, aion_gov_src, monkeypatch,
+):
+    """A later blocked GM run cannot replace the frozen terminal action run."""
+    with kb.connect() as conn:
+        parent, action_run, _child = _authorized_detached_controller_chain(
+            conn, monkeypatch,
+        )
+        assert kb.unblock_task(conn, parent)
+        conn.execute(
+            "UPDATE tasks SET block_recurrences = 0 WHERE id = ?", (parent,),
+        )
+        conn.commit()
+        later_run = _claim_and_run_id(conn, parent)
+        assert later_run > action_run
+        conn.execute(
+            "UPDATE task_events SET run_id = ? WHERE task_id = ? AND kind = ?",
+            (later_run, parent, kb.AION889_ATOMIC_FINALIZER_EVENT_KIND),
+        )
+        conn.commit()
+        assert kb.block_task(
+            conn, parent, reason="copied receipt on later run",
+            kind="needs_input", expected_run_id=later_run,
+        )
+        before = _native_state_snapshot(conn)
+
+        assert kb._aion889_atomic_finalizer_run_id(conn, parent) is None
+        with pytest.raises(kb.FactoryTerminalReceiptRequiredError):
+            kb.complete_task(conn, parent, summary="reject later substitution")
+        assert _native_state_snapshot(conn) == before
+
+
+def test_detached_controller_preserves_todo_when_another_child_parent_is_unsatisfied(
+    kanban_home, aion_gov_src, monkeypatch,
+):
+    with kb.connect() as conn:
+        parent, action_run, child = _authorized_detached_controller_chain(
+            conn, monkeypatch, child_parent_satisfied=False,
+        )
+
+        assert kb.complete_task(conn, parent, summary="authorized action completed")
+
+        parent_row = kb.get_task(conn, parent)
+        assert parent_row is not None and parent_row.status == "done"
+        child_row = kb.get_task(conn, child)
+        assert child_row is not None
+        assert child_row.status == "todo"
+        assert child_row.current_run_id is None
+        assert conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'promoted'",
+            (child,),
+        ).fetchone() is None
+        completed = conn.execute(
+            "SELECT run_id FROM task_events WHERE task_id = ? AND kind = 'completed'",
+            (parent,),
+        ).fetchone()
+        assert completed is not None and completed["run_id"] == action_run
+
+
+def _native_state_snapshot(conn):
+    tables = (
+        "tasks", "task_links", "task_comments", "task_events",
+        "task_runs", "task_attachments",
+    )
+    return {
+        table: [tuple(row) for row in conn.execute(f"SELECT * FROM {table} ORDER BY 1")]
+        for table in tables
+    }
+
+
+@pytest.mark.parametrize(
+    "drift",
+    [
+        "tampered_event", "duplicate_event", "active_run", "wrong_child",
+        "child_status", "stale_source_run", "unauthenticated_parent", "stale_runtime",
+        "null_event_run", "conflicting_event_run", "unsupported_status",
+        "unsatisfied_upstream", "unauthorized_actor", "prose_only",
+    ],
+)
+def test_detached_controller_drift_fails_closed_with_zero_mutation(
+    kanban_home, aion_gov_src, monkeypatch, drift,
+):
+    with kb.connect() as conn:
+        parent, action_run, child = _authorized_detached_controller_chain(conn, monkeypatch)
+        if drift == "tampered_event":
+            conn.execute(
+                "UPDATE task_events SET payload = '{}' WHERE task_id = ? AND kind = ?",
+                (parent, kb.AION889_ATOMIC_FINALIZER_EVENT_KIND),
+            )
+        elif drift == "duplicate_event":
+            kb._append_event(
+                conn, parent, kb.AION889_ATOMIC_FINALIZER_EVENT_KIND,
+                kb._aion889_atomic_finalizer_event_payload(), run_id=action_run,
+            )
+        elif drift == "active_run":
+            conn.execute(
+                "UPDATE tasks SET current_run_id = ?, claim_lock = 'stale-owner' WHERE id = ?",
+                (action_run, parent),
+            )
+        elif drift == "wrong_child":
+            monkeypatch.setattr(kb, "AION889_ATOMIC_FINALIZER_CHILD_ID", "t_deadbeef")
+        elif drift == "child_status":
+            conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (child,))
+        elif drift == "stale_source_run":
+            conn.execute(
+                "UPDATE task_runs SET status = 'done', outcome = 'completed' "
+                "WHERE id = ?", (kb.AION889_ATOMIC_FINALIZER_SOURCE_RUN_ID,),
+            )
+        elif drift == "unauthenticated_parent":
+            conn.execute(
+                "UPDATE tasks SET factory_terminal_receipt_sha256 = NULL WHERE id = ?",
+                (kb.AION889_ATOMIC_FINALIZER_REPAIR_PARENT_ID,),
+            )
+        elif drift == "stale_runtime":
+            monkeypatch.setattr(
+                kb, "_read_aion889_atomic_finalizer_runtime",
+                lambda _service: {
+                    "ActiveState": "active", "SubState": "running", "Result": "success",
+                    **kb.AION889_ATOMIC_FINALIZER_PRE_RUNTIME,
+                },
+            )
+        elif drift == "null_event_run":
+            conn.execute(
+                "UPDATE task_events SET run_id = NULL WHERE task_id = ? AND kind = ?",
+                (parent, kb.AION889_ATOMIC_FINALIZER_EVENT_KIND),
+            )
+        elif drift == "conflicting_event_run":
+            conn.execute(
+                "UPDATE task_events SET run_id = ? WHERE task_id = ? AND kind = ?",
+                (kb.AION889_ATOMIC_FINALIZER_SOURCE_RUN_ID, parent,
+                 kb.AION889_ATOMIC_FINALIZER_EVENT_KIND),
+            )
+        elif drift == "unsupported_status":
+            conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (parent,))
+        elif drift == "unsatisfied_upstream":
+            upstream = conn.execute(
+                "SELECT parent_id FROM task_links WHERE child_id = ? "
+                "AND parent_id != ? ORDER BY parent_id LIMIT 1",
+                (parent, kb.AION889_ATOMIC_FINALIZER_REPAIR_PARENT_ID),
+            ).fetchone()
+            assert upstream is not None
+            conn.execute(
+                "UPDATE tasks SET status = 'ready' WHERE id = ?", (upstream["parent_id"],),
+            )
+        elif drift == "unauthorized_actor":
+            conn.execute("UPDATE tasks SET assignee = 'gm2' WHERE id = ?", (parent,))
+        elif drift == "prose_only":
+            payload = conn.execute(
+                "SELECT payload FROM task_events WHERE task_id = ? AND kind = ?",
+                (parent, kb.AION889_ATOMIC_FINALIZER_EVENT_KIND),
+            ).fetchone()["payload"]
+            conn.execute(
+                "DELETE FROM task_events WHERE task_id = ? AND kind = ?",
+                (parent, kb.AION889_ATOMIC_FINALIZER_EVENT_KIND),
+            )
+            conn.execute(
+                "INSERT INTO task_comments(task_id, author, body, created_at) "
+                "VALUES (?, 'gm', ?, ?)", (parent, payload, int(time.time())),
+            )
+        conn.commit()
+        before = _native_state_snapshot(conn)
+
+        with pytest.raises(kb.FactoryTerminalReceiptRequiredError):
+            kb.complete_task(conn, parent, summary="must reject drift")
+
+        assert _native_state_snapshot(conn) == before
+
+
+def test_detached_controller_recompute_fault_rolls_back_parent_child_and_receipt(
+    kanban_home, aion_gov_src, monkeypatch,
+):
+    with kb.connect() as conn:
+        parent, _action_run, child = _authorized_detached_controller_chain(conn, monkeypatch)
+        before = _native_state_snapshot(conn)
+        before_files = {
+            path: path.read_bytes()
+            for path in kanban_home.rglob("aion_monarch_receipt*.json")
+        }
+        original = kb._aion889_recompute_exact_child_in_txn
+
+        def fail_after_recompute(c):
+            original(c)
+            raise RuntimeError("fault after dependent recompute")
+
+        monkeypatch.setattr(kb, "_aion889_recompute_exact_child_in_txn", fail_after_recompute)
+        with pytest.raises(RuntimeError, match="fault after dependent recompute"):
+            kb.complete_task(conn, parent, summary="rollback everything")
+
+        assert _native_state_snapshot(conn) == before
+        parent_row = kb.get_task(conn, parent)
+        child_row = kb.get_task(conn, child)
+        assert parent_row is not None and parent_row.status == "blocked"
+        assert child_row is not None and child_row.status == "todo"
+        after_files = {
+            path: path.read_bytes()
+            for path in kanban_home.rglob("aion_monarch_receipt*.json")
+        }
+        assert after_files == before_files
+
+
+def test_detached_controller_completion_is_not_replayable(
+    kanban_home, aion_gov_src, monkeypatch,
+):
+    with kb.connect() as conn:
+        parent, _action_run, child = _authorized_detached_controller_chain(conn, monkeypatch)
+        assert kb.complete_task(conn, parent, summary="authorized action completed")
+        before = _native_state_snapshot(conn)
+
+        assert kb.complete_task(conn, parent, summary="replay") is False
+
+        assert _native_state_snapshot(conn) == before
+        parent_row = kb.get_task(conn, parent)
+        child_row = kb.get_task(conn, child)
+        assert parent_row is not None and parent_row.status == "done"
+        assert child_row is not None and child_row.status == "ready"
 
 
 def _terminal_run_metadata(conn, task_id):
@@ -2998,3 +3326,68 @@ def test_f5_opaque_nonlanded_commit_reraises_zero_residue_then_retries(
         assert kb.get_task(conn, parent).status == "done"
         assert kb.get_task(conn, child).status == "ready"
         assert _bound_receipt_doc(conn, parent)["verdict"] == "OUTCOME_ACCEPTED"
+
+
+def test_detached_controller_opaque_landed_commit_finalizes_and_recomputes(
+    kanban_home, aion_gov_src, monkeypatch,
+):
+    """Opaque nesting participates in the outer landed controller transaction."""
+    with kb.connect() as real:
+        parent, action_run, child = _authorized_detached_controller_chain(
+            real, monkeypatch,
+        )
+        proxy = _OpaqueLandedProxy(real)
+        proxy.armed = True
+        conn = cast(sqlite3.Connection, proxy)
+
+        assert kb.complete_task(conn, parent, summary="opaque landed controller")
+
+        parent_row = kb.get_task(conn, parent)
+        assert parent_row is not None and parent_row.status == "done"
+        child_row = kb.get_task(conn, child)
+        assert child_row is not None and child_row.status == "ready"
+        assert child_row.current_run_id is None
+        completed = conn.execute(
+            "SELECT run_id FROM task_events WHERE task_id = ? AND kind = 'completed'",
+            (parent,),
+        ).fetchone()
+        assert completed is not None and completed["run_id"] == action_run
+        assert Path(kb.list_attachments(conn, parent)[0].stored_path).exists()
+
+
+def test_detached_controller_opaque_nonlanded_commit_rolls_back_and_retries(
+    kanban_home, aion_gov_src, monkeypatch,
+):
+    """Opaque non-landed failure preserves zero mutation and outer ownership."""
+    with kb.connect() as real:
+        parent, _action_run, child = _authorized_detached_controller_chain(
+            real, monkeypatch,
+        )
+        before = _native_state_snapshot(real)
+        before_files = {
+            path: path.read_bytes()
+            for path in kanban_home.rglob("aion_monarch_receipt*.json")
+        }
+        proxy = _OpaqueNonLandedProxy(real)
+        proxy.armed = True
+        conn = cast(sqlite3.Connection, proxy)
+
+        with pytest.raises(sqlite3.OperationalError, match="not landed"):
+            kb.complete_task(conn, parent, summary="opaque non-landed controller")
+
+        assert _native_state_snapshot(conn) == before
+        assert {
+            path: path.read_bytes()
+            for path in kanban_home.rglob("aion_monarch_receipt*.json")
+        } == before_files
+        parent_row = kb.get_task(conn, parent)
+        child_row = kb.get_task(conn, child)
+        assert parent_row is not None and parent_row.status == "blocked"
+        assert child_row is not None and child_row.status == "todo"
+
+        proxy.armed = False
+        assert kb.complete_task(conn, parent, summary="clean controller retry")
+        parent_row = kb.get_task(conn, parent)
+        child_row = kb.get_task(conn, child)
+        assert parent_row is not None and parent_row.status == "done"
+        assert child_row is not None and child_row.status == "ready"

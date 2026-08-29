@@ -637,7 +637,11 @@ def _handle_complete(args: dict, **kw) -> str:
             # Only enforce when a judge is actually reachable — see
             # _goal_judge_available for why an unavailable judge fails open.
             task = kb.get_task(conn, tid)
-            if task and task.goal_mode and _goal_judge_available():
+            controller_receipt = kb._aion889_atomic_finalizer_run_id(conn, tid)
+            if (
+                task and task.goal_mode and controller_receipt is None
+                and _goal_judge_available()
+            ):
                 verdict = "done"
                 reason = ""
                 try:
