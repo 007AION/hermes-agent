@@ -5759,6 +5759,33 @@ def _predecessor_process_exited(
     ).fetchone()
     if spawned is None:
         return True
+
+    # ``release_fenced_workers`` is the older, stronger reconciliation path:
+    # it proves the exact root identity gone and its persisted descendant
+    # lineage quiescent before emitting ``fence_released``.
+    fence_release = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'fence_released' AND id > ? "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id, int(spawned["id"])),
+    ).fetchone()
+
+    def _fence_release_proof() -> Optional[str]:
+        if fence_release is None:
+            return None
+        try:
+            receipt = json.loads(fence_release["payload"] or "{}")
+            if receipt["target"] != "ready":
+                return None
+            return {
+                "no_predecessor": "absent",
+                "predecessor_exited": "absent",
+                "predecessor_fenced": "absent",
+                "predecessor_pid_recycled": "starttime_mismatch",
+            }.get(receipt["reason"])
+        except (KeyError, TypeError, json.JSONDecodeError):
+            return None
+
     payload: dict[str, Any] = {}
     try:
         payload = json.loads(spawned["payload"] or "{}")
@@ -5768,6 +5795,10 @@ def _predecessor_process_exited(
         if run_id <= 0 or pid <= 0 or starttime < 0:
             return False
     except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        if _fence_release_proof() is not None:
+            # Legacy ``spawned`` events may lack starttime, but the existing
+            # fence receipt is still authoritative process/lineage closure.
+            return True
         # A live process with incomplete legacy identity cannot be proved to be
         # the predecessor rather than a recycled PID.  Permit only positive
         # absence; otherwise keep the task non-runnable.
@@ -5801,6 +5832,23 @@ def _predecessor_process_exited(
                 return True
         except (KeyError, TypeError, ValueError, json.JSONDecodeError):
             pass
+
+    proof = _fence_release_proof()
+    if proof is not None:
+        _append_event(
+            conn,
+            task_id,
+            "predecessor_exited",
+            {
+                "task_id": task_id,
+                "run_id": run_id,
+                "pid": pid,
+                "starttime": starttime,
+                "proof": proof,
+            },
+            run_id=run_id,
+        )
+        return True
 
     if not _pid_alive(pid):
         proof = "absent"
