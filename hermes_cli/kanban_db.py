@@ -187,6 +187,9 @@ FACTORY_SEMANTIC_FIELDS = (
     "canonical_incident",
 )
 
+AION_889_PREFLIGHT_DIRECTIVE_ID = "AION-889-PREFLIGHT-V1-IMPLEMENT"
+AION_889_PREFLIGHT_ACTIVATION_EPOCH = 1787729035
+
 # Creator profiles whose authenticated create identity forces the gate
 # UNCONDITIONALLY (REV2 — TOTAL gate entry): any task created under a factory
 # profile is a factory-build task, regardless of title/body markers. This makes
@@ -2974,6 +2977,75 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "factory_terminal_receipt_sha256 TEXT",
         )
 
+    if "factory_challenge_semantic_receipt_sha256" not in cols:
+        # AION-889 P2.5 additive carrier pointer.  MIGRATED_DISABLED: no claim
+        # or admission surface reads this column.  It binds a new trusted
+        # semantic attestation while preserving factory_terminal_receipt_sha256
+        # as immutable negative/source evidence.
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "factory_challenge_semantic_receipt_sha256",
+            "factory_challenge_semantic_receipt_sha256 TEXT",
+        )
+
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_factory_challenge_semantic_receipt_immutable
+        BEFORE UPDATE OF factory_challenge_semantic_receipt_sha256 ON tasks
+        WHEN OLD.factory_challenge_semantic_receipt_sha256 IS NOT NULL
+         AND NEW.factory_challenge_semantic_receipt_sha256
+             IS NOT OLD.factory_challenge_semantic_receipt_sha256
+        BEGIN
+            SELECT RAISE(ABORT,
+                'factory challenge semantic receipt pointer is immutable');
+        END;
+        """
+    )
+
+    if "factory_preflight_receipt_sha256" not in cols:
+        # AION-889 P4: one trusted, immutable preflight packet is the active
+        # admission authority for in-scope agent007 implementation pickup.
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "factory_preflight_receipt_sha256",
+            "factory_preflight_receipt_sha256 TEXT",
+        )
+    if "factory_preflight_required" not in cols:
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "factory_preflight_required",
+            "factory_preflight_required INTEGER NOT NULL DEFAULT 0",
+        )
+
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_factory_preflight_receipt_immutable
+        BEFORE UPDATE OF factory_preflight_receipt_sha256 ON tasks
+        WHEN OLD.factory_preflight_receipt_sha256 IS NOT NULL
+         AND NEW.factory_preflight_receipt_sha256
+             IS NOT OLD.factory_preflight_receipt_sha256
+        BEGIN
+            SELECT RAISE(ABORT,
+                'factory preflight receipt pointer is immutable');
+        END;
+        """
+    )
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_factory_preflight_required_immutable
+        BEFORE UPDATE OF factory_preflight_required ON tasks
+        WHEN OLD.factory_preflight_required = 1
+         AND COALESCE(NEW.factory_preflight_required, 0) != 1
+        BEGIN
+            SELECT RAISE(ABORT,
+                'factory preflight requirement is immutable');
+        END;
+        """
+    )
+
     # AION-889 Phase B REV1 — immutability (writer chokepoint guard). Once a
     # task is factory-build gated (factory_build_gate=1) it may NEVER be
     # demoted back to 0/NULL, on any update surface (dashboard direct status,
@@ -3859,6 +3931,14 @@ def create_task(
         created_by=created_by,
         factory_fields=factory_fields,
     )
+    preflight_required = int(
+        assignee == "agent007"
+        and now >= AION_889_PREFLIGHT_ACTIVATION_EPOCH
+        and (
+            factory_directive_id == AION_889_PREFLIGHT_DIRECTIVE_ID
+            or _body_has_aion_889_preflight_directive(body)
+        )
+    )
 
     # Resolve workspace_path from board-level default_workdir when the
     # caller did not specify one explicitly. Board defaults represent
@@ -3943,8 +4023,9 @@ def create_task(
                         branch_name, project_id, tenant, idempotency_key,
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
-                        goal_mode, goal_max_turns, session_id, factory_build_gate
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id, factory_build_gate,
+                        factory_preflight_required
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3970,6 +4051,7 @@ def create_task(
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
                         factory_gate,
+                        preflight_required,
                     ),
                 )
                 for pid in parents:
@@ -5286,6 +5368,218 @@ def recompute_ready(
 # Claim / complete / block
 # ---------------------------------------------------------------------------
 
+
+def _factory_preflight_scope_row(
+    conn: sqlite3.Connection, task_id: str, source_status: str,
+) -> Optional[sqlite3.Row]:
+    """Return the in-scope factory implementation row, else ``None``.
+
+    Exact pre-upgrade rows have ``factory_preflight_required=0`` because the
+    additive column did not exist at creation.  Admission therefore re-derives
+    the frozen directive from persisted canonical bytes and irreversibly
+    promotes the requirement bit inside the same claim transaction.
+    """
+
+    row = conn.execute(
+        "SELECT id, assignee, status, body, created_at, factory_build_gate, "
+        "factory_preflight_required, factory_preflight_receipt_sha256 "
+        "FROM tasks WHERE id=?",
+        (task_id,),
+    ).fetchone()
+    if (
+        row is None
+        or row["status"] != source_status
+        or row["factory_build_gate"] != 1
+        or row["assignee"] != "agent007"
+    ):
+        return None
+    required = row["factory_preflight_required"] == 1
+    if not required and _body_has_aion_889_preflight_directive(row["body"]):
+        created_after_activation = (
+            int(row["created_at"] or 0) >= AION_889_PREFLIGHT_ACTIVATION_EPOCH
+        )
+        resumed_after_activation = conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id=? AND created_at>=? "
+            "AND kind IN ('unblocked', 'promoted', 'review_handoff', "
+            "'review_resumed', 'review_changes_resumed', 'status') LIMIT 1",
+            (task_id, AION_889_PREFLIGHT_ACTIVATION_EPOCH),
+        ).fetchone() is not None
+        if created_after_activation or resumed_after_activation:
+            conn.execute(
+                "UPDATE tasks SET factory_preflight_required=1 "
+                "WHERE id=? AND factory_preflight_required=0",
+                (task_id,),
+            )
+            required = True
+    if not required:
+        return None
+    return row
+
+
+def _factory_preflight_decision(
+    conn: sqlite3.Connection, task_id: str, source_status: str,
+) -> Optional[dict[str, Any]]:
+    """Return PASS/BLOCK for in-scope pickup; ``None`` for legacy paths."""
+    import hashlib
+
+    from hermes_cli.aion_889_preflight import (
+        PreflightExpectation,
+        check_factory_preflight_receipt,
+        strict_json_loads,
+    )
+
+    row = _factory_preflight_scope_row(conn, task_id, source_status)
+    if row is None:
+        return None
+    pointer = row["factory_preflight_receipt_sha256"]
+    if not isinstance(pointer, str) or not re.fullmatch(r"[0-9a-f]{64}", pointer):
+        return {
+            "decision": "BLOCK", "reason_code": "RECEIPT_INVALID",
+            "detail_code": "MISSING_RECEIPT_POINTER",
+            "field": "factory_preflight_receipt_sha256", "evidence_ref": None,
+        }
+    attachments = conn.execute(
+        "SELECT id, stored_path, uploaded_by FROM task_attachments WHERE task_id=?",
+        (task_id,),
+    ).fetchall()
+    matching: list[tuple[sqlite3.Row, bytes]] = []
+    io_failed = False
+    for attachment in attachments:
+        try:
+            raw = Path(attachment["stored_path"]).read_bytes()
+        except OSError:
+            io_failed = True
+            continue
+        if hashlib.sha256(raw).hexdigest() == pointer:
+            matching.append((attachment, raw))
+    if not matching:
+        detail = "RECEIPT_IO_ERROR" if io_failed else "RECEIPT_ATTACHMENT_MISSING"
+        return {
+            "decision": "BLOCK", "reason_code": "RECEIPT_INVALID",
+            "detail_code": detail, "field": "factory_preflight_receipt_sha256",
+            "evidence_ref": pointer,
+        }
+    trusted = [
+        item for item in matching
+        if item[0]["uploaded_by"] in FACTORY_TRUSTED_RECEIPT_UPLOADERS
+    ]
+    if len(trusted) != 1:
+        return {
+            "decision": "BLOCK", "reason_code": "RECEIPT_INVALID",
+            "detail_code": "RECEIPT_PROVENANCE_INVALID", "field": "uploaded_by",
+            "evidence_ref": pointer,
+        }
+    attachment, raw = trusted[0]
+    try:
+        receipt = strict_json_loads(raw)
+    except (TypeError, ValueError, UnicodeDecodeError):
+        receipt = None
+    if not isinstance(receipt, dict):
+        return {
+            "decision": "BLOCK", "reason_code": "RECEIPT_INVALID",
+            "detail_code": "RECEIPT_JSON_INVALID", "field": "receipt",
+            "evidence_ref": pointer,
+        }
+    canonical = json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode()
+    if raw != canonical:
+        return {
+            "decision": "BLOCK", "reason_code": "RECEIPT_INVALID",
+            "detail_code": "RECEIPT_NOT_CANONICAL", "field": "receipt",
+            "evidence_ref": pointer,
+        }
+    checked = check_factory_preflight_receipt(
+        receipt, PreflightExpectation(task_id=task_id)
+    )
+    if checked.decision != "PASS":
+        return {
+            "decision": "BLOCK",
+            "reason_code": checked.baseline_reason_code or "RECEIPT_INVALID",
+            "detail_code": checked.detail_code, "field": checked.field,
+            "evidence_ref": pointer,
+        }
+    return {
+        "decision": "PASS", "reason_code": None, "detail_code": None,
+        "field": None, "evidence_ref": pointer,
+        "attachment_id": int(attachment["id"]),
+    }
+
+
+def _enforce_factory_preflight_before_claim(
+    conn: sqlite3.Connection, task_id: str, source_status: str,
+) -> bool:
+    """Fail closed before claim/run mutation. True means pickup may proceed."""
+    decision = _factory_preflight_decision(conn, task_id, source_status)
+    if decision is None:
+        return True
+    _append_event(conn, task_id, "preflight_decision", decision)
+    if decision["decision"] == "PASS":
+        return True
+    conn.execute(
+        "UPDATE tasks SET status='blocked', block_kind='needs_input', "
+        "claim_lock=NULL, claim_expires=NULL WHERE id=? AND status=?",
+        (task_id, source_status),
+    )
+    _append_event(
+        conn, task_id, "blocked",
+        {"reason": "AION_FACTORY_PREFLIGHT", "kind": "needs_input",
+         "detail_code": decision["detail_code"]},
+    )
+    return False
+
+
+def bind_factory_preflight_receipt(
+    conn: sqlite3.Connection, task_id: str, attachment_id: int,
+) -> str:
+    """Validate and immutably bind one trusted preflight attachment."""
+    import hashlib
+
+    attachment = get_attachment(conn, attachment_id)
+    if attachment is None or attachment.task_id != task_id:
+        raise ValueError("preflight attachment must belong to the target task")
+    if attachment.uploaded_by not in FACTORY_TRUSTED_RECEIPT_UPLOADERS:
+        raise ValueError("preflight attachment uploader is not trusted")
+    try:
+        raw = Path(attachment.stored_path).read_bytes()
+    except OSError as exc:
+        raise ValueError("preflight attachment bytes are unavailable") from exc
+    digest = hashlib.sha256(raw).hexdigest()
+    from hermes_cli.aion_889_preflight import (
+        PreflightExpectation,
+        check_factory_preflight_receipt,
+        strict_json_loads,
+    )
+    receipt = strict_json_loads(raw)
+    if not isinstance(receipt, dict):
+        raise ValueError("preflight receipt must be a JSON object")
+    if raw != json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode():
+        raise ValueError("preflight receipt must use canonical JSON bytes")
+    checked = check_factory_preflight_receipt(
+        receipt, PreflightExpectation(task_id=task_id)
+    )
+    if checked.decision != "PASS":
+        raise ValueError(
+            f"preflight receipt rejected: {checked.detail_code}:{checked.field}"
+        )
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET factory_preflight_receipt_sha256=? "
+            "WHERE id=? AND factory_preflight_receipt_sha256 IS NULL",
+            (digest, task_id),
+        )
+        if cur.rowcount != 1:
+            current = conn.execute(
+                "SELECT factory_preflight_receipt_sha256 FROM tasks WHERE id=?",
+                (task_id,),
+            ).fetchone()
+            if current is None or current[0] != digest:
+                raise ValueError("factory preflight receipt pointer already bound")
+        _append_event(
+            conn, task_id, "factory_preflight_receipt_bound",
+            {"sha256": digest, "attachment_id": attachment_id},
+        )
+    return digest
+
+
 def claim_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5303,6 +5597,8 @@ def claim_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        if not _enforce_factory_preflight_before_claim(conn, task_id, "ready"):
+            return None
         # Lifecycle control requests use this stronger CAS: the ready->running
         # claim may only occur while no task is running on this board. Because
         # BEGIN IMMEDIATE serializes writers, another claimer cannot cross this
@@ -5442,6 +5738,8 @@ def claim_review_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        if not _enforce_factory_preflight_before_claim(conn, task_id, "review"):
+            return None
         cur = conn.execute(
             """
             UPDATE tasks
@@ -6038,6 +6336,45 @@ def _body_has_factory_semantic_field(body: Optional[str]) -> bool:
     for field in FACTORY_SEMANTIC_FIELDS:
         if re.search(rf"(?m)^\s*{re.escape(field)}\s*:", body):
             return True
+    return False
+
+
+def _yaml_scalar(line: str, key: str) -> Optional[str]:
+    """Return a conservative one-line YAML scalar without parsing prose."""
+    match = re.match(rf"^[ \t]*{re.escape(key)}[ \t]*:[ \t]*(.*)$", line)
+    if match is None:
+        return None
+    value = re.sub(r"[ \t]+#.*$", "", match.group(1)).strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        value = value[1:-1]
+    return value
+
+
+def _body_has_aion_889_preflight_directive(body: Optional[str]) -> bool:
+    """Recognise the exact legacy or canonical Native directive representation."""
+    if not body:
+        return False
+    lines = body.splitlines()
+    if any(
+        _yaml_scalar(line, "factory_directive_id") == AION_889_PREFLIGHT_DIRECTIVE_ID
+        for line in lines
+    ):
+        return True
+    for index, line in enumerate(lines):
+        marker = re.match(
+            r"^([ \t]*)strategic_directive[ \t]*:[ \t]*(?:#.*)?$", line
+        )
+        if marker is None:
+            continue
+        parent_indent = len(marker.group(1).expandtabs(8))
+        for child in lines[index + 1 :]:
+            if not child.strip() or child.lstrip().startswith("#"):
+                continue
+            child_indent = len(child) - len(child.lstrip(" \t"))
+            if child_indent <= parent_indent:
+                break
+            if _yaml_scalar(child, "directive_id") == AION_889_PREFLIGHT_DIRECTIVE_ID:
+                return True
     return False
 
 
