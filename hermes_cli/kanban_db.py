@@ -7725,6 +7725,89 @@ def _historical_source_preserved_in_installed_git(
     return True
 
 
+def _authenticated_non_pr_review_evidence(
+    review_md: dict,
+    *,
+    task_id: str,
+    author_run_id: int,
+    handoff_reason: str,
+) -> bool:
+    """Validate the closed authenticated no-PR runtime-evidence family.
+
+    This family models an independently audited operation that legitimately has
+    no code PR or merge/install descendants.  Authority comes only from the
+    kernel-authenticated terminal reviewer run selected by the typed Native
+    handoff/verdict chain.  Task prose, comments, and caller-supplied evidence
+    are never read.
+    """
+    required_keys = {
+        "audit_outcome", "source_task_id", "source_run_id", "canonical_run_id",
+        "native_review_verdict", "evidence_sha256", "timer_sha256",
+        "artifact_sha256", "manifest_sha256", "github_receipt",
+        "github_receipt_body_sha256", "checks", "scope_limit", "artifacts",
+        "worker_session_id",
+    }
+    if set(review_md) != required_keys:
+        # Exact key closure makes this family mutually exclusive with every PR
+        # family and rejects caller-authored aliases or partial enrichment.
+        return False
+    if (
+        review_md.get("audit_outcome")
+        != "APPROVE_EXACT_NATURAL_RECOVERY_EVIDENCE"
+        or review_md.get("source_task_id") != task_id
+        or review_md.get("source_run_id") != author_run_id
+        or review_md.get("native_review_verdict") != "pass"
+    ):
+        return False
+    canonical_run_id = review_md.get("canonical_run_id")
+    worker_session_id = review_md.get("worker_session_id")
+    if (
+        not isinstance(canonical_run_id, str)
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", canonical_run_id) is None
+        or not isinstance(worker_session_id, str)
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", worker_session_id) is None
+    ):
+        return False
+    hash_keys = (
+        "evidence_sha256", "timer_sha256", "artifact_sha256",
+        "manifest_sha256", "github_receipt_body_sha256",
+    )
+    hashes = [review_md.get(key) for key in hash_keys]
+    if any(
+        not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None
+        for value in hashes
+    ) or len(set(hashes)) != len(hashes):
+        return False
+    receipt = review_md.get("github_receipt")
+    if not isinstance(receipt, str) or re.fullmatch(
+        r"https://github[.]com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/issues/"
+        r"[1-9][0-9]*#issuecomment-[1-9][0-9]*",
+        receipt,
+    ) is None:
+        return False
+    checks = review_md.get("checks")
+    artifacts = review_md.get("artifacts")
+    if (
+        not isinstance(checks, list)
+        or not checks
+        or any(not isinstance(check, str) or not check.strip() for check in checks)
+        or len(set(checks)) != len(checks)
+        or not isinstance(artifacts, list)
+        or not artifacts
+        or any(
+            not isinstance(path, str) or not path.startswith("/")
+            for path in artifacts
+        )
+        or not isinstance(review_md.get("scope_limit"), str)
+        or not review_md["scope_limit"].strip()
+    ):
+        return False
+    # A PR token is never authority, but its presence conflicts with this
+    # explicitly no-PR family and therefore fails closed rather than falling
+    # through to a different schema.
+    return re.search(r"\bPR\s+#[1-9][0-9]*\b", handoff_reason, re.IGNORECASE) is None
+
+
 def _reviewed_author_finalizer_run_id(
     conn: sqlite3.Connection, task_id: str,
 ) -> Optional[int]:
@@ -7840,6 +7923,13 @@ def _reviewed_author_finalizer_run_id(
     _reviewer_run_id, reviewer_profile, review_md = reviewer
     if reviewer_profile != FACTORY_REVIEW_AUDITOR_PROFILE:
         return None
+    if "evidence_sha256" in review_md:
+        return author_run_id if _authenticated_non_pr_review_evidence(
+            review_md,
+            task_id=task_id,
+            author_run_id=author_run_id,
+            handoff_reason=handoff.reason,
+        ) else None
     canonical_review_keys = {
         "review_outcome", "head_sha", "tree_sha", "base_sha",
         "github_review_id", "changed_files", "source_pr",

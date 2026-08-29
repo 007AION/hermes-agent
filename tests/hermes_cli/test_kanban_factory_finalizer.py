@@ -1190,6 +1190,199 @@ def _reviewed_author_chain(
     return author, author_run, reviewer, merger, runtime
 
 
+def _non_pr_reviewed_evidence_chain(conn, *, handoff_reason="exact runtime evidence"):
+    """Create the sanitized authenticated no-PR shape from t_cc5e6d1b/run3474."""
+    author = kb.create_task(
+        conn, title="runtime evidence author", factory_build_gate=1,
+        assignee="agent007",
+    )
+    reviewer = kb.create_task(
+        conn, title="independent runtime evidence audit", factory_build_gate=1,
+        assignee="bafuxunan", parents=[author],
+    )
+    author_run = _claim_and_run_id(conn, author)
+    assert kb.request_review_handoff(
+        conn,
+        author,
+        expected_run_id=author_run,
+        review_task_id=reviewer,
+        reason=handoff_reason,
+    ) is not None
+    reviewer_run = _claim_and_run_id(conn, reviewer)
+    assert kb.record_review_verdict(
+        conn,
+        author,
+        review_task_id=reviewer,
+        expected_review_run_id=reviewer_run,
+        verdict="pass",
+        reason="PASS for exact immutable runtime evidence only",
+    )
+    metadata = {
+        "audit_outcome": "APPROVE_EXACT_NATURAL_RECOVERY_EVIDENCE",
+        "source_task_id": author,
+        "source_run_id": author_run,
+        "canonical_run_id": "real-20260828T192101Z",
+        "native_review_verdict": "pass",
+        "evidence_sha256": "1" * 64,
+        "timer_sha256": "2" * 64,
+        "artifact_sha256": "3" * 64,
+        "manifest_sha256": "4" * 64,
+        "github_receipt": "https://github.com/example/governance/issues/790#issuecomment-12345",
+        "github_receipt_body_sha256": "5" * 64,
+        "checks": [
+            "exact source task and run binding",
+            "authenticated runtime receipt hash",
+            "zero-secret and zero-mutation ledger",
+        ],
+        "scope_limit": "Exact independently audited runtime evidence only.",
+        "artifacts": ["/tmp/sanitized-audit.md"],
+        "worker_session_id": "sanitized-review-session",
+    }
+    assert kb.complete_task(
+        conn,
+        reviewer,
+        expected_run_id=reviewer_run,
+        summary="independent runtime evidence audit passed",
+        metadata=metadata,
+    )
+    return author, author_run, reviewer
+
+
+def test_reviewed_author_accepts_authenticated_non_pr_reviewed_evidence_receipt(
+    kanban_home, aion_gov_src,
+):
+    """The audited runtime/evidence path converges without inventing a code PR."""
+    with kb.connect() as conn:
+        author, author_run, _reviewer = _non_pr_reviewed_evidence_chain(conn)
+        before = _native_state_snapshot(conn)
+
+        assert kb._reviewed_author_finalizer_run_id(conn, author) == author_run
+        assert _native_state_snapshot(conn) == before
+
+
+@pytest.mark.parametrize(
+    ("drift", "mutate"),
+    [
+        ("missing_source_task", lambda md: md.pop("source_task_id")),
+        ("cross_task", lambda md: md.__setitem__("source_task_id", "t_wrong")),
+        ("null_source_run", lambda md: md.__setitem__("source_run_id", None)),
+        ("stale_source_run", lambda md: md.__setitem__("source_run_id", -1)),
+        ("acceptance_identity", lambda md: md.__setitem__("audit_outcome", "PASS")),
+        ("evidence_hash", lambda md: md.__setitem__("evidence_sha256", "f" * 63)),
+        ("missing_timer_hash", lambda md: md.pop("timer_sha256")),
+        ("artifact_hash", lambda md: md.__setitem__("artifact_sha256", md["evidence_sha256"])),
+        ("manifest_hash", lambda md: md.__setitem__("manifest_sha256", None)),
+        ("receipt_hash", lambda md: md.__setitem__("github_receipt_body_sha256", "f" * 63)),
+        ("receipt_url", lambda md: md.__setitem__("github_receipt", "prose-only receipt")),
+        ("empty_checks", lambda md: md.__setitem__("checks", [])),
+        ("duplicate_checks", lambda md: md["checks"].append(md["checks"][0])),
+        ("mixed_pr_family", lambda md: md.__setitem__("head", "a" * 40)),
+        ("unknown_alias", lambda md: md.__setitem__("caller_evidence", "trusted")),
+    ],
+)
+def test_reviewed_author_rejects_non_pr_evidence_metadata_drift_zero_mutation(
+    kanban_home, aion_gov_src, drift, mutate,
+):
+    with kb.connect() as conn:
+        author, _author_run, reviewer = _non_pr_reviewed_evidence_chain(conn)
+        _rewrite_latest_run_metadata(conn, reviewer, mutate)
+        before = _native_state_snapshot(conn)
+
+        assert kb._reviewed_author_finalizer_run_id(conn, author) is None, drift
+        with pytest.raises(kb.FactoryTerminalReceiptRequiredError):
+            kb.complete_task(conn, author, summary=f"reject {drift}")
+        assert _native_state_snapshot(conn) == before
+
+
+@pytest.mark.parametrize(
+    "drift",
+    [
+        "missing_pass", "duplicate_pass", "pass_then_request_changes",
+        "null_review_run", "stale_review_run", "cross_task_verdict",
+        "missing_direct_edge", "self_audit", "wrong_reviewer_profile",
+        "unauthenticated_reviewer_receipt", "prose_only",
+    ],
+)
+def test_reviewed_author_rejects_non_pr_event_identity_and_receipt_drift(
+    kanban_home, aion_gov_src, drift,
+):
+    with kb.connect() as conn:
+        author, _author_run, reviewer = _non_pr_reviewed_evidence_chain(conn)
+        verdict = conn.execute(
+            "SELECT id, run_id, payload FROM task_events WHERE task_id = ? "
+            "AND kind = 'review_verdict' ORDER BY id DESC LIMIT 1",
+            (author,),
+        ).fetchone()
+        if drift == "missing_pass":
+            conn.execute("DELETE FROM task_events WHERE id = ?", (verdict["id"],))
+        elif drift == "duplicate_pass":
+            conn.execute(
+                "INSERT INTO task_events(task_id, kind, payload, run_id, created_at) "
+                "VALUES (?, 'review_verdict', ?, ?, ?)",
+                (author, verdict["payload"], verdict["run_id"], int(time.time())),
+            )
+        elif drift == "pass_then_request_changes":
+            payload = json.loads(verdict["payload"])
+            payload["verdict"] = "request_changes"
+            conn.execute(
+                "INSERT INTO task_events(task_id, kind, payload, run_id, created_at) "
+                "VALUES (?, 'review_verdict', ?, ?, ?)",
+                (author, json.dumps(payload), verdict["run_id"], int(time.time())),
+            )
+        elif drift in {"null_review_run", "stale_review_run", "cross_task_verdict"}:
+            payload = json.loads(verdict["payload"])
+            if drift == "null_review_run":
+                payload["review_run_id"] = None
+            elif drift == "stale_review_run":
+                payload["review_run_id"] = -1
+            else:
+                payload["review_task_id"] = "t_wrong"
+            conn.execute(
+                "UPDATE task_events SET payload = ? WHERE id = ?",
+                (json.dumps(payload), verdict["id"]),
+            )
+        elif drift == "missing_direct_edge":
+            conn.execute(
+                "DELETE FROM task_links WHERE parent_id = ? AND child_id = ?",
+                (author, reviewer),
+            )
+        elif drift in {"self_audit", "wrong_reviewer_profile"}:
+            profile = "agent007" if drift == "self_audit" else "gm2"
+            conn.execute("UPDATE tasks SET assignee = ? WHERE id = ?", (profile, reviewer))
+            conn.execute("UPDATE task_runs SET profile = ? WHERE task_id = ?", (profile, reviewer))
+        elif drift == "unauthenticated_reviewer_receipt":
+            conn.execute(
+                "UPDATE task_attachments SET uploaded_by = 'agent' WHERE task_id = ?",
+                (reviewer,),
+            )
+        elif drift == "prose_only":
+            metadata = _terminal_run_metadata(conn, reviewer)
+            metadata.pop("evidence_sha256")
+            _set_terminal_run_metadata(conn, reviewer, metadata)
+        conn.commit()
+        before = _native_state_snapshot(conn)
+
+        assert kb._reviewed_author_finalizer_run_id(conn, author) is None, drift
+        with pytest.raises(kb.FactoryTerminalReceiptRequiredError):
+            kb.complete_task(conn, author, summary=f"reject {drift}")
+        assert _native_state_snapshot(conn) == before
+
+
+def test_reviewed_author_rejects_non_pr_evidence_with_pr_handoff_prose(
+    kanban_home, aion_gov_src,
+):
+    with kb.connect() as conn:
+        author, *_ = _non_pr_reviewed_evidence_chain(
+            conn, handoff_reason="PR #999 allegedly authorizes runtime evidence",
+        )
+        before = _native_state_snapshot(conn)
+
+        assert kb._reviewed_author_finalizer_run_id(conn, author) is None
+        with pytest.raises(kb.FactoryTerminalReceiptRequiredError):
+            kb.complete_task(conn, author, summary="reject mixed PR/non-PR families")
+        assert _native_state_snapshot(conn) == before
+
+
 def test_reviewed_author_accepts_canonical_immutable_merger_receipt(
     kanban_home, aion_gov_src,
 ):
