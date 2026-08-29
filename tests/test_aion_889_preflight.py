@@ -7,8 +7,9 @@ P4; all preceding tests pin the pure checker encoding authorized at P1.
 
 from __future__ import annotations
 
-import hashlib
 import json
+import hashlib
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -31,6 +32,10 @@ from hermes_cli.aion_889_preflight import (
     strict_json_loads,
     SEMANTIC_MIGRATION_STATE,
     SEMANTIC_RECEIPT_SCHEMA,
+    FACTORY_PREFLIGHT_RECEIPT_SCHEMA,
+    PREFLIGHT_ACTIVATION_EPOCH,
+    PreflightExpectation,
+    check_factory_preflight_receipt,
 )
 
 SCOPE_IDENTITY_SHA256 = "1d89ce22d02156d562b4fe5ea9e72165068fa6d88edd9ecd17a62e2d1b01171f"
@@ -243,6 +248,222 @@ def test_in_scope_claim_without_preflight_receipt_blocks_before_run_row(
         "field": "factory_preflight_receipt_sha256",
         "evidence_ref": None,
     }
+
+
+TEST_FIRST_SHA256 = "3" * 64
+CHECKER_OUTPUT_SHA256 = "4" * 64
+
+
+def _preflight_receipt(task_id: str) -> dict[str, object]:
+    return {
+        "schema": FACTORY_PREFLIGHT_RECEIPT_SCHEMA,
+        "task_id": task_id,
+        "risk_tier": "T2_CORE_OR_HIGH_RISK",
+        "outcome_requirement_sha256": REQUIREMENTS_SHA256,
+        "solution_contract_sha256": SOLUTION_CONTRACT_SHA256,
+        "solution_challenge_verdict": "PASS_SOLUTION_CHALLENGE",
+        "acceptance_contract_sha256": ACCEPTANCE_CONTRACT_SHA256,
+        "acceptance_challenge_verdict": "PASS_ACCEPTANCE_CHALLENGE",
+        "test_first_evidence": TEST_FIRST_SHA256,
+        "preflight_checker_version": CHECKER_VERSION,
+        "preflight_verdict": "PASS",
+        "scope_identity_sha256": SCOPE_IDENTITY_SHA256,
+        "checker_output_sha256": CHECKER_OUTPUT_SHA256,
+    }
+
+
+def _preflight_expectation(task_id: str) -> PreflightExpectation:
+    return PreflightExpectation(task_id=task_id)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "detail"),
+    [
+        ("outcome_requirement_sha256", "0" * 64, "HASH_MISMATCH"),
+        ("solution_contract_sha256", "0" * 64, "HASH_MISMATCH"),
+        ("solution_challenge_verdict", "OUTCOME_ACCEPTED", "CHALLENGE_NOT_PASS"),
+        ("acceptance_contract_sha256", "0" * 64, "HASH_MISMATCH"),
+        ("acceptance_challenge_verdict", "OUTCOME_ACCEPTED", "CHALLENGE_NOT_PASS"),
+        ("test_first_evidence", "", "TEST_FIRST_EVIDENCE_INVALID"),
+        ("preflight_checker_version", "stale", "CHECKER_VERSION_MISMATCH"),
+        ("preflight_verdict", "BLOCK", "PREFLIGHT_NOT_PASS"),
+        ("scope_identity_sha256", "0" * 64, "SCOPE_BINDING_MISMATCH"),
+        ("checker_output_sha256", "", "CHECKER_OUTPUT_INVALID"),
+    ],
+)
+def test_each_invalid_preflight_machine_field_fails_closed(field, value, detail) -> None:
+    receipt = _preflight_receipt("t_fixture")
+    receipt[field] = value
+    result = check_factory_preflight_receipt(receipt, _preflight_expectation("t_fixture"))
+    assert result.decision == "BLOCK"
+    assert result.detail_code == detail
+    assert result.field == field
+
+
+@pytest.mark.parametrize("field", list(_preflight_receipt("t_fixture")))
+def test_each_preflight_field_is_required(field: str) -> None:
+    receipt = _preflight_receipt("t_fixture")
+    del receipt[field]
+    result = check_factory_preflight_receipt(receipt, _preflight_expectation("t_fixture"))
+    assert result.decision == "BLOCK"
+    assert result.detail_code == "MISSING_FIELD"
+    assert result.field == field
+
+
+def _create_in_scope_task(conn) -> str:
+    task_id = kb.create_task(
+        conn,
+        title="AION-889 active preflight fixture",
+        assignee="agent007",
+        factory_build_gate=1,
+        factory_directive_id="AION-889-PREFLIGHT-V1-IMPLEMENT",
+    )
+    conn.execute(
+        "UPDATE tasks SET created_at=? WHERE id=?",
+        (PREFLIGHT_ACTIVATION_EPOCH + 1, task_id),
+    )
+    return task_id
+
+
+def _bind_valid_preflight(conn, task_id: str) -> str:
+    raw = json.dumps(
+        _preflight_receipt(task_id), sort_keys=True, separators=(",", ":")
+    ).encode()
+    attachment_id = kb.store_attachment_bytes(
+        conn,
+        task_id,
+        "aion_factory_preflight_receipt.json",
+        raw,
+        content_type="application/json",
+        uploaded_by="aion_monarch_proof_kernel",
+    )
+    return kb.bind_factory_preflight_receipt(conn, task_id, attachment_id)
+
+
+def test_valid_frozen_packet_admits_exactly_once(kanban_home: Path) -> None:
+    with kb.connect() as conn:
+        task_id = _create_in_scope_task(conn)
+        receipt_sha = _bind_valid_preflight(conn, task_id)
+        first = kb.claim_task(conn, task_id, claimer="preflight-valid:1")
+        second = kb.claim_task(conn, task_id, claimer="preflight-valid:2")
+        run_count = conn.execute(
+            "SELECT COUNT(*) FROM task_runs WHERE task_id=?", (task_id,)
+        ).fetchone()[0]
+        pointer = conn.execute(
+            "SELECT factory_preflight_receipt_sha256 FROM tasks WHERE id=?", (task_id,)
+        ).fetchone()[0]
+    assert first is not None
+    assert second is None
+    assert run_count == 1
+    assert pointer == receipt_sha
+
+
+def test_forged_uploader_blocks_before_run_row(kanban_home: Path) -> None:
+    with kb.connect() as conn:
+        task_id = _create_in_scope_task(conn)
+        raw = json.dumps(
+            _preflight_receipt(task_id), sort_keys=True, separators=(",", ":")
+        ).encode()
+        kb.store_attachment_bytes(conn, task_id, "forged.json", raw, uploaded_by="agent")
+        sha = hashlib.sha256(raw).hexdigest()
+        conn.execute(
+            "UPDATE tasks SET factory_preflight_receipt_sha256=? WHERE id=?",
+            (sha, task_id),
+        )
+        assert kb.claim_task(conn, task_id, claimer="preflight-forged:1") is None
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_runs WHERE task_id=?", (task_id,)
+        ).fetchone()[0] == 0
+        event = [
+            e for e in kb.list_events(conn, task_id) if e.kind == "preflight_decision"
+        ][-1]
+    assert event.payload["detail_code"] == "RECEIPT_PROVENANCE_INVALID"
+
+
+def test_review_claim_surface_also_blocks_before_run_row(kanban_home: Path) -> None:
+    with kb.connect() as conn:
+        task_id = _create_in_scope_task(conn)
+        conn.execute("UPDATE tasks SET status='review' WHERE id=?", (task_id,))
+        assert kb.claim_review_task(conn, task_id, claimer="preflight-review:1") is None
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.status == "blocked"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_runs WHERE task_id=?", (task_id,)
+        ).fetchone()[0] == 0
+
+
+def test_block_bind_unblock_recovery_is_deterministic(kanban_home: Path) -> None:
+    with kb.connect() as conn:
+        task_id = _create_in_scope_task(conn)
+        assert kb.claim_task(conn, task_id, claimer="recovery:blocked") is None
+        assert kb.get_task(conn, task_id).status == "blocked"
+        _bind_valid_preflight(conn, task_id)
+        assert kb.unblock_task(conn, task_id)
+        claimed = kb.claim_task(conn, task_id, claimer="recovery:pass")
+        decisions = [
+            e.payload for e in kb.list_events(conn, task_id)
+            if e.kind == "preflight_decision"
+        ]
+        run_count = conn.execute(
+            "SELECT COUNT(*) FROM task_runs WHERE task_id=?", (task_id,)
+        ).fetchone()[0]
+    assert claimed is not None
+    assert [d["decision"] for d in decisions] == ["BLOCK", "PASS"]
+    assert run_count == 1
+
+
+def test_preflight_pointer_is_immutable(kanban_home: Path) -> None:
+    with kb.connect() as conn:
+        task_id = _create_in_scope_task(conn)
+        _bind_valid_preflight(conn, task_id)
+        with pytest.raises(sqlite3.IntegrityError, match="pointer is immutable"):
+            conn.execute(
+                "UPDATE tasks SET factory_preflight_receipt_sha256=? WHERE id=?",
+                ("f" * 64, task_id),
+            )
+
+
+def test_cross_task_preflight_replay_blocks(kanban_home: Path) -> None:
+    with kb.connect() as conn:
+        source = _create_in_scope_task(conn)
+        target = _create_in_scope_task(conn)
+        raw = json.dumps(
+            _preflight_receipt(source), sort_keys=True, separators=(",", ":")
+        ).encode()
+        kb.store_attachment_bytes(
+            conn,
+            target,
+            "replay.json",
+            raw,
+            uploaded_by="aion_monarch_proof_kernel",
+        )
+        sha = hashlib.sha256(raw).hexdigest()
+        conn.execute(
+            "UPDATE tasks SET factory_preflight_receipt_sha256=? WHERE id=?",
+            (sha, target),
+        )
+        assert kb.claim_task(conn, target, claimer="replay:1") is None
+        event = [
+            e for e in kb.list_events(conn, target) if e.kind == "preflight_decision"
+        ][-1]
+    assert event.payload["detail_code"] == "TASK_BINDING_MISMATCH"
+    assert event.payload["field"] == "task_id"
+
+
+def test_non_directive_and_other_profile_paths_remain_unchanged(kanban_home: Path) -> None:
+    with kb.connect() as conn:
+        legacy = kb.create_task(
+            conn, title="legacy factory", assignee="agent007", factory_build_gate=1
+        )
+        other = kb.create_task(
+            conn,
+            title="same directive other profile",
+            assignee="gm2",
+            factory_build_gate=1,
+            factory_directive_id="AION-889-PREFLIGHT-V1-IMPLEMENT",
+        )
+        assert kb.claim_task(conn, legacy, claimer="legacy:1") is not None
+        assert kb.claim_task(conn, other, claimer="other:1") is not None
 
 
 # ---------------------------------------------------------------------------
