@@ -222,6 +222,7 @@ AION889_ATOMIC_FINALIZER_TASK_ID = "t_420d4177"
 AION889_ATOMIC_FINALIZER_CHILD_ID = "t_8091a35d"
 AION889_ATOMIC_FINALIZER_REPAIR_PARENT_ID = "t_3a6a0184"
 AION889_ATOMIC_FINALIZER_SOURCE_RUN_ID = 3426
+AION889_ATOMIC_FINALIZER_ACTION_RUN_ID = 3500
 AION889_ATOMIC_FINALIZER_EVENT_KIND = "prior_terminal_authorization_consumed"
 AION889_ATOMIC_FINALIZER_PENDING_COMMAND_ID = 51021
 AION889_ATOMIC_FINALIZER_COMMAND_SHA256 = (
@@ -1884,6 +1885,14 @@ _STRICT_ORCHESTRATOR_ARCHIVE_AUTH = ContextVar(
     "kanban_strict_orchestrator_archive_auth", default=False,
 )
 
+# Tracks write boundaries owned by this context even when a connection proxy
+# deliberately hides ``sqlite3.Connection.in_transaction``.  Values are object
+# identities, scoped to the synchronous call chain and reset before the outer
+# owner commits or rolls back.
+_WRITE_TXN_CONNECTION_IDS: ContextVar[tuple[int, ...]] = ContextVar(
+    "kanban_write_txn_connection_ids", default=(),
+)
+
 
 @contextlib.contextmanager
 def _authenticated_strict_orchestrator_archive():
@@ -3506,15 +3515,24 @@ def write_txn(conn: sqlite3.Connection):
     shadow the original exception with a spurious rollback error.
     """
     _assert_not_delegated_child_mutation()
-    if getattr(conn, "in_transaction", False):
+    connection_id = id(conn)
+    active_connections = _WRITE_TXN_CONNECTION_IDS.get()
+    if connection_id in active_connections or getattr(conn, "in_transaction", False):
         # Preserve the caller's atomic boundary.  The outermost write_txn owns
         # commit/rollback and staged-receipt promotion; nested public mutators
-        # participate in that same transaction.
+        # participate in that same transaction.  The ContextVar is authoritative
+        # when an opaque proxy hides sqlite3.Connection.in_transaction.
         yield conn
         return
     _execute_boundary_with_retry(conn, "BEGIN IMMEDIATE")
     try:
-        yield conn
+        token = _WRITE_TXN_CONNECTION_IDS.set(
+            active_connections + (connection_id,)
+        )
+        try:
+            yield conn
+        finally:
+            _WRITE_TXN_CONNECTION_IDS.reset(token)
     except Exception:
         try:
             conn.execute("ROLLBACK")
@@ -8611,7 +8629,8 @@ def _aion889_atomic_finalizer_run_id(
         return None
     latest = runs[0]
     if (
-        latest["profile"] != "gm" or latest["status"] != "blocked"
+        int(latest["id"]) != AION889_ATOMIC_FINALIZER_ACTION_RUN_ID
+        or latest["profile"] != "gm" or latest["status"] != "blocked"
         or latest["outcome"] != "blocked"
     ):
         return None
@@ -8629,7 +8648,10 @@ def _aion889_atomic_finalizer_run_id(
         "SELECT run_id, payload FROM task_events WHERE task_id = ? AND kind = ?",
         (task_id, AION889_ATOMIC_FINALIZER_EVENT_KIND),
     ).fetchall()
-    if len(events) != 1 or events[0]["run_id"] != latest["id"]:
+    if (
+        len(events) != 1
+        or events[0]["run_id"] != AION889_ATOMIC_FINALIZER_ACTION_RUN_ID
+    ):
         return None
     try:
         payload = json.loads(events[0]["payload"] or "{}")
@@ -8691,7 +8713,7 @@ def _aion889_atomic_finalizer_run_id(
         or live.get("NRestarts") != before["NRestarts"]
     ):
         return None
-    return int(latest["id"])
+    return AION889_ATOMIC_FINALIZER_ACTION_RUN_ID
 
 
 def _aion889_recompute_exact_child_in_txn(conn: sqlite3.Connection) -> None:

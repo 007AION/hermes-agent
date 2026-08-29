@@ -34,6 +34,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -392,6 +393,7 @@ def _authorized_detached_controller_chain(
     monkeypatch.setattr(kb, "AION889_ATOMIC_FINALIZER_CHILD_ID", child)
     monkeypatch.setattr(kb, "AION889_ATOMIC_FINALIZER_REPAIR_PARENT_ID", repair)
     monkeypatch.setattr(kb, "AION889_ATOMIC_FINALIZER_SOURCE_RUN_ID", source_run)
+    monkeypatch.setattr(kb, "AION889_ATOMIC_FINALIZER_ACTION_RUN_ID", action_run)
     with kb.write_txn(conn):
         kb._append_event(
             conn, parent, kb.AION889_ATOMIC_FINALIZER_EVENT_KIND,
@@ -437,6 +439,54 @@ def test_detached_controller_finalizes_and_recomputes_child_atomically(
             (parent,),
         ).fetchone()
         assert completed is not None and completed["run_id"] == action_run
+
+
+def test_detached_controller_requires_frozen_terminal_action_run(
+    kanban_home, aion_gov_src, monkeypatch,
+):
+    """A valid receipt chain cannot authorize any run except the frozen action."""
+    with kb.connect() as conn:
+        parent, action_run, _child = _authorized_detached_controller_chain(
+            conn, monkeypatch,
+        )
+        assert kb._aion889_atomic_finalizer_run_id(conn, parent) == action_run
+
+        monkeypatch.setattr(
+            kb, "AION889_ATOMIC_FINALIZER_ACTION_RUN_ID", action_run + 1,
+        )
+        assert kb._aion889_atomic_finalizer_run_id(conn, parent) is None
+
+
+def test_detached_controller_rejects_later_run_receipt_substitution(
+    kanban_home, aion_gov_src, monkeypatch,
+):
+    """A later blocked GM run cannot replace the frozen terminal action run."""
+    with kb.connect() as conn:
+        parent, action_run, _child = _authorized_detached_controller_chain(
+            conn, monkeypatch,
+        )
+        assert kb.unblock_task(conn, parent)
+        conn.execute(
+            "UPDATE tasks SET block_recurrences = 0 WHERE id = ?", (parent,),
+        )
+        conn.commit()
+        later_run = _claim_and_run_id(conn, parent)
+        assert later_run > action_run
+        conn.execute(
+            "UPDATE task_events SET run_id = ? WHERE task_id = ? AND kind = ?",
+            (later_run, parent, kb.AION889_ATOMIC_FINALIZER_EVENT_KIND),
+        )
+        conn.commit()
+        assert kb.block_task(
+            conn, parent, reason="copied receipt on later run",
+            kind="needs_input", expected_run_id=later_run,
+        )
+        before = _native_state_snapshot(conn)
+
+        assert kb._aion889_atomic_finalizer_run_id(conn, parent) is None
+        with pytest.raises(kb.FactoryTerminalReceiptRequiredError):
+            kb.complete_task(conn, parent, summary="reject later substitution")
+        assert _native_state_snapshot(conn) == before
 
 
 def test_detached_controller_preserves_todo_when_another_child_parent_is_unsatisfied(
@@ -3276,3 +3326,68 @@ def test_f5_opaque_nonlanded_commit_reraises_zero_residue_then_retries(
         assert kb.get_task(conn, parent).status == "done"
         assert kb.get_task(conn, child).status == "ready"
         assert _bound_receipt_doc(conn, parent)["verdict"] == "OUTCOME_ACCEPTED"
+
+
+def test_detached_controller_opaque_landed_commit_finalizes_and_recomputes(
+    kanban_home, aion_gov_src, monkeypatch,
+):
+    """Opaque nesting participates in the outer landed controller transaction."""
+    with kb.connect() as real:
+        parent, action_run, child = _authorized_detached_controller_chain(
+            real, monkeypatch,
+        )
+        proxy = _OpaqueLandedProxy(real)
+        proxy.armed = True
+        conn = cast(sqlite3.Connection, proxy)
+
+        assert kb.complete_task(conn, parent, summary="opaque landed controller")
+
+        parent_row = kb.get_task(conn, parent)
+        assert parent_row is not None and parent_row.status == "done"
+        child_row = kb.get_task(conn, child)
+        assert child_row is not None and child_row.status == "ready"
+        assert child_row.current_run_id is None
+        completed = conn.execute(
+            "SELECT run_id FROM task_events WHERE task_id = ? AND kind = 'completed'",
+            (parent,),
+        ).fetchone()
+        assert completed is not None and completed["run_id"] == action_run
+        assert Path(kb.list_attachments(conn, parent)[0].stored_path).exists()
+
+
+def test_detached_controller_opaque_nonlanded_commit_rolls_back_and_retries(
+    kanban_home, aion_gov_src, monkeypatch,
+):
+    """Opaque non-landed failure preserves zero mutation and outer ownership."""
+    with kb.connect() as real:
+        parent, _action_run, child = _authorized_detached_controller_chain(
+            real, monkeypatch,
+        )
+        before = _native_state_snapshot(real)
+        before_files = {
+            path: path.read_bytes()
+            for path in kanban_home.rglob("aion_monarch_receipt*.json")
+        }
+        proxy = _OpaqueNonLandedProxy(real)
+        proxy.armed = True
+        conn = cast(sqlite3.Connection, proxy)
+
+        with pytest.raises(sqlite3.OperationalError, match="not landed"):
+            kb.complete_task(conn, parent, summary="opaque non-landed controller")
+
+        assert _native_state_snapshot(conn) == before
+        assert {
+            path: path.read_bytes()
+            for path in kanban_home.rglob("aion_monarch_receipt*.json")
+        } == before_files
+        parent_row = kb.get_task(conn, parent)
+        child_row = kb.get_task(conn, child)
+        assert parent_row is not None and parent_row.status == "blocked"
+        assert child_row is not None and child_row.status == "todo"
+
+        proxy.armed = False
+        assert kb.complete_task(conn, parent, summary="clean controller retry")
+        parent_row = kb.get_task(conn, parent)
+        child_row = kb.get_task(conn, child)
+        assert parent_row is not None and parent_row.status == "done"
+        assert child_row is not None and child_row.status == "ready"
