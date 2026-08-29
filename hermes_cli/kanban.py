@@ -834,6 +834,20 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_hb.add_argument("--note", default=None,
                       help="Optional short note attached to the heartbeat event")
 
+    # --- review-verdict (terminal-audit recovery; worker controller only) ---
+    p_verdict = sub.add_parser(
+        "review-verdict",
+        help="Recover one omitted REQUEST_CHANGES from an exact completed audit",
+    )
+    p_verdict.add_argument("author_task_id")
+    p_verdict.add_argument("review_task_id")
+    p_verdict.add_argument("expected_review_run_id", type=int)
+    p_verdict.add_argument("--reason", required=True)
+    p_verdict.add_argument(
+        "--recovery-receipt-json", required=True,
+        help="Closed JSON receipt copied from exact terminal audit run metadata",
+    )
+
     # --- assignees ---
     p_asg = sub.add_parser(
         "assignees",
@@ -1121,6 +1135,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "log":      _cmd_log,
             "runs":     _cmd_runs,
             "heartbeat": _cmd_heartbeat,
+            "review-verdict": _cmd_review_verdict,
             "assignees": _cmd_assignees,
             "notify-subscribe":   _cmd_notify_subscribe,
             "notify-list":        _cmd_notify_list,
@@ -1184,6 +1199,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "daemon",
     "repair",
     "heartbeat",
+    "review-verdict",
     "notify-subscribe",
     "notify-unsubscribe",
     "specify",
@@ -1481,6 +1497,47 @@ def _cmd_init(args: argparse.Namespace) -> int:
         "The gateway hosts an embedded dispatcher that ticks every 60 seconds\n"
         "by default (config: kanban.dispatch_interval_seconds). Without a\n"
         "running gateway, tasks stay in 'ready' forever."
+    )
+    return 0
+
+
+def _cmd_review_verdict(args: argparse.Namespace) -> int:
+    controller_task_id = os.environ.get("HERMES_KANBAN_TASK")
+    controller_profile = os.environ.get("HERMES_PROFILE")
+    if not controller_task_id or not controller_profile:
+        print("review-verdict recovery requires a dispatcher worker context", file=sys.stderr)
+        return 1
+    controller_run_id = _worker_run_id_for(controller_task_id)
+    if controller_run_id is None:
+        print("review-verdict recovery requires the current dispatcher run", file=sys.stderr)
+        return 1
+    try:
+        receipt = json.loads(args.recovery_receipt_json)
+    except (TypeError, ValueError):
+        print("--recovery-receipt-json must be valid JSON", file=sys.stderr)
+        return 2
+    if not isinstance(receipt, dict):
+        print("--recovery-receipt-json must decode to an object", file=sys.stderr)
+        return 2
+    with kb.connect_closing() as conn:
+        ok = kb.record_review_verdict(
+            conn,
+            args.author_task_id,
+            review_task_id=args.review_task_id,
+            expected_review_run_id=args.expected_review_run_id,
+            verdict="request_changes",
+            reason=args.reason,
+            recovery_receipt=receipt,
+            controller_task_id=controller_task_id,
+            controller_run_id=controller_run_id,
+            controller_profile=controller_profile,
+        )
+    if not ok:
+        print("completed review verdict recovery refused", file=sys.stderr)
+        return 1
+    print(
+        f"Recovered REQUEST_CHANGES for {args.author_task_id} "
+        f"from {args.review_task_id}/run{args.expected_review_run_id}"
     )
     return 0
 

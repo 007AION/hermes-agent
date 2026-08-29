@@ -207,6 +207,7 @@ FACTORY_REVIEW_AUDITOR_ACTOR = "GemAION"
 FACTORY_REVIEW_MERGER_PROFILE = "merger"
 FACTORY_REVIEW_MERGER_ACTOR = "kiddhu"
 FACTORY_REVIEW_REPOSITORY = "kiddhu/hermes-agent"
+FACTORY_REVIEW_VERDICT_RECOVERY_CONTROLLER_PROFILES = frozenset({"gm", "gm2"})
 # Closed typed success tokens emitted by authenticated terminal exact-head
 # audits.  Do not normalize case, spacing, substrings, or prose aliases here.
 FACTORY_TERMINAL_AUDIT_SUCCESS_VERDICTS = frozenset({
@@ -6052,6 +6053,10 @@ def _record_review_verdict(
     expected_review_run_id: int,
     verdict: str,
     reason: str,
+    recovery_receipt: Optional[dict] = None,
+    controller_task_id: Optional[str] = None,
+    controller_run_id: Optional[int] = None,
+    controller_profile: Optional[str] = None,
 ) -> bool:
     """Record a bound child verdict; only REQUEST_CHANGES resumes the author."""
     verdict = str(verdict or "").strip().lower()
@@ -6060,6 +6065,19 @@ def _record_review_verdict(
         return False
     expected_review_run_id = int(expected_review_run_id)
     with write_txn(conn):
+        if recovery_receipt is not None:
+            return _recover_completed_review_verdict(
+                conn,
+                task_id,
+                review_task_id=review_task_id,
+                expected_review_run_id=expected_review_run_id,
+                verdict=verdict,
+                reason=reason,
+                recovery_receipt=recovery_receipt,
+                controller_task_id=controller_task_id,
+                controller_run_id=controller_run_id,
+                controller_profile=controller_profile,
+            )
         prior = conn.execute(
             "SELECT run_id, payload FROM task_events WHERE task_id = ? "
             "AND kind = 'review_verdict' ORDER BY id DESC",
@@ -6184,6 +6202,174 @@ def _record_review_verdict(
         return True
 
 
+def _recover_completed_review_verdict(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    review_task_id: str,
+    expected_review_run_id: int,
+    verdict: str,
+    reason: str,
+    recovery_receipt: dict,
+    controller_task_id: Optional[str],
+    controller_run_id: Optional[int],
+    controller_profile: Optional[str],
+) -> bool:
+    """Recover one omitted first REQUEST_CHANGES from a terminal audit run."""
+    if (
+        verdict != "request_changes"
+        or not isinstance(recovery_receipt, dict)
+        or not controller_task_id
+        or controller_run_id is None
+        or controller_profile
+        not in FACTORY_REVIEW_VERDICT_RECOVERY_CONTROLLER_PROFILES
+    ):
+        return False
+    try:
+        controller_run_id = int(controller_run_id)
+    except (TypeError, ValueError):
+        return False
+    if conn.execute(
+        "SELECT 1 FROM tasks task JOIN task_runs run "
+        "ON run.id = ? AND run.task_id = task.id "
+        "WHERE task.id = ? AND task.assignee = ? AND task.status = 'running' "
+        "AND task.current_run_id = run.id AND run.profile = ? "
+        "AND run.status = 'running' AND run.outcome IS NULL "
+        "AND run.ended_at IS NULL",
+        (controller_run_id, controller_task_id, controller_profile, controller_profile),
+    ).fetchone() is None:
+        return False
+
+    author = conn.execute(
+        "SELECT status, assignee, current_run_id FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    child = conn.execute(
+        "SELECT status, assignee, current_run_id FROM tasks WHERE id = ?",
+        (review_task_id,),
+    ).fetchone()
+    handoff = _review_handoff_event_for_child(conn, task_id, review_task_id)
+    if handoff is None and author is not None and author["status"] == "ready":
+        handoff_rows = conn.execute(
+            "SELECT id, run_id, payload FROM task_events WHERE task_id = ? "
+            "AND kind = 'review_handoff' ORDER BY id DESC", (task_id,),
+        ).fetchall()
+        if handoff_rows:
+            replay_handoff = _review_handoff_receipt_from_row(task_id, handoff_rows[0])
+            if replay_handoff is not None and replay_handoff.review_task_id == review_task_id:
+                handoff = handoff_rows[0]
+    if (
+        author is None
+        or author["assignee"] != FACTORY_REVIEW_AUTHOR_PROFILE
+        or author["current_run_id"] is not None
+        or author["status"] not in {"review", "ready"}
+        or child is None
+        or child["assignee"] != FACTORY_REVIEW_AUDITOR_PROFILE
+        or child["status"] not in {"done", "archived"}
+        or child["current_run_id"] is not None
+        or conn.execute(
+            "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ?",
+            (task_id, review_task_id),
+        ).fetchone() is None
+        or handoff is None
+    ):
+        return False
+    runs = conn.execute(
+        "SELECT id, profile, status, outcome, summary, metadata, ended_at "
+        "FROM task_runs WHERE task_id = ? ORDER BY id DESC", (review_task_id,),
+    ).fetchall()
+    if (
+        not runs
+        or int(runs[0]["id"]) != expected_review_run_id
+        or any(row["ended_at"] is None for row in runs)
+    ):
+        return False
+    review_run = runs[0]
+    if (
+        review_run["profile"] != FACTORY_REVIEW_AUDITOR_PROFILE
+        or review_run["status"] != "done"
+        or review_run["outcome"] != "completed"
+        or review_run["ended_at"] is None
+        or review_run["summary"] != reason
+    ):
+        return False
+    try:
+        metadata = json.loads(review_run["metadata"] or "{}")
+    except (TypeError, ValueError):
+        return False
+    receipt_keys = {
+        "review_outcome", "repository", "pr", "head", "tree", "base",
+        "github_review_id", "github_review_url", "github_review_state",
+    }
+    if set(recovery_receipt) != receipt_keys:
+        return False
+    receipt = {key: metadata.get(key) for key in sorted(receipt_keys)}
+    expected_receipt = {key: recovery_receipt.get(key) for key in sorted(receipt_keys)}
+    review_id = receipt.get("github_review_id")
+    pr_number = receipt.get("pr")
+    if (
+        receipt != expected_receipt
+        or receipt.get("review_outcome") != "REQUEST_CHANGES_EXACT_HEAD"
+        or receipt.get("repository") != FACTORY_REVIEW_REPOSITORY
+        or isinstance(pr_number, bool) or not isinstance(pr_number, int) or pr_number <= 0
+        or any(
+            not isinstance(receipt.get(key), str)
+            or re.fullmatch(r"[0-9a-fA-F]{40}", receipt[key]) is None
+            for key in ("head", "tree", "base")
+        )
+        or isinstance(review_id, bool) or not isinstance(review_id, int) or review_id <= 0
+        or receipt.get("github_review_state") != "CHANGES_REQUESTED"
+        or receipt.get("github_review_url") != (
+            f"https://github.com/{FACTORY_REVIEW_REPOSITORY}/pull/{pr_number}"
+            f"#pullrequestreview-{review_id}"
+        )
+    ):
+        return False
+    payload = {
+        "version": 2,
+        "review_task_id": review_task_id,
+        "review_run_id": expected_review_run_id,
+        "verdict": verdict,
+        "reason": reason,
+        "recovery": True,
+        "recovery_receipt": receipt,
+        "controller": {
+            "task_id": controller_task_id,
+            "run_id": controller_run_id,
+            "profile": controller_profile,
+        },
+    }
+    prior = conn.execute(
+        "SELECT run_id, payload FROM task_events WHERE task_id = ? "
+        "AND kind = 'review_verdict' ORDER BY id", (task_id,),
+    ).fetchall()
+    if prior:
+        if len(prior) != 1:
+            return False
+        try:
+            prior_payload = json.loads(prior[0]["payload"] or "{}")
+        except (TypeError, ValueError):
+            return False
+        return (
+            prior[0]["run_id"] == expected_review_run_id
+            and prior_payload == payload
+            and author["status"] == "ready"
+        )
+    if author["status"] != "review":
+        return False
+    resumed = conn.execute(
+        "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+        "claim_expires = NULL, worker_pid = NULL, block_kind = NULL, "
+        "block_recurrences = 0 WHERE id = ? AND status = 'review' "
+        "AND current_run_id IS NULL", (task_id,),
+    )
+    if resumed.rowcount != 1:
+        raise _ReviewHandoffConflict
+    _append_event(
+        conn, task_id, "review_verdict", payload, run_id=expected_review_run_id,
+    )
+    return True
+
+
 def record_review_verdict(
     conn: sqlite3.Connection,
     task_id: str,
@@ -6192,6 +6378,10 @@ def record_review_verdict(
     expected_review_run_id: int,
     verdict: str,
     reason: str,
+    recovery_receipt: Optional[dict] = None,
+    controller_task_id: Optional[str] = None,
+    controller_run_id: Optional[int] = None,
+    controller_profile: Optional[str] = None,
 ) -> bool:
     """Public fail-closed wrapper for the bound review-verdict transaction."""
     try:
@@ -6202,6 +6392,10 @@ def record_review_verdict(
             expected_review_run_id=expected_review_run_id,
             verdict=verdict,
             reason=reason,
+            recovery_receipt=recovery_receipt,
+            controller_task_id=controller_task_id,
+            controller_run_id=controller_run_id,
+            controller_profile=controller_profile,
         )
     except _ReviewHandoffConflict:
         return False
