@@ -18,6 +18,13 @@ SOLUTION_CONTRACT_SHA256 = "7968793f2244ec8942822bc5a9c7319b3c8d65644402d1572d7f
 ACCEPTANCE_CONTRACT_SHA256 = "9e9e38b94a5f460fa16870f38b0af1ff1873f829c75d786cedd21184989a9630"
 CHECKER_VERSION = "AION_DUAL_CHALLENGE_PREFLIGHT_CHECKER_V2"
 
+# Frozen Monarch directive timestamp (2026-08-26T07:23:55Z). Factory
+# implementation work created after this point, or explicitly resumed after
+# it, must pass the active admission gate before a run row can exist.
+PREFLIGHT_ACTIVATION_EPOCH = 1787729035
+FACTORY_PREFLIGHT_RECEIPT_SCHEMA = "AION_FACTORY_PREFLIGHT_RECEIPT_V1"
+FACTORY_PREFLIGHT_RECEIPT_FILENAME = "aion_factory_preflight_receipt.json"
+
 # P2.5 additive trusted-evidence carrier.  MIGRATED_DISABLED is a hard inert
 # state: claim_task/claim_review_task do not import or call this binder.
 SEMANTIC_RECEIPT_SCHEMA = "aion.dual_challenge.semantic_receipt.v1"
@@ -70,6 +77,19 @@ class SemanticAttestationExpectation:
     source_factory_terminal_receipt_sha256: str
     governance_base_sha: str
     hermes_checker_head_sha: str
+
+
+@dataclass(frozen=True)
+class PreflightExpectation:
+    """Frozen machine truth consumed by the active implementation gate."""
+
+    task_id: str
+    requirements_sha256: str = REQUIREMENTS_SHA256
+    solution_sha256: str = SOLUTION_CONTRACT_SHA256
+    acceptance_sha256: str = ACCEPTANCE_CONTRACT_SHA256
+    scope_identity_sha256: str = (
+        "1d89ce22d02156d562b4fe5ea9e72165068fa6d88edd9ecd17a62e2d1b01171f"
+    )
 
 
 class SemanticPointerBindingError(RuntimeError):
@@ -219,6 +239,94 @@ def check_semantic_attestation(
     if bootstrap.get("hermes_checker_head_sha") != expected.hermes_checker_head_sha:
         return _block("BOOTSTRAP_HEAD_MISMATCH", "hermes_checker_head_sha")
     return check_challenge_semantic_bindings(receipt, expected.challenge)
+
+
+def check_factory_preflight_receipt(
+    receipt: dict[str, Any],
+    expected: PreflightExpectation,
+) -> ChallengeBindingResult:
+    """Validate one closed AION_FACTORY_PREFLIGHT receipt.
+
+    The caller separately verifies attachment bytes and trusted provenance.
+    This pure checker binds all frozen machine fields to the exact task/scope;
+    no caller boolean, narrative, network lookup, clock, or LLM is accepted.
+    """
+    required = (
+        "schema",
+        "task_id",
+        "risk_tier",
+        "outcome_requirement_sha256",
+        "solution_contract_sha256",
+        "solution_challenge_verdict",
+        "acceptance_contract_sha256",
+        "acceptance_challenge_verdict",
+        "test_first_evidence",
+        "preflight_checker_version",
+        "preflight_verdict",
+        "scope_identity_sha256",
+        "checker_output_sha256",
+    )
+    missing = tuple(field for field in required if field not in receipt)
+    if missing:
+        return ChallengeBindingResult(
+            decision="BLOCK",
+            baseline_reason_code="RECEIPT_INVALID",
+            detail_code="MISSING_FIELD",
+            field=missing[0],
+            missing_fields=missing,
+        )
+    exact = {
+        "schema": FACTORY_PREFLIGHT_RECEIPT_SCHEMA,
+        "task_id": expected.task_id,
+        "risk_tier": "T2_CORE_OR_HIGH_RISK",
+    }
+    for field, value in exact.items():
+        if receipt[field] != value:
+            detail = "RECEIPT_SCHEMA_INVALID" if field == "schema" else "TASK_BINDING_MISMATCH"
+            if field == "risk_tier":
+                detail = "RISK_TIER_MISMATCH"
+            return _block(detail, field)
+    hashes = {
+        "outcome_requirement_sha256": expected.requirements_sha256,
+        "solution_contract_sha256": expected.solution_sha256,
+        "acceptance_contract_sha256": expected.acceptance_sha256,
+    }
+    for field, value in hashes.items():
+        observed = receipt[field]
+        if not isinstance(observed, str) or not _HEX64.fullmatch(observed):
+            return _block("MALFORMED_FIELD", field)
+        if observed != value:
+            return _block("HASH_MISMATCH", field)
+    verdicts = {
+        "solution_challenge_verdict": "PASS_SOLUTION_CHALLENGE",
+        "acceptance_challenge_verdict": "PASS_ACCEPTANCE_CHALLENGE",
+    }
+    for field, value in verdicts.items():
+        if receipt[field] != value:
+            return _block("CHALLENGE_NOT_PASS", field)
+    for field, detail in (
+        ("test_first_evidence", "TEST_FIRST_EVIDENCE_INVALID"),
+        ("checker_output_sha256", "CHECKER_OUTPUT_INVALID"),
+    ):
+        value = receipt[field]
+        if not isinstance(value, str) or not _HEX64.fullmatch(value) or value == "0" * 64:
+            return _block(detail, field)
+    if receipt["preflight_checker_version"] != CHECKER_VERSION:
+        return _block("CHECKER_VERSION_MISMATCH", "preflight_checker_version")
+    if receipt["preflight_verdict"] != "PASS":
+        return _block("PREFLIGHT_NOT_PASS", "preflight_verdict")
+    scope = receipt["scope_identity_sha256"]
+    if not isinstance(scope, str) or not _HEX64.fullmatch(scope):
+        return _block("MALFORMED_FIELD", "scope_identity_sha256")
+    if scope != expected.scope_identity_sha256:
+        return _block("SCOPE_BINDING_MISMATCH", "scope_identity_sha256")
+    return ChallengeBindingResult(
+        decision="PASS",
+        baseline_reason_code=None,
+        detail_code=None,
+        field=None,
+        missing_fields=(),
+    )
 
 
 def bind_semantic_attestation_in_txn(
