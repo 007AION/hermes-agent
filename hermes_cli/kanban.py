@@ -2222,7 +2222,8 @@ def _cmd_complete(args: argparse.Namespace) -> int:
             # `hermes kanban complete <id>` from the terminal tool and
             # bypass the auxiliary judge that the tool-call path enforces.
             task = kb.get_task(conn, tid)
-            if task and task.goal_mode:
+            controller_receipt = kb._aion889_atomic_finalizer_run_id(conn, tid)
+            if task and task.goal_mode and controller_receipt is None:
                 judge_available = False
                 try:
                     from agent.auxiliary_client import get_text_auxiliary_client

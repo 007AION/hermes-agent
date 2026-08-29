@@ -574,7 +574,8 @@ class TestCLIJudgeGate:
     """
 
     def _run(self, monkeypatch, *, goal_mode=True, judge_available=True,
-             verdict="done", reason="", complete_ok=True, summary="done"):
+             verdict="done", reason="", complete_ok=True, summary="done",
+             controller_receipt=None):
         import argparse
         import types
         from unittest.mock import MagicMock
@@ -602,6 +603,10 @@ class TestCLIJudgeGate:
         monkeypatch.setattr("hermes_cli.kanban.kb.get_task", lambda conn, tid: fake_task)
         monkeypatch.setattr("hermes_cli.kanban.kb.complete_task", fake_complete_task)
         monkeypatch.setattr("hermes_cli.kanban.kb.connect_closing", fake_connect_closing)
+        monkeypatch.setattr(
+            "hermes_cli.kanban.kb._aion889_atomic_finalizer_run_id",
+            lambda conn, tid: controller_receipt,
+        )
         monkeypatch.setattr("hermes_cli.kanban._worker_run_id_for", lambda _: None)
 
         _aux_client = (object(), "judge-model") if judge_available else (None, None)
@@ -642,5 +647,13 @@ class TestCLIJudgeGate:
     def test_non_goal_mode_task_skips_gate(self, monkeypatch):
         """Plain (non-goal_mode) tasks are never sent to the judge."""
         rc, complete_calls = self._run(monkeypatch, goal_mode=False)
+        assert rc == 0
+        assert complete_calls == ["t1"]
+
+    def test_machine_controller_receipt_skips_circular_goal_judge(self, monkeypatch):
+        rc, complete_calls = self._run(
+            monkeypatch, verdict="continue", reason="child is not ready yet",
+            controller_receipt=3500,
+        )
         assert rc == 0
         assert complete_calls == ["t1"]
