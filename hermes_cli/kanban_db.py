@@ -188,6 +188,9 @@ FACTORY_SEMANTIC_FIELDS = (
     "canonical_incident",
 )
 
+AION_889_PREFLIGHT_DIRECTIVE_ID = "AION-889-PREFLIGHT-V1-IMPLEMENT"
+AION_889_PREFLIGHT_ACTIVATION_EPOCH = 1787729035
+
 # Creator profiles whose authenticated create identity forces the gate
 # UNCONDITIONALLY (REV2 — TOTAL gate entry): any task created under a factory
 # profile is a factory-build task, regardless of title/body markers. This makes
@@ -4033,16 +4036,10 @@ def create_task(
     )
     preflight_required = int(
         assignee == "agent007"
+        and now >= AION_889_PREFLIGHT_ACTIVATION_EPOCH
         and (
-            factory_directive_id == "AION-889-PREFLIGHT-V1-IMPLEMENT"
-            or bool(
-                body
-                and re.search(
-                    r"(?m)^\s*factory_directive_id\s*:\s*"
-                    r"['\"]?AION-889-PREFLIGHT-V1-IMPLEMENT['\"]?\s*$",
-                    body,
-                )
-            )
+            factory_directive_id == AION_889_PREFLIGHT_DIRECTIVE_ID
+            or _body_has_aion_889_preflight_directive(body)
         )
     )
 
@@ -6512,10 +6509,16 @@ def record_review_verdict(
 def _factory_preflight_scope_row(
     conn: sqlite3.Connection, task_id: str, source_status: str,
 ) -> Optional[sqlite3.Row]:
-    """Return the in-scope factory implementation row, else ``None``."""
+    """Return the in-scope factory implementation row, else ``None``.
+
+    Exact pre-upgrade rows have ``factory_preflight_required=0`` because the
+    additive column did not exist at creation.  Admission therefore re-derives
+    the frozen directive from persisted canonical bytes and irreversibly
+    promotes the requirement bit inside the same claim transaction.
+    """
 
     row = conn.execute(
-        "SELECT id, assignee, status, factory_build_gate, "
+        "SELECT id, assignee, status, body, created_at, factory_build_gate, "
         "factory_preflight_required, factory_preflight_receipt_sha256 "
         "FROM tasks WHERE id=?",
         (task_id,),
@@ -6524,9 +6527,28 @@ def _factory_preflight_scope_row(
         row is None
         or row["status"] != source_status
         or row["factory_build_gate"] != 1
-        or row["factory_preflight_required"] != 1
         or row["assignee"] != "agent007"
     ):
+        return None
+    required = row["factory_preflight_required"] == 1
+    if not required and _body_has_aion_889_preflight_directive(row["body"]):
+        created_after_activation = (
+            int(row["created_at"] or 0) >= AION_889_PREFLIGHT_ACTIVATION_EPOCH
+        )
+        resumed_after_activation = conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id=? AND created_at>=? "
+            "AND kind IN ('unblocked', 'promoted', 'review_handoff', "
+            "'review_resumed', 'review_changes_resumed', 'status') LIMIT 1",
+            (task_id, AION_889_PREFLIGHT_ACTIVATION_EPOCH),
+        ).fetchone() is not None
+        if created_after_activation or resumed_after_activation:
+            conn.execute(
+                "UPDATE tasks SET factory_preflight_required=1 "
+                "WHERE id=? AND factory_preflight_required=0",
+                (task_id,),
+            )
+            required = True
+    if not required:
         return None
     return row
 
@@ -7457,6 +7479,45 @@ def _body_has_factory_semantic_field(body: Optional[str]) -> bool:
     for field in FACTORY_SEMANTIC_FIELDS:
         if re.search(rf"(?m)^\s*{re.escape(field)}\s*:", body):
             return True
+    return False
+
+
+def _yaml_scalar(line: str, key: str) -> Optional[str]:
+    """Return a conservative one-line YAML scalar without parsing prose."""
+    match = re.match(rf"^[ \t]*{re.escape(key)}[ \t]*:[ \t]*(.*)$", line)
+    if match is None:
+        return None
+    value = re.sub(r"[ \t]+#.*$", "", match.group(1)).strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        value = value[1:-1]
+    return value
+
+
+def _body_has_aion_889_preflight_directive(body: Optional[str]) -> bool:
+    """Recognise the exact legacy or canonical Native directive representation."""
+    if not body:
+        return False
+    lines = body.splitlines()
+    if any(
+        _yaml_scalar(line, "factory_directive_id") == AION_889_PREFLIGHT_DIRECTIVE_ID
+        for line in lines
+    ):
+        return True
+    for index, line in enumerate(lines):
+        marker = re.match(
+            r"^([ \t]*)strategic_directive[ \t]*:[ \t]*(?:#.*)?$", line
+        )
+        if marker is None:
+            continue
+        parent_indent = len(marker.group(1).expandtabs(8))
+        for child in lines[index + 1 :]:
+            if not child.strip() or child.lstrip().startswith("#"):
+                continue
+            child_indent = len(child) - len(child.lstrip(" \t"))
+            if child_indent <= parent_indent:
+                break
+            if _yaml_scalar(child, "directive_id") == AION_889_PREFLIGHT_DIRECTIVE_ID:
+                return True
     return False
 
 

@@ -466,6 +466,139 @@ def test_non_directive_and_other_profile_paths_remain_unchanged(kanban_home: Pat
         assert kb.claim_task(conn, other, claimer="other:1") is not None
 
 
+CANONICAL_NATIVE_DIRECTIVE_BODY = """strategic_directive:
+  directive_id: AION-889-PREFLIGHT-V1-IMPLEMENT
+  source: AION-GM2 / 13爷
+  objective: fail closed before implementation pickup
+"""
+
+
+@pytest.mark.parametrize(("source_status", "claim_name"), [("ready", "claim_task"), ("review", "claim_review_task")])
+def test_canonical_nested_native_directive_requires_preflight_before_pickup(
+    kanban_home: Path, source_status: str, claim_name: str,
+) -> None:
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="canonical nested AION-889 directive",
+            body=CANONICAL_NATIVE_DIRECTIVE_BODY,
+            assignee="agent007",
+            factory_build_gate=1,
+        )
+        if source_status == "review":
+            conn.execute("UPDATE tasks SET status='review' WHERE id=?", (task_id,))
+        claimed = getattr(kb, claim_name)(conn, task_id, claimer=f"nested:{source_status}")
+        row = conn.execute(
+            "SELECT status, factory_preflight_required FROM tasks WHERE id=?",
+            (task_id,),
+        ).fetchone()
+        run_count = conn.execute(
+            "SELECT COUNT(*) FROM task_runs WHERE task_id=?", (task_id,)
+        ).fetchone()[0]
+        decisions = [
+            event for event in kb.list_events(conn, task_id)
+            if event.kind == "preflight_decision"
+        ]
+    assert claimed is None
+    assert tuple(row) == ("blocked", 1)
+    assert run_count == 0
+    assert len(decisions) == 1
+    assert decisions[0].payload["detail_code"] == "MISSING_RECEIPT_POINTER"
+
+
+@pytest.mark.parametrize(("source_status", "claim_name"), [("ready", "claim_task"), ("review", "claim_review_task")])
+def test_preupgrade_in_scope_row_is_migrated_fail_closed_at_pickup(
+    kanban_home: Path, source_status: str, claim_name: str,
+) -> None:
+    """Model an exact-base row migrated with the new requirement bit defaulting to 0."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="pre-upgrade AION-889 directive",
+            body="legacy row before preflight columns\n",
+            assignee="agent007",
+            factory_build_gate=1,
+        )
+        conn.execute(
+            "UPDATE tasks SET body=?, status=?, created_at=? WHERE id=?",
+            (
+                "factory_directive_id: AION-889-PREFLIGHT-V1-IMPLEMENT\n",
+                source_status,
+                PREFLIGHT_ACTIVATION_EPOCH + 1,
+                task_id,
+            ),
+        )
+        claimed = getattr(kb, claim_name)(conn, task_id, claimer=f"upgrade:{source_status}")
+        row = conn.execute(
+            "SELECT status, factory_preflight_required FROM tasks WHERE id=?",
+            (task_id,),
+        ).fetchone()
+        run_count = conn.execute(
+            "SELECT COUNT(*) FROM task_runs WHERE task_id=?", (task_id,)
+        ).fetchone()[0]
+    assert claimed is None
+    assert tuple(row) == ("blocked", 1)
+    assert run_count == 0
+
+
+@pytest.mark.parametrize(("source_status", "claim_name"), [("ready", "claim_task"), ("review", "claim_review_task")])
+def test_pre_activation_directive_resumed_after_activation_is_fail_closed(
+    kanban_home: Path, source_status: str, claim_name: str,
+) -> None:
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="resumed AION-889 directive",
+            body="legacy row before preflight columns\n",
+            assignee="agent007",
+            factory_build_gate=1,
+        )
+        conn.execute(
+            "UPDATE tasks SET body=?, status=?, created_at=? WHERE id=?",
+            (
+                CANONICAL_NATIVE_DIRECTIVE_BODY,
+                source_status,
+                PREFLIGHT_ACTIVATION_EPOCH - 1,
+                task_id,
+            ),
+        )
+        kb._append_event(conn, task_id, "unblocked", {"reason": "resume exact task"})
+        claimed = getattr(kb, claim_name)(conn, task_id, claimer=f"resume:{source_status}")
+        row = conn.execute(
+            "SELECT status, factory_preflight_required FROM tasks WHERE id=?",
+            (task_id,),
+        ).fetchone()
+        run_count = conn.execute(
+            "SELECT COUNT(*) FROM task_runs WHERE task_id=?", (task_id,)
+        ).fetchone()[0]
+    assert claimed is None
+    assert tuple(row) == ("blocked", 1)
+    assert run_count == 0
+
+
+def test_pre_activation_directive_without_resume_remains_legacy(
+    kanban_home: Path,
+) -> None:
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="historical AION-889 directive",
+            body="legacy row before preflight columns\n",
+            assignee="agent007",
+            factory_build_gate=1,
+        )
+        conn.execute(
+            "UPDATE tasks SET body=?, created_at=? WHERE id=?",
+            (CANONICAL_NATIVE_DIRECTIVE_BODY, PREFLIGHT_ACTIVATION_EPOCH - 1, task_id),
+        )
+        claimed = kb.claim_task(conn, task_id, claimer="historical:ready")
+        requirement = conn.execute(
+            "SELECT factory_preflight_required FROM tasks WHERE id=?", (task_id,)
+        ).fetchone()[0]
+    assert claimed is not None
+    assert requirement == 0
+
+
 # ---------------------------------------------------------------------------
 # P2.5 trusted-evidence carrier bootstrap (MIGRATED_DISABLED; no claim wiring)
 # ---------------------------------------------------------------------------
