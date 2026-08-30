@@ -1248,7 +1248,9 @@ def _non_pr_reviewed_evidence_chain(conn, *, handoff_reason="exact runtime evide
     return author, author_run, reviewer
 
 
-def _canonical_factory_packet_chain(conn, *, installed_source_shapes=False):
+def _canonical_factory_packet_chain(
+    conn, *, installed_source_shapes=False, legacy_installed_source_tail=False,
+):
     """Create the generic authenticated packet shapes emitted by the current lane."""
     head, tree, base, merge = "1" * 40, "2" * 40, "3" * 40, "4" * 40
     review_id, source_pr = 12345, 64
@@ -1358,7 +1360,7 @@ def _canonical_factory_packet_chain(conn, *, installed_source_shapes=False):
         "witness_type": f"EXACT_PR{source_pr}_INSTALLED_AND_TYPED_RUNTIME_WITNESS",
         "worker_session_id": "canonical-install-session",
     }
-    if installed_source_shapes:
+    if installed_source_shapes and not legacy_installed_source_tail:
         install_metadata = {
             "activation_performed": False, "audited_head": head,
             "author_finalizer_performed": False, "base": base,
@@ -1409,7 +1411,7 @@ def _canonical_factory_packet_chain(conn, *, installed_source_shapes=False):
     external = {"compressed_sha256": "8" * 64, "exact_shell_pid_unique_attribution": False, "outside_target_cgroup_proven": True, "restart_count": 1, "second_restart": 0, "uncompressed_sha256": "9" * 64}
     source = {"audited_head": head, "clean": True, "head": merge, "kanban_db_blob": "6" * 40, "kanban_db_sha256": module_hash, "tree": tree}
     resident = {"active_state": "active", "barrier_loaded": True, "configured_import_exact": True, "deep_health_exit_code": 0, "exec_start_monotonic": 1000, "main_pid": 2000, "nrestarts": 0, "pids_events_max": 0, "pids_max": 120, "pids_peak": 42, "proc_starttime_ticks": 3000, "result": "success", "sub_state": "running", "tasks_max": 120}
-    if installed_source_shapes:
+    if installed_source_shapes and not legacy_installed_source_tail:
         source = {
             **source, "merge_commit": merge,
         }
@@ -1446,7 +1448,7 @@ def _canonical_factory_packet_chain(conn, *, installed_source_shapes=False):
         "source": {"audited_head": head, "kanban_db_blob": "6" * 40, "kanban_db_sha256": module_hash, "merge_commit": merge, "tree": tree},
         "worker_session_id": "canonical-resident-audit-session",
     }
-    if installed_source_shapes:
+    if installed_source_shapes and not legacy_installed_source_tail:
         resident_metadata = {
             "artifact_sha256": "b" * 64,
             "artifacts": ["/tmp/canonical-resident-audit.md"],
@@ -1520,6 +1522,22 @@ def test_reviewed_author_accepts_installed_source_factory_packet_chain(
         assert author.status == "done"
 
 
+def test_reviewed_author_rejects_mixed_installed_source_and_legacy_packet_families(
+    kanban_home, aion_gov_src,
+):
+    with kb.connect() as conn:
+        chain = _canonical_factory_packet_chain(
+            conn,
+            installed_source_shapes=True,
+            legacy_installed_source_tail=True,
+        )
+        before = _native_state_snapshot(conn)
+        assert kb._reviewed_author_finalizer_run_id(conn, chain["author"]) is None
+        with pytest.raises(kb.FactoryTerminalReceiptRequiredError):
+            kb.complete_task(conn, chain["author"], summary="reject mixed packet families")
+        assert _native_state_snapshot(conn) == before
+
+
 @pytest.mark.parametrize(("target", "mutate"), [
     ("merger", lambda md: md.__setitem__("head", "f" * 40)),
     ("merger", lambda md: md["audit"].__setitem__("native_run_id", -1)),
@@ -1532,9 +1550,12 @@ def test_reviewed_author_accepts_installed_source_factory_packet_chain(
     ("installer", lambda md: md.__setitem__("merge", "f" * 40)),
     ("installer", lambda md: md["blobs"].__setitem__(next(iter(md["blobs"])), "f" * 40)),
     ("installer", lambda md: md.__setitem__("source_installed", False)),
+    ("installer", lambda md: md["install"].__setitem__("rollback_ref", "")),
     ("installer", lambda md: md["fresh_runtime"].__setitem__("approved", True)),
     ("installer", lambda md: md.__setitem__("source_head", "f" * 40)),
     ("activation", lambda md: md["source"].__setitem__("head", "f" * 40)),
+    ("activation", lambda md: md["source"].__setitem__("merge_commit", "f" * 40)),
+    ("activation", lambda md: md["resident_runtime"].__setitem__("main_pid", True)),
     ("activation", lambda md: md["source"].__setitem__("approved", True)),
     ("activation", lambda md: md.__setitem__("replay_restart_attempts", 1)),
     ("resident_audit", lambda md: md["native_replay"].__setitem__("run_id", -1)),
@@ -1555,6 +1576,50 @@ def test_reviewed_author_rejects_installed_source_packet_drift_zero_mutation(
         assert kb._reviewed_author_finalizer_run_id(conn, chain["author"]) is None
         with pytest.raises(kb.FactoryTerminalReceiptRequiredError):
             kb.complete_task(conn, chain["author"], summary="reject installed-source drift")
+        assert _native_state_snapshot(conn) == before
+
+
+@pytest.mark.parametrize(
+    ("field", "drift"),
+    [
+        ("kanban_db_blob", "f" * 40),
+        ("kanban_db_sha256", "f" * 64),
+    ],
+)
+def test_reviewed_author_rejects_coordinated_installed_source_identity_drift(
+    kanban_home, aion_gov_src, field, drift,
+):
+    with kb.connect() as conn:
+        chain = _canonical_factory_packet_chain(conn, installed_source_shapes=True)
+        _rewrite_latest_run_metadata(
+            conn, chain["activation"],
+            lambda md: md["source"].__setitem__(field, drift),
+        )
+        _rewrite_latest_run_metadata(
+            conn, chain["resident_audit"],
+            lambda md: md["source"].__setitem__(field, drift),
+        )
+        before = _native_state_snapshot(conn)
+        assert kb._reviewed_author_finalizer_run_id(conn, chain["author"]) is None
+        with pytest.raises(kb.FactoryTerminalReceiptRequiredError):
+            kb.complete_task(conn, chain["author"], summary="reject coordinated source drift")
+        assert _native_state_snapshot(conn) == before
+
+
+def test_reviewed_author_rejects_coordinated_bool_runtime_identity_drift(
+    kanban_home, aion_gov_src,
+):
+    with kb.connect() as conn:
+        chain = _canonical_factory_packet_chain(conn, installed_source_shapes=True)
+        for target in ("activation", "resident_audit"):
+            _rewrite_latest_run_metadata(
+                conn, chain[target],
+                lambda md: md["resident_runtime"].__setitem__("main_pid", True),
+            )
+        before = _native_state_snapshot(conn)
+        assert kb._reviewed_author_finalizer_run_id(conn, chain["author"]) is None
+        with pytest.raises(kb.FactoryTerminalReceiptRequiredError):
+            kb.complete_task(conn, chain["author"], summary="reject bool runtime identity")
         assert _native_state_snapshot(conn) == before
 
 

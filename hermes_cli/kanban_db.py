@@ -8556,6 +8556,26 @@ def _authenticated_canonical_factory_packet_chain(
             and (not positive or value > 0)
         )
 
+    def nonnegative_int(value) -> bool:
+        return type(value) is int and value >= 0
+
+    def exact_hash(value, width: int) -> bool:
+        return (
+            isinstance(value, str)
+            and re.fullmatch(rf"[0-9a-fA-F]{{{width}}}", value) is not None
+        )
+
+    def nonempty_string(value) -> bool:
+        return isinstance(value, str) and bool(value.strip())
+
+    def nonempty_string_list(value) -> bool:
+        return (
+            isinstance(value, list)
+            and bool(value)
+            and all(nonempty_string(item) for item in value)
+            and len(set(value)) == len(value)
+        )
+
     merger_keys = {
         "actor", "audited_head", "audited_tree", "audit", "base",
         "canonical_checkout", "checks", "changed_files", "child_task_id",
@@ -8728,9 +8748,14 @@ def _authenticated_canonical_factory_packet_chain(
         return False
     install = install_md.get("install")
     fresh_runtime = install_md.get("fresh_runtime")
+    blobs = install_md.get("blobs")
+    installed_module_blob = blobs.get("hermes_cli/kanban_db.py") if isinstance(blobs, dict) else None
     has_installed_source_install = set(install_md) == installed_source_install_keys
+    if has_installed_source_install != has_installed_source_merger:
+        # The schemas are closed end-to-end: never combine an installed-source
+        # authority packet with a legacy install/runtime tail, or vice versa.
+        return False
     if has_installed_source_install:
-        blobs = install_md.get("blobs")
         typed_symbol = install_md.get("typed_symbol")
         receipt_sha = install_md.get("receipt_sha256")
         if (
@@ -8755,6 +8780,7 @@ def _authenticated_canonical_factory_packet_chain(
             or install.get("changed_paths") != paths
             or install.get("preinstall_commit") != base
             or install.get("rollback_commit") != base
+            or not nonempty_string(install.get("rollback_ref"))
             or install.get("worktree_clean") is not True
             or install.get("method") != "existing_clean_git_editable_guarded_fast_forward"
             or not isinstance(fresh_runtime, dict)
@@ -8765,8 +8791,10 @@ def _authenticated_canonical_factory_packet_chain(
             or fresh_runtime.get("bytes_match") is not True
             or fresh_runtime.get("resolver_loaded") is not True
             or fresh_runtime.get("resolves_to_authoritative_root") is not True
-            or not isinstance(fresh_runtime.get("module_sha256"), str)
-            or re.fullmatch(r"[0-9a-fA-F]{64}", fresh_runtime["module_sha256"]) is None
+            or not exact_hash(fresh_runtime.get("module_sha256"), 64)
+            or not nonempty_string(fresh_runtime.get("module_path"))
+            or not fresh_runtime["module_path"].endswith("/hermes_cli/kanban_db.py")
+            or installed_module_blob is None
             or typed_symbol != {
                 "approval_commit_id_branch_in_finalizer": True,
                 "present_callable": True,
@@ -8897,6 +8925,22 @@ def _authenticated_canonical_factory_packet_chain(
             "main_pid", "memory_current", "memory_peak", "nrestarts", "pids_peak",
             "proc_starttime_ticks", "result", "sub_state", "tasks_max",
         }
+        or source.get("merge_commit") != merge_sha
+        or source.get("kanban_db_blob") != installed_module_blob
+        or source.get("kanban_db_sha256") != fresh_runtime.get("module_sha256")
+        or not exact_hash(external.get("compressed_sha256"), 64)
+        or not exact_hash(external.get("uncompressed_sha256"), 64)
+        or not exact_int(resident.get("active_enter_timestamp_monotonic"), positive=True)
+        or not exact_int(resident.get("exec_start_monotonic"), positive=True)
+        or resident["active_enter_timestamp_monotonic"] > resident["exec_start_monotonic"]
+        or not exact_int(resident.get("main_pid"), positive=True)
+        or not nonnegative_int(resident.get("memory_current"))
+        or not nonnegative_int(resident.get("memory_peak"))
+        or resident["memory_peak"] < resident["memory_current"]
+        or not exact_int(resident.get("nrestarts"), 0)
+        or not nonnegative_int(resident.get("pids_peak"))
+        or not exact_int(resident.get("proc_starttime_ticks"), positive=True)
+        or not exact_int(resident.get("tasks_max"), positive=True)
     ):
         return False
 
@@ -8930,6 +8974,8 @@ def _authenticated_canonical_factory_packet_chain(
         return False
     audit_source = resident_md.get("source")
     has_installed_source_resident = set(resident_md) == installed_source_resident_keys
+    if has_installed_source_resident != has_installed_source_install:
+        return False
     if has_installed_source_resident:
         audit_external = resident_md.get("external_receipt")
         focused_tests = resident_md.get("focused_tests")
@@ -8976,6 +9022,15 @@ def _authenticated_canonical_factory_packet_chain(
                 "pids_events_max", "pids_max", "pids_peak", "proc_starttime_ticks",
                 "result", "sub_state", "tasks_max",
             }
+            or not exact_int(audited_resident.get("exec_start_monotonic"), positive=True)
+            or not exact_int(audited_resident.get("main_pid"), positive=True)
+            or not exact_int(audited_resident.get("nrestarts"), 0)
+            or not nonnegative_int(audited_resident.get("pids_events_max"))
+            or not exact_int(audited_resident.get("pids_max"), positive=True)
+            or not nonnegative_int(audited_resident.get("pids_peak"))
+            or audited_resident["pids_peak"] > audited_resident["pids_max"]
+            or not exact_int(audited_resident.get("proc_starttime_ticks"), positive=True)
+            or not exact_int(audited_resident.get("tasks_max"), positive=True)
             or any(
                 audited_resident.get(key) != resident.get(key)
                 for key in (
