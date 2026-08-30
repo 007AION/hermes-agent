@@ -1248,6 +1248,216 @@ def _non_pr_reviewed_evidence_chain(conn, *, handoff_reason="exact runtime evide
     return author, author_run, reviewer
 
 
+def _canonical_factory_packet_chain(conn):
+    """Create the generic authenticated packet shapes emitted by the current lane."""
+    head, tree, base, merge = "1" * 40, "2" * 40, "3" * 40, "4" * 40
+    review_id, source_pr = 12345, 64
+    paths = ["hermes_cli/kanban_db.py", "tests/hermes_cli/test_kanban_db.py"]
+    author = kb.create_task(conn, title="packet author", factory_build_gate=1, assignee="agent007")
+    reviewer = kb.create_task(conn, title="packet audit", factory_build_gate=1, assignee="bafuxunan", parents=[author])
+    merger = kb.create_task(conn, title="packet merger", factory_build_gate=1, assignee="gm", parents=[reviewer])
+    installer = kb.create_task(conn, title="packet install", factory_build_gate=1, assignee="merger", parents=[merger])
+    activation = kb.create_task(conn, title="packet activation", factory_build_gate=1, assignee="agent007", parents=[installer])
+    resident_audit = kb.create_task(conn, title="packet resident audit", factory_build_gate=1, assignee="bafuxunan", parents=[activation])
+
+    author_run = _claim_and_run_id(conn, author)
+    assert kb.request_review_handoff(
+        conn, author, expected_run_id=author_run, review_task_id=reviewer,
+        reason=f"PR #{source_pr} frozen for independent exact-head audit",
+    )
+    review_run = _claim_and_run_id(conn, reviewer)
+    assert kb.record_review_verdict(
+        conn, author, review_task_id=reviewer,
+        expected_review_run_id=review_run, verdict="pass", reason="PASS_EXACT_HEAD",
+    )
+    review_url = f"https://github.com/kiddhu/hermes-agent/pull/{source_pr}#pullrequestreview-{review_id}"
+    assert kb.complete_task(conn, reviewer, expected_run_id=review_run, metadata={
+        "approval_commit_id": head, "approved": True, "base": base,
+        "github_review_id": review_id, "github_review_url": review_url,
+        "head": head, "head_tree": tree, "review_outcome": "PASS_EXACT_HEAD",
+        "tests_passed": 406, "tests_failed": 0,
+        "verification": ["canonical tests", "live exact-head readback"],
+        "worker_session_id": "canonical-review-session",
+    })
+
+    merger_run = _claim_and_run_id(conn, merger)
+    assert kb.complete_task(conn, merger, expected_run_id=merger_run, metadata={
+        "actor": "kiddhu", "audited_head": head, "audited_tree": tree,
+        "audit": {"github_review_id": review_id, "github_review_state": "APPROVED", "native_run_id": review_run, "native_task_id": reviewer, "verdict": "PASS_EXACT_HEAD"},
+        "base": base, "canonical_checkout": {"clean": True, "installed": False, "preserved_head": base},
+        "checks": {"bad_or_pending": 0, "neutral": 1, "skipped": 1, "success": 2, "total": 4},
+        "changed_files": paths, "child_task_id": installer,
+        "forbidden_actions_performed": [],
+        "formal_receipts": ["https://github.com/example/governance/issues/833#issuecomment-1"],
+        "issues_kept_open": [833, 790], "merge_commit": merge,
+        "merge_parents": [base, head], "merge_tree": tree,
+        "mutation_ledger": {"github_cas_merge": 1, "github_comments": 2, "native_child_creations": 1, "native_evidence_comments": 1},
+        "new_control_plane_count": 0, "pr": source_pr, "remote_main": merge,
+        "role_separation": {"author": "agent007/007AION", "auditor": "bafuxunan/GemAION", "merger": "gm/kiddhu"},
+        "secret_exposure": "none", "worker_session_id": "canonical-merge-session",
+    })
+
+    install_run = _claim_and_run_id(conn, installer)
+    module_hash = "5" * 64
+    assert kb.complete_task(conn, installer, expected_run_id=install_run, metadata={
+        "artifacts": ["/tmp/canonical-install-receipt.json"],
+        "author_finalizer_performed": False, "author_status_before_and_after": "review",
+        "canonical_run_id": install_run, "forbidden_actions_performed": [],
+        "fresh_runtime": {"bytes_match": True, "canonical_git_blob": "6" * 40, "module_path": "/repo/hermes_cli/kanban_db.py", "module_sha256": module_hash, "resolver_loaded": True, "working_git_blob": "6" * 40},
+        "github_review_id": review_id,
+        "install": {"changed_paths": paths, "head": merge, "method": "existing_clean_git_editable_guarded_fast_forward", "parents": [base, head], "preinstall_commit": base, "rollback_commit": base, "rollback_ref": "refs/aion/rollback/generic", "tree": tree, "worktree_clean": True},
+        "native_binding": {"auditor_profile": "bafuxunan", "author_profile": "agent007", "direct_parent_only": merger, "merge_profile": "gm", "parent_run": merger_run, "roles_distinct": True, "runtime_profile": "merger"},
+        "new_control_plane_count": 0, "not_true_done_for": ["reviewed-author finalization"],
+        "public_receipts": ["https://github.com/example/governance/issues/833#issuecomment-2"],
+        "receipt_sha256": "7" * 64, "review_obligations": {"count": 21, "review_statuses_unchanged": True},
+        "secret_exposure": "none", "source_changed_paths": paths, "source_head": head,
+        "source_merge": merge, "source_pr": source_pr, "source_tree": tree,
+        "tests": {"focused_total": "950 passed, 0 failed"},
+        "typed_witness": {
+            "admission_call_sites": {"claim_review_task": True, "claim_task": True, "recompute_ready": True},
+            "functional_smoke": {"absent_predecessor_releases": True, "live_matching_predecessor_blocks": True, "predecessor_exited_signal_emitted": True},
+            "live_board_smoke_zero_mutation": True,
+            "states": {"ACTIVATION_GATED": True, "INSTALLED_PRESENT": True, "RESIDENT_ACTIVE": True, "SOURCE_PRESENT": True},
+        },
+        "witness_type": f"EXACT_PR{source_pr}_INSTALLED_AND_TYPED_RUNTIME_WITNESS",
+        "worker_session_id": "canonical-install-session",
+    })
+
+    activation_run = _claim_and_run_id(conn, activation)
+    external = {"compressed_sha256": "8" * 64, "exact_shell_pid_unique_attribution": False, "outside_target_cgroup_proven": True, "restart_count": 1, "second_restart": 0, "uncompressed_sha256": "9" * 64}
+    source = {"audited_head": head, "clean": True, "head": merge, "kanban_db_blob": "6" * 40, "kanban_db_sha256": module_hash, "tree": tree}
+    resident = {"active_state": "active", "barrier_loaded": True, "configured_import_exact": True, "deep_health_exit_code": 0, "exec_start_monotonic": 1000, "main_pid": 2000, "nrestarts": 0, "pids_events_max": 0, "pids_max": 120, "pids_peak": 42, "proc_starttime_ticks": 3000, "result": "success", "sub_state": "running", "tasks_max": 120}
+    assert kb.complete_task(conn, activation, expected_run_id=activation_run, metadata={
+        "artifacts": ["/tmp/canonical-activation.json"], "audit_task": resident_audit,
+        "external_activation_receipt": external, "focused_barrier_tests": {"failed": 0, "passed": 5},
+        "forbidden_actions_performed": [], "formal_evidence": ["https://github.com/example/governance/issues/833#issuecomment-3"],
+        "new_control_plane_count": 0, "not_true_done_for": ["fresh resident audit"],
+        "outcome": "SAME_TASK_POST_ACTIVATION_READBACK_COMPLETE", "receipt_sha256": "a" * 64,
+        "replay_restart_attempts": 0, "resident_runtime": resident, "secret_exposure": "none",
+        "source": source, "worker_session_id": "canonical-activation-session",
+    })
+
+    resident_run = _claim_and_run_id(conn, resident_audit)
+    assert kb.complete_task(conn, resident_audit, expected_run_id=resident_run, metadata={
+        "artifact_sha256": "b" * 64, "artifacts": ["/tmp/canonical-resident-audit.md"],
+        "barrier_tests": {"failed": 0, "passed": 5}, "deep_health_exit_code": 0,
+        "external_receipt": external, "forbidden_actions_performed": [],
+        "formal_evidence": ["https://github.com/example/governance/issues/833#issuecomment-4"],
+        "new_control_plane_count": 0, "next_supported_gate": "reviewed-author finalization",
+        "not_true_done_for": ["production PASS"], "outcome": "PASS_EXACT_RESIDENT_RUNTIME",
+        "parent_replay": {"manual_claim_or_dispatch_count": 0, "natural_claim_run": activation_run, "restart_attempts": 0},
+        "resident": {"active_state": "active", "exec_start_monotonic": 1000, "main_pid": 2000, "nrestarts": 0, "proc_starttime_ticks": 3000, "result": "success", "sub_state": "running", "tasks_max": 120},
+        "resource_readback": {"memory_events_high": 1, "memory_events_max": 0, "memory_peak_bytes": 1024, "oom": 0, "oom_group_kill": 0, "oom_kill": 0, "pids_current": 2, "pids_events_max": 0, "pids_max": 120, "pids_peak": 42},
+        "secret_exposure": "none",
+        "source": {"audited_head": head, "kanban_db_blob": "6" * 40, "kanban_db_sha256": module_hash, "merge_commit": merge, "tree": tree},
+        "worker_session_id": "canonical-resident-audit-session",
+    })
+    return {"author": author, "author_run": author_run, "reviewer": reviewer, "review_run": review_run, "merger": merger, "merger_run": merger_run, "installer": installer, "install_run": install_run, "activation": activation, "activation_run": activation_run, "resident_audit": resident_audit, "resident_run": resident_run}
+
+
+def test_reviewed_author_accepts_current_canonical_factory_packet_chain(kanban_home, aion_gov_src):
+    with kb.connect() as conn:
+        chain = _canonical_factory_packet_chain(conn)
+        before = _native_state_snapshot(conn)
+        assert kb._reviewed_author_finalizer_run_id(conn, chain["author"]) == chain["author_run"]
+        assert _native_state_snapshot(conn) == before
+        assert kb.complete_task(conn, chain["author"], summary="canonical chain terminalized")
+        author = kb.get_task(conn, chain["author"])
+        assert author is not None
+        assert author.status == "done"
+
+
+@pytest.mark.parametrize(("target", "mutate"), [
+    ("reviewer", lambda md: md.pop("head")),
+    ("reviewer", lambda md: md.__setitem__("audit_outcome", "PASS_EXACT_HEAD")),
+    ("reviewer", lambda md: md.__setitem__("approved", False)),
+    ("reviewer", lambda md: md.__setitem__("tests_passed", True)),
+    ("reviewer", lambda md: md.__setitem__("github_review_url", "https://example.invalid")),
+    ("merger", lambda md: md.__setitem__("audited_head", "f" * 40)),
+    ("merger", lambda md: md.__setitem__("audited_tree", "f" * 40)),
+    ("merger", lambda md: md.__setitem__("base", "f" * 40)),
+    ("merger", lambda md: md["audit"].__setitem__("native_run_id", -1)),
+    ("merger", lambda md: md["role_separation"].__setitem__("auditor", md["role_separation"]["author"])),
+    ("installer", lambda md: md.__setitem__("source_pr", 65)),
+    ("installer", lambda md: md.__setitem__("source_merge", "f" * 40)),
+    ("activation", lambda md: md.__setitem__("replay_restart_attempts", 1)),
+    ("activation", lambda md: md["external_activation_receipt"].__setitem__("restart_count", True)),
+    ("activation", lambda md: md["source"].__setitem__("head", "f" * 40)),
+    ("resident_audit", lambda md: md["parent_replay"].__setitem__("natural_claim_run", -1)),
+    ("resident_audit", lambda md: md.__setitem__("outcome", "PASS")),
+    ("resident_audit", lambda md: md.__setitem__("deep_health_exit_code", False)),
+])
+def test_reviewed_author_rejects_current_canonical_packet_drift_zero_mutation(kanban_home, aion_gov_src, target, mutate):
+    with kb.connect() as conn:
+        chain = _canonical_factory_packet_chain(conn)
+        _rewrite_latest_run_metadata(conn, chain[target], mutate)
+        before = _native_state_snapshot(conn)
+        assert kb._reviewed_author_finalizer_run_id(conn, chain["author"]) is None
+        with pytest.raises(kb.FactoryTerminalReceiptRequiredError):
+            kb.complete_task(conn, chain["author"], summary="reject canonical drift")
+        assert _native_state_snapshot(conn) == before
+
+
+def test_reviewed_author_rejects_current_canonical_missing_edge_and_self_audit(kanban_home, aion_gov_src):
+    with kb.connect() as conn:
+        chain = _canonical_factory_packet_chain(conn)
+        conn.execute("DELETE FROM task_links WHERE parent_id = ? AND child_id = ?", (chain["activation"], chain["resident_audit"]))
+        conn.commit()
+        before = _native_state_snapshot(conn)
+        assert kb._reviewed_author_finalizer_run_id(conn, chain["author"]) is None
+        assert _native_state_snapshot(conn) == before
+    with kb.connect() as conn:
+        chain = _canonical_factory_packet_chain(conn)
+        conn.execute("UPDATE tasks SET assignee = 'agent007' WHERE id = ?", (chain["reviewer"],))
+        conn.execute("UPDATE task_runs SET profile = 'agent007' WHERE task_id = ?", (chain["reviewer"],))
+        conn.commit()
+        before = _native_state_snapshot(conn)
+        assert kb._reviewed_author_finalizer_run_id(conn, chain["author"]) is None
+        assert _native_state_snapshot(conn) == before
+
+
+def test_reviewed_author_rejects_current_canonical_ambiguous_runtime_audit(
+    kanban_home, aion_gov_src,
+):
+    with kb.connect() as conn:
+        chain = _canonical_factory_packet_chain(conn)
+        original = kb._authenticated_factory_run_metadata(conn, chain["resident_audit"])
+        assert original is not None
+        duplicate = kb.create_task(
+            conn, title="duplicate packet resident audit", factory_build_gate=1,
+            assignee="bafuxunan", parents=[chain["activation"]],
+        )
+        duplicate_run = _claim_and_run_id(conn, duplicate)
+        assert kb.complete_task(
+            conn, duplicate, expected_run_id=duplicate_run,
+            metadata=original[2],
+        )
+        before = _native_state_snapshot(conn)
+        assert kb._reviewed_author_finalizer_run_id(conn, chain["author"]) is None
+        assert _native_state_snapshot(conn) == before
+
+
+def test_reviewed_author_rejects_current_canonical_unauthenticated_packet_mutation(
+    kanban_home, aion_gov_src,
+):
+    with kb.connect() as conn:
+        chain = _canonical_factory_packet_chain(conn)
+        row = conn.execute(
+            "SELECT metadata FROM task_runs WHERE id = ?",
+            (chain["activation_run"],),
+        ).fetchone()
+        metadata = json.loads(row["metadata"])
+        metadata["source"]["head"] = "f" * 40
+        conn.execute(
+            "UPDATE task_runs SET metadata = ? WHERE id = ?",
+            (json.dumps(metadata, sort_keys=True), chain["activation_run"]),
+        )
+        conn.commit()
+        before = _native_state_snapshot(conn)
+        assert kb._reviewed_author_finalizer_run_id(conn, chain["author"]) is None
+        assert _native_state_snapshot(conn) == before
+
+
 def test_reviewed_author_accepts_authenticated_non_pr_reviewed_evidence_receipt(
     kanban_home, aion_gov_src,
 ):
