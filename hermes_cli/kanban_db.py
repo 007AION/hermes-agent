@@ -6308,7 +6308,10 @@ def _record_review_verdict(
     reason = str(reason or "").strip()
     if verdict not in {"pass", "request_changes"} or not reason:
         return False
-    expected_review_run_id = int(expected_review_run_id)
+    try:
+        expected_review_run_id = int(expected_review_run_id)
+    except (TypeError, ValueError):
+        return False
     with write_txn(conn):
         if recovery_receipt is not None:
             return _recover_completed_review_verdict(
@@ -6447,6 +6450,107 @@ def _record_review_verdict(
         return True
 
 
+def _closed_completed_audit_recovery_receipt(
+    metadata: dict,
+    receipt_keys: set[str],
+) -> tuple[Optional[dict], Optional[str]]:
+    """Extract exactly one closed top-level or nested recovery receipt family."""
+    if not isinstance(metadata, dict):
+        return None, None
+    top_level_keys = receipt_keys.intersection(metadata)
+    nested = metadata.get("recovery_receipt")
+    if nested is not None:
+        if top_level_keys or not isinstance(nested, dict) or set(nested) != receipt_keys:
+            return None, None
+        return {key: nested[key] for key in sorted(receipt_keys)}, "nested"
+    if top_level_keys != receipt_keys:
+        return None, None
+    return {key: metadata[key] for key in sorted(receipt_keys)}, "top_level"
+
+
+def _authenticated_prior_pass_handoff_run_id(
+    conn: sqlite3.Connection,
+    task_id: str,
+    prior_row: sqlite3.Row,
+    *,
+    later_review_task_id: str,
+    later_review_run_id: int,
+) -> Optional[int]:
+    """Authenticate one distinct original handoff/PASS before a later audit."""
+    try:
+        payload = json.loads(prior_row["payload"] or "{}")
+    except (TypeError, ValueError):
+        return None
+    if set(payload) != {
+        "version", "review_task_id", "review_run_id", "verdict", "reason",
+    }:
+        return None
+    original_task_id = payload.get("review_task_id")
+    original_run_id = payload.get("review_run_id")
+    if (
+        payload.get("version") != 1
+        or payload.get("verdict") != "pass"
+        or not isinstance(payload.get("reason"), str)
+        or not payload["reason"].strip()
+        or not isinstance(original_task_id, str)
+        or original_task_id == later_review_task_id
+        or isinstance(original_run_id, bool)
+        or not isinstance(original_run_id, int)
+        or original_run_id == later_review_run_id
+        or prior_row["run_id"] != original_run_id
+    ):
+        return None
+    handoff_rows = conn.execute(
+        "SELECT id, run_id, payload FROM task_events WHERE task_id = ? "
+        "AND kind = 'review_handoff' ORDER BY id DESC",
+        (task_id,),
+    ).fetchall()
+    if len(handoff_rows) != 1:
+        return None
+    handoff = _review_handoff_receipt_from_row(task_id, handoff_rows[0])
+    if handoff is None or handoff.review_task_id != original_task_id:
+        return None
+    source_runs = conn.execute(
+        "SELECT id, status, outcome, ended_at FROM task_runs "
+        "WHERE task_id = ? ORDER BY id DESC",
+        (task_id,),
+    ).fetchall()
+    if (
+        not source_runs
+        or int(source_runs[0]["id"]) != handoff.expected_run_id
+        or source_runs[0]["status"] != "review_required"
+        or source_runs[0]["outcome"] != "review_required"
+        or source_runs[0]["ended_at"] is None
+    ):
+        return None
+    original = conn.execute(
+        "SELECT status, assignee, current_run_id FROM tasks WHERE id = ?",
+        (original_task_id,),
+    ).fetchone()
+    original_run = conn.execute(
+        "SELECT profile, status, outcome, ended_at FROM task_runs "
+        "WHERE id = ? AND task_id = ?",
+        (original_run_id, original_task_id),
+    ).fetchone()
+    if (
+        original is None
+        or original["assignee"] != FACTORY_REVIEW_AUDITOR_PROFILE
+        or original["status"] not in {"done", "archived"}
+        or original["current_run_id"] is not None
+        or original_run is None
+        or original_run["profile"] != FACTORY_REVIEW_AUDITOR_PROFILE
+        or original_run["status"] != "done"
+        or original_run["outcome"] != "completed"
+        or original_run["ended_at"] is None
+        or conn.execute(
+            "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ?",
+            (task_id, original_task_id),
+        ).fetchone() is None
+    ):
+        return None
+    return handoff.expected_run_id
+
+
 def _recover_completed_review_verdict(
     conn: sqlite3.Connection,
     task_id: str,
@@ -6460,7 +6564,7 @@ def _recover_completed_review_verdict(
     controller_run_id: Optional[int],
     controller_profile: Optional[str],
 ) -> bool:
-    """Recover one omitted first REQUEST_CHANGES from a terminal audit run."""
+    """Recover one authenticated REQUEST_CHANGES from a terminal audit run."""
     if (
         verdict != "request_changes"
         or not isinstance(recovery_receipt, dict)
@@ -6492,16 +6596,6 @@ def _recover_completed_review_verdict(
         "SELECT status, assignee, current_run_id FROM tasks WHERE id = ?",
         (review_task_id,),
     ).fetchone()
-    handoff = _review_handoff_event_for_child(conn, task_id, review_task_id)
-    if handoff is None and author is not None and author["status"] == "ready":
-        handoff_rows = conn.execute(
-            "SELECT id, run_id, payload FROM task_events WHERE task_id = ? "
-            "AND kind = 'review_handoff' ORDER BY id DESC", (task_id,),
-        ).fetchall()
-        if handoff_rows:
-            replay_handoff = _review_handoff_receipt_from_row(task_id, handoff_rows[0])
-            if replay_handoff is not None and replay_handoff.review_task_id == review_task_id:
-                handoff = handoff_rows[0]
     if (
         author is None
         or author["assignee"] != FACTORY_REVIEW_AUTHOR_PROFILE
@@ -6515,7 +6609,6 @@ def _recover_completed_review_verdict(
             "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ?",
             (task_id, review_task_id),
         ).fetchone() is None
-        or handoff is None
     ):
         return False
     runs = conn.execute(
@@ -6547,7 +6640,11 @@ def _recover_completed_review_verdict(
     }
     if set(recovery_receipt) != receipt_keys:
         return False
-    receipt = {key: metadata.get(key) for key in sorted(receipt_keys)}
+    receipt, receipt_family = _closed_completed_audit_recovery_receipt(
+        metadata, receipt_keys,
+    )
+    if receipt is None:
+        return False
     expected_receipt = {key: recovery_receipt.get(key) for key in sorted(receipt_keys)}
     review_id = receipt.get("github_review_id")
     pr_number = receipt.get("pr")
@@ -6587,18 +6684,91 @@ def _recover_completed_review_verdict(
         "SELECT run_id, payload FROM task_events WHERE task_id = ? "
         "AND kind = 'review_verdict' ORDER BY id", (task_id,),
     ).fetchall()
-    if prior:
-        if len(prior) != 1:
-            return False
+    prior_payloads = []
+    for row in prior:
         try:
-            prior_payload = json.loads(prior[0]["payload"] or "{}")
+            prior_payload = json.loads(row["payload"] or "{}")
         except (TypeError, ValueError):
             return False
-        return (
-            prior[0]["run_id"] == expected_review_run_id
-            and prior_payload == payload
-            and author["status"] == "ready"
+        if not isinstance(prior_payload, dict):
+            return False
+        prior_payloads.append(prior_payload)
+
+    later_source_run_id = None
+    if prior and prior_payloads[0].get("verdict") == "pass":
+        later_source_run_id = _authenticated_prior_pass_handoff_run_id(
+            conn,
+            task_id,
+            prior[0],
+            later_review_task_id=review_task_id,
+            later_review_run_id=expected_review_run_id,
         )
+        if later_source_run_id is None or receipt_family != "nested":
+            return False
+        audit_target = metadata.get("audit_target")
+        same_author = metadata.get("same_author_recovery")
+        if (
+            metadata.get("outcome") != "REQUEST_CHANGES_EXACT_HEAD"
+            or not isinstance(audit_target, dict)
+            or set(audit_target) != {
+                "source_author_task", "source_author_run", "source_author_status",
+            }
+            or audit_target != {
+                "source_author_task": task_id,
+                "source_author_run": later_source_run_id,
+                "source_author_status": "review",
+            }
+            or not isinstance(same_author, dict)
+            or set(same_author) != {
+                "resume_existing_task", "resume_existing_run",
+                "replacement_author_allowed", "forced_status_allowed",
+            }
+            or same_author != {
+                "resume_existing_task": task_id,
+                "resume_existing_run": later_source_run_id,
+                "replacement_author_allowed": False,
+                "forced_status_allowed": False,
+            }
+        ):
+            return False
+        if len(prior) == 2:
+            return (
+                prior[1]["run_id"] == expected_review_run_id
+                and prior_payloads[1] == payload
+                and author["status"] == "ready"
+            )
+        if len(prior) != 1:
+            return False
+    else:
+        if receipt_family != "top_level":
+            return False
+        handoff = _review_handoff_event_for_child(conn, task_id, review_task_id)
+        if handoff is None and author["status"] == "ready":
+            handoff_rows = conn.execute(
+                "SELECT id, run_id, payload FROM task_events WHERE task_id = ? "
+                "AND kind = 'review_handoff' ORDER BY id DESC", (task_id,),
+            ).fetchall()
+            if handoff_rows:
+                replay_handoff = _review_handoff_receipt_from_row(task_id, handoff_rows[0])
+                if (
+                    replay_handoff is not None
+                    and replay_handoff.review_task_id == review_task_id
+                ):
+                    handoff = handoff_rows[0]
+        if handoff is None:
+            return False
+        if prior:
+            if len(prior) != 1:
+                return False
+            prior_payload = prior_payloads[0]
+            return (
+                prior[0]["run_id"] == expected_review_run_id
+                and prior_payload == payload
+                and author["status"] == "ready"
+            )
+
+    if prior and later_source_run_id is None:
+        return False
     if author["status"] != "review":
         return False
     resumed = conn.execute(
