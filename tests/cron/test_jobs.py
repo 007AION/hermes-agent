@@ -621,6 +621,49 @@ class TestMarkJobRun:
         updated = get_job(job["id"])
         assert updated["last_delivery_error"] is None
 
+    def test_alert_receipt_updates_only_for_alert_attempts(self, tmp_cron_dir):
+        job = create_job(prompt="Report", schedule="every 1h")
+        receipt = {
+            "status": "confirmed",
+            "platform": "discord",
+            "chat_id": "123",
+            "message_id": "456",
+            "thread_id": None,
+            "alert_dedupe_key": "alert-1",
+        }
+        mark_job_run(
+            job["id"], success=True,
+            alert_delivery_receipt=receipt,
+        )
+        updated = get_job(job["id"])
+        assert updated["last_alert_delivery_receipt"] == receipt
+        assert updated["last_alert_dedupe_key"] == "alert-1"
+
+        # A later routine run must not erase the last externally observable
+        # alert identity or its dedupe key.
+        mark_job_run(job["id"], success=True)
+        updated = get_job(job["id"])
+        assert updated["last_alert_delivery_receipt"] == receipt
+        assert updated["last_alert_dedupe_key"] == "alert-1"
+
+    def test_failed_alert_attempt_does_not_consume_dedupe_key(self, tmp_cron_dir):
+        job = create_job(prompt="Report", schedule="every 1h")
+        failed = {
+            "status": "failed",
+            "platform": "discord",
+            "chat_id": "123",
+            "message_id": None,
+            "thread_id": None,
+            "alert_dedupe_key": "retry-me",
+        }
+        mark_job_run(
+            job["id"], success=True,
+            alert_delivery_receipt=failed,
+        )
+        updated = get_job(job["id"])
+        assert updated["last_alert_delivery_receipt"] == failed
+        assert updated.get("last_alert_dedupe_key") is None
+
     def test_both_agent_and_delivery_error(self, tmp_cron_dir):
         """Agent fails AND delivery fails — both errors recorded."""
         job = create_job(prompt="Report", schedule="every 1h")

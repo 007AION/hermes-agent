@@ -620,6 +620,140 @@ class TestRoutingIntents:
             assert platforms == ["discord", "telegram"], f"token={token!r} -> {platforms}"
 
 
+class TestDistinctCronAlertDelivery:
+    """A qualifying cron alert must be distinct from its routine report."""
+
+    @staticmethod
+    def _job(**updates):
+        job = {
+            "id": "factory-director",
+            "name": "Factory Director",
+            "deliver": "origin",
+            "origin": {
+                "platform": "discord",
+                "chat_id": "123",
+                "user_id": "42",
+            },
+        }
+        job.update(updates)
+        return job
+
+    @staticmethod
+    def _config():
+        from gateway.config import Platform
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        config = MagicMock()
+        config.platforms = {Platform.DISCORD: pconfig}
+        return config
+
+    def test_historical_emitted_claim_stays_routine_without_distinct_receipt(self):
+        """RED: prose claiming emission was only ordinary cron output."""
+        receipts = []
+        send = AsyncMock(return_value={"success": True, "message_id": "routine-1"})
+        content = "notification_state: QUALIFYING\ndiscord_alert_emitted: true"
+
+        with patch("gateway.config.load_gateway_config", return_value=self._config()), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("tools.send_message_tool._send_to_platform", new=send):
+            assert _deliver_result(self._job(), content, receipt_holder=receipts) is None
+
+        sent = send.await_args.args[3]
+        assert sent == content
+        assert "<@42>" not in sent
+        assert receipts == []
+
+    def test_strict_alert_marker_mentions_origin_user_and_binds_message_receipt(self):
+        receipts = []
+        send = AsyncMock(return_value={"success": True, "message_id": "alert-1"})
+
+        with patch("gateway.config.load_gateway_config", return_value=self._config()), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("tools.send_message_tool._send_to_platform", new=send):
+            assert _deliver_result(
+                self._job(),
+                "[CRON_ALERT:aion-key-1]\nblocker details",
+                receipt_holder=receipts,
+            ) is None
+
+        sent = send.await_args.args[3]
+        assert sent.startswith("<@42> **Cron alert**\n")
+        assert "[CRON_ALERT" not in sent
+        assert receipts == [{
+            "alert_dedupe_key": "aion-key-1",
+            "chat_id": "123",
+            "message_id": "alert-1",
+            "platform": "discord",
+            "status": "confirmed",
+            "thread_id": None,
+        }]
+
+    def test_duplicate_alert_key_delivers_routine_report_without_second_mention(self):
+        receipts = []
+        send = AsyncMock(return_value={"success": True, "message_id": "routine-2"})
+        job = self._job(last_alert_dedupe_key="aion-key-1")
+
+        with patch("gateway.config.load_gateway_config", return_value=self._config()), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("tools.send_message_tool._send_to_platform", new=send):
+            assert _deliver_result(
+                job,
+                "[CRON_ALERT:aion-key-1]\nunchanged blocker",
+                receipt_holder=receipts,
+            ) is None
+
+        sent = send.await_args.args[3]
+        assert sent == "unchanged blocker"
+        assert "<@42>" not in sent
+        assert receipts == [{
+            "alert_dedupe_key": "aion-key-1",
+            "chat_id": "123",
+            "message_id": None,
+            "platform": "discord",
+            "status": "deduplicated",
+            "thread_id": None,
+        }]
+
+    @pytest.mark.parametrize("marker", ["[CRON_ALERT]", "prefix [CRON_ALERT:key]"])
+    def test_missing_or_nonleading_alert_key_is_routine(self, marker):
+        receipts = []
+        send = AsyncMock(return_value={"success": True, "message_id": "routine-3"})
+
+        with patch("gateway.config.load_gateway_config", return_value=self._config()), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("tools.send_message_tool._send_to_platform", new=send):
+            assert _deliver_result(
+                self._job(), f"{marker}\nordinary report", receipt_holder=receipts,
+            ) is None
+
+        assert "<@42>" not in send.await_args.args[3]
+        assert receipts == []
+
+    def test_alert_transport_failure_is_recorded_and_returned_not_raised(self):
+        receipts = []
+        send = AsyncMock(return_value={"error": "discord unavailable"})
+
+        with patch("gateway.config.load_gateway_config", return_value=self._config()), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("tools.send_message_tool._send_to_platform", new=send):
+            error = _deliver_result(
+                self._job(),
+                "[CRON_ALERT:aion-key-fail]\nblocker details",
+                receipt_holder=receipts,
+            )
+
+        assert "discord unavailable" in error
+        assert receipts == [{
+            "alert_dedupe_key": "aion-key-fail",
+            "chat_id": "123",
+            "message_id": None,
+            "platform": "discord",
+            "status": "failed",
+            "thread_id": None,
+        }]
+
+
 class TestDeliverResultWrapping:
     """Verify that cron deliveries are wrapped with header/footer and no longer mirrored."""
 
@@ -3162,6 +3296,26 @@ class TestBuildJobPromptSilentHint:
         result = _build_job_prompt(job)
         assert "do NOT use send_message" in result
         assert "automatically delivered" in result
+
+    def test_discord_origin_gets_strict_distinct_alert_protocol(self):
+        job = {
+            "prompt": "Alert only for a qualifying blocker",
+            "origin": {
+                "platform": "discord",
+                "chat_id": "123",
+                "user_id": "42",
+            },
+        }
+        result = _build_job_prompt(job)
+        assert "[CRON_ALERT:<dedupe-key>]" in result
+        assert "mentions the originating Discord user once" in result
+
+    def test_non_discord_cron_does_not_get_discord_alert_protocol(self):
+        job = {
+            "prompt": "Generate a report",
+            "origin": {"platform": "telegram", "chat_id": "123"},
+        }
+        assert "[CRON_ALERT:<dedupe-key>]" not in _build_job_prompt(job)
 
     def test_delivery_guidance_precedes_user_prompt(self):
         """System guidance appears before the user's prompt text."""
