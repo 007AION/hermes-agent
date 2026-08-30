@@ -8464,6 +8464,140 @@ def _authenticated_non_pr_review_evidence(
     return re.search(r"\bPR\s+#[1-9][0-9]*\b", handoff_reason, re.IGNORECASE) is None
 
 
+def _canonical_factory_review_packet(review_md: dict) -> Optional[dict]:
+    """Normalize one exact emitted audit packet into the canonical review shape."""
+    canonical_keys = {
+        "approval_commit_id", "approved", "base", "github_review_id",
+        "github_review_url", "head", "head_tree", "review_outcome",
+        "tests_failed", "tests_passed", "verification", "worker_session_id",
+    }
+    if set(review_md) == canonical_keys:
+        return review_md
+
+    lean_keys = [
+        key for key in review_md
+        if isinstance(key, str) and re.fullmatch(r"lean_pr([1-9][0-9]*)_compare", key)
+    ]
+    if len(lean_keys) != 1:
+        return None
+    lean_key = lean_keys[0]
+    emitted_keys = {
+        "artifacts", "base", "forbidden_actions_performed", "github_review",
+        "head", "hosted_ci", lean_key, "local_verification", "outcome",
+        "repository", "secret_exposure", "tree", "worker_session_id",
+    }
+    if set(review_md) != emitted_keys:
+        return None
+
+    head = review_md.get("head")
+    tree = review_md.get("tree")
+    base = review_md.get("base")
+    github_review = review_md.get("github_review")
+    hosted_ci = review_md.get("hosted_ci")
+    lean_compare = review_md.get(lean_key)
+    local = review_md.get("local_verification")
+    artifacts = review_md.get("artifacts")
+    review_id = github_review.get("id") if isinstance(github_review, dict) else None
+    review_url = github_review.get("url") if isinstance(github_review, dict) else None
+    review_match = re.fullmatch(
+        rf"https://github[.]com/{re.escape(FACTORY_REVIEW_REPOSITORY)}/pull/"
+        r"([1-9][0-9]*)#pullrequestreview-([1-9][0-9]*)",
+        review_url if isinstance(review_url, str) else "",
+    )
+    lean_match = re.fullmatch(r"lean_pr([1-9][0-9]*)_compare", lean_key)
+    local_ints = (
+        "factory_finalizer", "independent_hostile_zero_mutation", "kanban_db",
+        "total_failed", "total_passed",
+    )
+    if (
+        review_md.get("outcome") != "PASS_EXACT_HEAD"
+        or review_md.get("repository") != FACTORY_REVIEW_REPOSITORY
+        or review_md.get("forbidden_actions_performed") != []
+        or review_md.get("secret_exposure") != "none"
+        or not isinstance(review_md.get("worker_session_id"), str)
+        or not review_md["worker_session_id"].strip()
+        or any(
+            not isinstance(value, str) or re.fullmatch(r"[0-9a-fA-F]{40}", value) is None
+            for value in (head, tree, base)
+        )
+        or not isinstance(github_review, dict)
+        or set(github_review) != {"commit_id", "id", "state", "url"}
+        or github_review.get("commit_id") != head
+        or github_review.get("state") != "APPROVED"
+        or type(review_id) is not int or review_id <= 0
+        or review_match is None or lean_match is None
+        or int(review_match.group(1)) != int(lean_match.group(1))
+        or int(review_match.group(2)) != review_id
+        or not isinstance(artifacts, list) or not artifacts
+        or any(not isinstance(item, str) or not item.strip() for item in artifacts)
+        or len(set(artifacts)) != len(artifacts)
+        or not isinstance(hosted_ci, dict)
+        or set(hosted_ci) != {
+            "all_required_checks_pass", "failures", "run", "terminal",
+        }
+        or hosted_ci.get("all_required_checks_pass") != "SUCCESS"
+        or type(hosted_ci.get("failures")) is not int
+        or hosted_ci.get("failures") != 0
+        or type(hosted_ci.get("run")) is not int or hosted_ci["run"] <= 0
+        or type(hosted_ci.get("terminal")) is not int or hosted_ci["terminal"] <= 0
+        or not isinstance(lean_compare, dict)
+        or set(lean_compare) != {
+            "decision", "finalizer_schema_branch_count", "mixed_family_state_space",
+            "new_control_plane_count", "new_long_lived_state_count",
+            "new_runtime_component_count", "packet_family_count",
+        }
+        or lean_compare.get("decision") != "MINIMAL_REPAIR_WITH_NATIVE_GAP_PROOF"
+        or lean_compare.get("mixed_family_state_space") != "removed"
+        or any(
+            type(lean_compare.get(key)) is not int
+            for key in (
+                "finalizer_schema_branch_count", "new_control_plane_count",
+                "new_long_lived_state_count", "new_runtime_component_count",
+                "packet_family_count",
+            )
+        )
+        or lean_compare.get("finalizer_schema_branch_count") != 2
+        or lean_compare.get("packet_family_count") != 2
+        or any(
+            lean_compare.get(key) != 0
+            for key in (
+                "new_control_plane_count", "new_long_lived_state_count",
+                "new_runtime_component_count",
+            )
+        )
+        or not isinstance(local, dict)
+        or set(local) != {
+            "diff_check", "factory_finalizer", "independent_hostile_zero_mutation",
+            "kanban_db", "py_compile", "ruff", "total_failed", "total_passed",
+        }
+        or any(type(local.get(key)) is not int for key in local_ints)
+        or local.get("total_failed") != 0
+        or any(local.get(key, 0) <= 0 for key in local_ints if key != "total_failed")
+        or local.get("total_passed")
+        != local.get("factory_finalizer", 0) + local.get("kanban_db", 0)
+        or any(local.get(key) != "PASS" for key in ("diff_check", "py_compile", "ruff"))
+    ):
+        return None
+
+    return {
+        "approval_commit_id": head,
+        "approved": True,
+        "base": base,
+        "github_review_id": review_id,
+        "github_review_url": review_url,
+        "head": head,
+        "head_tree": tree,
+        "review_outcome": "PASS_EXACT_HEAD",
+        "tests_failed": local["total_failed"],
+        "tests_passed": local["total_passed"],
+        "verification": [
+            f"hosted CI run {hosted_ci['run']} exact-head PASS",
+            f"local {local['total_passed']} tests and hostile zero-mutation PASS",
+        ],
+        "worker_session_id": review_md["worker_session_id"],
+    }
+
+
 def _authenticated_canonical_factory_packet_chain(
     conn: sqlite3.Connection,
     *,
@@ -8932,7 +9066,7 @@ def _authenticated_canonical_factory_packet_chain(
         or not exact_hash(external.get("uncompressed_sha256"), 64)
         or not exact_int(resident.get("active_enter_timestamp_monotonic"), positive=True)
         or not exact_int(resident.get("exec_start_monotonic"), positive=True)
-        or resident["active_enter_timestamp_monotonic"] > resident["exec_start_monotonic"]
+        or resident["active_enter_timestamp_monotonic"] < resident["exec_start_monotonic"]
         or not exact_int(resident.get("main_pid"), positive=True)
         or not nonnegative_int(resident.get("memory_current"))
         or not nonnegative_int(resident.get("memory_peak"))
@@ -9198,7 +9332,8 @@ def _reviewed_author_finalizer_run_id(
     _reviewer_run_id, reviewer_profile, review_md = reviewer
     if reviewer_profile != FACTORY_REVIEW_AUDITOR_PROFILE:
         return None
-    if "approval_commit_id" in review_md:
+    canonical_review_md = _canonical_factory_review_packet(review_md)
+    if canonical_review_md is not None:
         return author_run_id if _authenticated_canonical_factory_packet_chain(
             conn,
             task_id=task_id,
@@ -9206,9 +9341,14 @@ def _reviewed_author_finalizer_run_id(
             reviewer_id=reviewer_id,
             reviewer_run_id=_reviewer_run_id,
             reviewer_profile=reviewer_profile,
-            review_md=review_md,
+            review_md=canonical_review_md,
             handoff_reason=handoff.reason,
         ) else None
+    if "approval_commit_id" in review_md or any(
+        isinstance(key, str) and re.fullmatch(r"lean_pr[1-9][0-9]*_compare", key)
+        for key in review_md
+    ):
+        return None
     if "evidence_sha256" in review_md:
         return author_run_id if _authenticated_non_pr_review_evidence(
             review_md,
