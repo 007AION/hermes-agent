@@ -329,6 +329,19 @@ def test_later_phase_recovery_rejects_binding_or_nested_receipt_drift_without_mu
         assert _snapshot(conn) == before
 
 
+def test_later_phase_recovery_rejects_top_level_receipt_plus_null_nested_family(
+    kanban_home,
+):
+    def add_conflicting_families(metadata):
+        metadata.update({**RECEIPT, "recovery_receipt": None})
+
+    with kb.connect() as conn:
+        fixture = _later_phase_fixture(conn, metadata_mutate=add_conflicting_families)
+        before = _snapshot(conn)
+        assert not _recover_later(conn, fixture)
+        assert _snapshot(conn) == before
+
+
 def test_later_phase_recovery_rejects_caller_reason_drift_and_missing_edge(
     kanban_home,
 ):

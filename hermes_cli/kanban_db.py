@@ -6458,8 +6458,8 @@ def _closed_completed_audit_recovery_receipt(
     if not isinstance(metadata, dict):
         return None, None
     top_level_keys = receipt_keys.intersection(metadata)
-    nested = metadata.get("recovery_receipt")
-    if nested is not None:
+    if "recovery_receipt" in metadata:
+        nested = metadata["recovery_receipt"]
         if top_level_keys or not isinstance(nested, dict) or set(nested) != receipt_keys:
             return None, None
         return {key: nested[key] for key in sorted(receipt_keys)}, "nested"
