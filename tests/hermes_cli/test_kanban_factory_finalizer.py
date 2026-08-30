@@ -29,6 +29,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -1250,6 +1251,7 @@ def _non_pr_reviewed_evidence_chain(conn, *, handoff_reason="exact runtime evide
 
 def _canonical_factory_packet_chain(
     conn, *, installed_source_shapes=False, legacy_installed_source_tail=False,
+    emitted_review_shape=False, real_systemd_order=True,
 ):
     """Create the generic authenticated packet shapes emitted by the current lane."""
     head, tree, base, merge = "1" * 40, "2" * 40, "3" * 40, "4" * 40
@@ -1273,14 +1275,52 @@ def _canonical_factory_packet_chain(
         expected_review_run_id=review_run, verdict="pass", reason="PASS_EXACT_HEAD",
     )
     review_url = f"https://github.com/kiddhu/hermes-agent/pull/{source_pr}#pullrequestreview-{review_id}"
-    assert kb.complete_task(conn, reviewer, expected_run_id=review_run, metadata={
+    review_metadata = {
         "approval_commit_id": head, "approved": True, "base": base,
         "github_review_id": review_id, "github_review_url": review_url,
         "head": head, "head_tree": tree, "review_outcome": "PASS_EXACT_HEAD",
         "tests_passed": 406, "tests_failed": 0,
         "verification": ["canonical tests", "live exact-head readback"],
         "worker_session_id": "canonical-review-session",
-    })
+    }
+    if emitted_review_shape:
+        review_metadata = {
+            "artifacts": ["/tmp/generic-review.yaml"],
+            "base": base,
+            "forbidden_actions_performed": [],
+            "github_review": {
+                "commit_id": head, "id": review_id, "state": "APPROVED",
+                "url": review_url,
+            },
+            "head": head,
+            "hosted_ci": {
+                "all_required_checks_pass": "SUCCESS", "failures": 0,
+                "run": 123456, "terminal": 37,
+            },
+            f"lean_pr{source_pr}_compare": {
+                "decision": "MINIMAL_REPAIR_WITH_NATIVE_GAP_PROOF",
+                "finalizer_schema_branch_count": 2,
+                "mixed_family_state_space": "removed",
+                "new_control_plane_count": 0,
+                "new_long_lived_state_count": 0,
+                "new_runtime_component_count": 0,
+                "packet_family_count": 2,
+            },
+            "local_verification": {
+                "diff_check": "PASS", "factory_finalizer": 314,
+                "independent_hostile_zero_mutation": 12, "kanban_db": 380,
+                "py_compile": "PASS", "ruff": "PASS", "total_failed": 0,
+                "total_passed": 694,
+            },
+            "outcome": "PASS_EXACT_HEAD",
+            "repository": "kiddhu/hermes-agent",
+            "secret_exposure": "none",
+            "tree": tree,
+            "worker_session_id": "emitted-review-session",
+        }
+    assert kb.complete_task(
+        conn, reviewer, expected_run_id=review_run, metadata=review_metadata,
+    )
 
     merger_run = _claim_and_run_id(conn, merger)
     merger_metadata = {
@@ -1416,7 +1456,10 @@ def _canonical_factory_packet_chain(
             **source, "merge_commit": merge,
         }
         resident = {
-            "active_enter_timestamp_monotonic": 900, "active_state": "active",
+            "active_enter_timestamp_monotonic": (
+                1100 if real_systemd_order else 900
+            ),
+            "active_state": "active",
             "barrier_loaded": True, "configured_import_exact": True,
             "deep_health_exit_code": 0, "exec_start_monotonic": 1000,
             "main_pid": 2000, "memory_current": 1024, "memory_peak": 2048,
@@ -1522,6 +1565,127 @@ def test_reviewed_author_accepts_installed_source_factory_packet_chain(
         assert author.status == "done"
 
 
+def test_reviewed_author_accepts_real_systemd_lifecycle_order(
+    kanban_home, aion_gov_src,
+):
+    """Active entry normally follows the main process start timestamp."""
+    with kb.connect() as conn:
+        chain = _canonical_factory_packet_chain(
+            conn, installed_source_shapes=True, real_systemd_order=True,
+        )
+        before = _native_state_snapshot(conn)
+        assert kb._reviewed_author_finalizer_run_id(
+            conn, chain["author"],
+        ) == chain["author_run"]
+        assert _native_state_snapshot(conn) == before
+
+
+def test_reviewed_author_accepts_exact_emitted_review_packet_at_canonical_boundary(
+    kanban_home, aion_gov_src,
+):
+    """The current audit completion packet feeds the installed-source chain."""
+    with kb.connect() as conn:
+        chain = _canonical_factory_packet_chain(
+            conn, installed_source_shapes=True, emitted_review_shape=True,
+        )
+        assert kb._canonical_factory_review_packet(
+            _terminal_run_metadata(conn, chain["reviewer"]),
+        ) is not None
+        before = _native_state_snapshot(conn)
+        assert kb._reviewed_author_finalizer_run_id(
+            conn, chain["author"],
+        ) == chain["author_run"]
+        assert _native_state_snapshot(conn) == before
+
+
+def _emitted_review_lean_compare(metadata):
+    key = next(
+        key for key in metadata
+        if re.fullmatch(r"lean_pr[1-9][0-9]*_compare", key)
+    )
+    return metadata[key]
+
+
+@pytest.mark.parametrize("mutate", [
+    lambda md: md.pop("artifacts"),
+    lambda md: md["artifacts"].append(md["artifacts"][0]),
+    lambda md: md.__setitem__("pr", 64),
+    lambda md: md.__setitem__("lean_pr65_compare", dict(_emitted_review_lean_compare(md))),
+    lambda md: md.__setitem__("outcome", "APPROVE_EXACT_HEAD"),
+    lambda md: md.__setitem__("repository", "attacker/repo"),
+    lambda md: md.__setitem__("head", "f" * 40),
+    lambda md: md.__setitem__("tree", "malformed"),
+    lambda md: md.__setitem__("base", None),
+    lambda md: md["github_review"].__setitem__("commit_id", "f" * 40),
+    lambda md: md["github_review"].__setitem__("id", True),
+    lambda md: md["github_review"].__setitem__("state", "CHANGES_REQUESTED"),
+    lambda md: md["github_review"].__setitem__(
+        "url", "https://github.com/kiddhu/hermes-agent/pull/65#pullrequestreview-12345",
+    ),
+    lambda md: md["hosted_ci"].__setitem__("failures", 1),
+    lambda md: md["hosted_ci"].__setitem__("run", True),
+    lambda md: md["hosted_ci"].__setitem__("terminal", 0),
+    lambda md: _emitted_review_lean_compare(md).__setitem__(
+        "finalizer_schema_branch_count", True,
+    ),
+    lambda md: _emitted_review_lean_compare(md).__setitem__("packet_family_count", 3),
+    lambda md: _emitted_review_lean_compare(md).__setitem__(
+        "new_control_plane_count", 1,
+    ),
+    lambda md: md["local_verification"].__setitem__("total_failed", True),
+    lambda md: md["local_verification"].__setitem__("total_passed", 695),
+    lambda md: md["local_verification"].__setitem__("ruff", "FAIL"),
+    lambda md: md.__setitem__("forbidden_actions_performed", ["rewrite"]),
+    lambda md: md.__setitem__("secret_exposure", "unknown"),
+])
+def test_reviewed_author_rejects_emitted_review_packet_drift_zero_mutation(
+    kanban_home, aion_gov_src, mutate,
+):
+    with kb.connect() as conn:
+        chain = _canonical_factory_packet_chain(
+            conn, installed_source_shapes=True, emitted_review_shape=True,
+        )
+        _rewrite_latest_run_metadata(conn, chain["reviewer"], mutate)
+        before = _native_state_snapshot(conn)
+        assert kb._reviewed_author_finalizer_run_id(conn, chain["author"]) is None
+        with pytest.raises(kb.FactoryTerminalReceiptRequiredError):
+            kb.complete_task(conn, chain["author"], summary="reject emitted review drift")
+        assert _native_state_snapshot(conn) == before
+
+
+def test_reviewed_author_rejects_emitted_review_edge_and_role_drift(
+    kanban_home, aion_gov_src,
+):
+    with kb.connect() as conn:
+        chain = _canonical_factory_packet_chain(
+            conn, installed_source_shapes=True, emitted_review_shape=True,
+        )
+        conn.execute(
+            "DELETE FROM task_links WHERE parent_id = ? AND child_id = ?",
+            (chain["author"], chain["reviewer"]),
+        )
+        conn.commit()
+        before = _native_state_snapshot(conn)
+        assert kb._reviewed_author_finalizer_run_id(conn, chain["author"]) is None
+        assert _native_state_snapshot(conn) == before
+    with kb.connect() as conn:
+        chain = _canonical_factory_packet_chain(
+            conn, installed_source_shapes=True, emitted_review_shape=True,
+        )
+        conn.execute(
+            "UPDATE tasks SET assignee = 'agent007' WHERE id = ?",
+            (chain["reviewer"],),
+        )
+        conn.execute(
+            "UPDATE task_runs SET profile = 'agent007' WHERE task_id = ?",
+            (chain["reviewer"],),
+        )
+        conn.commit()
+        before = _native_state_snapshot(conn)
+        assert kb._reviewed_author_finalizer_run_id(conn, chain["author"]) is None
+        assert _native_state_snapshot(conn) == before
+
+
 def test_reviewed_author_rejects_mixed_installed_source_and_legacy_packet_families(
     kanban_home, aion_gov_src,
 ):
@@ -1555,6 +1719,9 @@ def test_reviewed_author_rejects_mixed_installed_source_and_legacy_packet_famili
     ("installer", lambda md: md.__setitem__("source_head", "f" * 40)),
     ("activation", lambda md: md["source"].__setitem__("head", "f" * 40)),
     ("activation", lambda md: md["source"].__setitem__("merge_commit", "f" * 40)),
+    ("activation", lambda md: md["resident_runtime"].__setitem__(
+        "active_enter_timestamp_monotonic", 900,
+    )),
     ("activation", lambda md: md["resident_runtime"].__setitem__("main_pid", True)),
     ("activation", lambda md: md["source"].__setitem__("approved", True)),
     ("activation", lambda md: md.__setitem__("replay_restart_attempts", 1)),
