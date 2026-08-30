@@ -1656,7 +1656,8 @@ def _canonical_factory_packet_chain(
 
 
 def _canonical_factory_repair_phase_chain(
-    conn, *, resident_mutate=None, merge_mutate=None, install_mutate=None,
+    conn, *, resident_mutate=None, original_merge_mutate=None,
+    original_install_mutate=None, merge_mutate=None, install_mutate=None,
 ):
     """Model the exact resident REQUEST_CHANGES -> repair-author phase boundary."""
     original = _canonical_factory_packet_chain(
@@ -1664,6 +1665,8 @@ def _canonical_factory_repair_phase_chain(
         installed_source_shapes=True,
         emitted_review_shape=True,
         resident_request_changes=True,
+        merge_mutate=original_merge_mutate,
+        install_mutate=original_install_mutate,
         resident_mutate=resident_mutate,
     )
     repair_author = kb.create_task(
@@ -1695,10 +1698,14 @@ def test_reviewed_author_accepts_exact_repaired_phase_from_live_packet_families(
         assert kb._reviewed_author_repair_phase_task_id(
             conn,
             task_id=original["author"],
+            author_run_id=original["author_run"],
             reviewer_id=original["reviewer"],
+            reviewer_run_id=original["review_run"],
+            reviewer_profile="bafuxunan",
             review_md=kb._canonical_factory_review_packet(
                 _terminal_run_metadata(conn, original["reviewer"]),
             ),
+            handoff_reason="PR #64 frozen for independent exact-head audit",
         ) == repaired["author"]
         assert kb._reviewed_author_finalizer_run_id(
             conn, repaired["author"], _allow_repair_phase=False,
@@ -1749,6 +1756,23 @@ def test_reviewed_author_repair_phase_packet_drift_fails_closed_without_mutation
         original, _repaired = _canonical_factory_repair_phase_chain(
             conn, resident_mutate=mutate,
         )
+        before = _native_state_snapshot(conn)
+        assert kb._reviewed_author_finalizer_run_id(conn, original["author"]) is None
+        assert _native_state_snapshot(conn) == before
+
+
+@pytest.mark.parametrize(("packet", "mutate"), [
+    ("merge", lambda md: md.__setitem__("head", "f" * 40)),
+    ("merge", lambda md: md["audit"].__setitem__("run_id", True)),
+    ("install", lambda md: md.__setitem__("source_installed", False)),
+    ("install", lambda md: md["install"].__setitem__("head", "f" * 40)),
+])
+def test_reviewed_author_original_failed_phase_drift_fails_closed_without_mutation(
+    kanban_home, aion_gov_src, packet, mutate,
+):
+    with kb.connect() as conn:
+        kwargs = {f"original_{packet}_mutate": mutate}
+        original, _repaired = _canonical_factory_repair_phase_chain(conn, **kwargs)
         before = _native_state_snapshot(conn)
         assert kb._reviewed_author_finalizer_run_id(conn, original["author"]) is None
         assert _native_state_snapshot(conn) == before

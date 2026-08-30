@@ -8608,13 +8608,17 @@ def _authenticated_canonical_factory_packet_chain(
     reviewer_profile: str,
     review_md: dict,
     handoff_reason: str,
+    _request_changes_terminal_task_id: Optional[str] = None,
 ) -> bool:
     """Validate the closed audit -> merge -> install -> activation -> audit packets.
 
     These are the canonical completion packets emitted by the role-separated
     factory lane.  Every task/run is already receipt-authenticated by the
     caller; this adapter only accepts their exact structural families and
-    cross-binds immutable identities across direct Native edges.
+    cross-binds immutable identities across direct Native edges.  A repair
+    phase may name its exact authenticated REQUEST_CHANGES terminal so this
+    validator can authenticate the complete original prefix without treating
+    the failed terminal as a PASS packet.
     """
     if not task_id or isinstance(author_run_id, bool) or author_run_id <= 0:
         return False
@@ -9261,6 +9265,23 @@ def _authenticated_canonical_factory_packet_chain(
     ):
         return False
 
+    if _request_changes_terminal_task_id is not None:
+        request_terminal = _authenticated_factory_run_metadata(
+            conn, _request_changes_terminal_task_id,
+        )
+        return (
+            _request_changes_terminal_task_id
+            not in {task_id, reviewer_id, merger_id, install_id, activation_id}
+            and _one_direct_child(conn, activation_id)
+            == _request_changes_terminal_task_id
+            and activation_md.get("audit_task")
+            == _request_changes_terminal_task_id
+            and request_terminal is not None
+            and request_terminal[1] == FACTORY_REVIEW_AUDITOR_PROFILE
+            and _all_other_parents_terminal(
+                conn, _request_changes_terminal_task_id, activation_id,
+            )
+        )
 
     resident_keys = {
         "artifact_sha256", "artifacts", "barrier_tests", "deep_health_exit_code",
@@ -9404,8 +9425,12 @@ def _reviewed_author_repair_phase_task_id(
     conn: sqlite3.Connection,
     *,
     task_id: str,
+    author_run_id: int,
     reviewer_id: str,
+    reviewer_run_id: int,
+    reviewer_profile: str,
     review_md: dict,
+    handoff_reason: str,
 ) -> Optional[str]:
     """Resolve one exact resident REQUEST_CHANGES -> repair-author phase.
 
@@ -9576,6 +9601,19 @@ def _reviewed_author_repair_phase_task_id(
     ):
         return None
 
+    if not _authenticated_canonical_factory_packet_chain(
+        conn,
+        task_id=task_id,
+        author_run_id=author_run_id,
+        reviewer_id=reviewer_id,
+        reviewer_run_id=reviewer_run_id,
+        reviewer_profile=reviewer_profile,
+        review_md=review_md,
+        handoff_reason=handoff_reason,
+        _request_changes_terminal_task_id=failed_audit_id,
+    ):
+        return None
+
     repair_author = conn.execute(
         "SELECT status, assignee, factory_build_gate FROM tasks WHERE id = ?",
         (repair_author_id,),
@@ -9722,8 +9760,12 @@ def _reviewed_author_finalizer_run_id(
         repair_author_id = _reviewed_author_repair_phase_task_id(
             conn,
             task_id=task_id,
+            author_run_id=author_run_id,
             reviewer_id=reviewer_id,
+            reviewer_run_id=_reviewer_run_id,
+            reviewer_profile=reviewer_profile,
             review_md=canonical_review_md,
+            handoff_reason=handoff.reason,
         )
         if repair_author_id is None:
             return None
