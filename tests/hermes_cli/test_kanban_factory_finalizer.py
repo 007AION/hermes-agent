@@ -1251,13 +1251,17 @@ def _non_pr_reviewed_evidence_chain(conn, *, handoff_reason="exact runtime evide
 
 def _canonical_factory_packet_chain(
     conn, *, installed_source_shapes=False, legacy_installed_source_tail=False,
-    emitted_review_shape=False, real_systemd_order=True,
+    emitted_review_shape=False, real_systemd_order=True, existing_author=None,
+    actual_emitted_packets=False, resident_request_changes=False,
+    merge_mutate=None, install_mutate=None, resident_mutate=None,
 ):
     """Create the generic authenticated packet shapes emitted by the current lane."""
     head, tree, base, merge = "1" * 40, "2" * 40, "3" * 40, "4" * 40
     review_id, source_pr = 12345, 64
     paths = ["hermes_cli/kanban_db.py", "tests/hermes_cli/test_kanban_db.py"]
-    author = kb.create_task(conn, title="packet author", factory_build_gate=1, assignee="agent007")
+    author = existing_author or kb.create_task(
+        conn, title="packet author", factory_build_gate=1, assignee="agent007",
+    )
     reviewer = kb.create_task(conn, title="packet audit", factory_build_gate=1, assignee="bafuxunan", parents=[author])
     merger = kb.create_task(conn, title="packet merger", factory_build_gate=1, assignee="gm", parents=[reviewer])
     installer = kb.create_task(conn, title="packet install", factory_build_gate=1, assignee="merger", parents=[merger])
@@ -1371,6 +1375,45 @@ def _canonical_factory_packet_chain(
             "protected_issues": {"790": "open", "833": "open"},
             "secret_exposure": "none", "worker_session_id": "installed-source-merge-session",
         }
+    if actual_emitted_packets:
+        merger_metadata = {
+            "actor": {
+                "distinct_from": ["007AION", "GemAION"],
+                "github": "kiddhu", "role": "AION-GM",
+            },
+            "audit": {
+                "review_commit_id": head, "review_id": review_id,
+                "review_state": "APPROVED", "review_url": review_url,
+                "run_id": review_run, "task_id": reviewer,
+            },
+            "base": base,
+            "canonical_checkout": {
+                "branch": "main", "clean": True, "head": base,
+                "installed_in_this_task": False,
+            },
+            "changed_paths": paths,
+            "checks": {
+                "bad": 0, "ci_run": 123456, "ci_status": "completed/success",
+                "neutral": 1, "pending": 0, "skipped": 1, "success": 2,
+            },
+            "child": {
+                "assignee": "merger", "id": installer,
+                "purpose": "guarded clean fast-forward install plus typed witness",
+                "status": "todo",
+            },
+            "forbidden_actions_performed": [], "head": head,
+            "merge": {
+                "cas_sha_guard": head, "commit": merge,
+                "parents": [base, head], "remote_main": merge, "tree": tree,
+            },
+            "new_control_plane_count": 0, "new_runtime_module_count": 0,
+            "outcome": "ROLE_SEPARATED_CAS_MERGE_AND_MAIN_READBACK_COMPLETE",
+            "public_receipts": ["https://github.com/example/governance/issues/833#issuecomment-1"],
+            "secret_exposure": "none", "tree": tree,
+            "worker_session_id": "actual-merge-session",
+        }
+    if merge_mutate is not None:
+        merge_mutate(merger_metadata)
     assert kb.complete_task(
         conn, merger, expected_run_id=merger_run, metadata=merger_metadata,
     )
@@ -1443,6 +1486,32 @@ def _canonical_factory_packet_chain(
             "witness_type": f"EXACT_PR{source_pr}_INSTALLED_AND_TYPED_SOURCE_INSTALLED_RESIDENT_NOT_ACTIVATED_WITNESS",
             "worker_session_id": "installed-source-install-session",
         }
+    if actual_emitted_packets:
+        install_metadata.update({
+            "artifacts": ["/tmp/runtime.json", "/tmp/typed-witness.json"],
+            "changed_files": paths,
+            "install_epoch": 123456789,
+            "new_runtime_module_count": 0,
+            "receipt_actor": "kiddhu", "receipt_actor_id": 12485573,
+            "resident_runtime": {
+                "all_running_gateways_predate_install": True,
+                "hermes_gateway_gm2_NRestarts": "0",
+                "hermes_gateway_gm2_active_state": "active",
+                "hermes_gateway_gm2_main_pid": 2000,
+                "hermes_gateway_gm2_sub_state": "running",
+                "resident_kanban_db_blob_at_base": "8" * 40,
+                "running_gateway_pids": [2000],
+            },
+            "typed_symbols": {
+                "_canonical_factory_review_packet_present_callable": True,
+                "_authenticated_canonical_factory_packet_chain_present_callable": True,
+                "_reviewed_author_finalizer_run_id_wraps_canonical_packet": True,
+                "monotonic_fix_active_enter_lt_exec_start": True,
+            },
+        })
+        install_metadata.pop("typed_symbol")
+    if install_mutate is not None:
+        install_mutate(install_metadata)
     assert kb.complete_task(
         conn, installer, expected_run_id=install_run, metadata=install_metadata,
     )
@@ -1530,10 +1599,244 @@ def _canonical_factory_packet_chain(
             },
             "worker_session_id": "installed-source-resident-audit-session",
         }
+    if resident_request_changes:
+        resident_metadata = {
+            "artifact_sha256": "b" * 64,
+            "artifacts": ["/tmp/request-changes-audit.md"],
+            "exact_candidate": {
+                "audited_head": head, "base": base, "merge_commit": merge,
+                "pr": f"https://github.com/kiddhu/hermes-agent/pull/{source_pr}",
+                "tree": tree,
+            },
+            "focused_tests": {"failed": 0, "passed": 22},
+            "forbidden_actions_performed": [],
+            "formal_evidence": ["https://github.com/example/governance/issues/833#issuecomment-4"],
+            "github_readback": {
+                "actor": "GemAION", "body_sha256": "b" * 64,
+                "byte_exact": True,
+            },
+            "new_control_plane_count": 0,
+            "outcome": "REQUEST_CHANGES_EXACT_RESIDENT_PACKET",
+            "packet_blockers": [
+                {"evidence": "sanitized lifecycle mismatch", "id": "VALID_SYSTEMD_ORDER_REJECTED"},
+                {"evidence": "sanitized packet mismatch", "id": "EXACT_REVIEW_PACKET_NOT_ROUTED_TO_INSTALLED_CHAIN"},
+            ],
+            "parent_replay": {
+                "manual_claim_or_dispatch_count": 0, "natural_claim_run": activation_run,
+                "restart_attempts": 0, "task": activation,
+            },
+            "post_test_resource_readback": {
+                "memory_events_max": 0, "oom": 0, "oom_kill": 0,
+                "pids_events_max": 0, "pids_max": 120, "pids_peak": 42,
+                "tasks_max": 120,
+            },
+            "reviewed_author_probe": {
+                "author_task": author, "connection_total_changes_delta": 0,
+                "data_version_unchanged": True, "resolver_result": None,
+                "status_before_after": "review/review",
+            },
+            "secret_exposure": "none",
+            "source_identity": {
+                "kanban_db_blob": source["kanban_db_blob"],
+                "kanban_db_sha256": source["kanban_db_sha256"],
+                "rollback_commit": base,
+            },
+            "static_checks": {
+                "checkout_clean": True, "diff_check": "pass",
+                "py_compile": "pass", "ruff": "pass",
+            },
+            "worker_session_id": "request-changes-resident-session",
+        }
+    if resident_mutate is not None:
+        resident_mutate(resident_metadata)
     assert kb.complete_task(
         conn, resident_audit, expected_run_id=resident_run, metadata=resident_metadata,
     )
     return {"author": author, "author_run": author_run, "reviewer": reviewer, "review_run": review_run, "merger": merger, "merger_run": merger_run, "installer": installer, "install_run": install_run, "activation": activation, "activation_run": activation_run, "resident_audit": resident_audit, "resident_run": resident_run}
+
+
+def _canonical_factory_repair_phase_chain(
+    conn, *, resident_mutate=None, merge_mutate=None, install_mutate=None,
+):
+    """Model the exact resident REQUEST_CHANGES -> repair-author phase boundary."""
+    original = _canonical_factory_packet_chain(
+        conn,
+        installed_source_shapes=True,
+        emitted_review_shape=True,
+        resident_request_changes=True,
+        resident_mutate=resident_mutate,
+    )
+    repair_author = kb.create_task(
+        conn,
+        title="packet repair author",
+        factory_build_gate=1,
+        assignee="agent007",
+        parents=[original["resident_audit"]],
+    )
+    repaired = _canonical_factory_packet_chain(
+        conn,
+        installed_source_shapes=True,
+        emitted_review_shape=True,
+        existing_author=repair_author,
+        actual_emitted_packets=True,
+        merge_mutate=merge_mutate,
+        install_mutate=install_mutate,
+    )
+    return original, repaired
+
+
+def test_reviewed_author_accepts_exact_repaired_phase_from_live_packet_families(
+    kanban_home, aion_gov_src,
+):
+    with kb.connect() as conn:
+        original, repaired = _canonical_factory_repair_phase_chain(conn)
+        before = _native_state_snapshot(conn)
+
+        assert kb._reviewed_author_repair_phase_task_id(
+            conn,
+            task_id=original["author"],
+            reviewer_id=original["reviewer"],
+            review_md=kb._canonical_factory_review_packet(
+                _terminal_run_metadata(conn, original["reviewer"]),
+            ),
+        ) == repaired["author"]
+        assert kb._reviewed_author_finalizer_run_id(
+            conn, repaired["author"], _allow_repair_phase=False,
+        ) == repaired["author_run"]
+        assert kb._reviewed_author_finalizer_run_id(
+            conn, original["author"], _allow_repair_phase=False,
+        ) is None
+        assert kb._reviewed_author_finalizer_run_id(
+            conn, original["author"],
+        ) == original["author_run"]
+        assert _native_state_snapshot(conn) == before
+
+
+@pytest.mark.parametrize("mutate", [
+    lambda md: md.pop("outcome"),
+    lambda md: md.__setitem__("unknown", True),
+    lambda md: md["exact_candidate"].__setitem__("audited_head", "f" * 40),
+    lambda md: md["exact_candidate"].__setitem__("tree", "malformed"),
+    lambda md: md["exact_candidate"].__setitem__("base", "f" * 40),
+    lambda md: md["exact_candidate"].__setitem__("merge_commit", True),
+    lambda md: md["exact_candidate"].__setitem__(
+        "pr", "https://github.com/kiddhu/hermes-agent/pull/65",
+    ),
+    lambda md: md["reviewed_author_probe"].__setitem__("author_task", "t_attacker"),
+    lambda md: md["reviewed_author_probe"].__setitem__("resolver_result", 1),
+    lambda md: md["reviewed_author_probe"].__setitem__(
+        "connection_total_changes_delta", False,
+    ),
+    lambda md: md["parent_replay"].__setitem__("task", "t_attacker"),
+    lambda md: md["parent_replay"].__setitem__("natural_claim_run", True),
+    lambda md: md["parent_replay"].__setitem__("restart_attempts", 1),
+    lambda md: md["github_readback"].__setitem__("actor", "007AION"),
+    lambda md: md["github_readback"].__setitem__("byte_exact", 1),
+    lambda md: md["source_identity"].__setitem__("rollback_commit", "f" * 40),
+    lambda md: md["focused_tests"].__setitem__("failed", True),
+    lambda md: md["post_test_resource_readback"].__setitem__("oom_kill", 1),
+    lambda md: md["post_test_resource_readback"].__setitem__("pids_events_max", -1),
+    lambda md: md["static_checks"].__setitem__("ruff", "FAIL"),
+    lambda md: md["packet_blockers"].append(dict(md["packet_blockers"][0])),
+    lambda md: md["packet_blockers"][0].__setitem__("id", "UNAUTHENTICATED"),
+    lambda md: md.__setitem__("new_control_plane_count", False),
+    lambda md: md.__setitem__("secret_exposure", "present"),
+])
+def test_reviewed_author_repair_phase_packet_drift_fails_closed_without_mutation(
+    kanban_home, aion_gov_src, mutate,
+):
+    with kb.connect() as conn:
+        original, _repaired = _canonical_factory_repair_phase_chain(
+            conn, resident_mutate=mutate,
+        )
+        before = _native_state_snapshot(conn)
+        assert kb._reviewed_author_finalizer_run_id(conn, original["author"]) is None
+        assert _native_state_snapshot(conn) == before
+
+
+@pytest.mark.parametrize("mutate", [
+    lambda md: md.pop("outcome"),
+    lambda md: md.__setitem__("unknown", True),
+    lambda md: md["actor"].__setitem__("github", "007AION"),
+    lambda md: md["actor"].__setitem__("distinct_from", ["GemAION", "007AION"]),
+    lambda md: md["audit"].__setitem__("review_id", True),
+    lambda md: md["audit"].__setitem__("task_id", "t_attacker"),
+    lambda md: md["audit"].__setitem__("run_id", True),
+    lambda md: md["canonical_checkout"].__setitem__("clean", 1),
+    lambda md: md["checks"].__setitem__("bad", True),
+    lambda md: md["checks"].__setitem__("pending", 1),
+    lambda md: md["checks"].__setitem__("ci_status", "completed/failure"),
+    lambda md: md["checks"].__setitem__("success", False),
+    lambda md: md["child"].__setitem__("assignee", "agent007"),
+    lambda md: md["child"].__setitem__("id", "t_attacker"),
+    lambda md: md["child"].__setitem__("status", "ready"),
+    lambda md: md["merge"].__setitem__("cas_sha_guard", "f" * 40),
+    lambda md: md["merge"].__setitem__("parents", list(reversed(md["merge"]["parents"]))),
+    lambda md: md["merge"].__setitem__("remote_main", "f" * 40),
+    lambda md: md["changed_paths"].append(md["changed_paths"][0]),
+    lambda md: md.__setitem__("new_runtime_module_count", False),
+])
+def test_actual_role_separated_merge_packet_drift_fails_closed_without_mutation(
+    kanban_home, aion_gov_src, mutate,
+):
+    with kb.connect() as conn:
+        original, _repaired = _canonical_factory_repair_phase_chain(
+            conn, merge_mutate=mutate,
+        )
+        before = _native_state_snapshot(conn)
+        assert kb._reviewed_author_finalizer_run_id(conn, original["author"]) is None
+        assert _native_state_snapshot(conn) == before
+
+
+@pytest.mark.parametrize("mutate", [
+    lambda md: md.pop("typed_symbols"),
+    lambda md: md.__setitem__("unknown", True),
+    lambda md: md.__setitem__("canonical_run_id", True),
+    lambda md: md.__setitem__("activation_performed", 0),
+    lambda md: md.__setitem__("source_installed", 1),
+    lambda md: md.__setitem__("audited_head", "f" * 40),
+    lambda md: md["changed_files"].append(md["changed_files"][0]),
+    lambda md: md["blobs"].pop(next(iter(md["blobs"]))),
+    lambda md: md["install"].__setitem__("head", "f" * 40),
+    lambda md: md["install"].__setitem__("parents", list(reversed(md["install"]["parents"]))),
+    lambda md: md["install"].__setitem__("method", "force"),
+    lambda md: md["fresh_runtime"].__setitem__("bytes_match", 1),
+    lambda md: md["fresh_runtime"].__setitem__("module_sha256", "malformed"),
+    lambda md: md["typed_symbols"].pop("_canonical_factory_review_packet_present_callable"),
+    lambda md: md["typed_symbols"].__setitem__("monotonic_fix_active_enter_lt_exec_start", 1),
+    lambda md: md.__setitem__("receipt_actor", "007AION"),
+    lambda md: md.__setitem__("receipt_actor_id", True),
+    lambda md: md.__setitem__("install_epoch", False),
+    lambda md: md["resident_runtime"].__setitem__("hermes_gateway_gm2_NRestarts", "1"),
+    lambda md: md["resident_runtime"].__setitem__("hermes_gateway_gm2_main_pid", True),
+    lambda md: md["tests"].__setitem__("ruff", "FAIL"),
+    lambda md: md.__setitem__("new_runtime_module_count", False),
+    lambda md: md["artifacts"].append(md["artifacts"][0]),
+])
+def test_actual_installed_source_packet_drift_fails_closed_without_mutation(
+    kanban_home, aion_gov_src, mutate,
+):
+    with kb.connect() as conn:
+        original, _repaired = _canonical_factory_repair_phase_chain(
+            conn, install_mutate=mutate,
+        )
+        before = _native_state_snapshot(conn)
+        assert kb._reviewed_author_finalizer_run_id(conn, original["author"]) is None
+        assert _native_state_snapshot(conn) == before
+
+
+def test_reviewed_author_repair_phase_ambiguous_edge_fails_closed_without_mutation(
+    kanban_home, aion_gov_src,
+):
+    with kb.connect() as conn:
+        original, _repaired = _canonical_factory_repair_phase_chain(conn)
+        kb.create_task(
+            conn, title="ambiguous sibling", factory_build_gate=1,
+            assignee="gm", parents=[original["reviewer"]],
+        )
+        before = _native_state_snapshot(conn)
+        assert kb._reviewed_author_finalizer_run_id(conn, original["author"]) is None
+        assert _native_state_snapshot(conn) == before
 
 
 def test_reviewed_author_accepts_current_canonical_factory_packet_chain(kanban_home, aion_gov_src):
