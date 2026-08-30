@@ -8529,7 +8529,12 @@ def _authenticated_canonical_factory_packet_chain(
         return False
 
 
-    def exact_children(parent_id: str, keys: set[str], profiles: set[str]):
+    def exact_children(
+        parent_id: str,
+        keys: set[str] | tuple[set[str], ...],
+        profiles: set[str],
+    ):
+        key_families = (keys,) if isinstance(keys, set) else keys
         candidates = []
         for row in conn.execute(
             "SELECT child_id FROM task_links WHERE parent_id = ? ORDER BY child_id",
@@ -8540,7 +8545,7 @@ def _authenticated_canonical_factory_packet_chain(
             if candidate is None:
                 continue
             run_id, profile, metadata = candidate
-            if profile in profiles and set(metadata) == keys:
+            if profile in profiles and any(set(metadata) == family for family in key_families):
                 candidates.append((child_id, run_id, profile, metadata))
         return candidates
 
@@ -8551,6 +8556,26 @@ def _authenticated_canonical_factory_packet_chain(
             and (not positive or value > 0)
         )
 
+    def nonnegative_int(value) -> bool:
+        return type(value) is int and value >= 0
+
+    def exact_hash(value, width: int) -> bool:
+        return (
+            isinstance(value, str)
+            and re.fullmatch(rf"[0-9a-fA-F]{{{width}}}", value) is not None
+        )
+
+    def nonempty_string(value) -> bool:
+        return isinstance(value, str) and bool(value.strip())
+
+    def nonempty_string_list(value) -> bool:
+        return (
+            isinstance(value, list)
+            and bool(value)
+            and all(nonempty_string(item) for item in value)
+            and len(set(value)) == len(value)
+        )
+
     merger_keys = {
         "actor", "audited_head", "audited_tree", "audit", "base",
         "canonical_checkout", "checks", "changed_files", "child_task_id",
@@ -8559,7 +8584,15 @@ def _authenticated_canonical_factory_packet_chain(
         "new_control_plane_count", "pr", "remote_main", "role_separation",
         "secret_exposure", "worker_session_id",
     }
-    mergers = exact_children(reviewer_id, merger_keys, {"gm"})
+    installed_source_merger_keys = {
+        "actor", "audit", "base", "canonical_checkout", "checks", "child",
+        "evidence_comments", "forbidden_actions_performed", "head", "head_tree",
+        "merge", "merged_blobs", "new_control_plane_count", "not_true_done_for",
+        "pr", "pr_state", "protected_issues", "secret_exposure", "worker_session_id",
+    }
+    mergers = exact_children(
+        reviewer_id, (merger_keys, installed_source_merger_keys), {"gm"},
+    )
     if len(mergers) != 1:
         return False
 
@@ -8568,50 +8601,114 @@ def _authenticated_canonical_factory_packet_chain(
         return False
     audit = merge_md.get("audit")
     checkout = merge_md.get("canonical_checkout")
-    checks = merge_md.get("checks")
-    roles = merge_md.get("role_separation")
-    ledger = merge_md.get("mutation_ledger")
-    paths = merge_md.get("changed_files")
-    merge_sha = merge_md.get("merge_commit")
-    if (
-        merge_md.get("actor") != FACTORY_REVIEW_MERGER_ACTOR
-        or merge_md.get("audited_head") != head or merge_md.get("audited_tree") != tree
-        or merge_md.get("base") != base or merge_md.get("pr") != source_pr
-        or not isinstance(audit, dict)
-        or audit != {
-            "github_review_id": review_id, "github_review_state": "APPROVED",
-            "native_run_id": reviewer_run_id, "native_task_id": reviewer_id,
-            "verdict": "PASS_EXACT_HEAD",
-        }
-        or not isinstance(checkout, dict) or checkout.get("clean") is not True
-        or checkout.get("installed") is not False or checkout.get("preserved_head") != base
-        or not isinstance(checks, dict)
-        or any(type(checks.get(key)) is not int for key in ("bad_or_pending", "neutral", "skipped", "success", "total"))
-        or not exact_int(checks.get("bad_or_pending"), 0)
-        or not exact_int(checks.get("total"), positive=True)
-        or checks.get("neutral", 0) + checks.get("skipped", 0) + checks.get("success", 0) != checks.get("total")
-        or not isinstance(paths, list) or not paths
-        or any(not isinstance(path, str) or not path for path in paths)
-        or len(set(paths)) != len(paths)
-        or not isinstance(merge_sha, str) or re.fullmatch(r"[0-9a-fA-F]{40}", merge_sha) is None
-        or merge_md.get("merge_parents") != [base, head]
-        or merge_md.get("merge_tree") != tree or merge_md.get("remote_main") != merge_sha
-        or not isinstance(roles, dict)
-        or roles != {
-            "author": f"{FACTORY_REVIEW_AUTHOR_PROFILE}/{FACTORY_REVIEW_AUTHOR_ACTOR}",
-            "auditor": f"{FACTORY_REVIEW_AUDITOR_PROFILE}/{FACTORY_REVIEW_AUDITOR_ACTOR}",
-            "merger": f"gm/{FACTORY_REVIEW_MERGER_ACTOR}",
-        }
-        or len(set(roles.values())) != 3
-        or not isinstance(ledger, dict)
-        or not exact_int(ledger.get("github_cas_merge"), 1)
-        or not exact_int(ledger.get("native_child_creations"), 1)
-        or merge_md.get("forbidden_actions_performed") != []
-        or type(merge_md.get("new_control_plane_count")) is not int
-        or merge_md.get("new_control_plane_count") != 0
-        or merge_md.get("secret_exposure") != "none"
-    ):
-        return False
+    has_installed_source_merger = set(merge_md) == installed_source_merger_keys
+    if has_installed_source_merger:
+        actor = merge_md.get("actor")
+        child = merge_md.get("child")
+        merge = merge_md.get("merge")
+        merged_blobs = merge_md.get("merged_blobs")
+        protected_issues = merge_md.get("protected_issues")
+        paths = list(merged_blobs) if isinstance(merged_blobs, dict) else None
+        merge_sha = merge.get("commit") if isinstance(merge, dict) else None
+        if (
+            actor != {
+                "github": FACTORY_REVIEW_MERGER_ACTOR,
+                "profile": "gm",
+                "role_separated_from": [
+                    f"{FACTORY_REVIEW_AUTHOR_PROFILE}/{FACTORY_REVIEW_AUTHOR_ACTOR}",
+                    f"{FACTORY_REVIEW_AUDITOR_PROFILE}/{FACTORY_REVIEW_AUDITOR_ACTOR}",
+                ],
+            }
+            or audit != {
+                "approval_commit_id": head, "github_review_id": review_id,
+                "native_run_id": reviewer_run_id, "native_task_id": reviewer_id,
+                "review_actor": FACTORY_REVIEW_AUDITOR_ACTOR,
+                "review_state": "APPROVED", "verdict": "PASS_EXACT_HEAD",
+            }
+            or not exact_int(audit.get("github_review_id"), review_id)
+            or not exact_int(audit.get("native_run_id"), reviewer_run_id)
+            or checkout != {"dirty": False, "head": base, "installed_in_task": False}
+            or not isinstance(merge_md.get("checks"), str)
+            or not merge_md["checks"].strip()
+            or not isinstance(child, dict)
+            or set(child) != {"assignee", "id", "purpose", "status_at_creation"}
+            or child.get("assignee") != FACTORY_REVIEW_MERGER_PROFILE
+            or child.get("id") in {None, task_id, merger_id}
+            or child.get("status_at_creation") != "todo"
+            or not isinstance(child.get("purpose"), str) or not child["purpose"].strip()
+            or merge_md.get("head") != head or merge_md.get("head_tree") != tree
+            or merge_md.get("base") != base
+            or not exact_int(merge_md.get("pr"), source_pr)
+            or merge_md.get("pr_state") != "MERGED"
+            or not isinstance(merge, dict)
+            or set(merge) != {"cas_calls", "commit", "method", "parents", "remote_main", "tree"}
+            or not exact_int(merge.get("cas_calls"), 1)
+            or merge.get("method") != "merge"
+            or merge.get("parents") != [base, head]
+            or merge.get("remote_main") != merge_sha or merge.get("tree") != tree
+            or not isinstance(merge_sha, str)
+            or re.fullmatch(r"[0-9a-fA-F]{40}", merge_sha) is None
+            or not isinstance(merged_blobs, dict) or not merged_blobs
+            or any(
+                not isinstance(path, str) or not path
+                or not isinstance(blob, str)
+                or re.fullmatch(r"[0-9a-fA-F]{40}", blob) is None
+                for path, blob in merged_blobs.items()
+            )
+            or not isinstance(protected_issues, dict) or not protected_issues
+            or any(not isinstance(key, str) or not key for key in protected_issues)
+            or any(value != "open" for value in protected_issues.values())
+            or merge_md.get("forbidden_actions_performed") != []
+            or type(merge_md.get("new_control_plane_count")) is not int
+            or merge_md.get("new_control_plane_count") != 0
+            or merge_md.get("secret_exposure") != "none"
+        ):
+            return False
+    else:
+        checks = merge_md.get("checks")
+        roles = merge_md.get("role_separation")
+        ledger = merge_md.get("mutation_ledger")
+        paths = merge_md.get("changed_files")
+        merge_sha = merge_md.get("merge_commit")
+        if (
+            merge_md.get("actor") != FACTORY_REVIEW_MERGER_ACTOR
+            or merge_md.get("audited_head") != head or merge_md.get("audited_tree") != tree
+            or merge_md.get("base") != base or merge_md.get("pr") != source_pr
+            or not isinstance(audit, dict)
+            or audit != {
+                "github_review_id": review_id, "github_review_state": "APPROVED",
+                "native_run_id": reviewer_run_id, "native_task_id": reviewer_id,
+                "verdict": "PASS_EXACT_HEAD",
+            }
+            or not isinstance(checkout, dict) or checkout.get("clean") is not True
+            or checkout.get("installed") is not False or checkout.get("preserved_head") != base
+            or not isinstance(checks, dict)
+            or any(type(checks.get(key)) is not int for key in ("bad_or_pending", "neutral", "skipped", "success", "total"))
+            or not exact_int(checks.get("bad_or_pending"), 0)
+            or not exact_int(checks.get("total"), positive=True)
+            or checks.get("neutral", 0) + checks.get("skipped", 0) + checks.get("success", 0) != checks.get("total")
+            or not isinstance(paths, list) or not paths
+            or any(not isinstance(path, str) or not path for path in paths)
+            or len(set(paths)) != len(paths)
+            or not isinstance(merge_sha, str) or re.fullmatch(r"[0-9a-fA-F]{40}", merge_sha) is None
+            or merge_md.get("merge_parents") != [base, head]
+            or merge_md.get("merge_tree") != tree or merge_md.get("remote_main") != merge_sha
+            or not isinstance(roles, dict)
+            or roles != {
+                "author": f"{FACTORY_REVIEW_AUTHOR_PROFILE}/{FACTORY_REVIEW_AUTHOR_ACTOR}",
+                "auditor": f"{FACTORY_REVIEW_AUDITOR_PROFILE}/{FACTORY_REVIEW_AUDITOR_ACTOR}",
+                "merger": f"gm/{FACTORY_REVIEW_MERGER_ACTOR}",
+            }
+            or len(set(roles.values())) != 3
+            or not isinstance(ledger, dict)
+            or not exact_int(ledger.get("github_cas_merge"), 1)
+            or not exact_int(ledger.get("native_child_creations"), 1)
+            or merge_md.get("forbidden_actions_performed") != []
+            or type(merge_md.get("new_control_plane_count")) is not int
+            or merge_md.get("new_control_plane_count") != 0
+            or merge_md.get("secret_exposure") != "none"
+        ):
+            return False
 
 
     install_keys = {
@@ -8623,54 +8720,144 @@ def _authenticated_canonical_factory_packet_chain(
         "source_head", "source_merge", "source_pr", "source_tree", "tests",
         "typed_witness", "witness_type", "worker_session_id",
     }
-    installs = exact_children(merger_id, install_keys, {FACTORY_REVIEW_MERGER_PROFILE})
+    installed_source_install_keys = {
+        "activation_performed", "audited_head", "author_finalizer_performed", "base",
+        "blobs", "canonical_run_id", "forbidden_actions_performed", "fresh_runtime",
+        "install", "merge", "new_control_plane_count", "not_true_done_for", "pr",
+        "public_receipts", "receipt_sha256", "resident_activated", "resident_runtime",
+        "secret_exposure", "source_installed", "tests", "tree", "typed_symbol",
+        "witness_type", "worker_session_id",
+    }
+    installs = exact_children(
+        merger_id, (install_keys, installed_source_install_keys),
+        {FACTORY_REVIEW_MERGER_PROFILE},
+    )
     if len(installs) != 1:
         return False
 
     install_id, install_run_id, install_profile, install_md = installs[0]
     if (
         install_id in {task_id, merger_id}
-        or merge_md.get("child_task_id") != install_id
+        or (
+            merge_md.get("child_task_id") != install_id
+            if not has_installed_source_merger
+            else merge_md.get("child", {}).get("id") != install_id
+        )
         or not _all_other_parents_terminal(conn, install_id, merger_id)
     ):
         return False
     install = install_md.get("install")
-    binding = install_md.get("native_binding")
     fresh_runtime = install_md.get("fresh_runtime")
-    typed_witness = install_md.get("typed_witness")
-    if (
-        install_md.get("canonical_run_id") != install_run_id
-        or install_md.get("author_finalizer_performed") is not False
-        or install_md.get("author_status_before_and_after") != "review"
-        or install_md.get("github_review_id") != review_id
-        or install_md.get("source_pr") != source_pr
-        or install_md.get("source_head") != head or install_md.get("source_tree") != tree
-        or install_md.get("source_merge") != merge_sha
-        or install_md.get("source_changed_paths") != paths
-        or install_md.get("witness_type")
-        != f"EXACT_PR{source_pr}_INSTALLED_AND_TYPED_RUNTIME_WITNESS"
-        or not isinstance(install, dict) or install.get("head") != merge_sha
-        or install.get("tree") != tree or install.get("parents") != [base, head]
-        or install.get("changed_paths") != paths or install.get("worktree_clean") is not True
-        or not isinstance(binding, dict)
-        or binding.get("direct_parent_only") != merger_id
-        or binding.get("parent_run") != merger_run_id
-        or binding.get("author_profile") != FACTORY_REVIEW_AUTHOR_PROFILE
-        or binding.get("auditor_profile") != reviewer_profile
-        or binding.get("merge_profile") != merger_profile
-        or binding.get("runtime_profile") != install_profile
-        or binding.get("roles_distinct") is not True
-        or not isinstance(fresh_runtime, dict) or fresh_runtime.get("bytes_match") is not True
-        or fresh_runtime.get("resolver_loaded") is not True
-        or not isinstance(typed_witness, dict)
-        or typed_witness.get("live_board_smoke_zero_mutation") is not True
-        or not all(typed_witness.get("states", {}).get(key) is True for key in ("ACTIVATION_GATED", "INSTALLED_PRESENT", "RESIDENT_ACTIVE", "SOURCE_PRESENT"))
-        or install_md.get("forbidden_actions_performed") != []
-        or type(install_md.get("new_control_plane_count")) is not int
-        or install_md.get("new_control_plane_count") != 0
-        or install_md.get("secret_exposure") != "none"
-    ):
+    blobs = install_md.get("blobs")
+    installed_module_blob = blobs.get("hermes_cli/kanban_db.py") if isinstance(blobs, dict) else None
+    has_installed_source_install = set(install_md) == installed_source_install_keys
+    if has_installed_source_install != has_installed_source_merger:
+        # The schemas are closed end-to-end: never combine an installed-source
+        # authority packet with a legacy install/runtime tail, or vice versa.
         return False
+    if has_installed_source_install:
+        typed_symbol = install_md.get("typed_symbol")
+        receipt_sha = install_md.get("receipt_sha256")
+        if (
+            not has_installed_source_merger
+            or not exact_int(install_md.get("canonical_run_id"), install_run_id)
+            or install_md.get("activation_performed") is not False
+            or install_md.get("author_finalizer_performed") is not False
+            or install_md.get("resident_activated") is not False
+            or install_md.get("source_installed") is not True
+            or install_md.get("audited_head") != head
+            or install_md.get("base") != base or install_md.get("tree") != tree
+            or install_md.get("merge") != merge_sha
+            or not exact_int(install_md.get("pr"), source_pr)
+            or blobs != merge_md.get("merged_blobs")
+            or not isinstance(install, dict)
+            or set(install) != {
+                "changed_paths", "head", "method", "parents", "preinstall_commit",
+                "rollback_commit", "rollback_ref", "tree", "worktree_clean",
+            }
+            or install.get("head") != merge_sha or install.get("tree") != tree
+            or install.get("parents") != [base, head]
+            or install.get("changed_paths") != paths
+            or install.get("preinstall_commit") != base
+            or install.get("rollback_commit") != base
+            or not nonempty_string(install.get("rollback_ref"))
+            or install.get("worktree_clean") is not True
+            or install.get("method") != "existing_clean_git_editable_guarded_fast_forward"
+            or not isinstance(fresh_runtime, dict)
+            or set(fresh_runtime) != {
+                "bytes_match", "module_path", "module_sha256", "resolver_loaded",
+                "resolves_to_authoritative_root",
+            }
+            or fresh_runtime.get("bytes_match") is not True
+            or fresh_runtime.get("resolver_loaded") is not True
+            or fresh_runtime.get("resolves_to_authoritative_root") is not True
+            or not exact_hash(fresh_runtime.get("module_sha256"), 64)
+            or not nonempty_string(fresh_runtime.get("module_path"))
+            or not fresh_runtime["module_path"].endswith("/hermes_cli/kanban_db.py")
+            or installed_module_blob is None
+            or typed_symbol != {
+                "approval_commit_id_branch_in_finalizer": True,
+                "present_callable": True,
+                "symbol": "_authenticated_canonical_factory_packet_chain",
+            }
+            or install_md.get("witness_type")
+            != f"EXACT_PR{source_pr}_INSTALLED_AND_TYPED_SOURCE_INSTALLED_RESIDENT_NOT_ACTIVATED_WITNESS"
+            or not isinstance(receipt_sha, str)
+            or re.fullmatch(r"[0-9a-fA-F]{64}", receipt_sha) is None
+            or not isinstance(install_md.get("public_receipts"), list)
+            or not install_md["public_receipts"]
+            or any(
+                not isinstance(receipt, str) or not receipt
+                for receipt in install_md["public_receipts"]
+            )
+            or not isinstance(install_md.get("resident_runtime"), dict)
+            or set(install_md["resident_runtime"]) != {
+                "all_running_gateways_predate_install", "hermes_gateway_gm2_NRestarts",
+                "hermes_gateway_gm2_active_state", "hermes_gateway_gm2_sub_state",
+                "resident_kanban_db_blob_at_base",
+            }
+            or install_md.get("forbidden_actions_performed") != []
+            or type(install_md.get("new_control_plane_count")) is not int
+            or install_md.get("new_control_plane_count") != 0
+            or install_md.get("secret_exposure") != "none"
+        ):
+            return False
+    else:
+        binding = install_md.get("native_binding")
+        typed_witness = install_md.get("typed_witness")
+        if (
+            install_md.get("canonical_run_id") != install_run_id
+            or install_md.get("author_finalizer_performed") is not False
+            or install_md.get("author_status_before_and_after") != "review"
+            or install_md.get("github_review_id") != review_id
+            or install_md.get("source_pr") != source_pr
+            or install_md.get("source_head") != head or install_md.get("source_tree") != tree
+            or install_md.get("source_merge") != merge_sha
+            or install_md.get("source_changed_paths") != paths
+            or install_md.get("witness_type")
+            != f"EXACT_PR{source_pr}_INSTALLED_AND_TYPED_RUNTIME_WITNESS"
+            or not isinstance(install, dict) or install.get("head") != merge_sha
+            or install.get("tree") != tree or install.get("parents") != [base, head]
+            or install.get("changed_paths") != paths or install.get("worktree_clean") is not True
+            or not isinstance(binding, dict)
+            or binding.get("direct_parent_only") != merger_id
+            or binding.get("parent_run") != merger_run_id
+            or binding.get("author_profile") != FACTORY_REVIEW_AUTHOR_PROFILE
+            or binding.get("auditor_profile") != reviewer_profile
+            or binding.get("merge_profile") != merger_profile
+            or binding.get("runtime_profile") != install_profile
+            or binding.get("roles_distinct") is not True
+            or not isinstance(fresh_runtime, dict) or fresh_runtime.get("bytes_match") is not True
+            or fresh_runtime.get("resolver_loaded") is not True
+            or not isinstance(typed_witness, dict)
+            or typed_witness.get("live_board_smoke_zero_mutation") is not True
+            or not all(typed_witness.get("states", {}).get(key) is True for key in ("ACTIVATION_GATED", "INSTALLED_PRESENT", "RESIDENT_ACTIVE", "SOURCE_PRESENT"))
+            or install_md.get("forbidden_actions_performed") != []
+            or type(install_md.get("new_control_plane_count")) is not int
+            or install_md.get("new_control_plane_count") != 0
+            or install_md.get("secret_exposure") != "none"
+        ):
+            return False
 
 
     activation_keys = {
@@ -8722,6 +8909,40 @@ def _authenticated_canonical_factory_packet_chain(
         or activation_md.get("secret_exposure") != "none"
     ):
         return False
+    if has_installed_source_install and (
+        set(source) != {
+            "audited_head", "clean", "head", "kanban_db_blob", "kanban_db_sha256",
+            "merge_commit", "tree",
+        }
+        or set(external) != {
+            "compressed_sha256", "exact_shell_pid_unique_attribution",
+            "outside_target_cgroup_proven", "restart_count", "second_restart",
+            "uncompressed_sha256",
+        }
+        or set(resident) != {
+            "active_enter_timestamp_monotonic", "active_state", "barrier_loaded",
+            "configured_import_exact", "deep_health_exit_code", "exec_start_monotonic",
+            "main_pid", "memory_current", "memory_peak", "nrestarts", "pids_peak",
+            "proc_starttime_ticks", "result", "sub_state", "tasks_max",
+        }
+        or source.get("merge_commit") != merge_sha
+        or source.get("kanban_db_blob") != installed_module_blob
+        or source.get("kanban_db_sha256") != fresh_runtime.get("module_sha256")
+        or not exact_hash(external.get("compressed_sha256"), 64)
+        or not exact_hash(external.get("uncompressed_sha256"), 64)
+        or not exact_int(resident.get("active_enter_timestamp_monotonic"), positive=True)
+        or not exact_int(resident.get("exec_start_monotonic"), positive=True)
+        or resident["active_enter_timestamp_monotonic"] > resident["exec_start_monotonic"]
+        or not exact_int(resident.get("main_pid"), positive=True)
+        or not nonnegative_int(resident.get("memory_current"))
+        or not nonnegative_int(resident.get("memory_peak"))
+        or resident["memory_peak"] < resident["memory_current"]
+        or not exact_int(resident.get("nrestarts"), 0)
+        or not nonnegative_int(resident.get("pids_peak"))
+        or not exact_int(resident.get("proc_starttime_ticks"), positive=True)
+        or not exact_int(resident.get("tasks_max"), positive=True)
+    ):
+        return False
 
 
     resident_keys = {
@@ -8731,7 +8952,16 @@ def _authenticated_canonical_factory_packet_chain(
         "outcome", "parent_replay", "resident", "resource_readback",
         "secret_exposure", "source", "worker_session_id",
     }
-    audits = exact_children(activation_id, resident_keys, {FACTORY_REVIEW_AUDITOR_PROFILE})
+    installed_source_resident_keys = {
+        "artifact_sha256", "artifacts", "external_receipt", "focused_tests",
+        "forbidden_actions_performed", "formal_evidence", "native_replay",
+        "new_control_plane_count", "next_supported_gate", "not_true_done_for",
+        "outcome", "resident_runtime", "secret_exposure", "source", "worker_session_id",
+    }
+    audits = exact_children(
+        activation_id, (resident_keys, installed_source_resident_keys),
+        {FACTORY_REVIEW_AUDITOR_PROFILE},
+    )
     if len(audits) != 1:
         return False
 
@@ -8743,40 +8973,112 @@ def _authenticated_canonical_factory_packet_chain(
     ):
         return False
     audit_source = resident_md.get("source")
-    parent_replay = resident_md.get("parent_replay")
-    audited_resident = resident_md.get("resident")
-    if (
-        resident_md.get("outcome") != "PASS_EXACT_RESIDENT_RUNTIME"
-        or not isinstance(resident_md.get("barrier_tests"), dict)
-        or set(resident_md["barrier_tests"]) != {"failed", "passed"}
-        or not exact_int(resident_md["barrier_tests"].get("failed"), 0)
-        or not exact_int(resident_md["barrier_tests"].get("passed"), positive=True)
-        or not exact_int(resident_md.get("deep_health_exit_code"), 0)
-        or resident_md.get("external_receipt") != external
-        or not isinstance(parent_replay, dict)
-        or not exact_int(parent_replay.get("natural_claim_run"), activation_run_id)
-        or not exact_int(parent_replay.get("restart_attempts"), 0)
-        or not exact_int(parent_replay.get("manual_claim_or_dispatch_count"), 0)
-        or not isinstance(audit_source, dict)
-        or audit_source.get("audited_head") != head
-        or audit_source.get("merge_commit") != merge_sha
-        or audit_source.get("tree") != tree
-        or audit_source.get("kanban_db_blob") != source.get("kanban_db_blob")
-        or audit_source.get("kanban_db_sha256") != source.get("kanban_db_sha256")
-        or not isinstance(audited_resident, dict)
-        or any(
-            audited_resident.get(key) != resident.get(key)
-            for key in (
-                "active_state", "sub_state", "result", "nrestarts", "main_pid",
-                "proc_starttime_ticks", "exec_start_monotonic", "tasks_max",
-            )
-        )
-        or resident_md.get("forbidden_actions_performed") != []
-        or type(resident_md.get("new_control_plane_count")) is not int
-        or resident_md.get("new_control_plane_count") != 0
-        or resident_md.get("secret_exposure") != "none"
-    ):
+    has_installed_source_resident = set(resident_md) == installed_source_resident_keys
+    if has_installed_source_resident != has_installed_source_install:
         return False
+    if has_installed_source_resident:
+        audit_external = resident_md.get("external_receipt")
+        focused_tests = resident_md.get("focused_tests")
+        native_replay = resident_md.get("native_replay")
+        audited_resident = resident_md.get("resident_runtime")
+        expected_audit_source = {
+            key: source[key]
+            for key in (
+                "audited_head", "clean", "head", "kanban_db_blob",
+                "kanban_db_sha256", "tree",
+            )
+        }
+        if (
+            not has_installed_source_install
+            or resident_md.get("outcome") != "PASS_EXACT_RESIDENT_RUNTIME"
+            or not isinstance(focused_tests, dict)
+            or set(focused_tests) != {"failed", "passed"}
+            or not exact_int(focused_tests.get("failed"), 0)
+            or not exact_int(focused_tests.get("passed"), positive=True)
+            or not isinstance(audit_external, dict)
+            or set(audit_external) != {
+                "compressed_sha256", "exact_operator_cgroup_path_attributed",
+                "outside_target_cgroup_proven", "restart_count", "second_restart",
+                "uncompressed_sha256",
+            }
+            or audit_external.get("compressed_sha256") != external.get("compressed_sha256")
+            or audit_external.get("uncompressed_sha256") != external.get("uncompressed_sha256")
+            or audit_external.get("outside_target_cgroup_proven") is not True
+            or audit_external.get("exact_operator_cgroup_path_attributed") is not False
+            or not exact_int(audit_external.get("restart_count"), 1)
+            or not exact_int(audit_external.get("second_restart"), 0)
+            or audit_source != expected_audit_source
+            or not isinstance(native_replay, dict)
+            or set(native_replay) != {
+                "manual_claim_or_dispatch_count", "restart_attempts", "run_id", "task",
+            }
+            or native_replay.get("task") != activation_id
+            or not exact_int(native_replay.get("run_id"), activation_run_id)
+            or not exact_int(native_replay.get("restart_attempts"), 0)
+            or not exact_int(native_replay.get("manual_claim_or_dispatch_count"), 0)
+            or not isinstance(audited_resident, dict)
+            or set(audited_resident) != {
+                "active_state", "exec_start_monotonic", "main_pid", "nrestarts",
+                "pids_events_max", "pids_max", "pids_peak", "proc_starttime_ticks",
+                "result", "sub_state", "tasks_max",
+            }
+            or not exact_int(audited_resident.get("exec_start_monotonic"), positive=True)
+            or not exact_int(audited_resident.get("main_pid"), positive=True)
+            or not exact_int(audited_resident.get("nrestarts"), 0)
+            or not nonnegative_int(audited_resident.get("pids_events_max"))
+            or not exact_int(audited_resident.get("pids_max"), positive=True)
+            or not nonnegative_int(audited_resident.get("pids_peak"))
+            or audited_resident["pids_peak"] > audited_resident["pids_max"]
+            or not exact_int(audited_resident.get("proc_starttime_ticks"), positive=True)
+            or not exact_int(audited_resident.get("tasks_max"), positive=True)
+            or any(
+                audited_resident.get(key) != resident.get(key)
+                for key in (
+                    "active_state", "sub_state", "result", "nrestarts", "main_pid",
+                    "proc_starttime_ticks", "exec_start_monotonic", "tasks_max",
+                )
+            )
+            or resident_md.get("forbidden_actions_performed") != []
+            or type(resident_md.get("new_control_plane_count")) is not int
+            or resident_md.get("new_control_plane_count") != 0
+            or resident_md.get("secret_exposure") != "none"
+        ):
+            return False
+    else:
+        parent_replay = resident_md.get("parent_replay")
+        audited_resident = resident_md.get("resident")
+        if (
+            resident_md.get("outcome") != "PASS_EXACT_RESIDENT_RUNTIME"
+            or not isinstance(resident_md.get("barrier_tests"), dict)
+            or set(resident_md["barrier_tests"]) != {"failed", "passed"}
+            or not exact_int(resident_md["barrier_tests"].get("failed"), 0)
+            or not exact_int(resident_md["barrier_tests"].get("passed"), positive=True)
+            or not exact_int(resident_md.get("deep_health_exit_code"), 0)
+            or resident_md.get("external_receipt") != external
+            or not isinstance(parent_replay, dict)
+            or not exact_int(parent_replay.get("natural_claim_run"), activation_run_id)
+            or not exact_int(parent_replay.get("restart_attempts"), 0)
+            or not exact_int(parent_replay.get("manual_claim_or_dispatch_count"), 0)
+            or not isinstance(audit_source, dict)
+            or audit_source.get("audited_head") != head
+            or audit_source.get("merge_commit") != merge_sha
+            or audit_source.get("tree") != tree
+            or audit_source.get("kanban_db_blob") != source.get("kanban_db_blob")
+            or audit_source.get("kanban_db_sha256") != source.get("kanban_db_sha256")
+            or not isinstance(audited_resident, dict)
+            or any(
+                audited_resident.get(key) != resident.get(key)
+                for key in (
+                    "active_state", "sub_state", "result", "nrestarts", "main_pid",
+                    "proc_starttime_ticks", "exec_start_monotonic", "tasks_max",
+                )
+            )
+            or resident_md.get("forbidden_actions_performed") != []
+            or type(resident_md.get("new_control_plane_count")) is not int
+            or resident_md.get("new_control_plane_count") != 0
+            or resident_md.get("secret_exposure") != "none"
+        ):
+            return False
 
     return True
 
