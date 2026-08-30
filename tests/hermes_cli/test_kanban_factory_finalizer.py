@@ -1253,6 +1253,7 @@ def _canonical_factory_packet_chain(
     conn, *, installed_source_shapes=False, legacy_installed_source_tail=False,
     emitted_review_shape=False, real_systemd_order=True, existing_author=None,
     actual_emitted_packets=False, resident_request_changes=False,
+    request_changes_merger_shape=False,
     merge_mutate=None, install_mutate=None, resident_mutate=None,
 ):
     """Create the generic authenticated packet shapes emitted by the current lane."""
@@ -1411,6 +1412,48 @@ def _canonical_factory_packet_chain(
             "public_receipts": ["https://github.com/example/governance/issues/833#issuecomment-1"],
             "secret_exposure": "none", "tree": tree,
             "worker_session_id": "actual-merge-session",
+        }
+    if request_changes_merger_shape:
+        merger_metadata = {
+            "artifacts": ["/tmp/role-separated-merge-receipt.json"],
+            "audited_head": head, "audited_tree": tree, "base": base,
+            "canonical_checkout": {
+                "clean": True, "head": base, "install_performed": False,
+            },
+            "changed_paths": paths,
+            "checks": {
+                "all_required_pass": True, "failing": 0, "pending": 0,
+                "total": 37,
+            },
+            "created_child": {
+                "assignee": "merger", "id": installer,
+                "scope": "guarded source install plus typed witness",
+            },
+            "exact_audit": {
+                "review_id": review_id, "run": review_run,
+                "state": "APPROVED", "task": reviewer,
+            },
+            "forbidden_actions_performed": [],
+            "github_receipts": {
+                "issue_833": (
+                    "https://github.com/kiddhu/aion-governance/issues/833"
+                    "#issuecomment-1"
+                ),
+                "pr": (
+                    f"https://github.com/kiddhu/hermes-agent/pull/{source_pr}"
+                    "#issuecomment-2"
+                ),
+            },
+            "issue_833_state": "OPEN",
+            "merge": {
+                "actor": "kiddhu", "attempts": 1, "commit": merge,
+                "method": "merge", "parents": [base, head],
+                "sha_guarded": True, "tree": tree,
+            },
+            "new_control_plane_count": 0, "new_runtime_module_count": 0,
+            "outcome": "ROLE_SEPARATED_CAS_MERGE_AND_MAIN_READBACK_COMPLETE",
+            "pr": source_pr, "remote_main": merge, "secret_exposure": "none",
+            "worker_session_id": "request-changes-merge-session",
         }
     if merge_mutate is not None:
         merge_mutate(merger_metadata)
@@ -1665,6 +1708,7 @@ def _canonical_factory_repair_phase_chain(
         installed_source_shapes=True,
         emitted_review_shape=True,
         resident_request_changes=True,
+        request_changes_merger_shape=True,
         merge_mutate=original_merge_mutate,
         install_mutate=original_install_mutate,
         resident_mutate=resident_mutate,
@@ -1762,8 +1806,8 @@ def test_reviewed_author_repair_phase_packet_drift_fails_closed_without_mutation
 
 
 @pytest.mark.parametrize(("packet", "mutate"), [
-    ("merge", lambda md: md.__setitem__("head", "f" * 40)),
-    ("merge", lambda md: md["audit"].__setitem__("run_id", True)),
+    ("merge", lambda md: md.__setitem__("audited_head", "f" * 40)),
+    ("merge", lambda md: md["exact_audit"].__setitem__("run", True)),
     ("install", lambda md: md.__setitem__("source_installed", False)),
     ("install", lambda md: md["install"].__setitem__("head", "f" * 40)),
 ])

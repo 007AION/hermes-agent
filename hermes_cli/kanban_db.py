@@ -8734,9 +8734,19 @@ def _authenticated_canonical_factory_packet_chain(
         "new_control_plane_count", "new_runtime_module_count", "outcome",
         "public_receipts", "secret_exposure", "tree", "worker_session_id",
     }
+    request_changes_merger_keys = {
+        "artifacts", "audited_head", "audited_tree", "base", "canonical_checkout",
+        "changed_paths", "checks", "created_child", "exact_audit",
+        "forbidden_actions_performed", "github_receipts", "issue_833_state", "merge",
+        "new_control_plane_count", "new_runtime_module_count", "outcome", "pr",
+        "remote_main", "secret_exposure", "worker_session_id",
+    }
     mergers = exact_children(
         reviewer_id,
-        (merger_keys, installed_source_merger_keys, actual_role_separated_merger_keys),
+        (
+            merger_keys, installed_source_merger_keys,
+            actual_role_separated_merger_keys, request_changes_merger_keys,
+        ),
         {"gm"},
     )
     if len(mergers) != 1:
@@ -8749,6 +8759,7 @@ def _authenticated_canonical_factory_packet_chain(
     checkout = merge_md.get("canonical_checkout")
     has_installed_source_merger = set(merge_md) == installed_source_merger_keys
     has_actual_role_separated_merger = set(merge_md) == actual_role_separated_merger_keys
+    has_request_changes_merger = set(merge_md) == request_changes_merger_keys
     if has_actual_role_separated_merger:
         actor = merge_md.get("actor")
         child = merge_md.get("child")
@@ -8807,6 +8818,76 @@ def _authenticated_canonical_factory_packet_chain(
             or merge_md.get("outcome")
             != "ROLE_SEPARATED_CAS_MERGE_AND_MAIN_READBACK_COMPLETE"
             or not nonempty_string_list(merge_md.get("public_receipts"))
+            or merge_md.get("forbidden_actions_performed") != []
+            or not exact_int(merge_md.get("new_control_plane_count"), 0)
+            or not exact_int(merge_md.get("new_runtime_module_count"), 0)
+            or merge_md.get("secret_exposure") != "none"
+            or not nonempty_string(merge_md.get("worker_session_id"))
+        ):
+            return False
+    elif has_request_changes_merger:
+        checks = merge_md.get("checks")
+        child = merge_md.get("created_child")
+        exact_audit = merge_md.get("exact_audit")
+        github_receipts = merge_md.get("github_receipts")
+        merge = merge_md.get("merge")
+        paths = merge_md.get("changed_paths")
+        merge_sha = merge.get("commit") if isinstance(merge, dict) else None
+        if (
+            merge_md.get("audited_head") != head
+            or merge_md.get("audited_tree") != tree
+            or merge_md.get("base") != base
+            or not exact_int(merge_md.get("pr"), source_pr)
+            or checkout != {"clean": True, "head": base, "install_performed": False}
+            or not isinstance(paths, list) or not paths
+            or any(not nonempty_string(path) for path in paths)
+            or len(set(paths)) != len(paths)
+            or not isinstance(checks, dict)
+            or set(checks) != {"all_required_pass", "failing", "pending", "total"}
+            or checks.get("all_required_pass") is not True
+            or not exact_int(checks.get("failing"), 0)
+            or not exact_int(checks.get("pending"), 0)
+            or not exact_int(checks.get("total"), positive=True)
+            or not isinstance(child, dict)
+            or set(child) != {"assignee", "id", "scope"}
+            or child.get("assignee") != FACTORY_REVIEW_MERGER_PROFILE
+            or child.get("id") in {None, task_id, merger_id}
+            or not nonempty_string(child.get("scope"))
+            or exact_audit != {
+                "review_id": review_id, "run": reviewer_run_id,
+                "state": "APPROVED", "task": reviewer_id,
+            }
+            or not exact_int(exact_audit.get("review_id"), review_id)
+            or not exact_int(exact_audit.get("run"), reviewer_run_id)
+            or not isinstance(github_receipts, dict)
+            or set(github_receipts) != {"issue_833", "pr"}
+            or re.fullmatch(
+                r"https://github[.]com/kiddhu/aion-governance/issues/833"
+                r"#issuecomment-[1-9][0-9]*",
+                github_receipts.get("issue_833", ""),
+            ) is None
+            or re.fullmatch(
+                rf"https://github[.]com/{re.escape(FACTORY_REVIEW_REPOSITORY)}"
+                rf"/pull/{source_pr}#issuecomment-[1-9][0-9]*",
+                github_receipts.get("pr", ""),
+            ) is None
+            or merge_md.get("issue_833_state") != "OPEN"
+            or not isinstance(merge, dict)
+            or set(merge) != {
+                "actor", "attempts", "commit", "method", "parents", "sha_guarded",
+                "tree",
+            }
+            or merge.get("actor") != FACTORY_REVIEW_MERGER_ACTOR
+            or not exact_int(merge.get("attempts"), 1)
+            or merge.get("method") != "merge"
+            or merge.get("parents") != [base, head]
+            or merge.get("sha_guarded") is not True
+            or merge.get("tree") != tree
+            or not exact_hash(merge_sha, 40)
+            or merge_md.get("remote_main") != merge_sha
+            or merge_md.get("outcome")
+            != "ROLE_SEPARATED_CAS_MERGE_AND_MAIN_READBACK_COMPLETE"
+            or not nonempty_string_list(merge_md.get("artifacts"))
             or merge_md.get("forbidden_actions_performed") != []
             or not exact_int(merge_md.get("new_control_plane_count"), 0)
             or not exact_int(merge_md.get("new_runtime_module_count"), 0)
@@ -8962,8 +9043,15 @@ def _authenticated_canonical_factory_packet_chain(
         install_id in {task_id, merger_id}
         or (
             merge_md.get("child_task_id") != install_id
-            if not (has_installed_source_merger or has_actual_role_separated_merger)
-            else merge_md.get("child", {}).get("id") != install_id
+            if not (
+                has_installed_source_merger or has_actual_role_separated_merger
+                or has_request_changes_merger
+            )
+            else (
+                merge_md.get("created_child", {}).get("id") != install_id
+                if has_request_changes_merger
+                else merge_md.get("child", {}).get("id") != install_id
+            )
         )
         or not _all_other_parents_terminal(conn, install_id, merger_id)
     ):
@@ -8975,7 +9063,8 @@ def _authenticated_canonical_factory_packet_chain(
     has_installed_source_install = set(install_md) == installed_source_install_keys
     has_actual_installed_source = set(install_md) == actual_installed_source_keys
     if (
-        has_installed_source_install != has_installed_source_merger
+        has_installed_source_install
+        != (has_installed_source_merger or has_request_changes_merger)
         or has_actual_installed_source != has_actual_role_separated_merger
     ):
         # The schemas are closed end-to-end: never combine an installed-source
@@ -9080,7 +9169,7 @@ def _authenticated_canonical_factory_packet_chain(
         typed_symbol = install_md.get("typed_symbol")
         receipt_sha = install_md.get("receipt_sha256")
         if (
-            not has_installed_source_merger
+            not (has_installed_source_merger or has_request_changes_merger)
             or not exact_int(install_md.get("canonical_run_id"), install_run_id)
             or install_md.get("activation_performed") is not False
             or install_md.get("author_finalizer_performed") is not False
@@ -9090,7 +9179,15 @@ def _authenticated_canonical_factory_packet_chain(
             or install_md.get("base") != base or install_md.get("tree") != tree
             or install_md.get("merge") != merge_sha
             or not exact_int(install_md.get("pr"), source_pr)
-            or blobs != merge_md.get("merged_blobs")
+            or (
+                blobs != merge_md.get("merged_blobs")
+                if has_installed_source_merger
+                else (
+                    not isinstance(blobs, dict)
+                    or set(blobs) != set(paths or [])
+                    or any(not exact_hash(blob, 40) for blob in blobs.values())
+                )
+            )
             or not isinstance(install, dict)
             or set(install) != {
                 "changed_paths", "head", "method", "parents", "preinstall_commit",
