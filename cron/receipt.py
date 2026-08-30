@@ -65,7 +65,8 @@ _REDACT_FIELDS = frozenset({
 # UNRECONCILED_SELECTED_JOB_HASH_DRIFT finding).
 _VOLATILE_FIELDS = frozenset({
     "next_run_at", "last_run_at", "last_status", "last_error",
-    "last_delivery_error", "repeat", "state", "paused_at", "paused_reason",
+    "last_delivery_error", "last_alert_delivery_receipt",
+    "last_alert_dedupe_key", "repeat", "state", "paused_at", "paused_reason",
     "created_at", "updated_at",
     "execution_id", "session_id",
 })

@@ -1549,7 +1549,31 @@ def _is_channel_dm_topic(
     return is_channel
 
 
-def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
+_CRON_ALERT_RE = re.compile(
+    r"\A\[CRON_ALERT:([A-Za-z0-9][A-Za-z0-9._:-]{0,127})\][ \t]*(?:\r?\n|\Z)"
+)
+
+
+def _extract_cron_alert(content: str) -> tuple[Optional[str], str]:
+    """Return a strict leading alert dedupe key and marker-free content.
+
+    Alert intent is deliberately opt-in and machine-readable. Prose such as
+    ``discord_alert_emitted: true`` remains an ordinary cron report: it is not
+    evidence that a distinct notification was requested or delivered.
+    """
+    match = _CRON_ALERT_RE.match(content)
+    if match is None:
+        return None, content
+    return match.group(1), content[match.end():]
+
+
+def _deliver_result(
+    job: dict,
+    content: str,
+    adapters=None,
+    loop=None,
+    receipt_holder: Optional[list] = None,
+) -> Optional[str]:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
 
@@ -1560,6 +1584,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
 
     Returns None on success, or an error string on failure.
     """
+    alert_dedupe_key, content = _extract_cron_alert(content)
     targets = _resolve_delivery_targets(job)
     if not targets:
         deliver_value = _normalize_deliver_value(job.get("deliver", "local"))
@@ -1643,6 +1668,45 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
 
         # Diagnostic: log thread_id for topic-aware delivery debugging
         origin = _resolve_origin(job) or {}
+        alert_for_target = bool(
+            alert_dedupe_key
+            and str(platform_name).lower() == "discord"
+            and origin.get("user_id")
+            and _target_matches_origin(origin, platform_name, chat_id, thread_id)
+        )
+        alert_is_duplicate = bool(
+            alert_for_target
+            and job.get("last_alert_dedupe_key") == alert_dedupe_key
+        )
+        if alert_is_duplicate and receipt_holder is not None:
+            receipt_holder.append({
+                "alert_dedupe_key": alert_dedupe_key,
+                "chat_id": str(chat_id),
+                "message_id": None,
+                "platform": str(platform_name).lower(),
+                "status": "deduplicated",
+                "thread_id": str(thread_id) if thread_id is not None else None,
+            })
+        alert_send_active = alert_for_target and not alert_is_duplicate
+
+        def _record_alert_receipt(status: str, message_id=None) -> None:
+            if receipt_holder is None or not alert_send_active:
+                return
+            receipt_holder.append({
+                "alert_dedupe_key": alert_dedupe_key,
+                "chat_id": str(chat_id),
+                "message_id": str(message_id) if message_id is not None else None,
+                "platform": str(platform_name).lower(),
+                "status": status,
+                "thread_id": str(thread_id) if thread_id is not None else None,
+            })
+
+        target_delivery_content = cleaned_delivery_content
+        if alert_send_active:
+            target_delivery_content = (
+                f"<@{origin['user_id']}> **Cron alert**\n"
+                f"{cleaned_delivery_content.lstrip()}"
+            )
         origin_thread = origin.get("thread_id")
         if origin_thread and not thread_id:
             logger.warning(
@@ -1674,6 +1738,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
             msg = f"unknown platform '{platform_name}'"
             logger.warning("Job '%s': %s", job["id"], msg)
             delivery_errors.append(msg)
+            _record_alert_receipt("failed")
             continue
 
         from gateway.delivery import resolve_delivery_transport
@@ -1692,6 +1757,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
             msg = f"platform '{platform_name}' not configured/enabled"
             logger.warning("Job '%s': %s", job["id"], msg)
             delivery_errors.append(msg)
+            _record_alert_receipt("failed")
             continue
 
         # Prefer the resolved live transport when the gateway is running. This
@@ -1710,6 +1776,8 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
             and getattr(loop, "is_running", lambda: False)()
         )
         delivered = False
+        delivery_message_id = None
+        delivery_receipt_status = "confirmed"
         target_errors = []
 
         # Continuable cron surface (D1/D2/D6): resolve the delivery surface for
@@ -1882,7 +1950,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 # standalone cron path lacked this, so DM-topic cron deliveries
                 # landed in the General topic or were rejected by Bot API 10.0
                 # (#22773).
-                text_to_send = cleaned_delivery_content.strip()
+                text_to_send = target_delivery_content.strip()
                 adapter_ok = True
                 timed_out = False
                 if text_to_send:
@@ -1982,9 +2050,11 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                             if isinstance(send_result, dict):
                                 send_success = bool(send_result.get("success", False))
                                 send_raw_response = send_result.get("raw_response")
+                                delivery_message_id = send_result.get("message_id")
                             else:
                                 send_success = _confirm_adapter_delivery(send_result)
                                 send_raw_response = getattr(send_result, "raw_response", None)
+                                delivery_message_id = getattr(send_result, "message_id", None)
 
                             if not send_success:
                                 if isinstance(send_result, dict):
@@ -2061,6 +2131,11 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 if adapter_ok:
                     logger.info("Job '%s': delivered to %s:%s via live adapter", job["id"], platform_name, chat_id)
                     delivered = True
+                    if timed_out:
+                        delivery_receipt_status = "assumed_delivered"
+                    _record_alert_receipt(
+                        delivery_receipt_status, delivery_message_id,
+                    )
                     # Seed the thread session only now that delivery into it
                     # succeeded (deferred from thread-open above).
                     if opened_thread_id and not thread_seeded:
@@ -2108,6 +2183,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                         f"relay delivery to {platform_name}:{chat_id} failed"
                     )
                 delivery_errors.extend(target_errors)
+                _record_alert_receipt("failed")
                 continue
             # If the interpreter is finalizing (gateway SIGTERM / restart /
             # OOM), scheduling any new delivery is futile — asyncio.run and a
@@ -2120,9 +2196,10 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 logger.warning("Job '%s': %s", job["id"], msg)
                 target_errors.append(msg)
                 delivery_errors.extend(target_errors)
+                _record_alert_receipt("failed")
                 continue
             # Standalone path: run the async send in a fresh event loop (safe from any thread)
-            coro = _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files)
+            coro = _send_to_platform(platform, pconfig, chat_id, target_delivery_content, thread_id=thread_id, media_files=media_files)
             try:
                 result = asyncio.run(coro)
             except RuntimeError as run_err:
@@ -2139,6 +2216,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                     logger.warning("Job '%s': %s", job["id"], msg)
                     target_errors.append(msg)
                     delivery_errors.extend(target_errors)
+                    _record_alert_receipt("failed")
                     continue
                 # The thread-pool fallback can itself raise (SMTP ConnectionError,
                 # future.result timeout, etc.). An exception raised inside this
@@ -2151,7 +2229,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 try:
                     pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
                     try:
-                        future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files))
+                        future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, target_delivery_content, thread_id=thread_id, media_files=media_files))
                         result = future.result(timeout=30)
                     finally:
                         pool.shutdown(wait=False)
@@ -2163,17 +2241,20 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                         logger.warning("Job '%s': %s", job["id"], msg)
                         target_errors.append(msg)
                         delivery_errors.extend(target_errors)
+                        _record_alert_receipt("failed")
                         continue
                     msg = f"delivery to {platform_name}:{chat_id} failed: {e}"
                     logger.error("Job '%s': %s", job["id"], msg, exc_info=True)
                     target_errors.extend([msg])
                     delivery_errors.extend(target_errors)
+                    _record_alert_receipt("failed")
                     continue
             except Exception as e:
                 msg = f"delivery to {platform_name}:{chat_id} failed: {e}"
                 logger.error("Job '%s': %s", job["id"], msg, exc_info=True)
                 target_errors.extend([msg])
                 delivery_errors.extend(target_errors)
+                _record_alert_receipt("failed")
                 continue
 
             if result and result.get("error"):
@@ -2181,9 +2262,13 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 logger.error("Job '%s': %s", job["id"], msg)
                 target_errors.extend([msg])
                 delivery_errors.extend(target_errors)
+                _record_alert_receipt("failed")
                 continue
 
             logger.info("Job '%s': delivered to %s:%s", job["id"], platform_name, chat_id)
+            _record_alert_receipt(
+                "confirmed", result.get("message_id") if result else None,
+            )
             _maybe_mirror_cron_delivery(
                 job, platform_name, chat_id, mirror_text,
                 thread_id=thread_id, user_id=origin_user_id,
@@ -2632,6 +2717,21 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
 
     # Always prepend cron execution guidance so the agent knows how
     # delivery works and can suppress delivery when appropriate.
+    origin = _resolve_origin(job) or {}
+    alert_hint = ""
+    if (
+        str(origin.get("platform") or "").lower() == "discord"
+        and origin.get("user_id")
+    ):
+        alert_hint = (
+            "ALERT: If and only if the job prompt defines a qualifying alert "
+            "condition and the current observation qualifies, begin your final "
+            "response with exactly `[CRON_ALERT:<dedupe-key>]` on its own line. "
+            "Use a stable key for the same underlying observation; the scheduler "
+            "strips the marker, mentions the originating Discord user once, and "
+            "deduplicates repeated keys. Do not emit this marker for routine, "
+            "stale, or uncertain observations. "
+        )
     cron_hint = (
         "[IMPORTANT: You are running as a scheduled cron job. "
         "DELIVERY: Your final response will be automatically delivered "
@@ -2641,7 +2741,8 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
         "SILENT: If there is genuinely nothing new to report, respond "
         "with exactly \"[SILENT]\" (nothing else) to suppress delivery. "
         "Never combine [SILENT] with content — either report your "
-        "findings normally, or say [SILENT] and nothing more.]\n\n"
+        "findings normally, or say [SILENT] and nothing more. "
+        f"{alert_hint}]\n\n"
     )
     prompt = cron_hint + prompt
     if skills is None:
@@ -4079,6 +4180,7 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         # deferred agent is still torn down. Otherwise the outer `except` would
         # swallow the error and leak the agent's subprocesses/clients (#10200).
         delivery_error = None
+        alert_delivery_receipts: list = []
         try:
             output_file = save_job_output(job["id"], output)
             if verbose:
@@ -4118,7 +4220,13 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
 
             if should_deliver:
                 try:
-                    delivery_error = _deliver_result(job, deliver_content, adapters=adapters, loop=loop)
+                    delivery_error = _deliver_result(
+                        job,
+                        deliver_content,
+                        adapters=adapters,
+                        loop=loop,
+                        receipt_holder=alert_delivery_receipts,
+                    )
                 except Exception as de:
                     delivery_error = str(de)
                     logger.error("Delivery failed for job %s: %s", job["id"], de)
@@ -4137,7 +4245,23 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
 
         if not _consume_interrupted_flag(job["id"]):
-            mark_job_run(job["id"], success, error, delivery_error=delivery_error)
+            alert_delivery_receipt = next(
+                (
+                    receipt for receipt in alert_delivery_receipts
+                    if receipt.get("status") != "deduplicated"
+                ),
+                None,
+            )
+            if alert_delivery_receipt is None:
+                mark_job_run(
+                    job["id"], success, error, delivery_error=delivery_error,
+                )
+            else:
+                mark_job_run(
+                    job["id"], success, error,
+                    delivery_error=delivery_error,
+                    alert_delivery_receipt=alert_delivery_receipt,
+                )
         finish_execution(
             execution_id,
             success=success,

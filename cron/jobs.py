@@ -1638,8 +1638,13 @@ def remove_job(job_id: str) -> bool:
     return False
 
 
-def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
-                 delivery_error: Optional[str] = None):
+def mark_job_run(
+    job_id: str,
+    success: bool,
+    error: Optional[str] = None,
+    delivery_error: Optional[str] = None,
+    alert_delivery_receipt: Optional[Dict[str, Any]] = None,
+):
     """
     Mark a job as having been run.
     
@@ -1648,6 +1653,10 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
 
     ``delivery_error`` is tracked separately from the agent error — a job
     can succeed (agent produced output) but fail delivery (platform down).
+
+    ``alert_delivery_receipt`` is only supplied for a distinct alert attempt.
+    Routine runs preserve the last alert identity. A dedupe key is consumed
+    only by confirmed or assumed-delivered sends, so definite failures retry.
     """
     with _jobs_lock():
         jobs = load_jobs()
@@ -1659,6 +1668,14 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                 job["last_error"] = error if not success else None
                 # Track delivery failures separately — cleared on successful delivery
                 job["last_delivery_error"] = delivery_error
+                if alert_delivery_receipt is not None:
+                    job["last_alert_delivery_receipt"] = alert_delivery_receipt
+                    if alert_delivery_receipt.get("status") in {
+                        "confirmed", "assumed_delivered",
+                    }:
+                        job["last_alert_dedupe_key"] = (
+                            alert_delivery_receipt.get("alert_dedupe_key")
+                        )
                 # Clear any external-fire claim so a re-armed recurring job can
                 # be claimed again on its next fire (Phase 4C CAS).
                 job["fire_claim"] = None

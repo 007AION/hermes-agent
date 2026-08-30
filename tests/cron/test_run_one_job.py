@@ -27,11 +27,12 @@ def _patch_pipeline(monkeypatch, *, success=True, output="out", final="final res
         calls.append(("save", jid))
         return f"/tmp/{jid}.txt"
 
-    def fake_deliver(job, content, adapters=None, loop=None):
+    def fake_deliver(job, content, adapters=None, loop=None, receipt_holder=None):
         calls.append(("deliver", job["id"]))
         return None
 
-    def fake_mark(jid, ok, err=None, delivery_error=None):
+    def fake_mark(jid, ok, err=None, delivery_error=None,
+                  alert_delivery_receipt=None):
         calls.append(("mark", jid, ok))
 
     monkeypatch.setattr(s, "run_job", fake_run_job)
@@ -98,6 +99,49 @@ def test_run_one_job_failed_job_delivers_error(monkeypatch):
     assert "deliver" in kinds  # failures always deliver
     mark = [c for c in calls if c[0] == "mark"][0]
     assert mark == ("mark", "j5", False)
+
+
+def test_alert_delivery_failure_is_audited_without_blocking_native_run(monkeypatch):
+    receipt = {
+        "status": "failed",
+        "platform": "discord",
+        "chat_id": "123",
+        "thread_id": None,
+        "message_id": None,
+        "alert_dedupe_key": "blocker-1",
+    }
+    marks = []
+
+    monkeypatch.setattr(
+        s,
+        "run_job",
+        lambda job, **kwargs: (
+            True, "out", "[CRON_ALERT:blocker-1]\nblocked", None,
+        ),
+    )
+    monkeypatch.setattr(
+        s, "save_job_output", lambda jid, out: f"/tmp/{jid}.txt",
+    )
+
+    def fail_delivery(job, content, **kwargs):
+        kwargs["receipt_holder"].append(receipt)
+        return "delivery error: discord unavailable"
+
+    monkeypatch.setattr(s, "_deliver_result", fail_delivery)
+    monkeypatch.setattr(
+        s,
+        "mark_job_run",
+        lambda jid, ok, err=None, **kwargs: marks.append((ok, kwargs)),
+    )
+
+    assert s.run_one_job({"id": "alert-job", "name": "Factory Director"}) is True
+    assert marks == [(
+        True,
+        {
+            "delivery_error": "delivery error: discord unavailable",
+            "alert_delivery_receipt": receipt,
+        },
+    )]
 
 
 def test_run_one_job_exception_marks_failure(monkeypatch):
@@ -184,7 +228,7 @@ def test_run_one_job_delivers_before_agent_teardown(monkeypatch):
         defer_agent_teardown.append(FakeAgent())
         return (True, "out", "final response", None)
 
-    def fake_deliver(job, content, adapters=None, loop=None):
+    def fake_deliver(job, content, adapters=None, loop=None, receipt_holder=None):
         order.append("deliver")
         return None
 
@@ -219,7 +263,7 @@ def test_run_one_job_tears_down_deferred_agent_when_delivery_raises(monkeypatch)
         defer_agent_teardown.append(FakeAgent())
         return (True, "out", "final response", None)
 
-    def boom_deliver(job, content, adapters=None, loop=None):
+    def boom_deliver(job, content, adapters=None, loop=None, receipt_holder=None):
         order.append("deliver-raise")
         raise RuntimeError("send blew up")
 
