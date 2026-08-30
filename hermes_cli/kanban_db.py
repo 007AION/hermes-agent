@@ -8608,13 +8608,17 @@ def _authenticated_canonical_factory_packet_chain(
     reviewer_profile: str,
     review_md: dict,
     handoff_reason: str,
+    _request_changes_terminal_task_id: Optional[str] = None,
 ) -> bool:
     """Validate the closed audit -> merge -> install -> activation -> audit packets.
 
     These are the canonical completion packets emitted by the role-separated
     factory lane.  Every task/run is already receipt-authenticated by the
     caller; this adapter only accepts their exact structural families and
-    cross-binds immutable identities across direct Native edges.
+    cross-binds immutable identities across direct Native edges.  A repair
+    phase may name its exact authenticated REQUEST_CHANGES terminal so this
+    validator can authenticate the complete original prefix without treating
+    the failed terminal as a PASS packet.
     """
     if not task_id or isinstance(author_run_id, bool) or author_run_id <= 0:
         return False
@@ -8724,8 +8728,26 @@ def _authenticated_canonical_factory_packet_chain(
         "merge", "merged_blobs", "new_control_plane_count", "not_true_done_for",
         "pr", "pr_state", "protected_issues", "secret_exposure", "worker_session_id",
     }
+    actual_role_separated_merger_keys = {
+        "actor", "audit", "base", "canonical_checkout", "changed_paths", "checks",
+        "child", "forbidden_actions_performed", "head", "merge",
+        "new_control_plane_count", "new_runtime_module_count", "outcome",
+        "public_receipts", "secret_exposure", "tree", "worker_session_id",
+    }
+    request_changes_merger_keys = {
+        "artifacts", "audited_head", "audited_tree", "base", "canonical_checkout",
+        "changed_paths", "checks", "created_child", "exact_audit",
+        "forbidden_actions_performed", "github_receipts", "issue_833_state", "merge",
+        "new_control_plane_count", "new_runtime_module_count", "outcome", "pr",
+        "remote_main", "secret_exposure", "worker_session_id",
+    }
     mergers = exact_children(
-        reviewer_id, (merger_keys, installed_source_merger_keys), {"gm"},
+        reviewer_id,
+        (
+            merger_keys, installed_source_merger_keys,
+            actual_role_separated_merger_keys, request_changes_merger_keys,
+        ),
+        {"gm"},
     )
     if len(mergers) != 1:
         return False
@@ -8736,7 +8758,144 @@ def _authenticated_canonical_factory_packet_chain(
     audit = merge_md.get("audit")
     checkout = merge_md.get("canonical_checkout")
     has_installed_source_merger = set(merge_md) == installed_source_merger_keys
-    if has_installed_source_merger:
+    has_actual_role_separated_merger = set(merge_md) == actual_role_separated_merger_keys
+    has_request_changes_merger = set(merge_md) == request_changes_merger_keys
+    if has_actual_role_separated_merger:
+        actor = merge_md.get("actor")
+        child = merge_md.get("child")
+        checks = merge_md.get("checks")
+        merge = merge_md.get("merge")
+        paths = merge_md.get("changed_paths")
+        merge_sha = merge.get("commit") if isinstance(merge, dict) else None
+        if (
+            actor != {
+                "distinct_from": [FACTORY_REVIEW_AUTHOR_ACTOR, FACTORY_REVIEW_AUDITOR_ACTOR],
+                "github": FACTORY_REVIEW_MERGER_ACTOR,
+                "role": "AION-GM",
+            }
+            or audit != {
+                "review_commit_id": head, "review_id": review_id,
+                "review_state": "APPROVED", "review_url": review_url,
+                "run_id": reviewer_run_id, "task_id": reviewer_id,
+            }
+            or checkout != {
+                "branch": "main", "clean": True, "head": base,
+                "installed_in_this_task": False,
+            }
+            or checkout.get("clean") is not True
+            or checkout.get("installed_in_this_task") is not False
+            or not isinstance(paths, list) or not paths
+            or any(not nonempty_string(path) for path in paths)
+            or len(set(paths)) != len(paths)
+            or not isinstance(checks, dict)
+            or set(checks) != {
+                "bad", "ci_run", "ci_status", "neutral", "pending", "skipped",
+                "success",
+            }
+            or not exact_int(checks.get("bad"), 0)
+            or not exact_int(checks.get("pending"), 0)
+            or not exact_int(checks.get("ci_run"), positive=True)
+            or checks.get("ci_status") != "completed/success"
+            or any(
+                not nonnegative_int(checks.get(key))
+                for key in ("neutral", "skipped", "success")
+            )
+            or checks.get("success", 0) <= 0
+            or not isinstance(child, dict)
+            or set(child) != {"assignee", "id", "purpose", "status"}
+            or child.get("assignee") != FACTORY_REVIEW_MERGER_PROFILE
+            or child.get("id") in {None, task_id, merger_id}
+            or not nonempty_string(child.get("purpose"))
+            or child.get("status") != "todo"
+            or merge_md.get("head") != head or merge_md.get("tree") != tree
+            or merge_md.get("base") != base
+            or not isinstance(merge, dict)
+            or set(merge) != {"cas_sha_guard", "commit", "parents", "remote_main", "tree"}
+            or merge.get("cas_sha_guard") != head
+            or merge.get("parents") != [base, head]
+            or merge.get("remote_main") != merge_sha or merge.get("tree") != tree
+            or not exact_hash(merge_sha, 40)
+            or merge_md.get("outcome")
+            != "ROLE_SEPARATED_CAS_MERGE_AND_MAIN_READBACK_COMPLETE"
+            or not nonempty_string_list(merge_md.get("public_receipts"))
+            or merge_md.get("forbidden_actions_performed") != []
+            or not exact_int(merge_md.get("new_control_plane_count"), 0)
+            or not exact_int(merge_md.get("new_runtime_module_count"), 0)
+            or merge_md.get("secret_exposure") != "none"
+            or not nonempty_string(merge_md.get("worker_session_id"))
+        ):
+            return False
+    elif has_request_changes_merger:
+        checks = merge_md.get("checks")
+        child = merge_md.get("created_child")
+        exact_audit = merge_md.get("exact_audit")
+        github_receipts = merge_md.get("github_receipts")
+        merge = merge_md.get("merge")
+        paths = merge_md.get("changed_paths")
+        merge_sha = merge.get("commit") if isinstance(merge, dict) else None
+        if (
+            merge_md.get("audited_head") != head
+            or merge_md.get("audited_tree") != tree
+            or merge_md.get("base") != base
+            or not exact_int(merge_md.get("pr"), source_pr)
+            or checkout != {"clean": True, "head": base, "install_performed": False}
+            or not isinstance(paths, list) or not paths
+            or any(not nonempty_string(path) for path in paths)
+            or len(set(paths)) != len(paths)
+            or not isinstance(checks, dict)
+            or set(checks) != {"all_required_pass", "failing", "pending", "total"}
+            or checks.get("all_required_pass") is not True
+            or not exact_int(checks.get("failing"), 0)
+            or not exact_int(checks.get("pending"), 0)
+            or not exact_int(checks.get("total"), positive=True)
+            or not isinstance(child, dict)
+            or set(child) != {"assignee", "id", "scope"}
+            or child.get("assignee") != FACTORY_REVIEW_MERGER_PROFILE
+            or child.get("id") in {None, task_id, merger_id}
+            or not nonempty_string(child.get("scope"))
+            or exact_audit != {
+                "review_id": review_id, "run": reviewer_run_id,
+                "state": "APPROVED", "task": reviewer_id,
+            }
+            or not exact_int(exact_audit.get("review_id"), review_id)
+            or not exact_int(exact_audit.get("run"), reviewer_run_id)
+            or not isinstance(github_receipts, dict)
+            or set(github_receipts) != {"issue_833", "pr"}
+            or re.fullmatch(
+                r"https://github[.]com/kiddhu/aion-governance/issues/833"
+                r"#issuecomment-[1-9][0-9]*",
+                github_receipts.get("issue_833", ""),
+            ) is None
+            or re.fullmatch(
+                rf"https://github[.]com/{re.escape(FACTORY_REVIEW_REPOSITORY)}"
+                rf"/pull/{source_pr}#issuecomment-[1-9][0-9]*",
+                github_receipts.get("pr", ""),
+            ) is None
+            or merge_md.get("issue_833_state") != "OPEN"
+            or not isinstance(merge, dict)
+            or set(merge) != {
+                "actor", "attempts", "commit", "method", "parents", "sha_guarded",
+                "tree",
+            }
+            or merge.get("actor") != FACTORY_REVIEW_MERGER_ACTOR
+            or not exact_int(merge.get("attempts"), 1)
+            or merge.get("method") != "merge"
+            or merge.get("parents") != [base, head]
+            or merge.get("sha_guarded") is not True
+            or merge.get("tree") != tree
+            or not exact_hash(merge_sha, 40)
+            or merge_md.get("remote_main") != merge_sha
+            or merge_md.get("outcome")
+            != "ROLE_SEPARATED_CAS_MERGE_AND_MAIN_READBACK_COMPLETE"
+            or not nonempty_string_list(merge_md.get("artifacts"))
+            or merge_md.get("forbidden_actions_performed") != []
+            or not exact_int(merge_md.get("new_control_plane_count"), 0)
+            or not exact_int(merge_md.get("new_runtime_module_count"), 0)
+            or merge_md.get("secret_exposure") != "none"
+            or not nonempty_string(merge_md.get("worker_session_id"))
+        ):
+            return False
+    elif has_installed_source_merger:
         actor = merge_md.get("actor")
         child = merge_md.get("child")
         merge = merge_md.get("merge")
@@ -8862,8 +9021,18 @@ def _authenticated_canonical_factory_packet_chain(
         "secret_exposure", "source_installed", "tests", "tree", "typed_symbol",
         "witness_type", "worker_session_id",
     }
+    actual_installed_source_keys = {
+        "activation_performed", "artifacts", "audited_head",
+        "author_finalizer_performed", "base", "blobs", "canonical_run_id",
+        "changed_files", "forbidden_actions_performed", "fresh_runtime", "install",
+        "install_epoch", "merge", "new_control_plane_count", "new_runtime_module_count",
+        "not_true_done_for", "pr", "public_receipts", "receipt_actor",
+        "receipt_actor_id", "receipt_sha256", "resident_activated", "resident_runtime",
+        "secret_exposure", "source_installed", "tests", "tree", "typed_symbols",
+        "witness_type", "worker_session_id",
+    }
     installs = exact_children(
-        merger_id, (install_keys, installed_source_install_keys),
+        merger_id, (install_keys, installed_source_install_keys, actual_installed_source_keys),
         {FACTORY_REVIEW_MERGER_PROFILE},
     )
     if len(installs) != 1:
@@ -8874,8 +9043,15 @@ def _authenticated_canonical_factory_packet_chain(
         install_id in {task_id, merger_id}
         or (
             merge_md.get("child_task_id") != install_id
-            if not has_installed_source_merger
-            else merge_md.get("child", {}).get("id") != install_id
+            if not (
+                has_installed_source_merger or has_actual_role_separated_merger
+                or has_request_changes_merger
+            )
+            else (
+                merge_md.get("created_child", {}).get("id") != install_id
+                if has_request_changes_merger
+                else merge_md.get("child", {}).get("id") != install_id
+            )
         )
         or not _all_other_parents_terminal(conn, install_id, merger_id)
     ):
@@ -8885,15 +9061,23 @@ def _authenticated_canonical_factory_packet_chain(
     blobs = install_md.get("blobs")
     installed_module_blob = blobs.get("hermes_cli/kanban_db.py") if isinstance(blobs, dict) else None
     has_installed_source_install = set(install_md) == installed_source_install_keys
-    if has_installed_source_install != has_installed_source_merger:
+    has_actual_installed_source = set(install_md) == actual_installed_source_keys
+    if (
+        has_installed_source_install
+        != (has_installed_source_merger or has_request_changes_merger)
+        or has_actual_installed_source != has_actual_role_separated_merger
+    ):
         # The schemas are closed end-to-end: never combine an installed-source
         # authority packet with a legacy install/runtime tail, or vice versa.
         return False
-    if has_installed_source_install:
-        typed_symbol = install_md.get("typed_symbol")
+    closed_installed_source = has_installed_source_install or has_actual_installed_source
+    if has_actual_installed_source:
         receipt_sha = install_md.get("receipt_sha256")
+        typed_symbols = install_md.get("typed_symbols")
+        install_paths = install.get("changed_paths") if isinstance(install, dict) else None
+        tests = install_md.get("tests")
         if (
-            not has_installed_source_merger
+            not has_actual_role_separated_merger
             or not exact_int(install_md.get("canonical_run_id"), install_run_id)
             or install_md.get("activation_performed") is not False
             or install_md.get("author_finalizer_performed") is not False
@@ -8903,7 +9087,107 @@ def _authenticated_canonical_factory_packet_chain(
             or install_md.get("base") != base or install_md.get("tree") != tree
             or install_md.get("merge") != merge_sha
             or not exact_int(install_md.get("pr"), source_pr)
-            or blobs != merge_md.get("merged_blobs")
+            or install_md.get("changed_files") != paths
+            or not isinstance(blobs, dict) or set(blobs) != set(paths or [])
+            or any(not exact_hash(blob, 40) for blob in blobs.values())
+            or not isinstance(install, dict)
+            or set(install) != {
+                "changed_paths", "head", "method", "parents", "preinstall_commit",
+                "rollback_commit", "rollback_ref", "tree", "worktree_clean",
+            }
+            or install.get("head") != merge_sha or install.get("tree") != tree
+            or install.get("parents") != [base, head] or install_paths != paths
+            or install.get("preinstall_commit") != base
+            or install.get("rollback_commit") != base
+            or not nonempty_string(install.get("rollback_ref"))
+            or install.get("worktree_clean") is not True
+            or install.get("method") != "existing_clean_git_editable_guarded_fast_forward"
+            or not isinstance(fresh_runtime, dict)
+            or set(fresh_runtime) != {
+                "bytes_match", "module_path", "module_sha256", "resolver_loaded",
+                "resolves_to_authoritative_root",
+            }
+            or fresh_runtime.get("bytes_match") is not True
+            or fresh_runtime.get("resolver_loaded") is not True
+            or fresh_runtime.get("resolves_to_authoritative_root") is not True
+            or not exact_hash(fresh_runtime.get("module_sha256"), 64)
+            or not nonempty_string(fresh_runtime.get("module_path"))
+            or not fresh_runtime["module_path"].endswith("/hermes_cli/kanban_db.py")
+            or installed_module_blob is None
+            or typed_symbols != {
+                "_authenticated_canonical_factory_packet_chain_present_callable": True,
+                "_canonical_factory_review_packet_present_callable": True,
+                "_reviewed_author_finalizer_run_id_wraps_canonical_packet": True,
+                "monotonic_fix_active_enter_lt_exec_start": True,
+            }
+            or any(value is not True for value in typed_symbols.values())
+            or install_md.get("witness_type")
+            != f"EXACT_PR{source_pr}_INSTALLED_AND_TYPED_SOURCE_INSTALLED_RESIDENT_NOT_ACTIVATED_WITNESS"
+            or not exact_hash(receipt_sha, 64)
+            or not nonempty_string_list(install_md.get("artifacts"))
+            or not nonempty_string_list(install_md.get("public_receipts"))
+            or install_md.get("receipt_actor") != FACTORY_REVIEW_MERGER_ACTOR
+            or not exact_int(install_md.get("receipt_actor_id"), positive=True)
+            or not exact_int(install_md.get("install_epoch"), positive=True)
+            or not isinstance(install_md.get("resident_runtime"), dict)
+            or set(install_md["resident_runtime"]) != {
+                "all_running_gateways_predate_install", "hermes_gateway_gm2_NRestarts",
+                "hermes_gateway_gm2_active_state", "hermes_gateway_gm2_main_pid",
+                "hermes_gateway_gm2_sub_state", "resident_kanban_db_blob_at_base",
+                "running_gateway_pids",
+            }
+            or install_md["resident_runtime"].get("all_running_gateways_predate_install") is not True
+            or install_md["resident_runtime"].get("hermes_gateway_gm2_NRestarts") != "0"
+            or install_md["resident_runtime"].get("hermes_gateway_gm2_active_state") != "active"
+            or install_md["resident_runtime"].get("hermes_gateway_gm2_sub_state") != "running"
+            or not exact_int(install_md["resident_runtime"].get("hermes_gateway_gm2_main_pid"), positive=True)
+            or not exact_hash(install_md["resident_runtime"].get("resident_kanban_db_blob_at_base"), 40)
+            or not isinstance(install_md["resident_runtime"].get("running_gateway_pids"), list)
+            or not install_md["resident_runtime"]["running_gateway_pids"]
+            or any(
+                not exact_int(pid, positive=True)
+                for pid in install_md["resident_runtime"]["running_gateway_pids"]
+            )
+            or not isinstance(tests, dict)
+            or set(tests) != {
+                "diff_check", "focused_total", "py_compile", "ruff", "test_kanban_db",
+                "test_kanban_factory_finalizer",
+            }
+            or any(tests.get(key) != "pass" for key in ("diff_check", "py_compile", "ruff"))
+            or not all(
+                nonempty_string(tests.get(key))
+                for key in ("focused_total", "test_kanban_db", "test_kanban_factory_finalizer")
+            )
+            or install_md.get("forbidden_actions_performed") != []
+            or not exact_int(install_md.get("new_control_plane_count"), 0)
+            or not exact_int(install_md.get("new_runtime_module_count"), 0)
+            or install_md.get("secret_exposure") != "none"
+            or not nonempty_string(install_md.get("worker_session_id"))
+        ):
+            return False
+    elif has_installed_source_install:
+        typed_symbol = install_md.get("typed_symbol")
+        receipt_sha = install_md.get("receipt_sha256")
+        if (
+            not (has_installed_source_merger or has_request_changes_merger)
+            or not exact_int(install_md.get("canonical_run_id"), install_run_id)
+            or install_md.get("activation_performed") is not False
+            or install_md.get("author_finalizer_performed") is not False
+            or install_md.get("resident_activated") is not False
+            or install_md.get("source_installed") is not True
+            or install_md.get("audited_head") != head
+            or install_md.get("base") != base or install_md.get("tree") != tree
+            or install_md.get("merge") != merge_sha
+            or not exact_int(install_md.get("pr"), source_pr)
+            or (
+                blobs != merge_md.get("merged_blobs")
+                if has_installed_source_merger
+                else (
+                    not isinstance(blobs, dict)
+                    or set(blobs) != set(paths or [])
+                    or any(not exact_hash(blob, 40) for blob in blobs.values())
+                )
+            )
             or not isinstance(install, dict)
             or set(install) != {
                 "changed_paths", "head", "method", "parents", "preinstall_commit",
@@ -9043,7 +9327,7 @@ def _authenticated_canonical_factory_packet_chain(
         or activation_md.get("secret_exposure") != "none"
     ):
         return False
-    if has_installed_source_install and (
+    if closed_installed_source and (
         set(source) != {
             "audited_head", "clean", "head", "kanban_db_blob", "kanban_db_sha256",
             "merge_commit", "tree",
@@ -9078,6 +9362,23 @@ def _authenticated_canonical_factory_packet_chain(
     ):
         return False
 
+    if _request_changes_terminal_task_id is not None:
+        request_terminal = _authenticated_factory_run_metadata(
+            conn, _request_changes_terminal_task_id,
+        )
+        return (
+            _request_changes_terminal_task_id
+            not in {task_id, reviewer_id, merger_id, install_id, activation_id}
+            and _one_direct_child(conn, activation_id)
+            == _request_changes_terminal_task_id
+            and activation_md.get("audit_task")
+            == _request_changes_terminal_task_id
+            and request_terminal is not None
+            and request_terminal[1] == FACTORY_REVIEW_AUDITOR_PROFILE
+            and _all_other_parents_terminal(
+                conn, _request_changes_terminal_task_id, activation_id,
+            )
+        )
 
     resident_keys = {
         "artifact_sha256", "artifacts", "barrier_tests", "deep_health_exit_code",
@@ -9108,7 +9409,7 @@ def _authenticated_canonical_factory_packet_chain(
         return False
     audit_source = resident_md.get("source")
     has_installed_source_resident = set(resident_md) == installed_source_resident_keys
-    if has_installed_source_resident != has_installed_source_install:
+    if has_installed_source_resident != closed_installed_source:
         return False
     if has_installed_source_resident:
         audit_external = resident_md.get("external_receipt")
@@ -9123,7 +9424,7 @@ def _authenticated_canonical_factory_packet_chain(
             )
         }
         if (
-            not has_installed_source_install
+            not closed_installed_source
             or resident_md.get("outcome") != "PASS_EXACT_RESIDENT_RUNTIME"
             or not isinstance(focused_tests, dict)
             or set(focused_tests) != {"failed", "passed"}
@@ -9217,8 +9518,214 @@ def _authenticated_canonical_factory_packet_chain(
     return True
 
 
+def _reviewed_author_repair_phase_task_id(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    author_run_id: int,
+    reviewer_id: str,
+    reviewer_run_id: int,
+    reviewer_profile: str,
+    review_md: dict,
+    handoff_reason: str,
+) -> Optional[str]:
+    """Resolve one exact resident REQUEST_CHANGES -> repair-author phase.
+
+    The phase edge is accepted only when it is the sole structured Native path,
+    its terminal nodes have kernel-authenticated receipts, and the closed audit
+    packet cross-binds the original reviewed head and resident activation.  The
+    packet's prose fields are shape-checked but never used as authority.
+    """
+    path: list[str] = []
+    parent_id = reviewer_id
+    for _ in range(5):
+        child_id = _one_direct_child(conn, parent_id)
+        if child_id is None:
+            return None
+        parents = conn.execute(
+            "SELECT parent_id FROM task_links WHERE child_id = ? ORDER BY parent_id",
+            (child_id,),
+        ).fetchall()
+        if [str(row["parent_id"]) for row in parents] != [parent_id]:
+            return None
+        path.append(child_id)
+        parent_id = child_id
+    merger_id, installer_id, activation_id, failed_audit_id, repair_author_id = path
+
+    authenticated: list[tuple[int, str, dict]] = []
+    for node_id, expected_profile in zip(
+        path[:4],
+        ("gm", FACTORY_REVIEW_MERGER_PROFILE, FACTORY_REVIEW_AUTHOR_PROFILE,
+         FACTORY_REVIEW_AUDITOR_PROFILE),
+    ):
+        terminal = _authenticated_factory_run_metadata(conn, node_id)
+        if terminal is None or terminal[1] != expected_profile:
+            return None
+        authenticated.append(terminal)
+    activation_run_id, _activation_profile, activation_md = authenticated[2]
+    _failed_run_id, _failed_profile, failed_md = authenticated[3]
+
+    request_keys = {
+        "artifact_sha256", "artifacts", "exact_candidate", "focused_tests",
+        "forbidden_actions_performed", "formal_evidence", "github_readback",
+        "new_control_plane_count", "outcome", "packet_blockers", "parent_replay",
+        "post_test_resource_readback", "reviewed_author_probe", "secret_exposure",
+        "source_identity", "static_checks", "worker_session_id",
+    }
+    if set(failed_md) != request_keys:
+        return None
+
+    def exact_hash(value: object, length: int) -> bool:
+        return isinstance(value, str) and re.fullmatch(
+            rf"[0-9a-f]{{{length}}}", value,
+        ) is not None
+
+    def nonempty_string_list(value: object) -> bool:
+        return (
+            isinstance(value, list) and bool(value)
+            and all(isinstance(item, str) and bool(item.strip()) for item in value)
+            and len(set(value)) == len(value)
+        )
+
+    candidate = failed_md.get("exact_candidate")
+    source_pr_match = re.fullmatch(
+        rf"https://github[.]com/{re.escape(FACTORY_REVIEW_REPOSITORY)}"
+        r"/pull/([1-9][0-9]*)",
+        candidate.get("pr") if isinstance(candidate, dict) else "",
+    )
+    review_url = review_md.get("github_review_url")
+    review_pr_match = re.fullmatch(
+        rf"https://github[.]com/{re.escape(FACTORY_REVIEW_REPOSITORY)}"
+        r"/pull/([1-9][0-9]*)#pullrequestreview-[1-9][0-9]*",
+        review_url if isinstance(review_url, str) else "",
+    )
+    activation_source = activation_md.get("source")
+    parent_replay = failed_md.get("parent_replay")
+    probe = failed_md.get("reviewed_author_probe")
+    github_readback = failed_md.get("github_readback")
+    source_identity = failed_md.get("source_identity")
+    focused_tests = failed_md.get("focused_tests")
+    resources = failed_md.get("post_test_resource_readback")
+    static_checks = failed_md.get("static_checks")
+    blockers = failed_md.get("packet_blockers")
+    blocker_ids = (
+        {blocker.get("id") for blocker in blockers}
+        if isinstance(blockers, list)
+        and all(isinstance(blocker, dict) and set(blocker) == {"evidence", "id"}
+                for blocker in blockers)
+        else set()
+    )
+    if (
+        failed_md.get("outcome") != "REQUEST_CHANGES_EXACT_RESIDENT_PACKET"
+        or source_pr_match is None or review_pr_match is None
+        or source_pr_match.group(1) != review_pr_match.group(1)
+        or not isinstance(candidate, dict)
+        or set(candidate) != {"audited_head", "base", "merge_commit", "pr", "tree"}
+        or candidate.get("audited_head") != review_md.get("head")
+        or candidate.get("tree") != review_md.get("head_tree")
+        or candidate.get("base") != review_md.get("base")
+        or not exact_hash(candidate.get("merge_commit"), 40)
+        or not isinstance(activation_source, dict)
+        or activation_source.get("audited_head") != candidate.get("audited_head")
+        or activation_source.get("tree") != candidate.get("tree")
+        or activation_source.get("merge_commit") != candidate.get("merge_commit")
+        or activation_md.get("audit_task") != failed_audit_id
+        or not isinstance(parent_replay, dict)
+        or set(parent_replay) != {
+            "manual_claim_or_dispatch_count", "natural_claim_run", "restart_attempts", "task",
+        }
+        or parent_replay.get("task") != activation_id
+        or type(parent_replay.get("natural_claim_run")) is not int
+        or parent_replay.get("natural_claim_run") != activation_run_id
+        or type(parent_replay.get("manual_claim_or_dispatch_count")) is not int
+        or parent_replay.get("manual_claim_or_dispatch_count") != 0
+        or type(parent_replay.get("restart_attempts")) is not int
+        or parent_replay.get("restart_attempts") != 0
+        or not isinstance(probe, dict)
+        or set(probe) != {
+            "author_task", "connection_total_changes_delta", "data_version_unchanged",
+            "resolver_result", "status_before_after",
+        }
+        or probe.get("author_task") != task_id
+        or type(probe.get("connection_total_changes_delta")) is not int
+        or probe.get("connection_total_changes_delta") != 0
+        or probe.get("data_version_unchanged") is not True
+        or probe.get("resolver_result") is not None
+        or probe.get("status_before_after") != "review/review"
+        or github_readback is None or not isinstance(github_readback, dict)
+        or set(github_readback) != {"actor", "body_sha256", "byte_exact"}
+        or github_readback.get("actor") != FACTORY_REVIEW_AUDITOR_ACTOR
+        or github_readback.get("byte_exact") is not True
+        or not exact_hash(github_readback.get("body_sha256"), 64)
+        or not isinstance(source_identity, dict)
+        or set(source_identity) != {"kanban_db_blob", "kanban_db_sha256", "rollback_commit"}
+        or not exact_hash(source_identity.get("kanban_db_blob"), 40)
+        or not exact_hash(source_identity.get("kanban_db_sha256"), 64)
+        or source_identity.get("rollback_commit") != candidate.get("base")
+        or not isinstance(focused_tests, dict)
+        or set(focused_tests) != {"failed", "passed"}
+        or type(focused_tests.get("failed")) is not int or focused_tests.get("failed") != 0
+        or type(focused_tests.get("passed")) is not int or focused_tests.get("passed", 0) <= 0
+        or not isinstance(resources, dict)
+        or set(resources) != {
+            "memory_events_max", "oom", "oom_kill", "pids_events_max", "pids_max",
+            "pids_peak", "tasks_max",
+        }
+        or any(type(resources.get(key)) is not int for key in resources)
+        or any(resources.get(key) != 0 for key in ("memory_events_max", "oom", "oom_kill"))
+        or resources.get("pids_events_max", -1) < 0
+        or resources.get("pids_max", 0) <= 0 or resources.get("tasks_max", 0) <= 0
+        or resources.get("pids_peak", -1) < 0
+        or static_checks != {
+            "checkout_clean": True, "diff_check": "pass", "py_compile": "pass", "ruff": "pass",
+        }
+        or not isinstance(blockers, list) or len(blockers) != 2
+        or blocker_ids != {
+            "EXACT_REVIEW_PACKET_NOT_ROUTED_TO_INSTALLED_CHAIN",
+            "VALID_SYSTEMD_ORDER_REJECTED",
+        }
+        or any(not isinstance(blocker.get("evidence"), str) or not blocker["evidence"].strip()
+               for blocker in blockers)
+        or not exact_hash(failed_md.get("artifact_sha256"), 64)
+        or not nonempty_string_list(failed_md.get("artifacts"))
+        or not nonempty_string_list(failed_md.get("formal_evidence"))
+        or failed_md.get("forbidden_actions_performed") != []
+        or type(failed_md.get("new_control_plane_count")) is not int
+        or failed_md.get("new_control_plane_count") != 0
+        or failed_md.get("secret_exposure") != "none"
+        or not isinstance(failed_md.get("worker_session_id"), str)
+        or not failed_md["worker_session_id"].strip()
+    ):
+        return None
+
+    if not _authenticated_canonical_factory_packet_chain(
+        conn,
+        task_id=task_id,
+        author_run_id=author_run_id,
+        reviewer_id=reviewer_id,
+        reviewer_run_id=reviewer_run_id,
+        reviewer_profile=reviewer_profile,
+        review_md=review_md,
+        handoff_reason=handoff_reason,
+        _request_changes_terminal_task_id=failed_audit_id,
+    ):
+        return None
+
+    repair_author = conn.execute(
+        "SELECT status, assignee, factory_build_gate FROM tasks WHERE id = ?",
+        (repair_author_id,),
+    ).fetchone()
+    if (
+        repair_author is None or repair_author["status"] != "review"
+        or repair_author["assignee"] != FACTORY_REVIEW_AUTHOR_PROFILE
+        or not repair_author["factory_build_gate"]
+    ):
+        return None
+    return repair_author_id
+
+
 def _reviewed_author_finalizer_run_id(
-    conn: sqlite3.Connection, task_id: str,
+    conn: sqlite3.Connection, task_id: str, *, _allow_repair_phase: bool = True,
 ) -> Optional[int]:
     """Resolve one exact reviewed author chain, or fail closed on any drift.
 
@@ -9334,7 +9841,7 @@ def _reviewed_author_finalizer_run_id(
         return None
     canonical_review_md = _canonical_factory_review_packet(review_md)
     if canonical_review_md is not None:
-        return author_run_id if _authenticated_canonical_factory_packet_chain(
+        if _authenticated_canonical_factory_packet_chain(
             conn,
             task_id=task_id,
             author_run_id=author_run_id,
@@ -9343,7 +9850,25 @@ def _reviewed_author_finalizer_run_id(
             reviewer_profile=reviewer_profile,
             review_md=canonical_review_md,
             handoff_reason=handoff.reason,
-        ) else None
+        ):
+            return author_run_id
+        if not _allow_repair_phase:
+            return None
+        repair_author_id = _reviewed_author_repair_phase_task_id(
+            conn,
+            task_id=task_id,
+            author_run_id=author_run_id,
+            reviewer_id=reviewer_id,
+            reviewer_run_id=_reviewer_run_id,
+            reviewer_profile=reviewer_profile,
+            review_md=canonical_review_md,
+            handoff_reason=handoff.reason,
+        )
+        if repair_author_id is None:
+            return None
+        return author_run_id if _reviewed_author_finalizer_run_id(
+            conn, repair_author_id, _allow_repair_phase=False,
+        ) is not None else None
     if "approval_commit_id" in review_md or any(
         isinstance(key, str) and re.fullmatch(r"lean_pr[1-9][0-9]*_compare", key)
         for key in review_md
