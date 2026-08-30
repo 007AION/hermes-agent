@@ -1248,7 +1248,7 @@ def _non_pr_reviewed_evidence_chain(conn, *, handoff_reason="exact runtime evide
     return author, author_run, reviewer
 
 
-def _canonical_factory_packet_chain(conn):
+def _canonical_factory_packet_chain(conn, *, installed_source_shapes=False):
     """Create the generic authenticated packet shapes emitted by the current lane."""
     head, tree, base, merge = "1" * 40, "2" * 40, "3" * 40, "4" * 40
     review_id, source_pr = 12345, 64
@@ -1281,7 +1281,7 @@ def _canonical_factory_packet_chain(conn):
     })
 
     merger_run = _claim_and_run_id(conn, merger)
-    assert kb.complete_task(conn, merger, expected_run_id=merger_run, metadata={
+    merger_metadata = {
         "actor": "kiddhu", "audited_head": head, "audited_tree": tree,
         "audit": {"github_review_id": review_id, "github_review_state": "APPROVED", "native_run_id": review_run, "native_task_id": reviewer, "verdict": "PASS_EXACT_HEAD"},
         "base": base, "canonical_checkout": {"clean": True, "installed": False, "preserved_head": base},
@@ -1295,11 +1295,47 @@ def _canonical_factory_packet_chain(conn):
         "new_control_plane_count": 0, "pr": source_pr, "remote_main": merge,
         "role_separation": {"author": "agent007/007AION", "auditor": "bafuxunan/GemAION", "merger": "gm/kiddhu"},
         "secret_exposure": "none", "worker_session_id": "canonical-merge-session",
-    })
+    }
+    if installed_source_shapes:
+        merger_metadata = {
+            "actor": {
+                "github": "kiddhu", "profile": "gm",
+                "role_separated_from": ["agent007/007AION", "bafuxunan/GemAION"],
+            },
+            "audit": {
+                "approval_commit_id": head, "github_review_id": review_id,
+                "native_run_id": review_run, "native_task_id": reviewer,
+                "review_actor": "GemAION", "review_state": "APPROVED",
+                "verdict": "PASS_EXACT_HEAD",
+            },
+            "base": base,
+            "canonical_checkout": {"dirty": False, "head": base, "installed_in_task": False},
+            "checks": "all terminal non-failure at exact audited head",
+            "child": {
+                "assignee": "merger", "id": installer,
+                "purpose": "guarded canonical install plus typed source/installed/runtime witness",
+                "status_at_creation": "todo",
+            },
+            "evidence_comments": ["https://github.com/example/governance/issues/833#issuecomment-1"],
+            "forbidden_actions_performed": [], "head": head, "head_tree": tree,
+            "merge": {
+                "cas_calls": 1, "commit": merge, "method": "merge",
+                "parents": [base, head], "remote_main": merge, "tree": tree,
+            },
+            "merged_blobs": {path: "6" * 40 for path in paths},
+            "new_control_plane_count": 0,
+            "not_true_done_for": ["reviewed-author finalization"],
+            "pr": source_pr, "pr_state": "MERGED",
+            "protected_issues": {"790": "open", "833": "open"},
+            "secret_exposure": "none", "worker_session_id": "installed-source-merge-session",
+        }
+    assert kb.complete_task(
+        conn, merger, expected_run_id=merger_run, metadata=merger_metadata,
+    )
 
     install_run = _claim_and_run_id(conn, installer)
     module_hash = "5" * 64
-    assert kb.complete_task(conn, installer, expected_run_id=install_run, metadata={
+    install_metadata = {
         "artifacts": ["/tmp/canonical-install-receipt.json"],
         "author_finalizer_performed": False, "author_status_before_and_after": "review",
         "canonical_run_id": install_run, "forbidden_actions_performed": [],
@@ -1321,12 +1357,70 @@ def _canonical_factory_packet_chain(conn):
         },
         "witness_type": f"EXACT_PR{source_pr}_INSTALLED_AND_TYPED_RUNTIME_WITNESS",
         "worker_session_id": "canonical-install-session",
-    })
+    }
+    if installed_source_shapes:
+        install_metadata = {
+            "activation_performed": False, "audited_head": head,
+            "author_finalizer_performed": False, "base": base,
+            "blobs": {path: "6" * 40 for path in paths},
+            "canonical_run_id": install_run, "forbidden_actions_performed": [],
+            "fresh_runtime": {
+                "bytes_match": True, "module_path": "/repo/hermes_cli/kanban_db.py",
+                "module_sha256": module_hash, "resolver_loaded": True,
+                "resolves_to_authoritative_root": True,
+            },
+            "install": {
+                "changed_paths": paths, "head": merge,
+                "method": "existing_clean_git_editable_guarded_fast_forward",
+                "parents": [base, head], "preinstall_commit": base,
+                "rollback_commit": base, "rollback_ref": "refs/aion/rollback/generic",
+                "tree": tree, "worktree_clean": True,
+            },
+            "merge": merge, "new_control_plane_count": 0,
+            "not_true_done_for": ["reviewed-author finalization"], "pr": source_pr,
+            "public_receipts": ["https://github.com/example/governance/issues/833#issuecomment-2"],
+            "receipt_sha256": "7" * 64, "resident_activated": False,
+            "resident_runtime": {
+                "all_running_gateways_predate_install": True,
+                "hermes_gateway_gm2_NRestarts": "0",
+                "hermes_gateway_gm2_active_state": "active",
+                "hermes_gateway_gm2_sub_state": "running",
+                "resident_kanban_db_blob_at_base": "8" * 40,
+            },
+            "secret_exposure": "none", "source_installed": True,
+            "tests": {
+                "diff_check": "pass", "focused_total": "659 passed, 0 failed",
+                "py_compile": "pass", "ruff": "pass",
+                "test_kanban_db": "380 passed", "test_kanban_factory_finalizer": "279 passed",
+            },
+            "tree": tree,
+            "typed_symbol": {
+                "approval_commit_id_branch_in_finalizer": True, "present_callable": True,
+                "symbol": "_authenticated_canonical_factory_packet_chain",
+            },
+            "witness_type": f"EXACT_PR{source_pr}_INSTALLED_AND_TYPED_SOURCE_INSTALLED_RESIDENT_NOT_ACTIVATED_WITNESS",
+            "worker_session_id": "installed-source-install-session",
+        }
+    assert kb.complete_task(
+        conn, installer, expected_run_id=install_run, metadata=install_metadata,
+    )
 
     activation_run = _claim_and_run_id(conn, activation)
     external = {"compressed_sha256": "8" * 64, "exact_shell_pid_unique_attribution": False, "outside_target_cgroup_proven": True, "restart_count": 1, "second_restart": 0, "uncompressed_sha256": "9" * 64}
     source = {"audited_head": head, "clean": True, "head": merge, "kanban_db_blob": "6" * 40, "kanban_db_sha256": module_hash, "tree": tree}
     resident = {"active_state": "active", "barrier_loaded": True, "configured_import_exact": True, "deep_health_exit_code": 0, "exec_start_monotonic": 1000, "main_pid": 2000, "nrestarts": 0, "pids_events_max": 0, "pids_max": 120, "pids_peak": 42, "proc_starttime_ticks": 3000, "result": "success", "sub_state": "running", "tasks_max": 120}
+    if installed_source_shapes:
+        source = {
+            **source, "merge_commit": merge,
+        }
+        resident = {
+            "active_enter_timestamp_monotonic": 900, "active_state": "active",
+            "barrier_loaded": True, "configured_import_exact": True,
+            "deep_health_exit_code": 0, "exec_start_monotonic": 1000,
+            "main_pid": 2000, "memory_current": 1024, "memory_peak": 2048,
+            "nrestarts": 0, "pids_peak": 42, "proc_starttime_ticks": 3000,
+            "result": "success", "sub_state": "running", "tasks_max": 120,
+        }
     assert kb.complete_task(conn, activation, expected_run_id=activation_run, metadata={
         "artifacts": ["/tmp/canonical-activation.json"], "audit_task": resident_audit,
         "external_activation_receipt": external, "focused_barrier_tests": {"failed": 0, "passed": 5},
@@ -1338,7 +1432,7 @@ def _canonical_factory_packet_chain(conn):
     })
 
     resident_run = _claim_and_run_id(conn, resident_audit)
-    assert kb.complete_task(conn, resident_audit, expected_run_id=resident_run, metadata={
+    resident_metadata = {
         "artifact_sha256": "b" * 64, "artifacts": ["/tmp/canonical-resident-audit.md"],
         "barrier_tests": {"failed": 0, "passed": 5}, "deep_health_exit_code": 0,
         "external_receipt": external, "forbidden_actions_performed": [],
@@ -1351,7 +1445,49 @@ def _canonical_factory_packet_chain(conn):
         "secret_exposure": "none",
         "source": {"audited_head": head, "kanban_db_blob": "6" * 40, "kanban_db_sha256": module_hash, "merge_commit": merge, "tree": tree},
         "worker_session_id": "canonical-resident-audit-session",
-    })
+    }
+    if installed_source_shapes:
+        resident_metadata = {
+            "artifact_sha256": "b" * 64,
+            "artifacts": ["/tmp/canonical-resident-audit.md"],
+            "external_receipt": {
+                "compressed_sha256": external["compressed_sha256"],
+                "exact_operator_cgroup_path_attributed": False,
+                "outside_target_cgroup_proven": True,
+                "restart_count": 1, "second_restart": 0,
+                "uncompressed_sha256": external["uncompressed_sha256"],
+            },
+            "focused_tests": {"failed": 0, "passed": 22},
+            "forbidden_actions_performed": [],
+            "formal_evidence": ["https://github.com/example/governance/issues/833#issuecomment-4"],
+            "native_replay": {
+                "manual_claim_or_dispatch_count": 0, "restart_attempts": 0,
+                "run_id": activation_run, "task": activation,
+            },
+            "new_control_plane_count": 0,
+            "next_supported_gate": "SAME reviewed-author finalization",
+            "not_true_done_for": ["production PASS"],
+            "outcome": "PASS_EXACT_RESIDENT_RUNTIME",
+            "resident_runtime": {
+                key: resident[key]
+                for key in (
+                    "active_state", "exec_start_monotonic", "main_pid", "nrestarts",
+                    "pids_peak", "proc_starttime_ticks", "result", "sub_state", "tasks_max",
+                )
+            } | {"pids_events_max": 0, "pids_max": 120},
+            "secret_exposure": "none",
+            "source": {
+                key: source[key]
+                for key in (
+                    "audited_head", "clean", "head", "kanban_db_blob",
+                    "kanban_db_sha256", "tree",
+                )
+            },
+            "worker_session_id": "installed-source-resident-audit-session",
+        }
+    assert kb.complete_task(
+        conn, resident_audit, expected_run_id=resident_run, metadata=resident_metadata,
+    )
     return {"author": author, "author_run": author_run, "reviewer": reviewer, "review_run": review_run, "merger": merger, "merger_run": merger_run, "installer": installer, "install_run": install_run, "activation": activation, "activation_run": activation_run, "resident_audit": resident_audit, "resident_run": resident_run}
 
 
@@ -1365,6 +1501,112 @@ def test_reviewed_author_accepts_current_canonical_factory_packet_chain(kanban_h
         author = kb.get_task(conn, chain["author"])
         assert author is not None
         assert author.status == "done"
+
+
+def test_reviewed_author_accepts_installed_source_factory_packet_chain(
+    kanban_home, aion_gov_src,
+):
+    """The exact closed packet shapes emitted after the adapter remain consumable."""
+    with kb.connect() as conn:
+        chain = _canonical_factory_packet_chain(conn, installed_source_shapes=True)
+        before = _native_state_snapshot(conn)
+        assert kb._reviewed_author_finalizer_run_id(conn, chain["author"]) == chain["author_run"]
+        assert _native_state_snapshot(conn) == before
+        assert kb.complete_task(
+            conn, chain["author"], summary="installed-source chain terminalized",
+        )
+        author = kb.get_task(conn, chain["author"])
+        assert author is not None
+        assert author.status == "done"
+
+
+@pytest.mark.parametrize(("target", "mutate"), [
+    ("merger", lambda md: md.__setitem__("head", "f" * 40)),
+    ("merger", lambda md: md["audit"].__setitem__("native_run_id", -1)),
+    ("merger", lambda md: md["actor"].__setitem__("github", "007AION")),
+    ("merger", lambda md: md["merge"].__setitem__("parents", ["f" * 40, "1" * 40])),
+    ("merger", lambda md: md["child"].__setitem__("id", "t_wrong")),
+    ("merger", lambda md: md["child"].__setitem__("approved", True)),
+    ("merger", lambda md: md.__setitem__("merge_commit", "f" * 40)),
+    ("installer", lambda md: md.__setitem__("pr", 65)),
+    ("installer", lambda md: md.__setitem__("merge", "f" * 40)),
+    ("installer", lambda md: md["blobs"].__setitem__(next(iter(md["blobs"])), "f" * 40)),
+    ("installer", lambda md: md.__setitem__("source_installed", False)),
+    ("installer", lambda md: md["fresh_runtime"].__setitem__("approved", True)),
+    ("installer", lambda md: md.__setitem__("source_head", "f" * 40)),
+    ("activation", lambda md: md["source"].__setitem__("head", "f" * 40)),
+    ("activation", lambda md: md["source"].__setitem__("approved", True)),
+    ("activation", lambda md: md.__setitem__("replay_restart_attempts", 1)),
+    ("resident_audit", lambda md: md["native_replay"].__setitem__("run_id", -1)),
+    ("resident_audit", lambda md: md["native_replay"].__setitem__("task", "t_wrong")),
+    ("resident_audit", lambda md: md["external_receipt"].__setitem__("restart_count", True)),
+    ("resident_audit", lambda md: md["source"].__setitem__("audited_head", "f" * 40)),
+    ("resident_audit", lambda md: md["resident_runtime"].__setitem__("main_pid", -1)),
+    ("resident_audit", lambda md: md["native_replay"].__setitem__("approved", True)),
+    ("resident_audit", lambda md: md.__setitem__("barrier_tests", {"failed": 0, "passed": 1})),
+])
+def test_reviewed_author_rejects_installed_source_packet_drift_zero_mutation(
+    kanban_home, aion_gov_src, target, mutate,
+):
+    with kb.connect() as conn:
+        chain = _canonical_factory_packet_chain(conn, installed_source_shapes=True)
+        _rewrite_latest_run_metadata(conn, chain[target], mutate)
+        before = _native_state_snapshot(conn)
+        assert kb._reviewed_author_finalizer_run_id(conn, chain["author"]) is None
+        with pytest.raises(kb.FactoryTerminalReceiptRequiredError):
+            kb.complete_task(conn, chain["author"], summary="reject installed-source drift")
+        assert _native_state_snapshot(conn) == before
+
+
+@pytest.mark.parametrize(
+    ("target", "parent", "profile"),
+    [
+        ("merger", "reviewer", "gm"),
+        ("installer", "merger", "merger"),
+        ("resident_audit", "activation", "bafuxunan"),
+    ],
+)
+def test_reviewed_author_rejects_duplicate_installed_source_packet_family(
+    kanban_home, aion_gov_src, target, parent, profile,
+):
+    with kb.connect() as conn:
+        chain = _canonical_factory_packet_chain(conn, installed_source_shapes=True)
+        original = kb._authenticated_factory_run_metadata(conn, chain[target])
+        assert original is not None
+        duplicate = kb.create_task(
+            conn, title="duplicate installed-source packet", factory_build_gate=1,
+            assignee=profile, parents=[chain[parent]],
+        )
+        duplicate_run = _claim_and_run_id(conn, duplicate)
+        assert kb.complete_task(
+            conn, duplicate, expected_run_id=duplicate_run, metadata=original[2],
+        )
+        before = _native_state_snapshot(conn)
+        assert kb._reviewed_author_finalizer_run_id(conn, chain["author"]) is None
+        assert _native_state_snapshot(conn) == before
+
+
+def test_reviewed_author_rejects_installed_source_missing_edge_and_self_audit(
+    kanban_home, aion_gov_src,
+):
+    with kb.connect() as conn:
+        chain = _canonical_factory_packet_chain(conn, installed_source_shapes=True)
+        conn.execute(
+            "DELETE FROM task_links WHERE parent_id = ? AND child_id = ?",
+            (chain["activation"], chain["resident_audit"]),
+        )
+        conn.commit()
+        before = _native_state_snapshot(conn)
+        assert kb._reviewed_author_finalizer_run_id(conn, chain["author"]) is None
+        assert _native_state_snapshot(conn) == before
+    with kb.connect() as conn:
+        chain = _canonical_factory_packet_chain(conn, installed_source_shapes=True)
+        conn.execute("UPDATE tasks SET assignee = 'agent007' WHERE id = ?", (chain["reviewer"],))
+        conn.execute("UPDATE task_runs SET profile = 'agent007' WHERE task_id = ?", (chain["reviewer"],))
+        conn.commit()
+        before = _native_state_snapshot(conn)
+        assert kb._reviewed_author_finalizer_run_id(conn, chain["author"]) is None
+        assert _native_state_snapshot(conn) == before
 
 
 @pytest.mark.parametrize(("target", "mutate"), [
