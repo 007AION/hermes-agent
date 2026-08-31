@@ -5941,6 +5941,23 @@ def _review_handoff_receipt_from_row(
 ) -> Optional[ReviewHandoffReceipt]:
     try:
         payload = json.loads(row["payload"] or "{}")
+        required = {
+            "version", "expected_run_id", "review_task_id", "reason",
+            "recovery", "receipt_sha256",
+        }
+        if not isinstance(payload, dict) or set(payload) != required:
+            return None
+        strict_types = (
+            (payload["version"], int), (payload["expected_run_id"], int),
+            (payload["review_task_id"], str), (payload["reason"], str),
+            (payload["recovery"], bool), (payload["receipt_sha256"], str),
+        )
+        if any(type(value) is not expected for value, expected in strict_types):
+            return None
+        if payload["version"] != 1 or not payload["review_task_id"].strip() or not (
+            payload["reason"].strip()
+        ):
+            return None
         signed = {
             "task_id": task_id,
             "version": payload["version"],
@@ -5957,9 +5974,9 @@ def _review_handoff_receipt_from_row(
                 ensure_ascii=False,
             ).encode("utf-8")
         ).hexdigest()
-        if payload["version"] != 1 or payload["receipt_sha256"] != expected_hash:
+        if payload["receipt_sha256"] != expected_hash:
             return None
-        if int(row["run_id"]) != int(payload["expected_run_id"]):
+        if row["run_id"] != payload["expected_run_id"]:
             return None
         return ReviewHandoffReceipt(
             event_id=int(row["id"]),
@@ -5972,6 +5989,176 @@ def _review_handoff_receipt_from_row(
         )
     except (KeyError, TypeError, ValueError):
         return None
+
+
+def _canonical_review_verdict_payload(row: sqlite3.Row) -> Optional[dict[str, Any]]:
+    try:
+        payload = json.loads(row["payload"] or "{}")
+        schema = {"version": int, "review_task_id": str, "review_run_id": int,
+                  "verdict": str, "reason": str}
+        if (not isinstance(payload, dict) or set(payload) != set(schema)
+                or any(type(payload[key]) is not expected for key, expected in schema.items())):
+            return None
+        return payload if (
+            payload["version"] == 1 and bool(payload["review_task_id"].strip())
+            and payload["verdict"] in {"pass", "request_changes"}
+            and bool(payload["reason"].strip()) and payload["review_run_id"] == row["run_id"]
+        ) else None
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _canonical_audit_receipt(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> Optional[dict[str, Any]]:
+    """Return one authenticated Native handoff/verdict receipt.
+
+    Only task, run, edge, handoff, and paired-verdict rows are authoritative.
+    Audit metadata, comments, titles, caller data, and external state are cold.
+    """
+    identity_fields = (
+        "claim_lock", "claim_expires", "worker_pid", "worker_starttime",
+        "fence_lineage", "fence_disposition",
+    )
+    author = conn.execute(
+        "SELECT status, assignee, current_run_id, claim_lock, claim_expires, "
+        "worker_pid, worker_starttime, fence_lineage, fence_disposition, "
+        "factory_build_gate FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if (
+        author is None
+        or author["status"] != "review"
+        or author["factory_build_gate"] != 1
+        or not isinstance(author["assignee"], str)
+        or not author["assignee"]
+        or author["current_run_id"] is not None
+        or any(author[field] is not None for field in identity_fields)
+    ):
+        return None
+    author_profile = str(author["assignee"])
+    author_runs = conn.execute(
+        "SELECT id, profile, status, outcome, ended_at FROM task_runs "
+        "WHERE task_id = ? ORDER BY id DESC", (task_id,),
+    ).fetchall()
+    if (
+        not author_runs
+        or author_runs[0]["profile"] != author_profile
+        or author_runs[0]["status"] != "review_required"
+        or author_runs[0]["outcome"] != "review_required"
+        or author_runs[0]["ended_at"] is None
+        or any(row["ended_at"] is None for row in author_runs)
+    ):
+        return None
+    author_run_id = int(author_runs[0]["id"])
+    handoff_rows = conn.execute(
+        "SELECT id, run_id, payload FROM task_events WHERE task_id = ? "
+        "AND kind = 'review_handoff' AND run_id = ?",
+        (task_id, author_run_id),
+    ).fetchall()
+    if len(handoff_rows) != 1:
+        return None
+    handoff = _review_handoff_receipt_from_row(task_id, handoff_rows[0])
+    if handoff is None or handoff.expected_run_id != author_run_id:
+        return None
+
+    auditor_task_id = handoff.review_task_id
+    auditor = conn.execute(
+        "SELECT status, assignee, current_run_id, claim_lock, claim_expires, "
+        "worker_pid, worker_starttime, fence_lineage, fence_disposition "
+        "FROM tasks WHERE id = ?", (auditor_task_id,),
+    ).fetchone()
+    if (
+        auditor is None
+        or auditor["status"] not in {"done", "archived"}
+        or not isinstance(auditor["assignee"], str)
+        or not auditor["assignee"]
+        or auditor["assignee"] == author_profile
+        or auditor["current_run_id"] is not None
+        or any(auditor[field] is not None for field in identity_fields)
+        or conn.execute(
+            "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ?",
+            (task_id, auditor_task_id),
+        ).fetchone() is None
+    ):
+        return None
+    auditor_profile = str(auditor["assignee"])
+    same_profile_children = conn.execute(
+        "SELECT child.id FROM task_links edge JOIN tasks child "
+        "ON child.id = edge.child_id WHERE edge.parent_id = ? "
+        "AND child.assignee = ? ORDER BY child.id",
+        (task_id, auditor_profile),
+    ).fetchall()
+    if [str(row["id"]) for row in same_profile_children] != [auditor_task_id]:
+        return None
+
+    verdict_rows = conn.execute(
+        "SELECT id, run_id, payload, created_at FROM task_events "
+        "WHERE task_id = ? AND kind = 'review_verdict' AND id > ? ORDER BY id",
+        (task_id, handoff.event_id),
+    ).fetchall()
+    if len(verdict_rows) != 1:
+        return None
+    verdict_row = verdict_rows[0]
+    payload = _canonical_review_verdict_payload(verdict_row)
+    if (
+        payload is None
+        or payload["review_task_id"] != auditor_task_id
+        or type(verdict_row["created_at"]) is not int
+    ):
+        return None
+    auditor_run_id = int(payload["review_run_id"])
+    mirrors = conn.execute(
+        "SELECT run_id, payload FROM task_events WHERE task_id = ? "
+        "AND kind = 'review_verdict' AND run_id = ? AND id > ? ORDER BY id",
+        (auditor_task_id, auditor_run_id, handoff.event_id),
+    ).fetchall()
+    if len(mirrors) != 1:
+        return None
+    mirrored_payload = _canonical_review_verdict_payload(mirrors[0])
+    if mirrored_payload is None or mirrored_payload != payload:
+        return None
+
+    auditor_runs = conn.execute(
+        "SELECT id, profile, status, outcome, ended_at FROM task_runs "
+        "WHERE task_id = ? ORDER BY id DESC", (auditor_task_id,),
+    ).fetchall()
+    raw_verdict = str(payload["verdict"])
+    expected = (
+        ("done", "completed")
+        if raw_verdict == "pass"
+        else ("request_changes", "request_changes")
+    )
+    if (
+        not auditor_runs
+        or int(auditor_runs[0]["id"]) != auditor_run_id
+        or auditor_runs[0]["profile"] != auditor_profile
+        or (auditor_runs[0]["status"], auditor_runs[0]["outcome"]) != expected
+        or auditor_runs[0]["ended_at"] is None
+        or any(row["ended_at"] is None for row in auditor_runs)
+    ):
+        return None
+
+    receipt = {
+        "task_id": task_id,
+        "subject_id": f"{task_id}/{author_run_id}",
+        "subject_version_or_exact_hash": handoff.receipt_sha256,
+        "author_task_id": task_id,
+        "author_run_id": author_run_id,
+        "author_profile": author_profile,
+        "auditor_task_id": auditor_task_id,
+        "auditor_run_id": auditor_run_id,
+        "auditor_profile": auditor_profile,
+        "verdict": "PASS" if raw_verdict == "pass" else "REQUEST_CHANGES",
+        "issued_at": int(verdict_row["created_at"]),
+    }
+    receipt_hash = hashlib.sha256(
+        json.dumps(
+            receipt, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    return {**receipt, "receipt_hash": receipt_hash, "authenticated": True}
 
 
 def _reconcile_review_handoff_replay(
@@ -8388,214 +8575,15 @@ def _authenticated_non_pr_review_evidence(
     author_run_id: int,
     handoff_reason: str,
 ) -> bool:
-    """Validate the closed authenticated no-PR runtime-evidence family.
-
-    This family models an independently audited operation that legitimately has
-    no code PR or merge/install descendants.  Authority comes only from the
-    kernel-authenticated terminal reviewer run selected by the typed Native
-    handoff/verdict chain.  Task prose, comments, and caller-supplied evidence
-    are never read.
-    """
-    required_keys = {
-        "audit_outcome", "source_task_id", "source_run_id", "canonical_run_id",
-        "native_review_verdict", "evidence_sha256", "timer_sha256",
-        "artifact_sha256", "manifest_sha256", "github_receipt",
-        "github_receipt_body_sha256", "checks", "scope_limit", "artifacts",
-        "worker_session_id",
-    }
-    if set(review_md) != required_keys:
-        # Exact key closure makes this family mutually exclusive with every PR
-        # family and rejects caller-authored aliases or partial enrichment.
-        return False
-    if (
-        review_md.get("audit_outcome")
-        != "APPROVE_EXACT_NATURAL_RECOVERY_EVIDENCE"
-        or review_md.get("source_task_id") != task_id
-        or review_md.get("source_run_id") != author_run_id
-        or review_md.get("native_review_verdict") != "pass"
-    ):
-        return False
-    canonical_run_id = review_md.get("canonical_run_id")
-    worker_session_id = review_md.get("worker_session_id")
-    if (
-        not isinstance(canonical_run_id, str)
-        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", canonical_run_id) is None
-        or not isinstance(worker_session_id, str)
-        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", worker_session_id) is None
-    ):
-        return False
-    hash_keys = (
-        "evidence_sha256", "timer_sha256", "artifact_sha256",
-        "manifest_sha256", "github_receipt_body_sha256",
-    )
-    hashes = [review_md.get(key) for key in hash_keys]
-    if any(
-        not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None
-        for value in hashes
-    ) or len(set(hashes)) != len(hashes):
-        return False
-    receipt = review_md.get("github_receipt")
-    if not isinstance(receipt, str) or re.fullmatch(
-        r"https://github[.]com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/issues/"
-        r"[1-9][0-9]*#issuecomment-[1-9][0-9]*",
-        receipt,
-    ) is None:
-        return False
-    checks = review_md.get("checks")
-    artifacts = review_md.get("artifacts")
-    if (
-        not isinstance(checks, list)
-        or not checks
-        or any(not isinstance(check, str) or not check.strip() for check in checks)
-        or len(set(checks)) != len(checks)
-        or not isinstance(artifacts, list)
-        or not artifacts
-        or any(
-            not isinstance(path, str) or not path.startswith("/")
-            for path in artifacts
-        )
-        or not isinstance(review_md.get("scope_limit"), str)
-        or not review_md["scope_limit"].strip()
-    ):
-        return False
-    # A PR token is never authority, but its presence conflicts with this
-    # explicitly no-PR family and therefore fails closed rather than falling
-    # through to a different schema.
-    return re.search(r"\bPR\s+#[1-9][0-9]*\b", handoff_reason, re.IGNORECASE) is None
+    """Historical evidence family retained cold outside terminal authority."""
+    del review_md, task_id, author_run_id, handoff_reason
+    return False
 
 
 def _canonical_factory_review_packet(review_md: dict) -> Optional[dict]:
-    """Normalize one exact emitted audit packet into the canonical review shape."""
-    canonical_keys = {
-        "approval_commit_id", "approved", "base", "github_review_id",
-        "github_review_url", "head", "head_tree", "review_outcome",
-        "tests_failed", "tests_passed", "verification", "worker_session_id",
-    }
-    if set(review_md) == canonical_keys:
-        return review_md
-
-    lean_keys = [
-        key for key in review_md
-        if isinstance(key, str) and re.fullmatch(r"lean_pr([1-9][0-9]*)_compare", key)
-    ]
-    if len(lean_keys) != 1:
-        return None
-    lean_key = lean_keys[0]
-    emitted_keys = {
-        "artifacts", "base", "forbidden_actions_performed", "github_review",
-        "head", "hosted_ci", lean_key, "local_verification", "outcome",
-        "repository", "secret_exposure", "tree", "worker_session_id",
-    }
-    if set(review_md) != emitted_keys:
-        return None
-
-    head = review_md.get("head")
-    tree = review_md.get("tree")
-    base = review_md.get("base")
-    github_review = review_md.get("github_review")
-    hosted_ci = review_md.get("hosted_ci")
-    lean_compare = review_md.get(lean_key)
-    local = review_md.get("local_verification")
-    artifacts = review_md.get("artifacts")
-    review_id = github_review.get("id") if isinstance(github_review, dict) else None
-    review_url = github_review.get("url") if isinstance(github_review, dict) else None
-    review_match = re.fullmatch(
-        rf"https://github[.]com/{re.escape(FACTORY_REVIEW_REPOSITORY)}/pull/"
-        r"([1-9][0-9]*)#pullrequestreview-([1-9][0-9]*)",
-        review_url if isinstance(review_url, str) else "",
-    )
-    lean_match = re.fullmatch(r"lean_pr([1-9][0-9]*)_compare", lean_key)
-    local_ints = (
-        "factory_finalizer", "independent_hostile_zero_mutation", "kanban_db",
-        "total_failed", "total_passed",
-    )
-    if (
-        review_md.get("outcome") != "PASS_EXACT_HEAD"
-        or review_md.get("repository") != FACTORY_REVIEW_REPOSITORY
-        or review_md.get("forbidden_actions_performed") != []
-        or review_md.get("secret_exposure") != "none"
-        or not isinstance(review_md.get("worker_session_id"), str)
-        or not review_md["worker_session_id"].strip()
-        or any(
-            not isinstance(value, str) or re.fullmatch(r"[0-9a-fA-F]{40}", value) is None
-            for value in (head, tree, base)
-        )
-        or not isinstance(github_review, dict)
-        or set(github_review) != {"commit_id", "id", "state", "url"}
-        or github_review.get("commit_id") != head
-        or github_review.get("state") != "APPROVED"
-        or type(review_id) is not int or review_id <= 0
-        or review_match is None or lean_match is None
-        or int(review_match.group(1)) != int(lean_match.group(1))
-        or int(review_match.group(2)) != review_id
-        or not isinstance(artifacts, list) or not artifacts
-        or any(not isinstance(item, str) or not item.strip() for item in artifacts)
-        or len(set(artifacts)) != len(artifacts)
-        or not isinstance(hosted_ci, dict)
-        or set(hosted_ci) != {
-            "all_required_checks_pass", "failures", "run", "terminal",
-        }
-        or hosted_ci.get("all_required_checks_pass") != "SUCCESS"
-        or type(hosted_ci.get("failures")) is not int
-        or hosted_ci.get("failures") != 0
-        or type(hosted_ci.get("run")) is not int or hosted_ci["run"] <= 0
-        or type(hosted_ci.get("terminal")) is not int or hosted_ci["terminal"] <= 0
-        or not isinstance(lean_compare, dict)
-        or set(lean_compare) != {
-            "decision", "finalizer_schema_branch_count", "mixed_family_state_space",
-            "new_control_plane_count", "new_long_lived_state_count",
-            "new_runtime_component_count", "packet_family_count",
-        }
-        or lean_compare.get("decision") != "MINIMAL_REPAIR_WITH_NATIVE_GAP_PROOF"
-        or lean_compare.get("mixed_family_state_space") != "removed"
-        or any(
-            type(lean_compare.get(key)) is not int
-            for key in (
-                "finalizer_schema_branch_count", "new_control_plane_count",
-                "new_long_lived_state_count", "new_runtime_component_count",
-                "packet_family_count",
-            )
-        )
-        or lean_compare.get("finalizer_schema_branch_count") != 2
-        or lean_compare.get("packet_family_count") != 2
-        or any(
-            lean_compare.get(key) != 0
-            for key in (
-                "new_control_plane_count", "new_long_lived_state_count",
-                "new_runtime_component_count",
-            )
-        )
-        or not isinstance(local, dict)
-        or set(local) != {
-            "diff_check", "factory_finalizer", "independent_hostile_zero_mutation",
-            "kanban_db", "py_compile", "ruff", "total_failed", "total_passed",
-        }
-        or any(type(local.get(key)) is not int for key in local_ints)
-        or local.get("total_failed") != 0
-        or any(local.get(key, 0) <= 0 for key in local_ints if key != "total_failed")
-        or local.get("total_passed")
-        != local.get("factory_finalizer", 0) + local.get("kanban_db", 0)
-        or any(local.get(key) != "PASS" for key in ("diff_check", "py_compile", "ruff"))
-    ):
-        return None
-
-    return {
-        "approval_commit_id": head,
-        "approved": True,
-        "base": base,
-        "github_review_id": review_id,
-        "github_review_url": review_url,
-        "head": head,
-        "head_tree": tree,
-        "review_outcome": "PASS_EXACT_HEAD",
-        "tests_failed": local["total_failed"],
-        "tests_passed": local["total_passed"],
-        "verification": [
-            f"hosted CI run {hosted_ci['run']} exact-head PASS",
-            f"local {local['total_passed']} tests and hostile zero-mutation PASS",
-        ],
-        "worker_session_id": review_md["worker_session_id"],
-    }
+    """Historical packet adapter retained cold outside terminal authority."""
+    del review_md
+    return None
 
 
 def _authenticated_canonical_factory_packet_chain(
@@ -9727,12 +9715,23 @@ def _reviewed_author_repair_phase_task_id(
 def _reviewed_author_finalizer_run_id(
     conn: sqlite3.Connection, task_id: str, *, _allow_repair_phase: bool = True,
 ) -> Optional[int]:
-    """Resolve one exact reviewed author chain, or fail closed on any drift.
+    """Resolve a reviewed author from the sole canonical Native receipt.
 
-    The caller supplies no evidence. This resolver reads the immutable typed
-    handoff/verdict events plus kernel-authenticated terminal runs for the exact
-    reviewer -> merger -> runtime chain and cross-binds their structured facts.
+    ``_allow_repair_phase`` remains signature-compatible for installed callers;
+    packet-family repair interpretation is no longer part of terminal authority.
     """
+    del _allow_repair_phase
+    receipt = _canonical_audit_receipt(conn, task_id)
+    if (
+        receipt is None
+        or receipt.get("authenticated") is not True
+        or receipt.get("verdict") != "PASS"
+    ):
+        return None
+    return int(receipt["author_run_id"])
+
+    # Historical packet-family resolver retained cold during the immutable-row
+    # cutover. It is unreachable from the normal reviewed-author hot path.
     author = conn.execute(
         "SELECT status, assignee, current_run_id, claim_lock, claim_expires, "
         "worker_pid, worker_starttime, fence_lineage, fence_disposition "
