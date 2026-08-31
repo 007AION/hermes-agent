@@ -140,7 +140,7 @@ def test_kanban_tools_visible_with_toolset_config(monkeypatch, tmp_path):
         "kanban_list",
         "kanban_show", "kanban_complete", "kanban_block", "kanban_heartbeat",
         "kanban_request_review", "kanban_review_verdict",
-        "kanban_comment", "kanban_create", "kanban_link",
+        "kanban_comment", "kanban_create", "kanban_link", "kanban_unlink",
         "kanban_unblock", "kanban_archive",
         "kanban_attach", "kanban_attach_url", "kanban_attachments",
     }
@@ -1749,6 +1749,122 @@ def test_link_rejects_cycle(worker_env):
     assert json.loads(out).get("error")
 
 
+def test_unlink_promotes_child_and_returns_fresh_readback(monkeypatch, worker_env):
+    """Removing the final open parent immediately promotes the child."""
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    with kb.connect() as conn:
+        done_parent = kb.create_task(conn, title="done parent")
+        kb.complete_task(conn, done_parent)
+        open_parent = kb.create_task(conn, title="open parent")
+        child = kb.create_task(
+            conn, title="child", parents=[done_parent, open_parent]
+        )
+        assert kb.get_task(conn, child).status == "todo"
+
+    out = kt._handle_unlink({
+        "parent_id": open_parent,
+        "child_id": child,
+    })
+    receipt = json.loads(out)
+
+    assert receipt == {
+        "ok": True,
+        "parent_id": open_parent,
+        "child_id": child,
+        "removed": True,
+        "child_status": "ready",
+        "remaining_parent_ids": [done_parent],
+    }
+    with kb.connect() as conn:
+        assert kb.get_task(conn, child).status == "ready"
+        assert kb.parent_ids(conn, child) == [done_parent]
+
+
+def test_unlink_keeps_todo_with_another_open_parent_and_preserves_graph(
+    monkeypatch, worker_env
+):
+    """Only the exact edge is removed; other blockers and edges survive."""
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    with kb.connect() as conn:
+        removed_parent = kb.create_task(conn, title="removed parent")
+        remaining_parent = kb.create_task(conn, title="remaining parent")
+        child = kb.create_task(
+            conn, title="child", parents=[removed_parent, remaining_parent]
+        )
+        unrelated_parent = kb.create_task(conn, title="unrelated parent")
+        unrelated_child = kb.create_task(
+            conn, title="unrelated child", parents=[unrelated_parent]
+        )
+
+    receipt = json.loads(kt._handle_unlink({
+        "parent_id": removed_parent,
+        "child_id": child,
+    }))
+
+    assert receipt["ok"] is True
+    assert receipt["child_status"] == "todo"
+    assert receipt["remaining_parent_ids"] == [remaining_parent]
+    with kb.connect() as conn:
+        assert kb.parent_ids(conn, child) == [remaining_parent]
+        assert kb.get_task(conn, child).status == "todo"
+        assert kb.parent_ids(conn, unrelated_child) == [unrelated_parent]
+        assert kb.get_task(conn, unrelated_child).status == "todo"
+
+
+def test_unlink_missing_edge_fails_closed_without_mutation(monkeypatch, worker_env):
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    with kb.connect() as conn:
+        actual_parent = kb.create_task(conn, title="actual parent")
+        wrong_parent = kb.create_task(conn, title="wrong parent")
+        child = kb.create_task(conn, title="child", parents=[actual_parent])
+        before_events = list(kb.list_events(conn, child))
+
+    result = json.loads(kt._handle_unlink({
+        "parent_id": wrong_parent,
+        "child_id": child,
+    }))
+
+    assert "no such dependency link" in result.get("error", "")
+    with kb.connect() as conn:
+        assert kb.parent_ids(conn, child) == [actual_parent]
+        assert kb.get_task(conn, child).status == "todo"
+        assert list(kb.list_events(conn, child)) == before_events
+
+
+def test_unlink_rejects_missing_args_without_mutation(monkeypatch, worker_env):
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    from tools import kanban_tools as kt
+
+    assert json.loads(kt._handle_unlink({"parent_id": "x"})).get("error")
+    assert json.loads(kt._handle_unlink({"child_id": "y"})).get("error")
+
+
+def test_worker_unlink_is_orchestrator_only(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent")
+        child = kb.create_task(conn, title="child", parents=[parent])
+
+    result = json.loads(kt._handle_unlink({
+        "parent_id": parent,
+        "child_id": child,
+    }))
+    assert "orchestrator-only" in result.get("error", "")
+    with kb.connect() as conn:
+        assert kb.parent_ids(conn, child) == [parent]
+
+
 def test_unblock_happy_path(monkeypatch, worker_env):
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     from hermes_cli import kanban_db as kb
@@ -2478,6 +2594,34 @@ def test_board_param_routes_link_to_alt_board(multi_board_env):
         assert b in kb.child_ids(conn, a)
 
 
+def test_board_param_routes_unlink_to_alt_board(monkeypatch, multi_board_env):
+    """kanban_unlink removes only the alt board's exact edge."""
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    with kb.connect(board="alt") as conn:
+        alt_parent = kb.create_task(conn, title="alt parent")
+        alt_child = kb.create_task(conn, title="alt child", parents=[alt_parent])
+    with kb.connect() as conn:
+        default_parent = kb.create_task(conn, title="default parent")
+        default_child = kb.create_task(
+            conn, title="default child", parents=[default_parent]
+        )
+
+    receipt = json.loads(kt._handle_unlink({
+        "parent_id": alt_parent,
+        "child_id": alt_child,
+        "board": "alt",
+    }))
+    assert receipt["ok"] is True
+    assert receipt["child_status"] == "ready"
+    with kb.connect(board="alt") as conn:
+        assert kb.parent_ids(conn, alt_child) == []
+    with kb.connect() as conn:
+        assert kb.parent_ids(conn, default_child) == [default_parent]
+
+
 def test_board_param_none_falls_back_to_env(worker_env):
     """When ``board`` is omitted or None, behaviour is unchanged from
     before this feature — calls land on whatever the env resolves to.
@@ -2525,6 +2669,7 @@ def test_board_param_in_all_schemas():
         kt.KANBAN_CREATE_SCHEMA,
         kt.KANBAN_UNBLOCK_SCHEMA,
         kt.KANBAN_LINK_SCHEMA,
+        kt.KANBAN_UNLINK_SCHEMA,
         kt.KANBAN_ATTACH_SCHEMA,
         kt.KANBAN_ATTACH_URL_SCHEMA,
         kt.KANBAN_ATTACHMENTS_SCHEMA,

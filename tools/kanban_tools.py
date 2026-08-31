@@ -1663,6 +1663,52 @@ def _handle_link(args: dict, **kw) -> str:
         return tool_error(f"kanban_link: {e}")
 
 
+def _handle_unlink(args: dict, **kw) -> str:
+    """Remove one exact parent→child dependency edge through the Native DB."""
+    delegated_err = _reject_delegated_child_mutation("kanban_unlink")
+    if delegated_err:
+        return delegated_err
+    guard = _require_orchestrator_tool("kanban_unlink")
+    if guard:
+        return guard
+    parent_id = str(args.get("parent_id") or "").strip()
+    child_id = str(args.get("child_id") or "").strip()
+    if not parent_id or not child_id:
+        return tool_error("both parent_id and child_id are required")
+    board = args.get("board")
+    try:
+        kb, conn = _connect(board=board)
+        try:
+            removed = kb.unlink_tasks(
+                conn,
+                parent_id=parent_id,
+                child_id=child_id,
+            )
+            if not removed:
+                return tool_error(
+                    f"no such dependency link: {parent_id} -> {child_id}"
+                )
+            child = kb.get_task(conn, child_id)
+            if child is None:  # Defensive: a valid edge always has a child row.
+                raise RuntimeError(
+                    f"child {child_id} disappeared after dependency unlink"
+                )
+            return _ok(
+                parent_id=parent_id,
+                child_id=child_id,
+                removed=True,
+                child_status=child.status,
+                remaining_parent_ids=kb.parent_ids(conn, child_id),
+            )
+        finally:
+            conn.close()
+    except (ValueError, RuntimeError) as e:
+        return tool_error(f"kanban_unlink: {e}")
+    except Exception as e:
+        logger.exception("kanban_unlink failed")
+        return tool_error(f"kanban_unlink: {e}")
+
+
 # ---------------------------------------------------------------------------
 # Schemas
 # ---------------------------------------------------------------------------
@@ -2381,6 +2427,27 @@ KANBAN_LINK_SCHEMA = {
 }
 
 
+KANBAN_UNLINK_SCHEMA = {
+    "name": "kanban_unlink",
+    "description": (
+        "Remove one exact parent→child dependency edge after both tasks "
+        "already exist. The Native transaction immediately recomputes the "
+        "child's ready/todo status. A missing or mismatched edge fails closed "
+        "without mutation. Orchestrator-only — dispatcher-spawned task workers "
+        "never see this tool."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "parent_id": {"type": "string", "description": "Parent task id."},
+            "child_id": {"type": "string", "description": "Child task id."},
+            "board": _board_schema_prop(),
+        },
+        "required": ["parent_id", "child_id"],
+    },
+}
+
+
 # ---------------------------------------------------------------------------
 # Registration
 # ---------------------------------------------------------------------------
@@ -2518,4 +2585,13 @@ registry.register(
     handler=_handle_link,
     check_fn=_check_kanban_mode,
     emoji="🔗",
+)
+
+registry.register(
+    name="kanban_unlink",
+    toolset="kanban",
+    schema=KANBAN_UNLINK_SCHEMA,
+    handler=_handle_unlink,
+    check_fn=_check_kanban_orchestrator_mode,
+    emoji="🔓",
 )
