@@ -6022,11 +6022,11 @@ def _historical_auditor_child_is_non_authoritative(
 ) -> bool:
     """Authenticate one superseded same-profile audit child.
 
-    An explicitly archived child is closed history.  A non-archived child is
-    history only when its exact earlier handoff ended in one paired, typed
-    REQUEST_CHANGES verdict.  Merely being idle/todo is not enough: malformed,
-    unbound, PASS, active, or post-handoff competitors remain authoritative
-    ambiguity and fail closed.
+    A child is history only when it was explicitly archived *before* the latest
+    handoff without ever running, or when its latest ended run is bound to an
+    earlier typed handoff and paired REQUEST_CHANGES verdict.  Archiving after
+    the latest handoff cannot by itself erase a competitor: it is admissible
+    only when that earlier verdict had already made the child superseded.
     """
     identity_fields = (
         "current_run_id", "claim_lock", "claim_expires", "worker_pid",
@@ -6040,18 +6040,59 @@ def _historical_auditor_child_is_non_authoritative(
     if (
         child is None
         or child["assignee"] != auditor_profile
+        or child["status"] not in {"todo", "archived"}
         or any(child[field] is not None for field in identity_fields)
     ):
         return False
+
+    archive_event_id: Optional[int] = None
+    if child["status"] == "archived":
+        archive_rows = conn.execute(
+            "SELECT id, run_id, payload, created_at FROM task_events "
+            "WHERE task_id = ? AND kind = 'archived' ORDER BY id",
+            (auditor_task_id,),
+        ).fetchall()
+        if len(archive_rows) != 1:
+            return False
+        archive_row = archive_rows[0]
+        try:
+            archive_payload = json.loads(archive_row["payload"] or "{}")
+        except (TypeError, ValueError):
+            return False
+        if (
+            not isinstance(archive_payload, dict)
+            or set(archive_payload) != {"reason", "actor", "source"}
+            or any(
+                type(archive_payload[key]) is not str
+                or not archive_payload[key].strip()
+                for key in ("reason", "actor", "source")
+            )
+            or archive_payload["source"] != "kanban_archive"
+            or archive_row["run_id"] is not None
+            or type(archive_row["created_at"]) is not int
+        ):
+            return False
+        archive_event_id = int(archive_row["id"])
+
     runs = conn.execute(
         "SELECT id, profile, status, outcome, ended_at FROM task_runs "
         "WHERE task_id = ? ORDER BY id DESC", (auditor_task_id,),
     ).fetchall()
-    if any(row["ended_at"] is None for row in runs):
+    if any(
+        row["profile"] != auditor_profile or row["ended_at"] is None
+        for row in runs
+    ):
         return False
-    if child["status"] == "archived":
-        return True
-    if child["status"] != "todo" or len(runs) != 1:
+    if not runs:
+        return (
+            archive_event_id is not None
+            and archive_event_id < latest_handoff_event_id
+        )
+    if conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id = ? "
+        "AND kind = 'review_verdict' AND id > ? LIMIT 1",
+        (auditor_task_id, latest_handoff_event_id),
+    ).fetchone() is not None:
         return False
 
     handoff_rows = conn.execute(
@@ -6095,31 +6136,44 @@ def _historical_auditor_child_is_non_authoritative(
             return False
         if payload["review_task_id"] == auditor_task_id:
             matching.append((row, payload))
-    if len(matching) != 1:
-        return False
-    verdict_row, payload = matching[0]
-    if payload["verdict"] != "request_changes":
-        return False
-    review_run_id = int(payload["review_run_id"])
+    latest_run_id = int(runs[0]["id"])
+    terminal = [
+        (row, payload)
+        for row, payload in matching
+        if int(payload["review_run_id"]) == latest_run_id
+    ]
     if (
-        int(runs[0]["id"]) != review_run_id
-        or runs[0]["profile"] != auditor_profile
+        not matching
+        or len(terminal) != 1
+        or matching[-1] != terminal[0]
+        or terminal[0][1]["verdict"] != "request_changes"
         or runs[0]["status"] != "request_changes"
         or runs[0]["outcome"] != "request_changes"
-        or runs[0]["ended_at"] is None
     ):
         return False
-    mirrors = conn.execute(
-        "SELECT id, run_id, payload FROM task_events WHERE task_id = ? "
-        "AND kind = 'review_verdict' AND run_id = ? AND id > ? AND id < ? "
-        "ORDER BY id",
-        (auditor_task_id, review_run_id, prior_handoff.event_id,
-         latest_handoff_event_id),
-    ).fetchall()
-    if len(mirrors) != 1:
-        return False
-    mirrored = _canonical_review_verdict_payload(mirrors[0])
-    return mirrored == payload and verdict_row["run_id"] == review_run_id
+
+    run_by_id = {int(row["id"]): row for row in runs}
+    seen_run_ids: set[int] = set()
+    for verdict_row, payload in matching:
+        review_run_id = int(payload["review_run_id"])
+        run = run_by_id.get(review_run_id)
+        if review_run_id in seen_run_ids or run is None:
+            return False
+        seen_run_ids.add(review_run_id)
+        mirrors = conn.execute(
+            "SELECT id, run_id, payload FROM task_events WHERE task_id = ? "
+            "AND kind = 'review_verdict' AND run_id = ? AND id > ? AND id < ? "
+            "ORDER BY id",
+            (auditor_task_id, review_run_id, prior_handoff.event_id,
+             latest_handoff_event_id),
+        ).fetchall()
+        if (
+            len(mirrors) != 1
+            or _canonical_review_verdict_payload(mirrors[0]) != payload
+            or verdict_row["run_id"] != review_run_id
+        ):
+            return False
+    return True
 
 
 def _canonical_audit_receipt(

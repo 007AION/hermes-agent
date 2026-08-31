@@ -2230,33 +2230,125 @@ def test_canonical_audit_receipt_selects_latest_handoff_after_terminal_request_c
         assert _native_state_snapshot(conn) == before
 
 
-def test_canonical_audit_receipt_ignores_explicitly_archived_same_profile_sibling(
+def test_canonical_audit_receipt_ignores_pre_handoff_archived_same_profile_sibling(
     kanban_home, aion_gov_src,
 ):
     with kb.connect() as conn:
-        chain = _canonical_audit_receipt_chain(conn, author_assignee="agent007")
+        author = kb.create_task(
+            conn, title="generic reviewed author", factory_build_gate=1,
+            assignee="agent007",
+        )
         archived = kb.create_task(
             conn, title="explicitly superseded audit", assignee="bafuxunan",
-            parents=[chain["author"]],
+            parents=[author],
         )
-        conn.execute(
-            "UPDATE tasks SET status = 'archived' WHERE id = ?", (archived,),
+        assert kb.archive_task(
+            conn, archived, reason="superseded before exact audit selection",
+            actor="kanban-orchestrator", source="kanban_archive",
         )
-        conn.commit()
+        reviewer = kb.create_task(
+            conn, title="role-separated audit", factory_build_gate=1,
+            assignee="bafuxunan", parents=[author],
+        )
+        author_run = _claim_and_run_id(conn, author)
+        handoff = kb.request_review_handoff(
+            conn, author, expected_run_id=author_run, review_task_id=reviewer,
+            reason="exact Native receipt audit",
+        )
+        assert handoff is not None
+        reviewer_run = _claim_and_run_id(conn, reviewer)
+        assert kb.record_review_verdict(
+            conn, author, review_task_id=reviewer,
+            expected_review_run_id=reviewer_run, verdict="pass",
+            reason="PASS_EXACT_NATIVE_RECEIPT",
+        )
+        assert kb.complete_task(
+            conn, reviewer, expected_run_id=reviewer_run,
+            summary="independent audit passed",
+        )
         before = _native_state_snapshot(conn)
 
         assert kb._historical_auditor_child_is_non_authoritative(
             conn,
-            author_task_id=chain["author"],
+            author_task_id=author,
             author_profile="agent007",
             auditor_task_id=archived,
             auditor_profile="bafuxunan",
-            latest_handoff_event_id=chain["handoff"].event_id,
+            latest_handoff_event_id=handoff.event_id,
         )
-        receipt = kb._canonical_audit_receipt(conn, chain["author"])
+        receipt = kb._canonical_audit_receipt(conn, author)
 
         assert receipt is not None
-        assert receipt["auditor_task_id"] == chain["reviewer"]
+        assert receipt["auditor_task_id"] == reviewer
+        assert _native_state_snapshot(conn) == before
+
+
+def test_canonical_audit_receipt_rejects_post_handoff_archive_without_prior_verdict(
+    kanban_home, aion_gov_src,
+):
+    with kb.connect() as conn:
+        chain = _canonical_audit_receipt_chain(conn, author_assignee="agent007")
+        competitor = kb.create_task(
+            conn, title="post-handoff competing audit", assignee="bafuxunan",
+            parents=[chain["author"]],
+        )
+        assert kb.archive_task(
+            conn, competitor, reason="archive cannot manufacture supersession",
+            actor="kanban-orchestrator", source="kanban_archive",
+        )
+        before = _native_state_snapshot(conn)
+
+        assert kb._canonical_audit_receipt(conn, chain["author"]) is None
+        assert kb._reviewed_author_finalizer_run_id(conn, chain["author"]) is None
+        with pytest.raises(kb.FactoryTerminalReceiptRequiredError):
+            kb.complete_task(
+                conn, chain["author"], summary="reject post-handoff archive",
+            )
+        assert _native_state_snapshot(conn) == before
+
+
+@pytest.mark.parametrize("archive_drift", ["missing", "malformed", "duplicate"])
+def test_canonical_audit_receipt_rejects_bad_archive_provenance_zero_mutation(
+    kanban_home, aion_gov_src, archive_drift,
+):
+    with kb.connect() as conn:
+        chain = _canonical_multi_round_audit_receipt_chain(conn)
+        historical = chain["historical"][0]
+        archive_token = kb._STRICT_ORCHESTRATOR_ARCHIVE_AUTH.set(True)
+        try:
+            assert kb.archive_task(
+                conn, historical, reason="authenticated earlier request changes",
+                actor="kanban-orchestrator", source="kanban_archive",
+                fail_if_active_run=True, expected_status="todo",
+            )
+        finally:
+            kb._STRICT_ORCHESTRATOR_ARCHIVE_AUTH.reset(archive_token)
+        archive_row = conn.execute(
+            "SELECT id, payload, created_at FROM task_events WHERE task_id = ? "
+            "AND kind = 'archived'", (historical,),
+        ).fetchone()
+        if archive_drift == "missing":
+            conn.execute("DELETE FROM task_events WHERE id = ?", (archive_row["id"],))
+        elif archive_drift == "malformed":
+            conn.execute(
+                "UPDATE task_events SET payload = ? WHERE id = ?",
+                (json.dumps({"source": "kanban_archive"}), archive_row["id"]),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO task_events(task_id, kind, payload, created_at) "
+                "VALUES (?, 'archived', ?, ?)",
+                (historical, archive_row["payload"], archive_row["created_at"]),
+            )
+        conn.commit()
+        before = _native_state_snapshot(conn)
+
+        assert kb._canonical_audit_receipt(conn, chain["author"]) is None
+        assert kb._reviewed_author_finalizer_run_id(conn, chain["author"]) is None
+        with pytest.raises(kb.FactoryTerminalReceiptRequiredError):
+            kb.complete_task(
+                conn, chain["author"], summary="reject bad archive provenance",
+            )
         assert _native_state_snapshot(conn) == before
 
 
