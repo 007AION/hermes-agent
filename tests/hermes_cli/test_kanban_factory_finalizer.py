@@ -2231,7 +2231,7 @@ def test_canonical_audit_receipt_selects_latest_handoff_after_terminal_request_c
 
 
 def test_canonical_audit_receipt_ignores_pre_handoff_archived_same_profile_sibling(
-    kanban_home, aion_gov_src,
+    kanban_home, aion_gov_src, monkeypatch,
 ):
     with kb.connect() as conn:
         author = kb.create_task(
@@ -2242,12 +2242,28 @@ def test_canonical_audit_receipt_ignores_pre_handoff_archived_same_profile_sibli
             conn, title="explicitly superseded audit", assignee="bafuxunan",
             parents=[author],
         )
-        with kb._authenticated_strict_orchestrator_archive():
-            assert kb.archive_task(
-                conn, archived, reason="superseded before exact audit selection",
-                actor="kanban-orchestrator", source="kanban_archive",
-                fail_if_active_run=True, expected_status="todo",
-            )
+        # The strict factory write consumes two earlier clock samples. Put the
+        # second boundary exactly between the archived and authentication
+        # events that used to sample time independently.
+        boundary_times = iter((900, 900, 1000, 1001))
+        with monkeypatch.context() as patch_context:
+            patch_context.setattr(kb.time, "time", lambda: next(boundary_times))
+            with kb._authenticated_strict_orchestrator_archive():
+                assert kb.archive_task(
+                    conn, archived, reason="superseded before exact audit selection",
+                    actor="kanban-orchestrator", source="kanban_archive",
+                    fail_if_active_run=True, expected_status="todo",
+                )
+        archive_events = conn.execute(
+            "SELECT kind, created_at FROM task_events WHERE task_id = ? "
+            "AND kind IN ('archived', 'strict_orchestrator_archive_authenticated') "
+            "ORDER BY id",
+            (archived,),
+        ).fetchall()
+        assert [(row["kind"], row["created_at"]) for row in archive_events] == [
+            ("archived", 1000),
+            ("strict_orchestrator_archive_authenticated", 1000),
+        ]
         auth_payload = json.loads(conn.execute(
             "SELECT payload FROM task_events WHERE task_id = ? "
             "AND kind = 'strict_orchestrator_archive_authenticated'",

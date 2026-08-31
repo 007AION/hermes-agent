@@ -4873,15 +4873,17 @@ def _append_event(
     payload: Optional[dict] = None,
     *,
     run_id: Optional[int] = None,
+    created_at: Optional[int] = None,
 ) -> None:
     """Record an event row.  Called from within an already-open txn.
 
     ``run_id`` is optional: pass the current run id so UIs can group
     events by attempt. For events that aren't scoped to a single run
     (task created/edited/archived, dependency promotion) leave it None
-    and the row carries NULL.
+    and the row carries NULL. ``created_at`` lets one atomic operation bind
+    adjacent proof events to the same clock sample.
     """
-    now = int(time.time())
+    now = int(time.time()) if created_at is None else created_at
     pl = json.dumps(payload, ensure_ascii=False) if payload else None
     conn.execute(
         "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
@@ -13884,8 +13886,10 @@ def archive_task(
             )
             if value
         }
+        archive_created_at = int(time.time())
         _append_event(
             conn, task_id, "archived", audit_payload or None, run_id=run_id,
+            created_at=archive_created_at,
         )
         if strict_orchestrator_archive:
             # Persist a separate receipt minted only after the model-facing
@@ -13896,6 +13900,7 @@ def archive_task(
                 task_id,
                 "strict_orchestrator_archive_authenticated",
                 {"version": 1},
+                created_at=archive_created_at,
             )
     # ``archived`` parents no longer block children, same as ``done``.
     # Promote newly-unblocked dependents immediately instead of waiting
