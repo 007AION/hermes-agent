@@ -5991,6 +5991,23 @@ def _review_handoff_receipt_from_row(
         return None
 
 
+def _canonical_review_verdict_payload(row: sqlite3.Row) -> Optional[dict[str, Any]]:
+    try:
+        payload = json.loads(row["payload"] or "{}")
+        schema = {"version": int, "review_task_id": str, "review_run_id": int,
+                  "verdict": str, "reason": str}
+        if (not isinstance(payload, dict) or set(payload) != set(schema)
+                or any(type(payload[key]) is not expected for key, expected in schema.items())):
+            return None
+        return payload if (
+            payload["version"] == 1 and bool(payload["review_task_id"].strip())
+            and payload["verdict"] in {"pass", "request_changes"}
+            and bool(payload["reason"].strip()) and payload["review_run_id"] == row["run_id"]
+        ) else None
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
 def _canonical_audit_receipt(
     conn: sqlite3.Connection,
     task_id: str,
@@ -6084,25 +6101,11 @@ def _canonical_audit_receipt(
     if len(verdict_rows) != 1:
         return None
     verdict_row = verdict_rows[0]
-    try:
-        payload = json.loads(verdict_row["payload"] or "{}")
-    except (TypeError, ValueError):
-        return None
+    payload = _canonical_review_verdict_payload(verdict_row)
     if (
-        not isinstance(payload, dict)
-        or set(payload) != {
-            "version", "review_task_id", "review_run_id", "verdict", "reason",
-        }
-        or payload.get("version") != 1
-        or payload.get("review_task_id") != auditor_task_id
-        or isinstance(payload.get("review_run_id"), bool)
-        or not isinstance(payload.get("review_run_id"), int)
-        or payload["review_run_id"] != verdict_row["run_id"]
-        or payload.get("verdict") not in {"pass", "request_changes"}
-        or not isinstance(payload.get("reason"), str)
-        or not payload["reason"].strip()
-        or isinstance(verdict_row["created_at"], bool)
-        or not isinstance(verdict_row["created_at"], int)
+        payload is None
+        or payload["review_task_id"] != auditor_task_id
+        or type(verdict_row["created_at"]) is not int
     ):
         return None
     auditor_run_id = int(payload["review_run_id"])
@@ -6113,11 +6116,8 @@ def _canonical_audit_receipt(
     ).fetchall()
     if len(mirrors) != 1:
         return None
-    try:
-        mirrored_payload = json.loads(mirrors[0]["payload"] or "{}")
-    except (TypeError, ValueError):
-        return None
-    if mirrors[0]["run_id"] != auditor_run_id or mirrored_payload != payload:
+    mirrored_payload = _canonical_review_verdict_payload(mirrors[0])
+    if mirrored_payload is None or mirrored_payload != payload:
         return None
 
     auditor_runs = conn.execute(

@@ -2107,6 +2107,45 @@ def test_canonical_audit_receipt_hostile_drift_is_zero_mutation(
         assert _native_state_snapshot(conn) == before
 
 
+@pytest.mark.parametrize("scope", ["parent", "mirror", "paired"])
+@pytest.mark.parametrize(("field", "invalid"), [
+    ("version", True),
+    ("review_task_id", None),
+    ("review_run_id", "not-an-integer"),
+    ("verdict", {"value": "pass"}),
+    ("reason", False),
+])
+def test_canonical_audit_receipt_rejects_untyped_verdict_payloads_zero_mutation(
+    kanban_home, aion_gov_src, scope, field, invalid,
+):
+    with kb.connect() as conn:
+        chain = _canonical_audit_receipt_chain(conn)
+        targets = {
+            "parent": [chain["author"]],
+            "mirror": [chain["reviewer"]],
+            "paired": [chain["author"], chain["reviewer"]],
+        }[scope]
+        for task_id in targets:
+            row = conn.execute(
+                "SELECT id, payload FROM task_events WHERE task_id = ? "
+                "AND kind = 'review_verdict'", (task_id,),
+            ).fetchone()
+            payload = json.loads(row["payload"])
+            payload[field] = invalid
+            conn.execute(
+                "UPDATE task_events SET payload = ? WHERE id = ?",
+                (json.dumps(payload), row["id"]),
+            )
+        conn.commit()
+        before = _native_state_snapshot(conn)
+
+        assert kb._canonical_audit_receipt(conn, chain["author"]) is None
+        assert kb._reviewed_author_finalizer_run_id(conn, chain["author"]) is None
+        with pytest.raises(kb.FactoryTerminalReceiptRequiredError):
+            kb.complete_task(conn, chain["author"], summary="reject untyped verdict")
+        assert _native_state_snapshot(conn) == before
+
+
 def test_canonical_audit_receipt_ignores_cold_business_packet_metadata(
     kanban_home, aion_gov_src,
 ):
