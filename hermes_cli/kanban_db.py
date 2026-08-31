@@ -8464,6 +8464,263 @@ def _authenticated_non_pr_review_evidence(
     return re.search(r"\bPR\s+#[1-9][0-9]*\b", handoff_reason, re.IGNORECASE) is None
 
 
+def _authenticated_non_pr_controller_review_evidence(
+    conn: sqlite3.Connection,
+    review_md: dict,
+    *,
+    task_id: str,
+    author_run_id: int,
+    author_profile: str,
+    reviewer_id: str,
+    reviewer_run_id: int,
+    handoff_reason: str,
+) -> bool:
+    """Validate one closed GM/controller -> independent terminal-audit family.
+
+    The acceptance identity is the exact audit artifact schema plus its SHA-256.
+    Authority comes from the Native handoff/verdict edge and the reviewer run's
+    proof-kernel-authenticated terminal receipt; task prose, comments, titles,
+    and caller-supplied completion metadata are never authority.
+    """
+    metadata_keys = {
+        "artifact_sha256", "artifacts", "author_run", "author_task",
+        "claim_ceiling", "evidence", "forbidden_actions_performed",
+        "review_outcome", "secret_exposure", "worker_session_id",
+    }
+    verdict = "PASS_MINIMUM_LIVENESS_AND_LEAN_WITH_ORDERED_RESOURCE_GATE"
+    if (
+        author_profile not in FACTORY_REVIEW_VERDICT_RECOVERY_CONTROLLER_PROFILES
+        or set(review_md) != metadata_keys
+        or review_md.get("author_task") != task_id
+        or type(review_md.get("author_run")) is not int
+        or review_md.get("author_run") != author_run_id
+        or review_md.get("review_outcome") != verdict
+        or review_md.get("forbidden_actions_performed") != []
+        or review_md.get("secret_exposure") != "none"
+        or not isinstance(review_md.get("worker_session_id"), str)
+        or not review_md["worker_session_id"].strip()
+        or re.search(r"\bPR\s+#[1-9][0-9]*\b", handoff_reason, re.IGNORECASE)
+        is not None
+    ):
+        return False
+
+    audit_children = conn.execute(
+        "SELECT child.id FROM task_links link "
+        "JOIN tasks child ON child.id = link.child_id "
+        "WHERE link.parent_id = ? AND child.assignee = ? ORDER BY child.id",
+        (task_id, FACTORY_REVIEW_AUDITOR_PROFILE),
+    ).fetchall()
+    if [str(row["id"]) for row in audit_children] != [reviewer_id]:
+        return False
+
+    claim = review_md.get("claim_ceiling")
+    evidence = review_md.get("evidence")
+    artifacts = review_md.get("artifacts")
+    artifact_sha = review_md.get("artifact_sha256")
+    evidence_keys = {
+        "audit_review_verdict_events", "disk_used_percent", "installed_head",
+        "installed_tree", "native_quick_check", "resident_pid",
+        "resolver_candidates_remaining", "review_handoff_run",
+        "supported_finalization_run",
+    }
+    if (
+        not isinstance(claim, dict)
+        or set(claim) != {"factory_reliability", "seekapi_release"}
+        or claim.get("factory_reliability") != "NOT_CLAIMED"
+        or not isinstance(claim.get("seekapi_release"), str)
+        or not claim["seekapi_release"].startswith("HOLD_")
+        or not isinstance(evidence, dict)
+        or set(evidence) != evidence_keys
+        or evidence.get("native_quick_check") != "ok"
+        or type(evidence.get("resolver_candidates_remaining")) is not int
+        or evidence.get("resolver_candidates_remaining") != 0
+        or type(evidence.get("resident_pid")) is not int
+        or evidence.get("resident_pid", 0) <= 0
+        or any(
+            type(evidence.get(key)) is not int or evidence.get(key, 0) <= 0
+            for key in ("review_handoff_run", "supported_finalization_run")
+        )
+        or isinstance(evidence.get("disk_used_percent"), bool)
+        or not isinstance(evidence.get("disk_used_percent"), (int, float))
+        or not 0 <= evidence["disk_used_percent"] <= 100
+        or any(
+            not isinstance(evidence.get(key), str)
+            or re.fullmatch(r"[0-9a-fA-F]{40}", evidence[key]) is None
+            for key in ("installed_head", "installed_tree")
+        )
+        or not isinstance(artifact_sha, str)
+        or re.fullmatch(r"[0-9a-f]{64}", artifact_sha) is None
+        or not isinstance(artifacts, list)
+        or len(artifacts) != 1
+        or not isinstance(artifacts[0], str)
+        or not artifacts[0].endswith(".json")
+    ):
+        return False
+
+    verdict_event_ids = evidence.get("audit_review_verdict_events")
+    if (
+        not isinstance(verdict_event_ids, list)
+        or len(verdict_event_ids) != 2
+        or len(set(verdict_event_ids)) != 2
+        or any(type(event_id) is not int or event_id <= 0 for event_id in verdict_event_ids)
+    ):
+        return False
+    event_rows = conn.execute(
+        "SELECT id, task_id, kind, run_id, payload FROM task_events "
+        "WHERE id IN (?, ?) ORDER BY id",
+        tuple(verdict_event_ids),
+    ).fetchall()
+    if (
+        len(event_rows) != 2
+        or {str(row["task_id"]) for row in event_rows} != {task_id, reviewer_id}
+        or any(
+            row["kind"] != "review_verdict" or row["run_id"] != reviewer_run_id
+            for row in event_rows
+        )
+        or event_rows[0]["payload"] != event_rows[1]["payload"]
+    ):
+        return False
+
+    matching_attachments = [
+        attachment for attachment in list_attachments(conn, reviewer_id)
+        if attachment.stored_path == artifacts[0]
+    ]
+    if len(matching_attachments) != 1:
+        return False
+    attachment = matching_attachments[0]
+    if attachment.uploaded_by != "kanban_complete":
+        return False
+    try:
+        artifact_bytes = Path(attachment.stored_path).read_bytes()
+        artifact = json.loads(artifact_bytes.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    if (
+        len(artifact_bytes) != attachment.size
+        or _sha256_hex(artifact_bytes) != artifact_sha
+        or not isinstance(artifact, dict)
+    ):
+        return False
+
+    artifact_keys = {
+        "schema", "audit_task", "audit_run", "author_task", "author_run",
+        "verdict", "claim_ceiling", "scope_binding", "candidate_artifacts",
+        "installed", "resident", "native_wake", "review_handoff_canary",
+        "supported_finalization", "lean_runtime", "resource_gate", "residuals",
+        "native_quick_check", "forbidden_actions_performed", "secret_exposure",
+    }
+    schema_match = re.fullmatch(
+        r"AION_[1-9][0-9]*_MINIMUM_LIVENESS_INDEPENDENT_AUDIT_V1",
+        artifact.get("schema") if isinstance(artifact.get("schema"), str) else "",
+    )
+    artifact_claim = artifact.get("claim_ceiling")
+    installed = artifact.get("installed")
+    resident = artifact.get("resident")
+    scope = artifact.get("scope_binding")
+    scope_url = scope.get("governing_comment_url") if isinstance(scope, dict) else None
+    candidate_artifacts = artifact.get("candidate_artifacts")
+    residuals = artifact.get("residuals")
+    resource_gate = artifact.get("resource_gate")
+    if (
+        set(artifact) != artifact_keys
+        or schema_match is None
+        or artifact.get("audit_task") != reviewer_id
+        or type(artifact.get("audit_run")) is not int
+        or artifact.get("audit_run") != reviewer_run_id
+        or artifact.get("author_task") != task_id
+        or type(artifact.get("author_run")) is not int
+        or artifact.get("author_run") != author_run_id
+        or artifact.get("verdict") != verdict
+        or artifact.get("native_quick_check") != "ok"
+        or artifact.get("forbidden_actions_performed") != []
+        or artifact.get("secret_exposure") != "none"
+        or artifact_claim != {
+            "control_plane_liveness": "PASS", "review_handoff": "PASS", **claim,
+        }
+        or not isinstance(scope, dict)
+        or set(scope) != {
+            "governing_comment_id", "governing_comment_url", "later_comments",
+            "later_superseding_monarch_commands",
+        }
+        or type(scope.get("governing_comment_id")) is not int
+        or scope.get("governing_comment_id", 0) <= 0
+        or re.fullmatch(
+            r"https://github[.]com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/issues/"
+            r"[1-9][0-9]*#issuecomment-([1-9][0-9]*)",
+            scope_url if isinstance(scope_url, str) else "",
+        ) is None
+        or not isinstance(scope_url, str)
+        or not scope_url.endswith(
+            f"issuecomment-{scope['governing_comment_id']}"
+        )
+        or type(scope.get("later_superseding_monarch_commands")) is not int
+        or scope.get("later_superseding_monarch_commands") != 0
+        or not isinstance(scope.get("later_comments"), list)
+        or len(set(scope["later_comments"])) != len(scope["later_comments"])
+        or any(type(comment_id) is not int or comment_id <= 0 for comment_id in scope["later_comments"])
+        or not isinstance(candidate_artifacts, dict)
+        or not candidate_artifacts
+        or any(
+            not isinstance(name, str) or not name
+            or not isinstance(value, str)
+            or re.fullmatch(r"[0-9a-f]{64}", value) is None
+            for name, value in candidate_artifacts.items()
+        )
+        or len(set(candidate_artifacts.values())) != len(candidate_artifacts)
+        or not isinstance(installed, dict)
+        or installed.get("head") != evidence["installed_head"]
+        or installed.get("tree") != evidence["installed_tree"]
+        or installed.get("workspace_clean") is not True
+        or not isinstance(resident, dict)
+        or resident.get("main_pid") != evidence["resident_pid"]
+        or resident.get("active_state") != "active"
+        or resident.get("sub_state") != "running"
+        or resident.get("result") != "success"
+        or type(resident.get("nrestarts")) is not int
+        or resident.get("nrestarts") != 0
+        or not isinstance(residuals, dict)
+        or residuals.get("machine_resolvable_review_rows") != 0
+        or not isinstance(resource_gate, dict)
+        or set(resource_gate) != {
+            "disk_used_percent", "df_display_percent", "classification",
+            "hygiene_owner", "same_seekapi", "required_edges", "current_states",
+        }
+        or resource_gate.get("disk_used_percent") != evidence["disk_used_percent"]
+        or not isinstance(resource_gate.get("classification"), str)
+        or not resource_gate["classification"].endswith("_HOLD")
+    ):
+        return False
+
+    hygiene_id = resource_gate.get("hygiene_owner")
+    product_id = resource_gate.get("same_seekapi")
+    if (
+        not isinstance(hygiene_id, str)
+        or not isinstance(product_id, str)
+        or hygiene_id in {task_id, reviewer_id, product_id}
+        or product_id in {task_id, reviewer_id}
+        or resource_gate.get("required_edges")
+        != [f"{task_id}->{hygiene_id}", f"{hygiene_id}->{product_id}"]
+    ):
+        return False
+    state_rows = conn.execute(
+        "SELECT id, status FROM tasks WHERE id IN (?, ?) ORDER BY id",
+        (hygiene_id, product_id),
+    ).fetchall()
+    return (
+        len(state_rows) == 2
+        and resource_gate.get("current_states")
+        == {str(row["id"]): str(row["status"]) for row in state_rows}
+        and conn.execute(
+            "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ?",
+            (task_id, hygiene_id),
+        ).fetchone() is not None
+        and conn.execute(
+            "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ?",
+            (hygiene_id, product_id),
+        ).fetchone() is not None
+    )
+
+
 def _canonical_factory_review_packet(review_md: dict) -> Optional[dict]:
     """Normalize one exact emitted audit packet into the canonical review shape."""
     canonical_keys = {
@@ -9735,14 +9992,23 @@ def _reviewed_author_finalizer_run_id(
     """
     author = conn.execute(
         "SELECT status, assignee, current_run_id, claim_lock, claim_expires, "
-        "worker_pid, worker_starttime, fence_lineage, fence_disposition "
+        "worker_pid, worker_starttime, fence_lineage, fence_disposition, "
+        "factory_build_gate "
         "FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
+    author_profile = str(author["assignee"]) if author is not None else ""
+    controller_author = (
+        author_profile in FACTORY_REVIEW_VERDICT_RECOVERY_CONTROLLER_PROFILES
+        and author is not None and author["factory_build_gate"] == 1
+    )
     if (
         author is None
         or author["status"] != "review"
-        or author["assignee"] != FACTORY_REVIEW_AUTHOR_PROFILE
+        or (
+            author_profile != FACTORY_REVIEW_AUTHOR_PROFILE
+            and not controller_author
+        )
         or author["current_run_id"] is not None
         or any(
             author[field] is not None
@@ -9754,7 +10020,7 @@ def _reviewed_author_finalizer_run_id(
     ):
         return None
     runs = conn.execute(
-        "SELECT id, status, outcome, ended_at FROM task_runs "
+        "SELECT id, profile, status, outcome, ended_at FROM task_runs "
         "WHERE task_id = ? ORDER BY id DESC",
         (task_id,),
     ).fetchall()
@@ -9766,6 +10032,7 @@ def _reviewed_author_finalizer_run_id(
         or latest["outcome"] != "review_required"
         or latest["ended_at"] is None
         or any(row["ended_at"] is None for row in runs)
+        or (controller_author and latest["profile"] != author_profile)
     ):
         return None
     author_run_id = int(latest["id"])
@@ -9839,6 +10106,17 @@ def _reviewed_author_finalizer_run_id(
     _reviewer_run_id, reviewer_profile, review_md = reviewer
     if reviewer_profile != FACTORY_REVIEW_AUDITOR_PROFILE:
         return None
+    if controller_author:
+        return author_run_id if _authenticated_non_pr_controller_review_evidence(
+            conn,
+            review_md,
+            task_id=task_id,
+            author_run_id=author_run_id,
+            author_profile=author_profile,
+            reviewer_id=reviewer_id,
+            reviewer_run_id=_reviewer_run_id,
+            handoff_reason=handoff.reason,
+        ) else None
     canonical_review_md = _canonical_factory_review_packet(review_md)
     if canonical_review_md is not None:
         if _authenticated_canonical_factory_packet_chain(

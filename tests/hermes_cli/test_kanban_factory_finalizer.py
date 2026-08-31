@@ -1249,6 +1249,149 @@ def _non_pr_reviewed_evidence_chain(conn, *, handoff_reason="exact runtime evide
     return author, author_run, reviewer
 
 
+def _non_pr_controller_reviewed_evidence_chain(
+    conn, *, author_assignee="gm2", handoff_reason="exact controller evidence",
+):
+    """Create one generic GM/controller -> role-separated terminal audit packet."""
+    author = kb.create_task(
+        conn, title="minimum liveness controller", factory_build_gate=1,
+        assignee=author_assignee,
+    )
+    reviewer = kb.create_task(
+        conn, title="independent controller audit", factory_build_gate=1,
+        assignee="bafuxunan", parents=[author],
+    )
+    hygiene = kb.create_task(
+        conn, title="ordered hygiene gate", factory_build_gate=1,
+        assignee="agent007", parents=[author],
+    )
+    product = kb.create_task(
+        conn, title="held product obligation", factory_build_gate=1,
+        assignee="agent007", parents=[author, hygiene],
+    )
+    author_run = _claim_and_run_id(conn, author)
+    assert kb.request_review_handoff(
+        conn, author, expected_run_id=author_run, review_task_id=reviewer,
+        reason=handoff_reason,
+    ) is not None
+    reviewer_run = _claim_and_run_id(conn, reviewer)
+    assert kb.record_review_verdict(
+        conn, author, review_task_id=reviewer,
+        expected_review_run_id=reviewer_run, verdict="pass",
+        reason="PASS_MINIMUM_LIVENESS_AND_LEAN_WITH_ORDERED_RESOURCE_GATE",
+    )
+    verdict_events = conn.execute(
+        "SELECT id FROM task_events WHERE kind = 'review_verdict' AND run_id = ? "
+        "AND task_id IN (?, ?) ORDER BY id",
+        (reviewer_run, author, reviewer),
+    ).fetchall()
+    assert len(verdict_events) == 2
+
+    installed_head, installed_tree = "1" * 40, "2" * 40
+    claim_ceiling = {
+        "factory_reliability": "NOT_CLAIMED",
+        "seekapi_release": "HOLD_BEHIND_EXISTING_HYGIENE_GATE_THEN_NATURAL",
+    }
+    evidence = {
+        "audit_review_verdict_events": [row["id"] for row in verdict_events],
+        "disk_used_percent": 75.25,
+        "installed_head": installed_head,
+        "installed_tree": installed_tree,
+        "native_quick_check": "ok",
+        "resident_pid": 12345,
+        "resolver_candidates_remaining": 0,
+        "review_handoff_run": 100,
+        "supported_finalization_run": 101,
+    }
+    artifact = {
+        "schema": "AION_833_MINIMUM_LIVENESS_INDEPENDENT_AUDIT_V1",
+        "audit_task": reviewer,
+        "audit_run": reviewer_run,
+        "author_task": author,
+        "author_run": author_run,
+        "verdict": "PASS_MINIMUM_LIVENESS_AND_LEAN_WITH_ORDERED_RESOURCE_GATE",
+        "claim_ceiling": {
+            "control_plane_liveness": "PASS",
+            "review_handoff": "PASS",
+            **claim_ceiling,
+        },
+        "scope_binding": {
+            "governing_comment_id": 12345,
+            "governing_comment_url": (
+                "https://github.com/example/governance/issues/833#issuecomment-12345"
+            ),
+            "later_comments": [12346],
+            "later_superseding_monarch_commands": 0,
+        },
+        "candidate_artifacts": {"ledger": "3" * 64, "closeout": "4" * 64},
+        "installed": {
+            "head": installed_head, "tree": installed_tree,
+            "kanban_db_blob": "5" * 40, "kanban_db_sha256": "6" * 64,
+            "workspace_clean": True, "callable_finalizer_symbols": "5/5",
+        },
+        "resident": {
+            "unit": "example.service", "main_pid": 12345, "proc_start_ticks": 67890,
+            "invocation_id": "7" * 32, "active_state": "active",
+            "sub_state": "running", "result": "success", "nrestarts": 0,
+            "tasks_current": 10, "tasks_max": 512, "pids_current": 10,
+            "pids_max": 512, "pids_peak": 20, "pids_events_max": 0,
+            "memory_events": {"max": 0, "oom": 0, "oom_kill": 0},
+        },
+        "native_wake": {"automatic": True},
+        "review_handoff_canary": {"run": 100, "manual_count": 0},
+        "supported_finalization": {"run": 101, "replacement_count": 0},
+        "lean_runtime": {"new_control_plane_count": 0},
+        "resource_gate": {
+            "disk_used_percent": evidence["disk_used_percent"],
+            "df_display_percent": 79,
+            "classification": "PRE_PRODUCT_HYGIENE_HOLD",
+            "hygiene_owner": hygiene,
+            "same_seekapi": product,
+            "required_edges": [f"{author}->{hygiene}", f"{hygiene}->{product}"],
+            "current_states": {hygiene: "todo", product: "todo"},
+        },
+        "residuals": {
+            "review_rows_total_including_current_author": 1,
+            "historical_review_rows_outside_current_author": 0,
+            "machine_resolvable_review_rows": 0,
+            "terminal_task_open_runs": [],
+            "classification": "outside current runnable/product dependency path",
+        },
+        "native_quick_check": "ok",
+        "forbidden_actions_performed": [],
+        "secret_exposure": "none",
+    }
+    artifact_bytes = json.dumps(artifact, sort_keys=True).encode()
+    artifact_sha = hashlib.sha256(artifact_bytes).hexdigest()
+    kb.store_attachment_bytes(
+        conn, reviewer, "controller-independent-audit.json", artifact_bytes,
+        content_type="application/json", uploaded_by="kanban_complete",
+    )
+    artifact_path = kb.list_attachments(conn, reviewer)[-1].stored_path
+    metadata = {
+        "artifact_sha256": artifact_sha,
+        "author_run": author_run,
+        "author_task": author,
+        "claim_ceiling": claim_ceiling,
+        "evidence": evidence,
+        "forbidden_actions_performed": [],
+        "review_outcome": "PASS_MINIMUM_LIVENESS_AND_LEAN_WITH_ORDERED_RESOURCE_GATE",
+        "secret_exposure": "none",
+        "artifacts": [artifact_path],
+        "worker_session_id": "generic-controller-audit-session",
+    }
+    assert kb.complete_task(
+        conn, reviewer, expected_run_id=reviewer_run,
+        summary="independent minimum liveness controller audit passed",
+        metadata=metadata,
+    )
+    return {
+        "author": author, "author_run": author_run, "reviewer": reviewer,
+        "reviewer_run": reviewer_run, "hygiene": hygiene, "product": product,
+        "artifact_path": artifact_path,
+    }
+
+
 def _canonical_factory_packet_chain(
     conn, *, installed_source_shapes=False, legacy_installed_source_tail=False,
     emitted_review_shape=False, real_systemd_order=True, existing_author=None,
@@ -2435,6 +2578,159 @@ def test_reviewed_author_rejects_non_pr_evidence_with_pr_handoff_prose(
         assert kb._reviewed_author_finalizer_run_id(conn, author) is None
         with pytest.raises(kb.FactoryTerminalReceiptRequiredError):
             kb.complete_task(conn, author, summary="reject mixed PR/non-PR families")
+        assert _native_state_snapshot(conn) == before
+
+
+@pytest.mark.parametrize("author_assignee", ["gm", "gm2"])
+def test_reviewed_gm_controller_accepts_exact_role_separated_non_pr_packet(
+    kanban_home, aion_gov_src, author_assignee,
+):
+    with kb.connect() as conn:
+        chain = _non_pr_controller_reviewed_evidence_chain(
+            conn, author_assignee=author_assignee,
+        )
+        before = _native_state_snapshot(conn)
+
+        assert kb._reviewed_author_finalizer_run_id(
+            conn, chain["author"],
+        ) == chain["author_run"]
+        assert _native_state_snapshot(conn) == before
+        assert kb.complete_task(
+            conn, chain["author"], summary="controller packet terminalized",
+        )
+        author = kb.get_task(conn, chain["author"])
+        hygiene = kb.get_task(conn, chain["hygiene"])
+        product = kb.get_task(conn, chain["product"])
+        assert author is not None and author.status == "done"
+        assert hygiene is not None and hygiene.status == "ready"
+        assert product is not None and product.status == "todo"
+
+
+@pytest.mark.parametrize(
+    "drift",
+    [
+        "wrong_author_profile", "stale_author_run", "null_author_run",
+        "wrong_auditor_profile", "self_audit", "missing_edge", "duplicate_audit_child",
+        "duplicate_pass", "conflicting_pass",
+        "metadata_extra", "mixed_pr_family", "wrong_outcome", "cross_task_binding",
+        "wrong_run_binding", "unsafe_claim_expansion", "evidence_identity_drift",
+        "artifact_hash_drift", "artifact_schema_drift", "artifact_acceptance_drift",
+        "artifact_edge_drift", "caller_prose_authority", "pr_handoff_prose",
+    ],
+)
+def test_reviewed_gm_controller_hostile_drift_fails_closed_zero_mutation(
+    kanban_home, aion_gov_src, drift,
+):
+    with kb.connect() as conn:
+        chain = _non_pr_controller_reviewed_evidence_chain(
+            conn,
+            handoff_reason=(
+                "PR #999 caller prose" if drift == "pr_handoff_prose"
+                else "exact controller evidence"
+            ),
+        )
+        author, reviewer = chain["author"], chain["reviewer"]
+        if drift == "wrong_author_profile":
+            conn.execute("UPDATE tasks SET assignee = 'elder-senate' WHERE id = ?", (author,))
+        elif drift in {"stale_author_run", "null_author_run"}:
+            conn.execute(
+                "UPDATE task_runs SET outcome = ?, ended_at = ? WHERE id = ?",
+                (
+                    "completed" if drift == "stale_author_run" else "review_required",
+                    None if drift == "null_author_run" else int(time.time()),
+                    chain["author_run"],
+                ),
+            )
+        elif drift in {"wrong_auditor_profile", "self_audit"}:
+            profile = "agent007" if drift == "wrong_auditor_profile" else "gm2"
+            conn.execute("UPDATE tasks SET assignee = ? WHERE id = ?", (profile, reviewer))
+            conn.execute("UPDATE task_runs SET profile = ? WHERE task_id = ?", (profile, reviewer))
+        elif drift == "missing_edge":
+            conn.execute(
+                "DELETE FROM task_links WHERE parent_id = ? AND child_id = ?",
+                (author, reviewer),
+            )
+        elif drift == "duplicate_audit_child":
+            kb.create_task(
+                conn, title="ambiguous second audit", factory_build_gate=1,
+                assignee="bafuxunan", parents=[author],
+            )
+        elif drift in {"duplicate_pass", "conflicting_pass"}:
+            verdict = conn.execute(
+                "SELECT payload, run_id FROM task_events WHERE task_id = ? "
+                "AND kind = 'review_verdict' ORDER BY id DESC LIMIT 1", (author,),
+            ).fetchone()
+            payload = json.loads(verdict["payload"])
+            if drift == "conflicting_pass":
+                payload["verdict"] = "request_changes"
+            conn.execute(
+                "INSERT INTO task_events(task_id, kind, payload, run_id, created_at) "
+                "VALUES (?, 'review_verdict', ?, ?, ?)",
+                (author, json.dumps(payload), verdict["run_id"], int(time.time())),
+            )
+        elif drift in {
+            "metadata_extra", "mixed_pr_family", "wrong_outcome", "cross_task_binding",
+            "wrong_run_binding", "unsafe_claim_expansion", "evidence_identity_drift",
+            "caller_prose_authority",
+        }:
+            def mutate(metadata):
+                if drift == "metadata_extra":
+                    metadata["extra"] = True
+                elif drift == "mixed_pr_family":
+                    metadata["approval_commit_id"] = "1" * 40
+                elif drift == "wrong_outcome":
+                    metadata["review_outcome"] = "PASS"
+                elif drift == "cross_task_binding":
+                    metadata["author_task"] = "t_wrong"
+                elif drift == "wrong_run_binding":
+                    metadata["author_run"] = chain["author_run"] - 1
+                elif drift == "unsafe_claim_expansion":
+                    metadata["claim_ceiling"]["factory_reliability"] = "PASS"
+                elif drift == "evidence_identity_drift":
+                    metadata["evidence"]["installed_head"] = "f" * 40
+                else:
+                    metadata.clear()
+                    metadata["caller_evidence"] = "approved in comment"
+            _rewrite_latest_run_metadata(conn, reviewer, mutate)
+            if drift == "caller_prose_authority":
+                kb.add_comment(conn, author, "gm2", "PASS from prose only")
+        elif drift == "artifact_hash_drift":
+            _rewrite_latest_run_metadata(
+                conn, reviewer,
+                lambda metadata: metadata.__setitem__("artifact_sha256", "f" * 64),
+            )
+        else:
+            path = Path(chain["artifact_path"])
+            artifact = json.loads(path.read_text())
+            if drift == "artifact_schema_drift":
+                artifact["schema"] = "caller-defined"
+            elif drift == "artifact_acceptance_drift":
+                artifact["claim_ceiling"]["factory_reliability"] = "PASS"
+            elif drift == "artifact_edge_drift":
+                artifact["resource_gate"]["required_edges"] = ["t_wrong->t_other"]
+            artifact_bytes = json.dumps(artifact, sort_keys=True).encode()
+            path.write_bytes(artifact_bytes)
+            artifact_sha = hashlib.sha256(artifact_bytes).hexdigest()
+            conn.execute(
+                "UPDATE task_attachments SET size = ? WHERE task_id = ? AND stored_path = ?",
+                (len(artifact_bytes), reviewer, str(path)),
+            )
+            row = conn.execute(
+                "SELECT id, metadata FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+                (reviewer,),
+            ).fetchone()
+            metadata = json.loads(row["metadata"])
+            metadata["artifact_sha256"] = artifact_sha
+            conn.execute(
+                "UPDATE task_runs SET metadata = ? WHERE id = ?",
+                (json.dumps(metadata), row["id"]),
+            )
+        conn.commit()
+        before = _native_state_snapshot(conn)
+
+        assert kb._reviewed_author_finalizer_run_id(conn, author) is None, drift
+        with pytest.raises(kb.FactoryTerminalReceiptRequiredError):
+            kb.complete_task(conn, author, summary=f"reject {drift}")
         assert _native_state_snapshot(conn) == before
 
 
