@@ -2248,11 +2248,12 @@ def test_canonical_audit_receipt_ignores_pre_handoff_archived_same_profile_sibli
                 actor="kanban-orchestrator", source="kanban_archive",
                 fail_if_active_run=True, expected_status="todo",
             )
-        archive_payload = json.loads(conn.execute(
-            "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'archived'",
+        auth_payload = json.loads(conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? "
+            "AND kind = 'strict_orchestrator_archive_authenticated'",
             (archived,),
         ).fetchone()["payload"])
-        assert archive_payload["authenticated_strict_orchestrator_archive"] is True
+        assert auth_payload == {"version": 1}
         reviewer = kb.create_task(
             conn, title="role-separated audit", factory_build_gate=1,
             assignee="bafuxunan", parents=[author],
@@ -2308,11 +2309,11 @@ def test_canonical_audit_receipt_rejects_forged_pre_handoff_archive_labels(
             conn, archived, reason="caller-controlled labels",
             actor="kanban-orchestrator", source="kanban_archive",
         )
-        archive_payload = json.loads(conn.execute(
-            "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'archived'",
+        assert conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? "
+            "AND kind = 'strict_orchestrator_archive_authenticated'",
             (archived,),
-        ).fetchone()["payload"])
-        assert "authenticated_strict_orchestrator_archive" not in archive_payload
+        ).fetchone() is None
         reviewer = kb.create_task(
             conn, title="role-separated audit", factory_build_gate=1,
             assignee="bafuxunan", parents=[author],

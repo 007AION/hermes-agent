@@ -6060,28 +6060,13 @@ def _historical_auditor_child_is_non_authoritative(
             archive_payload = json.loads(archive_row["payload"] or "{}")
         except (TypeError, ValueError):
             return False
-        archive_keys = {"reason", "actor", "source"}
-        authenticated_archive = (
-            archive_payload.get("authenticated_strict_orchestrator_archive")
-            if isinstance(archive_payload, dict)
-            else None
-        )
         if (
             not isinstance(archive_payload, dict)
-            or set(archive_payload) not in {
-                frozenset(archive_keys),
-                frozenset(
-                    archive_keys | {"authenticated_strict_orchestrator_archive"},
-                ),
-            }
+            or set(archive_payload) != {"reason", "actor", "source"}
             or any(
                 type(archive_payload[key]) is not str
                 or not archive_payload[key].strip()
                 for key in ("reason", "actor", "source")
-            )
-            or (
-                "authenticated_strict_orchestrator_archive" in archive_payload
-                and authenticated_archive is not True
             )
             or archive_payload["source"] != "kanban_archive"
             or archive_row["run_id"] is not None
@@ -6089,6 +6074,29 @@ def _historical_auditor_child_is_non_authoritative(
         ):
             return False
         archive_event_id = int(archive_row["id"])
+        auth_rows = conn.execute(
+            "SELECT id, run_id, payload, created_at FROM task_events "
+            "WHERE task_id = ? "
+            "AND kind = 'strict_orchestrator_archive_authenticated' ORDER BY id",
+            (auditor_task_id,),
+        ).fetchall()
+        if len(auth_rows) > 1:
+            return False
+        if auth_rows:
+            auth_row = auth_rows[0]
+            try:
+                auth_payload = json.loads(auth_row["payload"] or "{}")
+            except (TypeError, ValueError):
+                return False
+            if (
+                auth_payload != {"version": 1}
+                or auth_row["run_id"] is not None
+                or type(auth_row["created_at"]) is not int
+                or int(auth_row["id"]) != archive_event_id + 1
+                or int(auth_row["created_at"]) != int(archive_row["created_at"])
+            ):
+                return False
+            authenticated_archive = True
 
     runs = conn.execute(
         "SELECT id, profile, status, outcome, ended_at FROM task_runs "
@@ -13867,7 +13875,7 @@ def archive_task(
             outcome="reclaimed",
             summary="invariant recovery on archive",
         )
-        audit_payload: dict[str, Any] = {
+        audit_payload = {
             key: value
             for key, value in (
                 ("reason", reason),
@@ -13876,14 +13884,19 @@ def archive_task(
             )
             if value
         }
-        if strict_orchestrator_archive:
-            # Persist the model-facing handler's already-validated capability.
-            # ``actor`` and ``source`` are caller-supplied audit labels; this
-            # marker is minted only from the ContextVar-backed live-role guard.
-            audit_payload["authenticated_strict_orchestrator_archive"] = True
         _append_event(
             conn, task_id, "archived", audit_payload or None, run_id=run_id,
         )
+        if strict_orchestrator_archive:
+            # Persist a separate receipt minted only after the model-facing
+            # handler's ContextVar-backed live-role guard and atomic todo/no-run
+            # checks pass. Existing archived-event payloads remain stable.
+            _append_event(
+                conn,
+                task_id,
+                "strict_orchestrator_archive_authenticated",
+                {"version": 1},
+            )
     # ``archived`` parents no longer block children, same as ``done``.
     # Promote newly-unblocked dependents immediately instead of waiting
     # for a later dispatcher tick.
