@@ -416,6 +416,65 @@ def _authorized_detached_controller_chain(
     return parent, action_run, child
 
 
+def _controlled_no_product_blocked_closeout_chain(conn):
+    from hermes_cli.aion_889_preflight import (
+        ACCEPTANCE_CONTRACT_SHA256,
+        CHECKER_VERSION,
+        FACTORY_PREFLIGHT_RECEIPT_SCHEMA,
+        REQUIREMENTS_SHA256,
+        SOLUTION_CONTRACT_SHA256,
+        compute_scope_identity_sha256,
+    )
+
+    task_id = kb.create_task(
+        conn,
+        title="generic controlled no-product fixture",
+        assignee="agent007",
+        factory_build_gate=1,
+        factory_directive_id="AION-889-PREFLIGHT-V1-IMPLEMENT",
+    )
+    scope_hash = compute_scope_identity_sha256(
+        directive_id="AION-889-PREFLIGHT-V1-IMPLEMENT",
+        risk_tier="T2_CORE_OR_HIGH_RISK",
+        requirements_sha256=REQUIREMENTS_SHA256,
+        solution_sha256=SOLUTION_CONTRACT_SHA256,
+        acceptance_sha256=ACCEPTANCE_CONTRACT_SHA256,
+    )
+    receipt = {
+        "schema": FACTORY_PREFLIGHT_RECEIPT_SCHEMA,
+        "task_id": task_id,
+        "risk_tier": "T2_CORE_OR_HIGH_RISK",
+        "outcome_requirement_sha256": REQUIREMENTS_SHA256,
+        "solution_contract_sha256": SOLUTION_CONTRACT_SHA256,
+        "solution_challenge_verdict": "PASS_SOLUTION_CHALLENGE",
+        "acceptance_contract_sha256": ACCEPTANCE_CONTRACT_SHA256,
+        "acceptance_challenge_verdict": "PASS_ACCEPTANCE_CHALLENGE",
+        "test_first_evidence": "3" * 64,
+        "preflight_checker_version": CHECKER_VERSION,
+        "preflight_verdict": "PASS",
+        "scope_identity_sha256": scope_hash,
+        "checker_output_sha256": "4" * 64,
+    }
+    raw = json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode()
+    attachment_id = kb.store_attachment_bytes(
+        conn, task_id, "aion_factory_preflight_receipt.json", raw,
+        content_type="application/json",
+        uploaded_by="aion_monarch_proof_kernel",
+    )
+    kb.bind_factory_preflight_receipt(conn, task_id, attachment_id)
+    claimed = kb.claim_task(conn, task_id, claimer="controlled-no-product")
+    assert claimed is not None and claimed.current_run_id is not None
+    run_id = int(claimed.current_run_id)
+    assert kb.block_task(
+        conn,
+        task_id,
+        reason=kb.FACTORY_CONTROLLED_NO_PRODUCT_CLOSEOUT_REASON,
+        kind="capability",
+        expected_run_id=run_id,
+    )
+    return task_id, run_id
+
+
 def test_detached_controller_finalizes_and_recomputes_child_atomically(
     kanban_home, aion_gov_src, monkeypatch,
 ):
@@ -440,6 +499,108 @@ def test_detached_controller_finalizes_and_recomputes_child_atomically(
             (parent,),
         ).fetchone()
         assert completed is not None and completed["run_id"] == action_run
+
+
+def test_controlled_no_product_blocked_closeout_is_generic_and_read_only(
+    kanban_home, aion_gov_src,
+):
+    with kb.connect() as conn:
+        task_id, run_id = _controlled_no_product_blocked_closeout_chain(conn)
+        before = _native_state_snapshot(conn)
+
+        assert kb._controlled_no_product_blocked_closeout_run_id(conn, task_id) == run_id
+        assert kb._detached_controller_finalizer_run_id(conn, task_id) == run_id
+        assert _native_state_snapshot(conn) == before
+
+
+def test_controlled_no_product_blocked_closeout_finalizes_through_existing_kernel(
+    kanban_home, aion_gov_src,
+):
+    with kb.connect() as conn:
+        task_id, run_id = _controlled_no_product_blocked_closeout_chain(conn)
+
+        assert kb.complete_task(
+            conn, task_id, summary="controlled no-product canary closeout",
+        )
+
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.status == "done"
+        completed = conn.execute(
+            "SELECT run_id FROM task_events WHERE task_id = ? AND kind = 'completed'",
+            (task_id,),
+        ).fetchone()
+        assert completed is not None and completed["run_id"] == run_id
+
+
+@pytest.mark.parametrize(
+    "drift",
+    [
+        "wrong_profile", "wrong_block_reason", "missing_preflight", "extra_edge",
+        "extra_run", "malformed_decision", "duplicate_pass", "later_claim",
+        "active_identity", "wrong_family_block_kind",
+    ],
+)
+def test_controlled_no_product_blocked_closeout_hostile_drift_zero_mutation(
+    kanban_home, aion_gov_src, drift,
+):
+    with kb.connect() as conn:
+        task_id, run_id = _controlled_no_product_blocked_closeout_chain(conn)
+        if drift == "wrong_profile":
+            conn.execute("UPDATE tasks SET assignee = 'gm2' WHERE id = ?", (task_id,))
+        elif drift == "wrong_block_reason":
+            conn.execute(
+                "UPDATE task_runs SET summary = 'ordinary capability block' WHERE id = ?",
+                (run_id,),
+            )
+        elif drift == "missing_preflight":
+            conn.execute(
+                "DELETE FROM task_attachments WHERE task_id = ? "
+                "AND filename = 'aion_factory_preflight_receipt.json'",
+                (task_id,),
+            )
+        elif drift == "extra_edge":
+            child = kb.create_task(conn, title="unexpected product", assignee="agent007")
+            conn.execute(
+                "INSERT INTO task_links(parent_id, child_id) VALUES (?, ?)",
+                (task_id, child),
+            )
+        elif drift == "extra_run":
+            conn.execute(
+                "INSERT INTO task_runs(task_id, profile, status, outcome, started_at, ended_at) "
+                "VALUES (?, 'agent007', 'blocked', 'blocked', 1, 1)",
+                (task_id,),
+            )
+        elif drift == "malformed_decision":
+            conn.execute(
+                "UPDATE task_events SET payload = '{}' WHERE task_id = ? "
+                "AND kind = 'preflight_decision'", (task_id,),
+            )
+        elif drift == "duplicate_pass":
+            row = conn.execute(
+                "SELECT payload FROM task_events WHERE task_id = ? "
+                "AND kind = 'preflight_decision'", (task_id,),
+            ).fetchone()
+            kb._append_event(conn, task_id, "preflight_decision", json.loads(row["payload"]))
+        elif drift == "later_claim":
+            kb._append_event(
+                conn, task_id, "claimed", {"run_id": run_id}, run_id=run_id,
+            )
+        elif drift == "active_identity":
+            conn.execute(
+                "UPDATE tasks SET current_run_id = ?, claim_lock = 'live' WHERE id = ?",
+                (run_id, task_id),
+            )
+        else:
+            conn.execute(
+                "UPDATE tasks SET block_kind = 'needs_input' WHERE id = ?", (task_id,),
+            )
+        conn.commit()
+        before = _native_state_snapshot(conn)
+
+        assert kb._controlled_no_product_blocked_closeout_run_id(conn, task_id) is None
+        with pytest.raises(kb.FactoryTerminalReceiptRequiredError):
+            kb.complete_task(conn, task_id, summary=f"reject {drift}")
+        assert _native_state_snapshot(conn) == before
 
 
 def test_detached_controller_requires_frozen_terminal_action_run(
@@ -1285,6 +1446,56 @@ def _canonical_audit_receipt_chain(conn, *, author_assignee="gm2"):
     }
 
 
+def _canonical_multi_round_audit_receipt_chain(conn):
+    author = kb.create_task(
+        conn, title="multi-round reviewed author", factory_build_gate=1,
+        assignee="agent007",
+    )
+    historical = [
+        kb.create_task(
+            conn, title=f"superseded audit {index}", factory_build_gate=1,
+            assignee="bafuxunan", parents=[author],
+        )
+        for index in range(2)
+    ]
+    reviewer = kb.create_task(
+        conn, title="latest exact audit", factory_build_gate=1,
+        assignee="bafuxunan", parents=[author],
+    )
+    for index, prior in enumerate(historical):
+        author_run = _claim_and_run_id(conn, author)
+        assert kb.request_review_handoff(
+            conn, author, expected_run_id=author_run, review_task_id=prior,
+            reason=f"repair round {index}",
+        )
+        review_run = _claim_and_run_id(conn, prior)
+        assert kb.record_review_verdict(
+            conn, author, review_task_id=prior,
+            expected_review_run_id=review_run, verdict="request_changes",
+            reason=f"REQUEST_CHANGES_ROUND_{index}",
+        )
+    author_run = _claim_and_run_id(conn, author)
+    handoff = kb.request_review_handoff(
+        conn, author, expected_run_id=author_run, review_task_id=reviewer,
+        reason="latest exact repair",
+    )
+    assert handoff is not None
+    reviewer_run = _claim_and_run_id(conn, reviewer)
+    assert kb.record_review_verdict(
+        conn, author, review_task_id=reviewer,
+        expected_review_run_id=reviewer_run, verdict="pass",
+        reason="PASS_LATEST_EXACT_REPAIR",
+    )
+    assert kb.complete_task(
+        conn, reviewer, expected_run_id=reviewer_run,
+        summary="latest independent audit passed",
+    )
+    return {
+        "author": author, "author_run": author_run, "historical": historical,
+        "reviewer": reviewer, "reviewer_run": reviewer_run, "handoff": handoff,
+    }
+
+
 def _canonical_factory_packet_chain(
     conn, *, installed_source_shapes=False, legacy_installed_source_tail=False,
     emitted_review_shape=False, real_systemd_order=True, existing_author=None,
@@ -1989,6 +2200,114 @@ def test_canonical_audit_receipt_finalizes_generic_author_and_recomputes_child(
             conn, chain["author"], summary="idempotent replay",
         )
         assert _native_state_snapshot(conn) == completed
+
+
+def test_canonical_audit_receipt_selects_latest_handoff_after_terminal_request_changes(
+    kanban_home, aion_gov_src,
+):
+    with kb.connect() as conn:
+        chain = _canonical_multi_round_audit_receipt_chain(conn)
+        before = _native_state_snapshot(conn)
+
+        assert all(
+            kb._historical_auditor_child_is_non_authoritative(
+                conn,
+                author_task_id=chain["author"],
+                author_profile="agent007",
+                auditor_task_id=historical,
+                auditor_profile="bafuxunan",
+                latest_handoff_event_id=chain["handoff"].event_id,
+            )
+            for historical in chain["historical"]
+        )
+        receipt = kb._canonical_audit_receipt(conn, chain["author"])
+
+        assert receipt is not None
+        assert receipt["author_run_id"] == chain["author_run"]
+        assert receipt["auditor_task_id"] == chain["reviewer"]
+        assert receipt["auditor_run_id"] == chain["reviewer_run"]
+        assert receipt["verdict"] == "PASS"
+        assert _native_state_snapshot(conn) == before
+
+
+def test_canonical_audit_receipt_ignores_explicitly_archived_same_profile_sibling(
+    kanban_home, aion_gov_src,
+):
+    with kb.connect() as conn:
+        chain = _canonical_audit_receipt_chain(conn, author_assignee="agent007")
+        archived = kb.create_task(
+            conn, title="explicitly superseded audit", assignee="bafuxunan",
+            parents=[chain["author"]],
+        )
+        conn.execute(
+            "UPDATE tasks SET status = 'archived' WHERE id = ?", (archived,),
+        )
+        conn.commit()
+        before = _native_state_snapshot(conn)
+
+        assert kb._historical_auditor_child_is_non_authoritative(
+            conn,
+            author_task_id=chain["author"],
+            author_profile="agent007",
+            auditor_task_id=archived,
+            auditor_profile="bafuxunan",
+            latest_handoff_event_id=chain["handoff"].event_id,
+        )
+        receipt = kb._canonical_audit_receipt(conn, chain["author"])
+
+        assert receipt is not None
+        assert receipt["auditor_task_id"] == chain["reviewer"]
+        assert _native_state_snapshot(conn) == before
+
+
+@pytest.mark.parametrize("competitor_status", ["todo", "ready", "running", "review"])
+def test_canonical_audit_receipt_rejects_live_same_profile_competitor_zero_mutation(
+    kanban_home, aion_gov_src, competitor_status,
+):
+    with kb.connect() as conn:
+        chain = _canonical_audit_receipt_chain(conn, author_assignee="agent007")
+        competitor = kb.create_task(
+            conn, title="competing audit", assignee="bafuxunan",
+            parents=[chain["author"]],
+        )
+        conn.execute(
+            "UPDATE tasks SET status = ? WHERE id = ?",
+            (competitor_status, competitor),
+        )
+        conn.commit()
+        before = _native_state_snapshot(conn)
+
+        assert kb._canonical_audit_receipt(conn, chain["author"]) is None
+        assert kb._reviewed_author_finalizer_run_id(conn, chain["author"]) is None
+        with pytest.raises(kb.FactoryTerminalReceiptRequiredError):
+            kb.complete_task(conn, chain["author"], summary="reject live competitor")
+        assert _native_state_snapshot(conn) == before
+
+
+def test_canonical_audit_receipt_rejects_malformed_historical_verdict_zero_mutation(
+    kanban_home, aion_gov_src,
+):
+    with kb.connect() as conn:
+        chain = _canonical_multi_round_audit_receipt_chain(conn)
+        historical = chain["historical"][0]
+        row = conn.execute(
+            "SELECT id, payload FROM task_events WHERE task_id = ? "
+            "AND kind = 'review_verdict'", (historical,),
+        ).fetchone()
+        payload = json.loads(row["payload"])
+        payload["review_run_id"] = "malformed"
+        conn.execute(
+            "UPDATE task_events SET payload = ? WHERE id = ?",
+            (json.dumps(payload), row["id"]),
+        )
+        conn.commit()
+        before = _native_state_snapshot(conn)
+
+        assert kb._canonical_audit_receipt(conn, chain["author"]) is None
+        assert kb._reviewed_author_finalizer_run_id(conn, chain["author"]) is None
+        with pytest.raises(kb.FactoryTerminalReceiptRequiredError):
+            kb.complete_task(conn, chain["author"], summary="reject malformed history")
+        assert _native_state_snapshot(conn) == before
 
 
 @pytest.mark.parametrize(
