@@ -31,6 +31,31 @@ RECEIPT = {
     "github_review_state": "CHANGES_REQUESTED",
 }
 
+LEGACY_RECEIPT = {
+    **RECEIPT,
+    "repository": "kiddhu/aion-governance",
+    "pr": 934,
+    "github_review_id": 5071574170,
+    "github_review_url": (
+        "https://github.com/kiddhu/aion-governance/pull/934"
+        "#pullrequestreview-5071574170"
+    ),
+}
+
+
+def _legacy_metadata():
+    return {
+        "corrected_final_verdict": "REQUEST_CHANGES_EXACT_HEAD",
+        **{
+            key: value
+            for key, value in LEGACY_RECEIPT.items()
+            if key not in {"review_outcome", "github_review_state"}
+        },
+        "merge_allowed": False,
+        "true_done": False,
+        "static_evidence": {"regression": "189 passed"},
+    }
+
 
 def _later_metadata(author, author_run, *, receipt=None):
     return {
@@ -564,3 +589,280 @@ def test_cli_recovery_requires_and_uses_dispatcher_controller_context(
     with kb.connect() as conn:
         author = kb.get_task(conn, fixture[0])
         assert author is not None and author.status == "ready"
+
+
+def _same_auditor_terminal_correction_fixture(
+    conn, *, controller_profile="gm2", metadata_mutate=None,
+):
+    author = kb.create_task(conn, title="implementation", assignee="agent007")
+    first_author = kb.claim_task(conn, author)
+    assert first_author is not None and first_author.current_run_id is not None
+    audit = kb.create_task(
+        conn, title="reused exact audit", assignee="bafuxunan", parents=[author]
+    )
+    first_handoff = kb.request_review_handoff(
+        conn, author, expected_run_id=first_author.current_run_id,
+        review_task_id=audit, reason="first exact head frozen",
+    )
+    assert first_handoff is not None
+    first_audit = kb.claim_task(conn, audit)
+    assert first_audit is not None and first_audit.current_run_id is not None
+    assert kb.record_review_verdict(
+        conn, author, review_task_id=audit,
+        expected_review_run_id=first_audit.current_run_id,
+        verdict="request_changes",
+        reason="REQUEST_CHANGES_EXACT_HEAD: repair the first head",
+    )
+    second_author = kb.claim_task(conn, author)
+    assert second_author is not None and second_author.current_run_id is not None
+    second_handoff = kb.request_review_handoff(
+        conn, author, expected_run_id=second_author.current_run_id,
+        review_task_id=audit, reason="repaired exact head frozen",
+    )
+    assert second_handoff is not None
+    second_audit = kb.claim_task(conn, audit)
+    assert second_audit is not None and second_audit.current_run_id is not None
+    assert kb.record_review_verdict(
+        conn, author, review_task_id=audit,
+        expected_review_run_id=second_audit.current_run_id, verdict="pass",
+        reason="PASS_EXACT_HEAD_WITH_RUNTIME_LIMITS: static checks accepted",
+    )
+    metadata = _legacy_metadata()
+    if metadata_mutate is not None:
+        metadata_mutate(metadata)
+    terminal_reason = "REQUEST_CHANGES_EXACT_HEAD: immutable runtime evidence absent"
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE task_runs SET status='done', outcome='completed', summary=?, "
+            "metadata=?, ended_at=23456, claim_lock=NULL, claim_expires=NULL, "
+            "worker_pid=NULL WHERE id=?",
+            (terminal_reason, json.dumps(metadata), second_audit.current_run_id),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='done', current_run_id=NULL, claim_lock=NULL, "
+            "claim_expires=NULL, worker_pid=NULL WHERE id=?", (audit,),
+        )
+    controller = kb.create_task(conn, title="controller", assignee=controller_profile)
+    controller_claim = kb.claim_task(conn, controller)
+    assert controller_claim is not None and controller_claim.current_run_id is not None
+    return {
+        "author": author, "audit": audit,
+        "audit_run": second_audit.current_run_id,
+        "controller": controller, "controller_run": controller_claim.current_run_id,
+        "first_author_run": first_author.current_run_id,
+        "first_audit_run": first_audit.current_run_id,
+        "second_author_run": second_author.current_run_id,
+        "first_handoff": first_handoff.event_id,
+        "second_handoff": second_handoff.event_id,
+        "reason": terminal_reason,
+    }
+
+
+def _recover_same_auditor(conn, fixture, *, receipt=None, reason=None, profile="gm2"):
+    return kb.record_review_verdict(
+        conn, fixture["author"], review_task_id=fixture["audit"],
+        expected_review_run_id=fixture["audit_run"], verdict="request_changes",
+        reason=fixture["reason"] if reason is None else reason,
+        recovery_receipt=LEGACY_RECEIPT if receipt is None else receipt,
+        controller_task_id=fixture["controller"],
+        controller_run_id=fixture["controller_run"], controller_profile=profile,
+    )
+
+
+def test_same_auditor_terminal_correction_resumes_once_and_is_idempotent(kanban_home):
+    with kb.connect() as conn:
+        fixture = _same_auditor_terminal_correction_fixture(conn)
+        before = _snapshot(conn)
+        assert _recover_same_auditor(conn, fixture)
+        after = _snapshot(conn)
+        assert after != before
+        assert _recover_same_auditor(conn, fixture)
+        assert _snapshot(conn) == after
+        author = kb.get_task(conn, fixture["author"])
+        assert author is not None and author.status == "ready"
+        events = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? "
+            "AND kind='review_verdict' ORDER BY id", (fixture["author"],),
+        ).fetchall()
+        assert [json.loads(row["payload"])["verdict"] for row in events] == [
+            "request_changes", "pass", "request_changes",
+        ]
+        recovery = json.loads(events[-1]["payload"])
+        assert recovery["version"] == 2 and recovery["recovery"] is True
+        assert recovery["recovery_receipt"] == LEGACY_RECEIPT
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda value: value.pop("corrected_final_verdict"),
+        lambda value: value.__setitem__("corrected_final_verdict", "PASS_EXACT_HEAD"),
+        lambda value: value.__setitem__("merge_allowed", True),
+        lambda value: value.__setitem__("true_done", True),
+        lambda value: value.__setitem__("review_outcome", "REQUEST_CHANGES_EXACT_HEAD"),
+        lambda value: value.__setitem__("github_review_state", "CHANGES_REQUESTED"),
+        lambda value: value.__setitem__("final_verdict", "REQUEST_CHANGES_EXACT_HEAD"),
+        lambda value: value.__setitem__("recovery_receipt", copy.deepcopy(LEGACY_RECEIPT)),
+        lambda value: value.__setitem__("head", "f" * 40),
+        lambda value: value.__setitem__("tree", "f" * 40),
+        lambda value: value.__setitem__("base", "f" * 40),
+        lambda value: value.__setitem__("github_review_id", 1),
+        lambda value: value.__setitem__(
+            "github_review_url",
+            "https://github.com/kiddhu/aion-governance/pull/934#pullrequestreview-1",
+        ),
+    ],
+)
+def test_same_auditor_terminal_correction_rejects_metadata_drift_without_mutation(
+    kanban_home, mutate,
+):
+    with kb.connect() as conn:
+        fixture = _same_auditor_terminal_correction_fixture(
+            conn, metadata_mutate=mutate,
+        )
+        before = _snapshot(conn)
+        assert not _recover_same_auditor(conn, fixture)
+        assert _snapshot(conn) == before
+
+
+@pytest.mark.parametrize(
+    "drift",
+    [
+        "missing_handoff", "duplicate_handoff", "out_of_order_handoff",
+        "missing_mirror", "duplicate_mirror", "wrong_first_verdict",
+        "wrong_second_run", "open_first_run", "nonlatest_run",
+        "post_terminal_verdict", "missing_edge", "wrong_auditor_role",
+        "wrong_source_run", "mirrors_before_author", "mirrors_after_terminal",
+    ],
+)
+def test_same_auditor_terminal_correction_rejects_round_drift_without_mutation(
+    kanban_home, drift,
+):
+    with kb.connect() as conn:
+        fixture = _same_auditor_terminal_correction_fixture(conn)
+        author, audit = fixture["author"], fixture["audit"]
+        if drift == "missing_handoff":
+            conn.execute("DELETE FROM task_events WHERE id=?", (fixture["first_handoff"],))
+        elif drift == "duplicate_handoff":
+            row = conn.execute(
+                "SELECT task_id,kind,payload,run_id,created_at FROM task_events WHERE id=?",
+                (fixture["first_handoff"],),
+            ).fetchone()
+            conn.execute(
+                "INSERT INTO task_events(task_id,kind,payload,run_id,created_at) "
+                "VALUES (?,?,?,?,?)", tuple(row),
+            )
+        elif drift == "out_of_order_handoff":
+            conn.execute(
+                "UPDATE task_events SET id=id+100000 WHERE id=?",
+                (fixture["first_handoff"],),
+            )
+        elif drift in {"missing_mirror", "duplicate_mirror"}:
+            row = conn.execute(
+                "SELECT id,task_id,kind,payload,run_id,created_at FROM task_events "
+                "WHERE task_id=? AND kind='review_verdict' AND run_id=?",
+                (audit, fixture["first_audit_run"]),
+            ).fetchone()
+            if drift == "missing_mirror":
+                conn.execute("DELETE FROM task_events WHERE id=?", (row["id"],))
+            else:
+                conn.execute(
+                    "INSERT INTO task_events(task_id,kind,payload,run_id,created_at) "
+                    "VALUES (?,?,?,?,?)", tuple(row)[1:],
+                )
+        elif drift in {"mirrors_before_author", "mirrors_after_terminal"}:
+            mirrors = conn.execute(
+                "SELECT id FROM task_events WHERE task_id=? "
+                "AND kind='review_verdict' ORDER BY id", (audit,),
+            ).fetchall()
+            assert len(mirrors) == 2
+            if drift == "mirrors_before_author":
+                moved_ids = (-2, -1)
+            else:
+                max_event_id = conn.execute(
+                    "SELECT MAX(id) FROM task_events",
+                ).fetchone()[0]
+                moved_ids = (max_event_id + 1, max_event_id + 2)
+            for mirror, moved_id in zip(mirrors, moved_ids):
+                conn.execute(
+                    "UPDATE task_events SET id=? WHERE id=?",
+                    (moved_id, mirror["id"]),
+                )
+        elif drift == "wrong_first_verdict":
+            for task_id in (author, audit):
+                row = conn.execute(
+                    "SELECT id,payload FROM task_events WHERE task_id=? "
+                    "AND kind='review_verdict' AND run_id=?",
+                    (task_id, fixture["first_audit_run"]),
+                ).fetchone()
+                payload = json.loads(row["payload"])
+                payload["verdict"] = "pass"
+                conn.execute(
+                    "UPDATE task_events SET payload=? WHERE id=?",
+                    (json.dumps(payload), row["id"]),
+                )
+        elif drift == "wrong_second_run":
+            row = conn.execute(
+                "SELECT id,payload FROM task_events WHERE task_id=? "
+                "AND kind='review_verdict' AND run_id=?",
+                (author, fixture["audit_run"]),
+            ).fetchone()
+            payload = json.loads(row["payload"])
+            payload["review_run_id"] = fixture["first_audit_run"]
+            conn.execute(
+                "UPDATE task_events SET payload=? WHERE id=?",
+                (json.dumps(payload), row["id"]),
+            )
+        elif drift == "open_first_run":
+            conn.execute(
+                "UPDATE task_runs SET ended_at=NULL WHERE id=?",
+                (fixture["first_audit_run"],),
+            )
+        elif drift == "nonlatest_run":
+            conn.execute(
+                "INSERT INTO task_runs(task_id,profile,status,outcome,started_at,ended_at) "
+                "VALUES (?, 'bafuxunan', 'done', 'completed', 1, 2)", (audit,),
+            )
+        elif drift == "post_terminal_verdict":
+            kb._append_event(
+                conn, author, "review_verdict",
+                {"version": 1, "review_task_id": audit,
+                 "review_run_id": fixture["audit_run"], "verdict": "pass",
+                 "reason": "ambiguous later verdict"}, run_id=fixture["audit_run"],
+            )
+        elif drift == "missing_edge":
+            conn.execute(
+                "DELETE FROM task_links WHERE parent_id=? AND child_id=?", (author, audit),
+            )
+        elif drift == "wrong_auditor_role":
+            conn.execute("UPDATE tasks SET assignee='gm' WHERE id=?", (audit,))
+        else:
+            conn.execute(
+                "UPDATE task_runs SET status='done',outcome='completed' WHERE id=?",
+                (fixture["second_author_run"],),
+            )
+        conn.commit()
+        before = _snapshot(conn)
+        assert not _recover_same_auditor(conn, fixture)
+        assert _snapshot(conn) == before
+
+
+@pytest.mark.parametrize("field", ["head", "tree", "base", "github_review_id"])
+def test_same_auditor_terminal_correction_rejects_caller_receipt_drift(
+    kanban_home, field,
+):
+    with kb.connect() as conn:
+        fixture = _same_auditor_terminal_correction_fixture(conn)
+        receipt = copy.deepcopy(LEGACY_RECEIPT)
+        receipt[field] = 1 if field == "github_review_id" else "f" * 40
+        before = _snapshot(conn)
+        assert not _recover_same_auditor(conn, fixture, receipt=receipt)
+        assert _snapshot(conn) == before
+
+
+def test_same_auditor_terminal_correction_rejects_reason_drift(kanban_home):
+    with kb.connect() as conn:
+        fixture = _same_auditor_terminal_correction_fixture(conn)
+        before = _snapshot(conn)
+        assert not _recover_same_auditor(conn, fixture, reason="different summary")
+        assert _snapshot(conn) == before

@@ -7151,6 +7151,158 @@ def _closed_completed_audit_recovery_receipt(
     return {key: metadata[key] for key in sorted(receipt_keys)}, "top_level"
 
 
+def _legacy_terminal_correction_recovery_receipt(
+    metadata: dict,
+    recovery_receipt: dict,
+) -> Optional[dict[str, Any]]:
+    """Map one persisted legacy terminal correction to the closed receipt schema."""
+    conflicting_keys = {
+        "review_outcome", "github_review_state", "recovery_receipt",
+        "final_verdict", "verdict", "merge_base",
+    }
+    persisted_keys = {
+        "corrected_final_verdict", "repository", "pr", "head", "tree", "base",
+        "github_review_id", "github_review_url", "merge_allowed", "true_done",
+    }
+    if (
+        not isinstance(metadata, dict)
+        or not isinstance(recovery_receipt, dict)
+        or conflicting_keys.intersection(metadata)
+        or not persisted_keys.issubset(metadata)
+        or set(recovery_receipt) != _COMPLETED_RECOVERY_RECEIPT_KEYS
+        or metadata["corrected_final_verdict"] != "REQUEST_CHANGES_EXACT_HEAD"
+        or type(metadata["merge_allowed"]) is not bool
+        or metadata["merge_allowed"] is not False
+        or type(metadata["true_done"]) is not bool
+        or metadata["true_done"] is not False
+    ):
+        return None
+    repository = metadata["repository"]
+    pr_number = metadata["pr"]
+    review_id = metadata["github_review_id"]
+    if (
+        type(repository) is not str
+        or re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository) is None
+        or type(pr_number) is not int
+        or pr_number <= 0
+        or type(review_id) is not int
+        or review_id <= 0
+        or any(
+            type(metadata[key]) is not str
+            or re.fullmatch(r"[0-9a-fA-F]{40}", metadata[key]) is None
+            for key in ("head", "tree", "base")
+        )
+        or metadata["github_review_url"] != (
+            f"https://github.com/{repository}/pull/{pr_number}"
+            f"#pullrequestreview-{review_id}"
+        )
+    ):
+        return None
+    expected = {
+        "review_outcome": metadata["corrected_final_verdict"],
+        "repository": repository,
+        "pr": pr_number,
+        "head": metadata["head"],
+        "tree": metadata["tree"],
+        "base": metadata["base"],
+        "github_review_id": review_id,
+        "github_review_url": metadata["github_review_url"],
+        "github_review_state": "CHANGES_REQUESTED",
+    }
+    return expected if recovery_receipt == expected else None
+
+
+def _authenticated_same_auditor_terminal_correction_source_run_id(
+    conn: sqlite3.Connection,
+    task_id: str,
+    review_task_id: str,
+    expected_review_run_id: int,
+    prior: list[sqlite3.Row],
+    runs: list[sqlite3.Row],
+) -> Optional[int]:
+    """Authenticate two complete REQUEST_CHANGES→transient-PASS rounds."""
+    if len(prior) < 2 or len(runs) != 2:
+        return None
+    handoff_rows = conn.execute(
+        "SELECT id, run_id, payload FROM task_events WHERE task_id = ? "
+        "AND kind = 'review_handoff' ORDER BY id", (task_id,),
+    ).fetchall()
+    if len(handoff_rows) != 2:
+        return None
+    first_handoff = _review_handoff_receipt_from_row(task_id, handoff_rows[0])
+    second_handoff = _review_handoff_receipt_from_row(task_id, handoff_rows[1])
+    if (
+        first_handoff is None
+        or second_handoff is None
+        or first_handoff.review_task_id != review_task_id
+        or second_handoff.review_task_id != review_task_id
+        or first_handoff.recovery is not False
+        or second_handoff.recovery is not False
+    ):
+        return None
+    first_payload = _canonical_review_verdict_payload(prior[0])
+    second_payload = _canonical_review_verdict_payload(prior[1])
+    if (
+        first_payload is None
+        or second_payload is None
+        or first_payload["review_task_id"] != review_task_id
+        or second_payload["review_task_id"] != review_task_id
+        or first_payload["verdict"] != "request_changes"
+        or second_payload["verdict"] != "pass"
+        or second_payload["review_run_id"] != expected_review_run_id
+        or not (
+            first_handoff.event_id < int(prior[0]["id"])
+            < second_handoff.event_id < int(prior[1]["id"])
+        )
+    ):
+        return None
+    review_run_ids = (
+        first_payload["review_run_id"], second_payload["review_run_id"],
+    )
+    if (
+        review_run_ids[0] == review_run_ids[1]
+        or [int(row["id"]) for row in reversed(runs)] != list(review_run_ids)
+        or runs[1]["status"] != "request_changes"
+        or runs[1]["outcome"] != "request_changes"
+        or runs[1]["summary"] != first_payload["reason"]
+    ):
+        return None
+    source_run_ids = (first_handoff.expected_run_id, second_handoff.expected_run_id)
+    source_runs = conn.execute(
+        "SELECT id, profile, status, outcome, summary, ended_at FROM task_runs "
+        "WHERE task_id = ? AND status = 'review_required' ORDER BY id",
+        (task_id,),
+    ).fetchall()
+    if (
+        len(source_runs) != 2
+        or [int(row["id"]) for row in source_runs] != list(source_run_ids)
+        or any(
+            row["profile"] != FACTORY_REVIEW_AUTHOR_PROFILE
+            or row["outcome"] != "review_required"
+            or row["ended_at"] is None
+            for row in source_runs
+        )
+        or source_runs[0]["summary"] != first_handoff.reason
+        or source_runs[1]["summary"] != second_handoff.reason
+    ):
+        return None
+    mirrors = conn.execute(
+        "SELECT id, run_id, payload FROM task_events WHERE task_id = ? "
+        "AND kind = 'review_verdict' ORDER BY id", (review_task_id,),
+    ).fetchall()
+    if len(mirrors) != 2:
+        return None
+    for author_row, mirror_row in zip(prior[:2], mirrors):
+        if (
+            int(mirror_row["id"]) != int(author_row["id"]) + 1
+            or mirror_row["run_id"] != author_row["run_id"]
+            or mirror_row["payload"] != author_row["payload"]
+            or _canonical_review_verdict_payload(mirror_row) is None
+        ):
+            return None
+    return second_handoff.expected_run_id
+
+
 def _authenticated_prior_pass_handoff_run_id(
     conn: sqlite3.Connection,
     task_id: str,
@@ -7318,12 +7470,18 @@ def _recover_completed_review_verdict(
     except (TypeError, ValueError):
         return False
     expected_receipt = _canonical_completed_recovery_receipt(recovery_receipt)
-    if expected_receipt is None:
-        return False
     receipt, receipt_family = _closed_completed_audit_recovery_receipt(
         metadata, _COMPLETED_RECOVERY_RECEIPT_KEYS,
     )
-    if receipt != expected_receipt:
+    if expected_receipt is None:
+        expected_receipt = _legacy_terminal_correction_recovery_receipt(
+            metadata, recovery_receipt,
+        )
+        receipt = expected_receipt
+        receipt_family = (
+            "legacy_terminal_correction" if expected_receipt is not None else None
+        )
+    if expected_receipt is None or receipt != expected_receipt:
         return False
     payload = {
         "version": 2,
@@ -7340,7 +7498,7 @@ def _recover_completed_review_verdict(
         },
     }
     prior = conn.execute(
-        "SELECT run_id, payload FROM task_events WHERE task_id = ? "
+        "SELECT id, run_id, payload FROM task_events WHERE task_id = ? "
         "AND kind = 'review_verdict' ORDER BY id", (task_id,),
     ).fetchall()
     prior_payloads = []
@@ -7354,7 +7512,24 @@ def _recover_completed_review_verdict(
         prior_payloads.append(prior_payload)
 
     later_source_run_id = None
-    if prior and prior_payloads[0].get("verdict") == "pass":
+    correction_source_run_id = None
+    if receipt_family == "legacy_terminal_correction":
+        correction_source_run_id = (
+            _authenticated_same_auditor_terminal_correction_source_run_id(
+                conn, task_id, review_task_id, expected_review_run_id, prior, runs,
+            )
+        )
+        if correction_source_run_id is None:
+            return False
+        if len(prior) == 3:
+            return (
+                prior[2]["run_id"] == expected_review_run_id
+                and prior_payloads[2] == payload
+                and author["status"] == "ready"
+            )
+        if len(prior) != 2:
+            return False
+    elif prior and prior_payloads[0].get("verdict") == "pass":
         later_source_run_id = _authenticated_prior_pass_handoff_run_id(
             conn,
             task_id,
@@ -7426,7 +7601,7 @@ def _recover_completed_review_verdict(
                 and author["status"] == "ready"
             )
 
-    if prior and later_source_run_id is None:
+    if prior and later_source_run_id is None and correction_source_run_id is None:
         return False
     if author["status"] != "review":
         return False
