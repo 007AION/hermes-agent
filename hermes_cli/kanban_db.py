@@ -5941,6 +5941,23 @@ def _review_handoff_receipt_from_row(
 ) -> Optional[ReviewHandoffReceipt]:
     try:
         payload = json.loads(row["payload"] or "{}")
+        required = {
+            "version", "expected_run_id", "review_task_id", "reason",
+            "recovery", "receipt_sha256",
+        }
+        if not isinstance(payload, dict) or set(payload) != required:
+            return None
+        strict_types = (
+            (payload["version"], int), (payload["expected_run_id"], int),
+            (payload["review_task_id"], str), (payload["reason"], str),
+            (payload["recovery"], bool), (payload["receipt_sha256"], str),
+        )
+        if any(type(value) is not expected for value, expected in strict_types):
+            return None
+        if payload["version"] != 1 or not payload["review_task_id"].strip() or not (
+            payload["reason"].strip()
+        ):
+            return None
         signed = {
             "task_id": task_id,
             "version": payload["version"],
@@ -5957,9 +5974,9 @@ def _review_handoff_receipt_from_row(
                 ensure_ascii=False,
             ).encode("utf-8")
         ).hexdigest()
-        if payload["version"] != 1 or payload["receipt_sha256"] != expected_hash:
+        if payload["receipt_sha256"] != expected_hash:
             return None
-        if int(row["run_id"]) != int(payload["expected_run_id"]):
+        if row["run_id"] != payload["expected_run_id"]:
             return None
         return ReviewHandoffReceipt(
             event_id=int(row["id"]),
