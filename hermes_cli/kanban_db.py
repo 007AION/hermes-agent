@@ -6013,6 +6013,211 @@ def _canonical_review_verdict_payload(row: sqlite3.Row) -> Optional[dict[str, An
         return None
 
 
+_COMPLETED_RECOVERY_RECEIPT_KEYS = {
+    "review_outcome", "repository", "pr", "head", "tree", "base",
+    "github_review_id", "github_review_url", "github_review_state",
+}
+
+
+def _canonical_completed_recovery_receipt(receipt: Any) -> Optional[dict[str, Any]]:
+    """Return one strictly closed completed-audit recovery receipt."""
+    if not isinstance(receipt, dict) or set(receipt) != _COMPLETED_RECOVERY_RECEIPT_KEYS:
+        return None
+    review_id = receipt.get("github_review_id")
+    pr_number = receipt.get("pr")
+    if (
+        receipt.get("review_outcome") != "REQUEST_CHANGES_EXACT_HEAD"
+        or receipt.get("repository") != FACTORY_REVIEW_REPOSITORY
+        or isinstance(pr_number, bool)
+        or not isinstance(pr_number, int)
+        or pr_number <= 0
+        or any(
+            not isinstance(receipt.get(key), str)
+            or re.fullmatch(r"[0-9a-fA-F]{40}", receipt[key]) is None
+            for key in ("head", "tree", "base")
+        )
+        or isinstance(review_id, bool)
+        or not isinstance(review_id, int)
+        or review_id <= 0
+        or receipt.get("github_review_state") != "CHANGES_REQUESTED"
+        or receipt.get("github_review_url") != (
+            f"https://github.com/{FACTORY_REVIEW_REPOSITORY}/pull/{pr_number}"
+            f"#pullrequestreview-{review_id}"
+        )
+    ):
+        return None
+    return {key: receipt[key] for key in sorted(_COMPLETED_RECOVERY_RECEIPT_KEYS)}
+
+
+def _canonical_completed_recovery_payload(row: sqlite3.Row) -> Optional[dict[str, Any]]:
+    """Parse the exact version-2 event minted by completed-audit recovery."""
+    try:
+        payload = json.loads(row["payload"] or "{}")
+    except (TypeError, ValueError):
+        return None
+    schema = {
+        "version": int,
+        "review_task_id": str,
+        "review_run_id": int,
+        "verdict": str,
+        "reason": str,
+        "recovery": bool,
+        "recovery_receipt": dict,
+        "controller": dict,
+    }
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != set(schema)
+        or any(type(payload[key]) is not expected for key, expected in schema.items())
+        or payload["version"] != 2
+        or payload["verdict"] != "request_changes"
+        or payload["recovery"] is not True
+        or not payload["review_task_id"].strip()
+        or not payload["reason"].strip()
+        or row["run_id"] != payload["review_run_id"]
+        or _canonical_completed_recovery_receipt(payload["recovery_receipt"]) is None
+    ):
+        return None
+    controller = payload["controller"]
+    controller_schema = {"task_id": str, "run_id": int, "profile": str}
+    if (
+        set(controller) != set(controller_schema)
+        or any(
+            type(controller[key]) is not expected
+            for key, expected in controller_schema.items()
+        )
+        or not controller["task_id"].strip()
+        or controller["profile"] not in FACTORY_REVIEW_VERDICT_RECOVERY_CONTROLLER_PROFILES
+    ):
+        return None
+    return payload
+
+
+def _completed_recovery_history_is_non_authoritative(
+    conn: sqlite3.Connection,
+    *,
+    author_task_id: str,
+    author_profile: str,
+    auditor_task_id: str,
+    auditor_profile: str,
+    latest_handoff_event_id: int,
+    runs: list[sqlite3.Row],
+) -> bool:
+    """Authenticate one terminal audit converted by the version-2 recovery path."""
+    if (
+        author_profile != FACTORY_REVIEW_AUTHOR_PROFILE
+        or auditor_profile != FACTORY_REVIEW_AUDITOR_PROFILE
+        or len(runs) != 1
+        or runs[0]["status"] != "done"
+        or runs[0]["outcome"] != "completed"
+    ):
+        return False
+    handoff_rows = conn.execute(
+        "SELECT id, run_id, payload FROM task_events WHERE task_id = ? "
+        "AND kind = 'review_handoff' AND id < ? ORDER BY id",
+        (author_task_id, latest_handoff_event_id),
+    ).fetchall()
+    bound_handoffs = []
+    for row in handoff_rows:
+        receipt = _review_handoff_receipt_from_row(author_task_id, row)
+        if receipt is None:
+            return False
+        if receipt.review_task_id == auditor_task_id:
+            bound_handoffs.append(receipt)
+    if len(bound_handoffs) != 1:
+        return False
+    prior_handoff = bound_handoffs[0]
+    author_run = conn.execute(
+        "SELECT profile, status, outcome, ended_at FROM task_runs "
+        "WHERE id = ? AND task_id = ?",
+        (prior_handoff.expected_run_id, author_task_id),
+    ).fetchone()
+    if (
+        author_run is None
+        or author_run["profile"] != author_profile
+        or author_run["status"] != "review_required"
+        or author_run["outcome"] != "review_required"
+        or author_run["ended_at"] is None
+    ):
+        return False
+    recovery_rows = conn.execute(
+        "SELECT id, run_id, payload, created_at FROM task_events "
+        "WHERE task_id = ? AND kind = 'review_verdict' "
+        "AND id > ? AND id < ? ORDER BY id",
+        (author_task_id, prior_handoff.event_id, latest_handoff_event_id),
+    ).fetchall()
+    if len(recovery_rows) != 1:
+        return False
+    recovery_row = recovery_rows[0]
+    payload = _canonical_completed_recovery_payload(recovery_row)
+    review_run_id = int(runs[0]["id"])
+    if (
+        payload is None
+        or payload["review_task_id"] != auditor_task_id
+        or payload["review_run_id"] != review_run_id
+        or payload["reason"] != runs[0]["summary"]
+        or type(recovery_row["created_at"]) is not int
+    ):
+        return False
+    try:
+        metadata = json.loads(runs[0]["metadata"] or "{}")
+    except (TypeError, ValueError):
+        return False
+    receipt, family = _closed_completed_audit_recovery_receipt(
+        metadata, _COMPLETED_RECOVERY_RECEIPT_KEYS,
+    )
+    if (
+        family != "top_level"
+        or receipt != _canonical_completed_recovery_receipt(
+            payload["recovery_receipt"]
+        )
+    ):
+        return False
+    controller = payload["controller"]
+    controller_row = conn.execute(
+        "SELECT status, assignee, current_run_id, claim_lock, claim_expires, "
+        "worker_pid, worker_starttime, fence_lineage, fence_disposition "
+        "FROM tasks WHERE id = ?", (controller["task_id"],),
+    ).fetchone()
+    controller_runs = conn.execute(
+        "SELECT id, profile, status, outcome, started_at, ended_at FROM task_runs "
+        "WHERE task_id = ? ORDER BY id DESC", (controller["task_id"],),
+    ).fetchall()
+    identity_fields = (
+        "current_run_id", "claim_lock", "claim_expires", "worker_pid",
+        "worker_starttime", "fence_lineage", "fence_disposition",
+    )
+    if (
+        controller_row is None
+        or controller_row["status"] not in {"done", "archived"}
+        or controller_row["assignee"] != controller["profile"]
+        or any(controller_row[field] is not None for field in identity_fields)
+        or not controller_runs
+        or int(controller_runs[0]["id"]) != controller["run_id"]
+        or controller_runs[0]["profile"] != controller["profile"]
+        or controller_runs[0]["status"] != "done"
+        or controller_runs[0]["outcome"] != "completed"
+        or controller_runs[0]["ended_at"] is None
+        or type(controller_runs[0]["started_at"]) is not int
+        or not (
+            int(controller_runs[0]["started_at"])
+            <= int(recovery_row["created_at"])
+            <= int(controller_runs[0]["ended_at"])
+        )
+    ):
+        return False
+    if conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id = ? "
+        "AND kind = 'review_verdict' AND run_id = ? LIMIT 1",
+        (auditor_task_id, review_run_id),
+    ).fetchone() is not None:
+        return False
+    return conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id = ? AND id > ? LIMIT 1",
+        (auditor_task_id, latest_handoff_event_id),
+    ).fetchone() is None
+
+
 def _historical_auditor_child_is_non_authoritative(
     conn: sqlite3.Connection,
     *,
@@ -6024,11 +6229,10 @@ def _historical_auditor_child_is_non_authoritative(
 ) -> bool:
     """Authenticate one superseded same-profile audit child.
 
-    A child is history only when it was explicitly archived *before* the latest
-    handoff without ever running, or when its latest ended run is bound to an
-    earlier typed handoff and paired REQUEST_CHANGES verdict.  Archiving after
-    the latest handoff cannot by itself erase a competitor: it is admissible
-    only when that earlier verdict had already made the child superseded.
+    Every run must be machine-bound to an earlier typed handoff and terminal
+    REQUEST_CHANGES.  Two narrow historical variants are also recognized: the
+    exact version-2 completed-audit recovery receipt, and one initial blocked
+    precursor before a reused child's complete REQUEST_CHANGES rounds.
     """
     identity_fields = (
         "current_run_id", "claim_lock", "claim_expires", "worker_pid",
@@ -6042,7 +6246,7 @@ def _historical_auditor_child_is_non_authoritative(
     if (
         child is None
         or child["assignee"] != auditor_profile
-        or child["status"] not in {"todo", "archived"}
+        or child["status"] not in {"todo", "done", "archived"}
         or any(child[field] is not None for field in identity_fields)
     ):
         return False
@@ -6101,8 +6305,8 @@ def _historical_auditor_child_is_non_authoritative(
             authenticated_archive = True
 
     runs = conn.execute(
-        "SELECT id, profile, status, outcome, ended_at FROM task_runs "
-        "WHERE task_id = ? ORDER BY id DESC", (auditor_task_id,),
+        "SELECT id, profile, status, outcome, summary, metadata, ended_at "
+        "FROM task_runs WHERE task_id = ? ORDER BY id DESC", (auditor_task_id,),
     ).fetchall()
     if any(
         row["profile"] != auditor_profile or row["ended_at"] is None
@@ -6115,11 +6319,34 @@ def _historical_auditor_child_is_non_authoritative(
             and archive_event_id < latest_handoff_event_id
             and authenticated_archive is True
         )
-    if conn.execute(
-        "SELECT 1 FROM task_events WHERE task_id = ? "
-        "AND kind = 'review_verdict' AND id > ? LIMIT 1",
+    if child["status"] == "done":
+        return _completed_recovery_history_is_non_authoritative(
+            conn,
+            author_task_id=author_task_id,
+            author_profile=author_profile,
+            auditor_task_id=auditor_task_id,
+            auditor_profile=auditor_profile,
+            latest_handoff_event_id=latest_handoff_event_id,
+            runs=runs,
+        )
+    if child["status"] not in {"todo", "archived"}:
+        return False
+
+    post_handoff_events = conn.execute(
+        "SELECT id FROM task_events WHERE task_id = ? AND id > ? ORDER BY id",
         (auditor_task_id, latest_handoff_event_id),
-    ).fetchone() is not None:
+    ).fetchall()
+    allowed_post_ids = set()
+    if archive_event_id is not None and archive_event_id > latest_handoff_event_id:
+        allowed_post_ids.add(archive_event_id)
+        auth_row = conn.execute(
+            "SELECT id FROM task_events WHERE task_id = ? "
+            "AND kind = 'strict_orchestrator_archive_authenticated'",
+            (auditor_task_id,),
+        ).fetchone()
+        if auth_row is not None:
+            allowed_post_ids.add(int(auth_row["id"]))
+    if any(int(row["id"]) not in allowed_post_ids for row in post_handoff_events):
         return False
 
     handoff_rows = conn.execute(
@@ -6134,73 +6361,113 @@ def _historical_auditor_child_is_non_authoritative(
             return False
         if receipt.review_task_id == auditor_task_id:
             bound_handoffs.append(receipt)
-    if len(bound_handoffs) != 1:
-        return False
-    prior_handoff = bound_handoffs[0]
-    author_run = conn.execute(
-        "SELECT profile, status, outcome, ended_at FROM task_runs "
-        "WHERE id = ? AND task_id = ?",
-        (prior_handoff.expected_run_id, author_task_id),
-    ).fetchone()
-    if (
-        author_run is None
-        or author_run["profile"] != author_profile
-        or author_run["status"] != "review_required"
-        or author_run["outcome"] != "review_required"
-        or author_run["ended_at"] is None
-    ):
-        return False
-
-    verdict_rows = conn.execute(
-        "SELECT id, run_id, payload FROM task_events WHERE task_id = ? "
-        "AND kind = 'review_verdict' AND id > ? AND id < ? ORDER BY id",
-        (author_task_id, prior_handoff.event_id, latest_handoff_event_id),
-    ).fetchall()
-    matching = []
-    for row in verdict_rows:
-        payload = _canonical_review_verdict_payload(row)
-        if payload is None:
-            return False
-        if payload["review_task_id"] == auditor_task_id:
-            matching.append((row, payload))
-    latest_run_id = int(runs[0]["id"])
-    terminal = [
-        (row, payload)
-        for row, payload in matching
-        if int(payload["review_run_id"]) == latest_run_id
-    ]
-    if (
-        not matching
-        or len(terminal) != 1
-        or matching[-1] != terminal[0]
-        or terminal[0][1]["verdict"] != "request_changes"
-        or runs[0]["status"] != "request_changes"
-        or runs[0]["outcome"] != "request_changes"
-    ):
+    if not bound_handoffs:
         return False
 
     run_by_id = {int(row["id"]): row for row in runs}
     seen_run_ids: set[int] = set()
-    for verdict_row, payload in matching:
+    precursor_seen = False
+    request_changes_rounds = 0
+    for index, prior_handoff in enumerate(bound_handoffs):
+        next_event_id = (
+            bound_handoffs[index + 1].event_id
+            if index + 1 < len(bound_handoffs)
+            else latest_handoff_event_id
+        )
+        if prior_handoff.event_id >= next_event_id:
+            return False
+        author_run = conn.execute(
+            "SELECT profile, status, outcome, ended_at FROM task_runs "
+            "WHERE id = ? AND task_id = ?",
+            (prior_handoff.expected_run_id, author_task_id),
+        ).fetchone()
+        if (
+            author_run is None
+            or author_run["profile"] != author_profile
+            or author_run["status"] != "review_required"
+            or author_run["outcome"] != "review_required"
+            or author_run["ended_at"] is None
+        ):
+            return False
+        verdict_rows = conn.execute(
+            "SELECT id, run_id, payload FROM task_events WHERE task_id = ? "
+            "AND kind = 'review_verdict' AND id > ? AND id < ? ORDER BY id",
+            (author_task_id, prior_handoff.event_id, next_event_id),
+        ).fetchall()
+        matching = []
+        for verdict_row in verdict_rows:
+            payload = _canonical_review_verdict_payload(verdict_row)
+            if payload is None:
+                return False
+            if payload["review_task_id"] == auditor_task_id:
+                matching.append((verdict_row, payload))
+        blocked = conn.execute(
+            "SELECT id, run_id, payload FROM task_events WHERE task_id = ? "
+            "AND kind = 'blocked' AND id > ? AND id < ? ORDER BY id",
+            (auditor_task_id, prior_handoff.event_id, next_event_id),
+        ).fetchall()
+        if blocked:
+            if (
+                index != 0
+                or precursor_seen
+                or len(blocked) != 1
+                or blocked[0]["run_id"] is None
+                or (matching and int(blocked[0]["id"]) >= int(matching[0][0]["id"]))
+            ):
+                return False
+            precursor_run_id = int(blocked[0]["run_id"])
+            precursor_run = run_by_id.get(precursor_run_id)
+            try:
+                blocked_payload = json.loads(blocked[0]["payload"] or "{}")
+            except (TypeError, ValueError):
+                return False
+            if (
+                precursor_run is None
+                or precursor_run_id in seen_run_ids
+                or precursor_run["status"] != "blocked"
+                or precursor_run["outcome"] != "blocked"
+                or set(blocked_payload) != {"reason", "kind", "recurrences"}
+                or not isinstance(blocked_payload["reason"], str)
+                or not blocked_payload["reason"].strip()
+                or blocked_payload["kind"] not in {
+                    None, "dependency", "needs_input", "capability", "transient",
+                }
+                or type(blocked_payload["recurrences"]) is not int
+                or blocked_payload["recurrences"] != 1
+                or precursor_run["summary"] != blocked_payload["reason"]
+            ):
+                return False
+            seen_run_ids.add(precursor_run_id)
+            precursor_seen = True
+        if not matching:
+            if index != 0 or not precursor_seen:
+                return False
+            continue
+        if len(matching) != 1:
+            return False
+        verdict_row, payload = matching[0]
         review_run_id = int(payload["review_run_id"])
         run = run_by_id.get(review_run_id)
-        if review_run_id in seen_run_ids or run is None:
-            return False
-        seen_run_ids.add(review_run_id)
         mirrors = conn.execute(
             "SELECT id, run_id, payload FROM task_events WHERE task_id = ? "
             "AND kind = 'review_verdict' AND run_id = ? AND id > ? AND id < ? "
             "ORDER BY id",
-            (auditor_task_id, review_run_id, prior_handoff.event_id,
-             latest_handoff_event_id),
+            (auditor_task_id, review_run_id, prior_handoff.event_id, next_event_id),
         ).fetchall()
         if (
-            len(mirrors) != 1
+            review_run_id in seen_run_ids
+            or run is None
+            or payload["verdict"] != "request_changes"
+            or run["status"] != "request_changes"
+            or run["outcome"] != "request_changes"
+            or len(mirrors) != 1
             or _canonical_review_verdict_payload(mirrors[0]) != payload
             or verdict_row["run_id"] != review_run_id
         ):
             return False
-    return True
+        seen_run_ids.add(review_run_id)
+        request_changes_rounds += 1
+    return request_changes_rounds > 0 and seen_run_ids == set(run_by_id)
 
 
 def _canonical_audit_receipt(
@@ -6258,6 +6525,13 @@ def _canonical_audit_receipt(
     if handoff is None or handoff.expected_run_id != author_run_id:
         return None
 
+    if conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id = ? "
+        "AND kind = 'review_handoff' AND id > ? LIMIT 1",
+        (task_id, handoff.event_id),
+    ).fetchone() is not None:
+        return None
+
     auditor_task_id = handoff.review_task_id
     auditor = conn.execute(
         "SELECT status, assignee, current_run_id, claim_lock, claim_expires, "
@@ -6286,17 +6560,33 @@ def _canonical_audit_receipt(
         (task_id, auditor_profile),
     ).fetchall()
     sibling_ids = [str(row["id"]) for row in same_profile_children]
-    if auditor_task_id not in sibling_ids or any(
-        not _historical_auditor_child_is_non_authoritative(
-            conn,
-            author_task_id=task_id,
-            author_profile=author_profile,
-            auditor_task_id=sibling_id,
-            auditor_profile=auditor_profile,
-            latest_handoff_event_id=handoff.event_id,
+    historical_handoff_rows = conn.execute(
+        "SELECT id, run_id, payload FROM task_events WHERE task_id = ? "
+        "AND kind = 'review_handoff' AND id < ? ORDER BY id",
+        (task_id, handoff.event_id),
+    ).fetchall()
+    historical_handoff_ids = set()
+    for row in historical_handoff_rows:
+        historical_handoff = _review_handoff_receipt_from_row(task_id, row)
+        if historical_handoff is None:
+            return None
+        historical_handoff_ids.add(historical_handoff.review_task_id)
+    if (
+        auditor_task_id not in sibling_ids
+        or auditor_task_id in historical_handoff_ids
+        or not historical_handoff_ids.issubset(set(sibling_ids))
+        or any(
+            not _historical_auditor_child_is_non_authoritative(
+                conn,
+                author_task_id=task_id,
+                author_profile=author_profile,
+                auditor_task_id=sibling_id,
+                auditor_profile=auditor_profile,
+                latest_handoff_event_id=handoff.event_id,
+            )
+            for sibling_id in sibling_ids
+            if sibling_id != auditor_task_id
         )
-        for sibling_id in sibling_ids
-        if sibling_id != auditor_task_id
     ):
         return None
 
@@ -6338,12 +6628,11 @@ def _canonical_audit_receipt(
         else ("request_changes", "request_changes")
     )
     if (
-        not auditor_runs
+        len(auditor_runs) != 1
         or int(auditor_runs[0]["id"]) != auditor_run_id
         or auditor_runs[0]["profile"] != auditor_profile
         or (auditor_runs[0]["status"], auditor_runs[0]["outcome"]) != expected
         or auditor_runs[0]["ended_at"] is None
-        or any(row["ended_at"] is None for row in auditor_runs)
     ):
         return None
 
@@ -7028,37 +7317,13 @@ def _recover_completed_review_verdict(
         metadata = json.loads(review_run["metadata"] or "{}")
     except (TypeError, ValueError):
         return False
-    receipt_keys = {
-        "review_outcome", "repository", "pr", "head", "tree", "base",
-        "github_review_id", "github_review_url", "github_review_state",
-    }
-    if set(recovery_receipt) != receipt_keys:
+    expected_receipt = _canonical_completed_recovery_receipt(recovery_receipt)
+    if expected_receipt is None:
         return False
     receipt, receipt_family = _closed_completed_audit_recovery_receipt(
-        metadata, receipt_keys,
+        metadata, _COMPLETED_RECOVERY_RECEIPT_KEYS,
     )
-    if receipt is None:
-        return False
-    expected_receipt = {key: recovery_receipt.get(key) for key in sorted(receipt_keys)}
-    review_id = receipt.get("github_review_id")
-    pr_number = receipt.get("pr")
-    if (
-        receipt != expected_receipt
-        or receipt.get("review_outcome") != "REQUEST_CHANGES_EXACT_HEAD"
-        or receipt.get("repository") != FACTORY_REVIEW_REPOSITORY
-        or isinstance(pr_number, bool) or not isinstance(pr_number, int) or pr_number <= 0
-        or any(
-            not isinstance(receipt.get(key), str)
-            or re.fullmatch(r"[0-9a-fA-F]{40}", receipt[key]) is None
-            for key in ("head", "tree", "base")
-        )
-        or isinstance(review_id, bool) or not isinstance(review_id, int) or review_id <= 0
-        or receipt.get("github_review_state") != "CHANGES_REQUESTED"
-        or receipt.get("github_review_url") != (
-            f"https://github.com/{FACTORY_REVIEW_REPOSITORY}/pull/{pr_number}"
-            f"#pullrequestreview-{review_id}"
-        )
-    ):
+    if receipt != expected_receipt:
         return False
     payload = {
         "version": 2,
