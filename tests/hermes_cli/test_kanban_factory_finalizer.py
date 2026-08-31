@@ -1496,6 +1496,194 @@ def _canonical_multi_round_audit_receipt_chain(conn):
     }
 
 
+def _canonical_completed_recovery_history_chain(conn):
+    author = kb.create_task(
+        conn, title="recovered reviewed author", factory_build_gate=1,
+        assignee="agent007",
+    )
+    historical = kb.create_task(
+        conn, title="terminal recovered audit",
+        assignee="bafuxunan", parents=[author],
+    )
+    reviewer = kb.create_task(
+        conn, title="latest exact audit",
+        assignee="bafuxunan", parents=[author],
+    )
+    author_run = _claim_and_run_id(conn, author)
+    assert kb.request_review_handoff(
+        conn, author, expected_run_id=author_run, review_task_id=historical,
+        reason="initial exact head",
+    )
+    historical_run = _claim_and_run_id(conn, historical)
+    recovery_reason = "REQUEST_CHANGES_EXACT_HEAD: exact terminal blockers"
+    recovery_receipt = {
+        "review_outcome": "REQUEST_CHANGES_EXACT_HEAD",
+        "repository": "kiddhu/hermes-agent",
+        "pr": 60,
+        "head": "1" * 40,
+        "tree": "2" * 40,
+        "base": "3" * 40,
+        "github_review_id": 12345,
+        "github_review_url": (
+            "https://github.com/kiddhu/hermes-agent/pull/60"
+            "#pullrequestreview-12345"
+        ),
+        "github_review_state": "CHANGES_REQUESTED",
+    }
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE task_runs SET status='done', outcome='completed', summary=?, "
+            "metadata=?, ended_at=12345, claim_lock=NULL, claim_expires=NULL, "
+            "worker_pid=NULL WHERE id=?",
+            (
+                recovery_reason,
+                json.dumps({**recovery_receipt, "changed_files": ["exact.py"]}),
+                historical_run,
+            ),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='done', current_run_id=NULL, claim_lock=NULL, "
+            "claim_expires=NULL, worker_pid=NULL WHERE id=?",
+            (historical,),
+        )
+    controller = kb.create_task(conn, title="gm2 recovery controller", assignee="gm2")
+    controller_run = _claim_and_run_id(conn, controller)
+    assert kb.record_review_verdict(
+        conn,
+        author,
+        review_task_id=historical,
+        expected_review_run_id=historical_run,
+        verdict="request_changes",
+        reason=recovery_reason,
+        recovery_receipt=recovery_receipt,
+        controller_task_id=controller,
+        controller_run_id=controller_run,
+        controller_profile="gm2",
+    )
+    assert kb.complete_task(
+        conn, controller, expected_run_id=controller_run,
+        summary="recovery controller completed",
+    )
+    latest_author_run = _claim_and_run_id(conn, author)
+    handoff = kb.request_review_handoff(
+        conn, author, expected_run_id=latest_author_run, review_task_id=reviewer,
+        reason="repaired exact head",
+    )
+    assert handoff is not None
+    reviewer_run = _claim_and_run_id(conn, reviewer)
+    assert kb.record_review_verdict(
+        conn, author, review_task_id=reviewer,
+        expected_review_run_id=reviewer_run, verdict="pass",
+        reason="PASS_LATEST_EXACT_REPAIR",
+    )
+    assert kb.complete_task(
+        conn, reviewer, expected_run_id=reviewer_run,
+        summary="latest independent audit passed",
+    )
+    recovery_event = conn.execute(
+        "SELECT id FROM task_events WHERE task_id = ? AND kind = 'review_verdict' "
+        "AND run_id = ?", (author, historical_run),
+    ).fetchone()
+    assert recovery_event is not None
+    return {
+        "author": author, "author_run": latest_author_run,
+        "historical": historical, "historical_run": historical_run,
+        "controller": controller, "controller_run": controller_run,
+        "reviewer": reviewer, "reviewer_run": reviewer_run, "handoff": handoff,
+        "recovery_event": int(recovery_event["id"]),
+    }
+
+
+def _canonical_reused_auditor_history_chain(conn):
+    author = kb.create_task(
+        conn, title="reused-child reviewed author", factory_build_gate=1,
+        assignee="bafuxunan",
+    )
+    historical = kb.create_task(
+        conn, title="reused historical audit",
+        assignee="elder-senate", parents=[author],
+    )
+    reviewer = kb.create_task(
+        conn, title="latest role-separated audit",
+        assignee="elder-senate", parents=[author],
+    )
+
+    precursor_author_run = _claim_and_run_id(conn, author)
+    precursor_handoff = kb.request_review_handoff(
+        conn, author, expected_run_id=precursor_author_run,
+        review_task_id=historical, reason="initial audit attempt",
+    )
+    assert precursor_handoff is not None
+    precursor_run = _claim_and_run_id(conn, historical)
+    assert kb.block_task(
+        conn, historical, reason="transient provider failure", kind="transient",
+        expected_run_id=precursor_run,
+    )
+    assert kb.unblock_task(conn, historical)
+    with kb.write_txn(conn):
+        assert conn.execute(
+            "UPDATE tasks SET status='ready' WHERE id=? AND status='todo'",
+            (historical,),
+        ).rowcount == 1
+        kb._append_event(conn, historical, "promoted", None)
+
+    initial_round_run = _claim_and_run_id(conn, historical)
+    assert kb.record_review_verdict(
+        conn, author, review_task_id=historical,
+        expected_review_run_id=initial_round_run, verdict="request_changes",
+        reason="REQUEST_CHANGES_ROUND_0",
+    )
+    rounds = [(precursor_handoff, initial_round_run)]
+    for index in range(1, 3):
+        round_author_run = _claim_and_run_id(conn, author)
+        round_handoff = kb.request_review_handoff(
+            conn, author, expected_run_id=round_author_run,
+            review_task_id=historical, reason=f"repair round {index}",
+        )
+        assert round_handoff is not None
+        round_run = _claim_and_run_id(conn, historical)
+        assert kb.record_review_verdict(
+            conn, author, review_task_id=historical,
+            expected_review_run_id=round_run, verdict="request_changes",
+            reason=f"REQUEST_CHANGES_ROUND_{index}",
+        )
+        rounds.append((round_handoff, round_run))
+
+    latest_author_run = _claim_and_run_id(conn, author)
+    latest_handoff = kb.request_review_handoff(
+        conn, author, expected_run_id=latest_author_run, review_task_id=reviewer,
+        reason="latest exact repair",
+    )
+    assert latest_handoff is not None
+    reviewer_run = _claim_and_run_id(conn, reviewer)
+    assert kb.record_review_verdict(
+        conn, author, review_task_id=reviewer,
+        expected_review_run_id=reviewer_run, verdict="pass",
+        reason="PASS_LATEST_EXACT_REPAIR",
+    )
+    assert kb.complete_task(
+        conn, reviewer, expected_run_id=reviewer_run,
+        summary="latest independent audit passed",
+    )
+    assert kb.archive_task(
+        conn, historical, reason="superseded after latest exact PASS",
+        actor="kanban-orchestrator", source="kanban_archive",
+        fail_if_active_run=True, expected_status="todo",
+    )
+    archive = conn.execute(
+        "SELECT id FROM task_events WHERE task_id = ? AND kind = 'archived'",
+        (historical,),
+    ).fetchone()
+    assert archive is not None
+    return {
+        "author": author, "author_run": latest_author_run,
+        "historical": historical, "precursor_handoff": precursor_handoff,
+        "precursor_run": precursor_run, "rounds": rounds,
+        "reviewer": reviewer, "reviewer_run": reviewer_run,
+        "handoff": latest_handoff, "archive_event": int(archive["id"]),
+    }
+
+
 def _canonical_factory_packet_chain(
     conn, *, installed_source_shapes=False, legacy_installed_source_tail=False,
     emitted_review_shape=False, real_systemd_order=True, existing_author=None,
@@ -2227,6 +2415,323 @@ def test_canonical_audit_receipt_selects_latest_handoff_after_terminal_request_c
         assert receipt["auditor_task_id"] == chain["reviewer"]
         assert receipt["auditor_run_id"] == chain["reviewer_run"]
         assert receipt["verdict"] == "PASS"
+        assert _native_state_snapshot(conn) == before
+
+
+def test_canonical_audit_receipt_rejects_reused_current_auditor_child(
+    kanban_home, aion_gov_src,
+):
+    with kb.connect() as conn:
+        author = kb.create_task(
+            conn, title="author with reused current auditor", factory_build_gate=1,
+            assignee="agent007",
+        )
+        reviewer = kb.create_task(
+            conn, title="reused current auditor", assignee="bafuxunan",
+            parents=[author],
+        )
+        first_author_run = _claim_and_run_id(conn, author)
+        assert kb.request_review_handoff(
+            conn, author, expected_run_id=first_author_run,
+            review_task_id=reviewer, reason="first candidate",
+        )
+        first_review_run = _claim_and_run_id(conn, reviewer)
+        assert kb.record_review_verdict(
+            conn, author, review_task_id=reviewer,
+            expected_review_run_id=first_review_run, verdict="request_changes",
+            reason="REQUEST_CHANGES_FIRST_CANDIDATE",
+        )
+        latest_author_run = _claim_and_run_id(conn, author)
+        assert kb.request_review_handoff(
+            conn, author, expected_run_id=latest_author_run,
+            review_task_id=reviewer, reason="latest candidate",
+        )
+        latest_review_run = _claim_and_run_id(conn, reviewer)
+        assert kb.record_review_verdict(
+            conn, author, review_task_id=reviewer,
+            expected_review_run_id=latest_review_run, verdict="pass",
+            reason="PASS_LATEST_CANDIDATE",
+        )
+        assert kb.complete_task(
+            conn, reviewer, expected_run_id=latest_review_run,
+            summary="latest reused-current audit passed",
+        )
+        before = _native_state_snapshot(conn)
+
+        assert kb._canonical_audit_receipt(conn, author) is None
+        assert kb._reviewed_author_finalizer_run_id(conn, author) is None
+        with pytest.raises(kb.FactoryTerminalReceiptRequiredError):
+            kb.complete_task(conn, author, summary="reject reused current auditor")
+        assert _native_state_snapshot(conn) == before
+
+
+@pytest.mark.parametrize(
+    ("fixture", "author_profile", "auditor_profile"),
+    [
+        (_canonical_completed_recovery_history_chain, "agent007", "bafuxunan"),
+        (_canonical_reused_auditor_history_chain, "bafuxunan", "elder-senate"),
+    ],
+)
+def test_canonical_audit_receipt_authenticates_residual_historical_variants(
+    kanban_home, aion_gov_src, fixture, author_profile, auditor_profile,
+):
+    with kb.connect() as conn:
+        chain = fixture(conn)
+        before = _native_state_snapshot(conn)
+
+        assert kb._historical_auditor_child_is_non_authoritative(
+            conn,
+            author_task_id=chain["author"],
+            author_profile=author_profile,
+            auditor_task_id=chain["historical"],
+            auditor_profile=auditor_profile,
+            latest_handoff_event_id=chain["handoff"].event_id,
+        )
+        receipt = kb._canonical_audit_receipt(conn, chain["author"])
+
+        assert receipt is not None
+        assert receipt["author_run_id"] == chain["author_run"]
+        assert receipt["auditor_task_id"] == chain["reviewer"]
+        assert receipt["auditor_run_id"] == chain["reviewer_run"]
+        assert receipt["verdict"] == "PASS"
+        assert _native_state_snapshot(conn) == before
+        assert kb.complete_task(
+            conn, chain["author"], summary="residual history terminalized on copy",
+        )
+        author = kb.get_task(conn, chain["author"])
+        assert author is not None and author.status == "done"
+
+
+@pytest.mark.parametrize(
+    "drift",
+    [
+        "missing_field", "extra_field", "type_drift", "reason_mismatch",
+        "receipt_mismatch", "metadata_mismatch", "controller_nonterminal",
+        "controller_wrong_profile", "controller_nonlatest", "cross_controller_run",
+        "child_nonlatest", "duplicate_recovery", "ordinary_done_no_recovery",
+        "unexpected_mirror", "wrong_role", "missing_edge", "post_latest_event",
+    ],
+)
+def test_completed_recovery_history_hostile_drift_zero_mutation(
+    kanban_home, aion_gov_src, drift,
+):
+    with kb.connect() as conn:
+        chain = _canonical_completed_recovery_history_chain(conn)
+        event = conn.execute(
+            "SELECT payload FROM task_events WHERE id = ?",
+            (chain["recovery_event"],),
+        ).fetchone()
+        payload = json.loads(event["payload"])
+        if drift == "missing_field":
+            payload.pop("controller")
+        elif drift == "extra_field":
+            payload["caller_claim"] = True
+        elif drift == "type_drift":
+            payload["version"] = True
+        elif drift == "reason_mismatch":
+            payload["reason"] = "controller prose"
+        elif drift == "receipt_mismatch":
+            payload["recovery_receipt"]["head"] = "f" * 40
+        elif drift == "metadata_mismatch":
+            run = conn.execute(
+                "SELECT metadata FROM task_runs WHERE id = ?",
+                (chain["historical_run"],),
+            ).fetchone()
+            metadata = json.loads(run["metadata"])
+            metadata["head"] = "f" * 40
+            conn.execute(
+                "UPDATE task_runs SET metadata = ? WHERE id = ?",
+                (json.dumps(metadata), chain["historical_run"]),
+            )
+        elif drift == "controller_nonterminal":
+            conn.execute(
+                "UPDATE tasks SET status='running', current_run_id=? WHERE id=?",
+                (chain["controller_run"], chain["controller"]),
+            )
+            conn.execute(
+                "UPDATE task_runs SET status='running', outcome=NULL, ended_at=NULL "
+                "WHERE id=?", (chain["controller_run"],),
+            )
+        elif drift == "controller_wrong_profile":
+            conn.execute(
+                "UPDATE tasks SET assignee='gm' WHERE id=?", (chain["controller"],),
+            )
+        elif drift == "controller_nonlatest":
+            conn.execute(
+                "INSERT INTO task_runs(task_id, profile, status, outcome, started_at, ended_at) "
+                "VALUES (?, 'gm2', 'done', 'completed', 1, 2)",
+                (chain["controller"],),
+            )
+        elif drift == "cross_controller_run":
+            payload["controller"]["run_id"] = chain["reviewer_run"]
+        elif drift == "child_nonlatest":
+            conn.execute(
+                "INSERT INTO task_runs(task_id, profile, status, outcome, started_at, ended_at) "
+                "VALUES (?, 'bafuxunan', 'done', 'completed', 1, 2)",
+                (chain["historical"],),
+            )
+        elif drift == "duplicate_recovery":
+            row = conn.execute(
+                "SELECT task_id, kind, payload, run_id, created_at FROM task_events "
+                "WHERE id=?", (chain["recovery_event"],),
+            ).fetchone()
+            conn.execute(
+                "INSERT INTO task_events(task_id, kind, payload, run_id, created_at) "
+                "VALUES (?, ?, ?, ?, ?)", tuple(row),
+            )
+        elif drift == "ordinary_done_no_recovery":
+            conn.execute(
+                "DELETE FROM task_events WHERE id=?", (chain["recovery_event"],),
+            )
+        elif drift == "unexpected_mirror":
+            conn.execute(
+                "INSERT INTO task_events(task_id,kind,payload,run_id,created_at) "
+                "VALUES (?, 'review_verdict', ?, ?, 1)",
+                (chain["historical"], json.dumps(payload), chain["historical_run"]),
+            )
+        elif drift == "wrong_role":
+            conn.execute(
+                "UPDATE tasks SET assignee='gm' WHERE id=?", (chain["historical"],),
+            )
+        elif drift == "missing_edge":
+            conn.execute(
+                "DELETE FROM task_links WHERE parent_id=? AND child_id=?",
+                (chain["author"], chain["historical"]),
+            )
+        elif drift == "post_latest_event":
+            kb._append_event(conn, chain["historical"], "status", {"status": "done"})
+        if drift in {
+            "missing_field", "extra_field", "type_drift", "reason_mismatch",
+            "receipt_mismatch", "cross_controller_run",
+        }:
+            conn.execute(
+                "UPDATE task_events SET payload=? WHERE id=?",
+                (json.dumps(payload), chain["recovery_event"]),
+            )
+        conn.commit()
+        before = _native_state_snapshot(conn)
+
+        assert kb._canonical_audit_receipt(conn, chain["author"]) is None
+        assert kb._reviewed_author_finalizer_run_id(conn, chain["author"]) is None
+        with pytest.raises(kb.FactoryTerminalReceiptRequiredError):
+            kb.complete_task(conn, chain["author"], summary=f"reject {drift}")
+        assert _native_state_snapshot(conn) == before
+
+
+@pytest.mark.parametrize(
+    "drift",
+    [
+        "missing_handoff", "duplicate_handoff", "missing_mirror",
+        "duplicate_mirror", "skipped_round", "mismatched_round",
+        "out_of_order_round", "run_drift", "historical_pass", "open_run",
+        "nonterminal_child", "archive_payload_drift", "duplicate_archive",
+        "unexpected_post_latest_event",
+    ],
+)
+def test_reused_auditor_history_hostile_drift_zero_mutation(
+    kanban_home, aion_gov_src, drift,
+):
+    with kb.connect() as conn:
+        chain = _canonical_reused_auditor_history_chain(conn)
+        first_handoff, first_run = chain["rounds"][0]
+        second_handoff, second_run = chain["rounds"][1]
+        if drift == "missing_handoff":
+            conn.execute("DELETE FROM task_events WHERE id=?", (first_handoff.event_id,))
+        elif drift == "duplicate_handoff":
+            row = conn.execute(
+                "SELECT task_id,kind,payload,run_id,created_at FROM task_events WHERE id=?",
+                (first_handoff.event_id,),
+            ).fetchone()
+            conn.execute(
+                "INSERT INTO task_events(task_id,kind,payload,run_id,created_at) "
+                "VALUES (?,?,?,?,?)", tuple(row),
+            )
+        elif drift in {"missing_mirror", "duplicate_mirror"}:
+            row = conn.execute(
+                "SELECT id,task_id,kind,payload,run_id,created_at FROM task_events "
+                "WHERE task_id=? AND kind='review_verdict' AND run_id=?",
+                (chain["historical"], first_run),
+            ).fetchone()
+            if drift == "missing_mirror":
+                conn.execute("DELETE FROM task_events WHERE id=?", (row["id"],))
+            else:
+                conn.execute(
+                    "INSERT INTO task_events(task_id,kind,payload,run_id,created_at) "
+                    "VALUES (?,?,?,?,?)",
+                    (row["task_id"], row["kind"], row["payload"], row["run_id"],
+                     row["created_at"]),
+                )
+        elif drift == "skipped_round":
+            conn.execute(
+                "DELETE FROM task_events WHERE task_id=? AND kind='review_verdict' "
+                "AND run_id=?", (chain["author"], second_run),
+            )
+        elif drift == "mismatched_round":
+            row = conn.execute(
+                "SELECT id,payload FROM task_events WHERE task_id=? "
+                "AND kind='review_verdict' AND run_id=?",
+                (chain["author"], second_run),
+            ).fetchone()
+            payload = json.loads(row["payload"])
+            payload["review_task_id"] = chain["reviewer"]
+            conn.execute(
+                "UPDATE task_events SET payload=? WHERE id=?",
+                (json.dumps(payload), row["id"]),
+            )
+        elif drift == "out_of_order_round":
+            conn.execute(
+                "UPDATE task_events SET id=id+1000000 WHERE id=?",
+                (first_handoff.event_id,),
+            )
+        elif drift == "run_drift":
+            conn.execute(
+                "UPDATE task_runs SET status='done', outcome='completed' WHERE id=?",
+                (first_run,),
+            )
+        elif drift == "historical_pass":
+            for task_id in (chain["author"], chain["historical"]):
+                row = conn.execute(
+                    "SELECT id,payload FROM task_events WHERE task_id=? "
+                    "AND kind='review_verdict' AND run_id=?",
+                    (task_id, first_run),
+                ).fetchone()
+                payload = json.loads(row["payload"])
+                payload["verdict"] = "pass"
+                conn.execute(
+                    "UPDATE task_events SET payload=? WHERE id=?",
+                    (json.dumps(payload), row["id"]),
+                )
+        elif drift == "open_run":
+            conn.execute(
+                "UPDATE task_runs SET ended_at=NULL WHERE id=?", (first_run,),
+            )
+        elif drift == "nonterminal_child":
+            conn.execute(
+                "UPDATE tasks SET status='todo' WHERE id=?", (chain["historical"],),
+            )
+        elif drift == "archive_payload_drift":
+            conn.execute(
+                "UPDATE task_events SET payload='{}' WHERE id=?",
+                (chain["archive_event"],),
+            )
+        elif drift == "duplicate_archive":
+            row = conn.execute(
+                "SELECT task_id,kind,payload,run_id,created_at FROM task_events WHERE id=?",
+                (chain["archive_event"],),
+            ).fetchone()
+            conn.execute(
+                "INSERT INTO task_events(task_id,kind,payload,run_id,created_at) "
+                "VALUES (?,?,?,?,?)", tuple(row),
+            )
+        else:
+            kb._append_event(conn, chain["historical"], "status", {"status": "archived"})
+        conn.commit()
+        before = _native_state_snapshot(conn)
+
+        assert kb._canonical_audit_receipt(conn, chain["author"]) is None
+        assert kb._reviewed_author_finalizer_run_id(conn, chain["author"]) is None
+        with pytest.raises(kb.FactoryTerminalReceiptRequiredError):
+            kb.complete_task(conn, chain["author"], summary=f"reject {drift}")
         assert _native_state_snapshot(conn) == before
 
 
