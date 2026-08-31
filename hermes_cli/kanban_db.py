@@ -6046,6 +6046,7 @@ def _historical_auditor_child_is_non_authoritative(
         return False
 
     archive_event_id: Optional[int] = None
+    authenticated_archive = False
     if child["status"] == "archived":
         archive_rows = conn.execute(
             "SELECT id, run_id, payload, created_at FROM task_events "
@@ -6059,13 +6060,28 @@ def _historical_auditor_child_is_non_authoritative(
             archive_payload = json.loads(archive_row["payload"] or "{}")
         except (TypeError, ValueError):
             return False
+        archive_keys = {"reason", "actor", "source"}
+        authenticated_archive = (
+            archive_payload.get("authenticated_strict_orchestrator_archive")
+            if isinstance(archive_payload, dict)
+            else None
+        )
         if (
             not isinstance(archive_payload, dict)
-            or set(archive_payload) != {"reason", "actor", "source"}
+            or set(archive_payload) not in {
+                frozenset(archive_keys),
+                frozenset(
+                    archive_keys | {"authenticated_strict_orchestrator_archive"},
+                ),
+            }
             or any(
                 type(archive_payload[key]) is not str
                 or not archive_payload[key].strip()
                 for key in ("reason", "actor", "source")
+            )
+            or (
+                "authenticated_strict_orchestrator_archive" in archive_payload
+                and authenticated_archive is not True
             )
             or archive_payload["source"] != "kanban_archive"
             or archive_row["run_id"] is not None
@@ -6087,6 +6103,7 @@ def _historical_auditor_child_is_non_authoritative(
         return (
             archive_event_id is not None
             and archive_event_id < latest_handoff_event_id
+            and authenticated_archive is True
         )
     if conn.execute(
         "SELECT 1 FROM task_events WHERE task_id = ? "
@@ -13850,7 +13867,7 @@ def archive_task(
             outcome="reclaimed",
             summary="invariant recovery on archive",
         )
-        audit_payload = {
+        audit_payload: dict[str, Any] = {
             key: value
             for key, value in (
                 ("reason", reason),
@@ -13859,6 +13876,11 @@ def archive_task(
             )
             if value
         }
+        if strict_orchestrator_archive:
+            # Persist the model-facing handler's already-validated capability.
+            # ``actor`` and ``source`` are caller-supplied audit labels; this
+            # marker is minted only from the ContextVar-backed live-role guard.
+            audit_payload["authenticated_strict_orchestrator_archive"] = True
         _append_event(
             conn, task_id, "archived", audit_payload or None, run_id=run_id,
         )

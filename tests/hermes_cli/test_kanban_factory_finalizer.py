@@ -2242,10 +2242,17 @@ def test_canonical_audit_receipt_ignores_pre_handoff_archived_same_profile_sibli
             conn, title="explicitly superseded audit", assignee="bafuxunan",
             parents=[author],
         )
-        assert kb.archive_task(
-            conn, archived, reason="superseded before exact audit selection",
-            actor="kanban-orchestrator", source="kanban_archive",
-        )
+        with kb._authenticated_strict_orchestrator_archive():
+            assert kb.archive_task(
+                conn, archived, reason="superseded before exact audit selection",
+                actor="kanban-orchestrator", source="kanban_archive",
+                fail_if_active_run=True, expected_status="todo",
+            )
+        archive_payload = json.loads(conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'archived'",
+            (archived,),
+        ).fetchone()["payload"])
+        assert archive_payload["authenticated_strict_orchestrator_archive"] is True
         reviewer = kb.create_task(
             conn, title="role-separated audit", factory_build_gate=1,
             assignee="bafuxunan", parents=[author],
@@ -2280,6 +2287,58 @@ def test_canonical_audit_receipt_ignores_pre_handoff_archived_same_profile_sibli
 
         assert receipt is not None
         assert receipt["auditor_task_id"] == reviewer
+        assert _native_state_snapshot(conn) == before
+
+
+def test_canonical_audit_receipt_rejects_forged_pre_handoff_archive_labels(
+    kanban_home, aion_gov_src,
+):
+    with kb.connect() as conn:
+        author = kb.create_task(
+            conn, title="generic reviewed author", factory_build_gate=1,
+            assignee="agent007",
+        )
+        archived = kb.create_task(
+            conn, title="forged superseded audit", assignee="bafuxunan",
+            parents=[author],
+        )
+        # Direct callers can forge actor/source strings, but cannot make
+        # archive_task persist the authenticated strict-orchestrator marker.
+        assert kb.archive_task(
+            conn, archived, reason="caller-controlled labels",
+            actor="kanban-orchestrator", source="kanban_archive",
+        )
+        archive_payload = json.loads(conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'archived'",
+            (archived,),
+        ).fetchone()["payload"])
+        assert "authenticated_strict_orchestrator_archive" not in archive_payload
+        reviewer = kb.create_task(
+            conn, title="role-separated audit", factory_build_gate=1,
+            assignee="bafuxunan", parents=[author],
+        )
+        author_run = _claim_and_run_id(conn, author)
+        handoff = kb.request_review_handoff(
+            conn, author, expected_run_id=author_run, review_task_id=reviewer,
+            reason="exact Native receipt audit",
+        )
+        assert handoff is not None
+        reviewer_run = _claim_and_run_id(conn, reviewer)
+        assert kb.record_review_verdict(
+            conn, author, review_task_id=reviewer,
+            expected_review_run_id=reviewer_run, verdict="pass",
+            reason="PASS_EXACT_NATIVE_RECEIPT",
+        )
+        assert kb.complete_task(
+            conn, reviewer, expected_run_id=reviewer_run,
+            summary="independent audit passed",
+        )
+        before = _native_state_snapshot(conn)
+
+        assert kb._canonical_audit_receipt(conn, author) is None
+        assert kb._reviewed_author_finalizer_run_id(conn, author) is None
+        with pytest.raises(kb.FactoryTerminalReceiptRequiredError):
+            kb.complete_task(conn, author, summary="reject forged archive labels")
         assert _native_state_snapshot(conn) == before
 
 
