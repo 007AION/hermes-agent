@@ -732,7 +732,7 @@ def test_same_auditor_terminal_correction_rejects_metadata_drift_without_mutatio
         "missing_mirror", "duplicate_mirror", "wrong_first_verdict",
         "wrong_second_run", "open_first_run", "nonlatest_run",
         "post_terminal_verdict", "missing_edge", "wrong_auditor_role",
-        "wrong_source_run",
+        "wrong_source_run", "mirrors_before_author", "mirrors_after_terminal",
     ],
 )
 def test_same_auditor_terminal_correction_rejects_round_drift_without_mutation(
@@ -769,6 +769,24 @@ def test_same_auditor_terminal_correction_rejects_round_drift_without_mutation(
                 conn.execute(
                     "INSERT INTO task_events(task_id,kind,payload,run_id,created_at) "
                     "VALUES (?,?,?,?,?)", tuple(row)[1:],
+                )
+        elif drift in {"mirrors_before_author", "mirrors_after_terminal"}:
+            mirrors = conn.execute(
+                "SELECT id FROM task_events WHERE task_id=? "
+                "AND kind='review_verdict' ORDER BY id", (audit,),
+            ).fetchall()
+            assert len(mirrors) == 2
+            if drift == "mirrors_before_author":
+                moved_ids = (-2, -1)
+            else:
+                max_event_id = conn.execute(
+                    "SELECT MAX(id) FROM task_events",
+                ).fetchone()[0]
+                moved_ids = (max_event_id + 1, max_event_id + 2)
+            for mirror, moved_id in zip(mirrors, moved_ids):
+                conn.execute(
+                    "UPDATE task_events SET id=? WHERE id=?",
+                    (moved_id, mirror["id"]),
                 )
         elif drift == "wrong_first_verdict":
             for task_id in (author, audit):

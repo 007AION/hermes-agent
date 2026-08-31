@@ -7294,7 +7294,8 @@ def _authenticated_same_auditor_terminal_correction_source_run_id(
         return None
     for author_row, mirror_row in zip(prior[:2], mirrors):
         if (
-            mirror_row["run_id"] != author_row["run_id"]
+            int(mirror_row["id"]) != int(author_row["id"]) + 1
+            or mirror_row["run_id"] != author_row["run_id"]
             or mirror_row["payload"] != author_row["payload"]
             or _canonical_review_verdict_payload(mirror_row) is None
         ):
