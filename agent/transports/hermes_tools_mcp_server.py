@@ -139,14 +139,14 @@ EXPOSED_TOOLS: tuple[str, ...] = (
     "kanban_heartbeat",
     "kanban_show",
     "kanban_list",
-    # NOTE: kanban_create / kanban_unblock / kanban_archive / kanban_link are
-    # orchestrator-only — the kanban tool gates them on HERMES_KANBAN_TASK
-    # being unset. They're exposed here for orchestrator agents running on the
-    # codex runtime that need to dispatch or retire tasks.
+    # NOTE: board-routing tools are gated by their Kanban check_fn. They're
+    # exposed here for orchestrator agents running on the codex runtime that
+    # need to dispatch, retire, or repair exact dependency edges.
     "kanban_create",
     "kanban_unblock",
     "kanban_archive",
     "kanban_link",
+    "kanban_unlink",
 )
 
 
