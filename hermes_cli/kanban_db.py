@@ -211,6 +211,9 @@ FACTORY_REVIEW_MERGER_PROFILE = "merger"
 FACTORY_REVIEW_MERGER_ACTOR = "kiddhu"
 FACTORY_REVIEW_REPOSITORY = "kiddhu/hermes-agent"
 FACTORY_REVIEW_VERDICT_RECOVERY_CONTROLLER_PROFILES = frozenset({"gm", "gm2"})
+FACTORY_CONTROLLED_NO_PRODUCT_CLOSEOUT_REASON = (
+    "MACHINE_CANARY_COMPLETE_NO_PRODUCT_PAYLOAD"
+)
 # Closed typed success tokens emitted by authenticated terminal exact-head
 # audits.  Do not normalize case, spacing, substrings, or prose aliases here.
 FACTORY_TERMINAL_AUDIT_SUCCESS_VERDICTS = frozenset({
@@ -4870,15 +4873,17 @@ def _append_event(
     payload: Optional[dict] = None,
     *,
     run_id: Optional[int] = None,
+    created_at: Optional[int] = None,
 ) -> None:
     """Record an event row.  Called from within an already-open txn.
 
     ``run_id`` is optional: pass the current run id so UIs can group
     events by attempt. For events that aren't scoped to a single run
     (task created/edited/archived, dependency promotion) leave it None
-    and the row carries NULL.
+    and the row carries NULL. ``created_at`` lets one atomic operation bind
+    adjacent proof events to the same clock sample.
     """
-    now = int(time.time())
+    now = int(time.time()) if created_at is None else created_at
     pl = json.dumps(payload, ensure_ascii=False) if payload else None
     conn.execute(
         "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
@@ -6008,6 +6013,196 @@ def _canonical_review_verdict_payload(row: sqlite3.Row) -> Optional[dict[str, An
         return None
 
 
+def _historical_auditor_child_is_non_authoritative(
+    conn: sqlite3.Connection,
+    *,
+    author_task_id: str,
+    author_profile: str,
+    auditor_task_id: str,
+    auditor_profile: str,
+    latest_handoff_event_id: int,
+) -> bool:
+    """Authenticate one superseded same-profile audit child.
+
+    A child is history only when it was explicitly archived *before* the latest
+    handoff without ever running, or when its latest ended run is bound to an
+    earlier typed handoff and paired REQUEST_CHANGES verdict.  Archiving after
+    the latest handoff cannot by itself erase a competitor: it is admissible
+    only when that earlier verdict had already made the child superseded.
+    """
+    identity_fields = (
+        "current_run_id", "claim_lock", "claim_expires", "worker_pid",
+        "worker_starttime", "fence_lineage", "fence_disposition",
+    )
+    child = conn.execute(
+        "SELECT status, assignee, current_run_id, claim_lock, claim_expires, "
+        "worker_pid, worker_starttime, fence_lineage, fence_disposition "
+        "FROM tasks WHERE id = ?", (auditor_task_id,),
+    ).fetchone()
+    if (
+        child is None
+        or child["assignee"] != auditor_profile
+        or child["status"] not in {"todo", "archived"}
+        or any(child[field] is not None for field in identity_fields)
+    ):
+        return False
+
+    archive_event_id: Optional[int] = None
+    authenticated_archive = False
+    if child["status"] == "archived":
+        archive_rows = conn.execute(
+            "SELECT id, run_id, payload, created_at FROM task_events "
+            "WHERE task_id = ? AND kind = 'archived' ORDER BY id",
+            (auditor_task_id,),
+        ).fetchall()
+        if len(archive_rows) != 1:
+            return False
+        archive_row = archive_rows[0]
+        try:
+            archive_payload = json.loads(archive_row["payload"] or "{}")
+        except (TypeError, ValueError):
+            return False
+        if (
+            not isinstance(archive_payload, dict)
+            or set(archive_payload) != {"reason", "actor", "source"}
+            or any(
+                type(archive_payload[key]) is not str
+                or not archive_payload[key].strip()
+                for key in ("reason", "actor", "source")
+            )
+            or archive_payload["source"] != "kanban_archive"
+            or archive_row["run_id"] is not None
+            or type(archive_row["created_at"]) is not int
+        ):
+            return False
+        archive_event_id = int(archive_row["id"])
+        auth_rows = conn.execute(
+            "SELECT id, run_id, payload, created_at FROM task_events "
+            "WHERE task_id = ? "
+            "AND kind = 'strict_orchestrator_archive_authenticated' ORDER BY id",
+            (auditor_task_id,),
+        ).fetchall()
+        if len(auth_rows) > 1:
+            return False
+        if auth_rows:
+            auth_row = auth_rows[0]
+            try:
+                auth_payload = json.loads(auth_row["payload"] or "{}")
+            except (TypeError, ValueError):
+                return False
+            if (
+                auth_payload != {"version": 1}
+                or auth_row["run_id"] is not None
+                or type(auth_row["created_at"]) is not int
+                or int(auth_row["id"]) != archive_event_id + 1
+                or int(auth_row["created_at"]) != int(archive_row["created_at"])
+            ):
+                return False
+            authenticated_archive = True
+
+    runs = conn.execute(
+        "SELECT id, profile, status, outcome, ended_at FROM task_runs "
+        "WHERE task_id = ? ORDER BY id DESC", (auditor_task_id,),
+    ).fetchall()
+    if any(
+        row["profile"] != auditor_profile or row["ended_at"] is None
+        for row in runs
+    ):
+        return False
+    if not runs:
+        return (
+            archive_event_id is not None
+            and archive_event_id < latest_handoff_event_id
+            and authenticated_archive is True
+        )
+    if conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id = ? "
+        "AND kind = 'review_verdict' AND id > ? LIMIT 1",
+        (auditor_task_id, latest_handoff_event_id),
+    ).fetchone() is not None:
+        return False
+
+    handoff_rows = conn.execute(
+        "SELECT id, run_id, payload FROM task_events WHERE task_id = ? "
+        "AND kind = 'review_handoff' AND id < ? ORDER BY id",
+        (author_task_id, latest_handoff_event_id),
+    ).fetchall()
+    bound_handoffs = []
+    for row in handoff_rows:
+        receipt = _review_handoff_receipt_from_row(author_task_id, row)
+        if receipt is None:
+            return False
+        if receipt.review_task_id == auditor_task_id:
+            bound_handoffs.append(receipt)
+    if len(bound_handoffs) != 1:
+        return False
+    prior_handoff = bound_handoffs[0]
+    author_run = conn.execute(
+        "SELECT profile, status, outcome, ended_at FROM task_runs "
+        "WHERE id = ? AND task_id = ?",
+        (prior_handoff.expected_run_id, author_task_id),
+    ).fetchone()
+    if (
+        author_run is None
+        or author_run["profile"] != author_profile
+        or author_run["status"] != "review_required"
+        or author_run["outcome"] != "review_required"
+        or author_run["ended_at"] is None
+    ):
+        return False
+
+    verdict_rows = conn.execute(
+        "SELECT id, run_id, payload FROM task_events WHERE task_id = ? "
+        "AND kind = 'review_verdict' AND id > ? AND id < ? ORDER BY id",
+        (author_task_id, prior_handoff.event_id, latest_handoff_event_id),
+    ).fetchall()
+    matching = []
+    for row in verdict_rows:
+        payload = _canonical_review_verdict_payload(row)
+        if payload is None:
+            return False
+        if payload["review_task_id"] == auditor_task_id:
+            matching.append((row, payload))
+    latest_run_id = int(runs[0]["id"])
+    terminal = [
+        (row, payload)
+        for row, payload in matching
+        if int(payload["review_run_id"]) == latest_run_id
+    ]
+    if (
+        not matching
+        or len(terminal) != 1
+        or matching[-1] != terminal[0]
+        or terminal[0][1]["verdict"] != "request_changes"
+        or runs[0]["status"] != "request_changes"
+        or runs[0]["outcome"] != "request_changes"
+    ):
+        return False
+
+    run_by_id = {int(row["id"]): row for row in runs}
+    seen_run_ids: set[int] = set()
+    for verdict_row, payload in matching:
+        review_run_id = int(payload["review_run_id"])
+        run = run_by_id.get(review_run_id)
+        if review_run_id in seen_run_ids or run is None:
+            return False
+        seen_run_ids.add(review_run_id)
+        mirrors = conn.execute(
+            "SELECT id, run_id, payload FROM task_events WHERE task_id = ? "
+            "AND kind = 'review_verdict' AND run_id = ? AND id > ? AND id < ? "
+            "ORDER BY id",
+            (auditor_task_id, review_run_id, prior_handoff.event_id,
+             latest_handoff_event_id),
+        ).fetchall()
+        if (
+            len(mirrors) != 1
+            or _canonical_review_verdict_payload(mirrors[0]) != payload
+            or verdict_row["run_id"] != review_run_id
+        ):
+            return False
+    return True
+
+
 def _canonical_audit_receipt(
     conn: sqlite3.Connection,
     task_id: str,
@@ -6090,7 +6285,19 @@ def _canonical_audit_receipt(
         "AND child.assignee = ? ORDER BY child.id",
         (task_id, auditor_profile),
     ).fetchall()
-    if [str(row["id"]) for row in same_profile_children] != [auditor_task_id]:
+    sibling_ids = [str(row["id"]) for row in same_profile_children]
+    if auditor_task_id not in sibling_ids or any(
+        not _historical_auditor_child_is_non_authoritative(
+            conn,
+            author_task_id=task_id,
+            author_profile=author_profile,
+            auditor_task_id=sibling_id,
+            auditor_profile=auditor_profile,
+            latest_handoff_event_id=handoff.event_id,
+        )
+        for sibling_id in sibling_ids
+        if sibling_id != auditor_task_id
+    ):
         return None
 
     verdict_rows = conn.execute(
@@ -10756,6 +10963,159 @@ def _aion889_atomic_finalizer_run_id(
     return AION889_ATOMIC_FINALIZER_ACTION_RUN_ID
 
 
+def _controlled_no_product_blocked_closeout_run_id(
+    conn: sqlite3.Connection, task_id: str,
+) -> Optional[int]:
+    """Resolve one preflight-authenticated no-product canary closeout.
+
+    This is deliberately data-bound rather than ID-, title-, body-, or prose-
+    bound.  It accepts only a leaf factory task whose sole ended run followed
+    the trusted preflight PASS and then emitted the exact typed controlled-
+    closeout block.  Any extra run, edge, active identity, later lifecycle
+    event, malformed decision, or missing live receipt validation fails closed.
+    """
+    task = conn.execute(
+        "SELECT status, assignee, current_run_id, claim_lock, claim_expires, "
+        "worker_pid, worker_starttime, fence_lineage, fence_disposition, "
+        "factory_build_gate, factory_preflight_required, "
+        "factory_preflight_receipt_sha256, factory_terminal_receipt_sha256, "
+        "block_kind, block_recurrences FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    identity_fields = (
+        "current_run_id", "claim_lock", "claim_expires", "worker_pid",
+        "worker_starttime", "fence_lineage", "fence_disposition",
+    )
+    if (
+        task is None
+        or task["status"] != "blocked"
+        or task["assignee"] != "agent007"
+        or task["factory_build_gate"] != 1
+        or task["factory_preflight_required"] != 1
+        or task["factory_terminal_receipt_sha256"] is not None
+        or task["block_kind"] != "capability"
+        or task["block_recurrences"] != 1
+        or any(task[field] is not None for field in identity_fields)
+        or not isinstance(task["factory_preflight_receipt_sha256"], str)
+        or re.fullmatch(
+            r"[0-9a-f]{64}", task["factory_preflight_receipt_sha256"]
+        ) is None
+    ):
+        return None
+    if conn.execute(
+        "SELECT 1 FROM task_links WHERE parent_id = ? OR child_id = ? LIMIT 1",
+        (task_id, task_id),
+    ).fetchone() is not None:
+        return None
+
+    runs = conn.execute(
+        "SELECT id, profile, status, outcome, summary, metadata, error, ended_at "
+        "FROM task_runs WHERE task_id = ? ORDER BY id", (task_id,),
+    ).fetchall()
+    if len(runs) != 1:
+        return None
+    run = runs[0]
+    if (
+        run["profile"] != "agent007"
+        or run["status"] != "blocked"
+        or run["outcome"] != "blocked"
+        or run["summary"] != FACTORY_CONTROLLED_NO_PRODUCT_CLOSEOUT_REASON
+        or run["metadata"] is not None
+        or run["error"] is not None
+        or run["ended_at"] is None
+    ):
+        return None
+    run_id = int(run["id"])
+
+    decisions = conn.execute(
+        "SELECT id, run_id, payload FROM task_events WHERE task_id = ? "
+        "AND kind = 'preflight_decision' ORDER BY id", (task_id,),
+    ).fetchall()
+    parsed_decisions = []
+    for row in decisions:
+        try:
+            payload = json.loads(row["payload"] or "{}")
+        except (TypeError, ValueError):
+            return None
+        if (
+            row["run_id"] is not None
+            or not isinstance(payload, dict)
+            or set(payload) - {
+                "decision", "reason_code", "detail_code", "field",
+                "evidence_ref", "attachment_id",
+            }
+            or payload.get("decision") not in {"PASS", "BLOCK"}
+        ):
+            return None
+        parsed_decisions.append((row, payload))
+    passes = [item for item in parsed_decisions if item[1]["decision"] == "PASS"]
+    if len(passes) != 1 or passes[0] != parsed_decisions[-1]:
+        return None
+    pass_row, pass_payload = passes[0]
+    if (
+        set(pass_payload) != {
+            "decision", "reason_code", "detail_code", "field",
+            "evidence_ref", "attachment_id",
+        }
+        or pass_payload["reason_code"] is not None
+        or pass_payload["detail_code"] is not None
+        or pass_payload["field"] is not None
+        or pass_payload["evidence_ref"]
+        != task["factory_preflight_receipt_sha256"]
+        or type(pass_payload["attachment_id"]) is not int
+        or pass_payload["attachment_id"] <= 0
+    ):
+        return None
+    live_decision = _factory_preflight_decision(conn, task_id, "blocked")
+    if live_decision != pass_payload:
+        return None
+
+    claimed = conn.execute(
+        "SELECT id, run_id, payload FROM task_events WHERE task_id = ? "
+        "AND kind = 'claimed' ORDER BY id", (task_id,),
+    ).fetchall()
+    blocked = conn.execute(
+        "SELECT id, run_id, payload FROM task_events WHERE task_id = ? "
+        "AND kind = 'blocked' AND run_id IS NOT NULL ORDER BY id", (task_id,),
+    ).fetchall()
+    if len(claimed) != 1 or len(blocked) != 1:
+        return None
+    try:
+        claimed_payload = json.loads(claimed[0]["payload"] or "{}")
+        blocked_payload = json.loads(blocked[0]["payload"] or "{}")
+    except (TypeError, ValueError):
+        return None
+    if (
+        claimed[0]["run_id"] != run_id
+        or claimed_payload.get("run_id") != run_id
+        or blocked[0]["run_id"] != run_id
+        or blocked_payload != {
+            "reason": FACTORY_CONTROLLED_NO_PRODUCT_CLOSEOUT_REASON,
+            "kind": "capability",
+            "recurrences": 1,
+        }
+        or not (int(pass_row["id"]) < int(claimed[0]["id"]) < int(blocked[0]["id"]))
+        or conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? AND id > ? "
+            "AND kind IN ('unblocked', 'claimed', 'preflight_decision', "
+            "'review_handoff', 'review_verdict', 'completed', 'archived') LIMIT 1",
+            (task_id, blocked[0]["id"]),
+        ).fetchone() is not None
+    ):
+        return None
+    return run_id
+
+
+def _detached_controller_finalizer_run_id(
+    conn: sqlite3.Connection, task_id: str,
+) -> Optional[int]:
+    """Resolve either existing closed controller evidence or no-product closeout."""
+    exact = _aion889_atomic_finalizer_run_id(conn, task_id)
+    return exact if exact is not None else _controlled_no_product_blocked_closeout_run_id(
+        conn, task_id,
+    )
+
+
 def _aion889_recompute_exact_child_in_txn(conn: sqlite3.Connection) -> None:
     """Run ordinary recompute in-txn and verify the exact child's natural result."""
     child_id = AION889_ATOMIC_FINALIZER_CHILD_ID
@@ -10811,7 +11171,7 @@ def _run_kernel_finalizer(
 
     def _terminal_write(c: sqlite3.Connection, tid: str, rid: str) -> None:
         if detached_controller:
-            resolved_run_id = _aion889_atomic_finalizer_run_id(c, tid)
+            resolved_run_id = _detached_controller_finalizer_run_id(c, tid)
             if resolved_run_id is None or resolved_run_id != int(rid):
                 raise FactoryTerminalReceiptRequiredError(
                     task_id, reason="detached controller action evidence drift"
@@ -11018,6 +11378,7 @@ def complete_task(
     _finalizer_run_id = None
     _reviewed_author_finalizer = False
     _detached_controller_finalizer = False
+    _detached_controller_exact_child_recompute = False
     if _gate_row is not None and _gate_row["factory_build_gate"]:
         # Determine whether a VALID pre-bound receipt already exists (the
         # merge / already-terminal path, preserved unchanged). Any failure
@@ -11083,10 +11444,14 @@ def complete_task(
                         _reviewed_author_finalizer = True
                         _finalizer_run_id = str(_reviewed_run_id)
                 elif _gate_row["status"] == "blocked":
-                    _controller_run_id = _aion889_atomic_finalizer_run_id(conn, task_id)
+                    _controller_run_id = _detached_controller_finalizer_run_id(conn, task_id)
                     if _controller_run_id is not None:
                         _run_finalizer = True
                         _detached_controller_finalizer = True
+                        _detached_controller_exact_child_recompute = (
+                            _aion889_atomic_finalizer_run_id(conn, task_id)
+                            == _controller_run_id
+                        )
                         _finalizer_run_id = str(_controller_run_id)
             if not _run_finalizer:
                 raise FactoryTerminalReceiptRequiredError(task_id, reason=_prebound_reason)
@@ -11269,7 +11634,7 @@ def complete_task(
             completed_payload,
             run_id=run_id,
         )
-        if _detached_controller_finalizer:
+        if _detached_controller_exact_child_recompute:
             # The exact controller repair requires parent terminality and the
             # ordinary dependency promotion to commit (or roll back) together.
             _aion889_recompute_exact_child_in_txn(conn)
@@ -13521,9 +13886,22 @@ def archive_task(
             )
             if value
         }
+        archive_created_at = int(time.time())
         _append_event(
             conn, task_id, "archived", audit_payload or None, run_id=run_id,
+            created_at=archive_created_at,
         )
+        if strict_orchestrator_archive:
+            # Persist a separate receipt minted only after the model-facing
+            # handler's ContextVar-backed live-role guard and atomic todo/no-run
+            # checks pass. Existing archived-event payloads remain stable.
+            _append_event(
+                conn,
+                task_id,
+                "strict_orchestrator_archive_authenticated",
+                {"version": 1},
+                created_at=archive_created_at,
+            )
     # ``archived`` parents no longer block children, same as ``done``.
     # Promote newly-unblocked dependents immediately instead of waiting
     # for a later dispatcher tick.
