@@ -375,10 +375,12 @@ def test_rearms_same_terminal_request_changes_auditor_once(kanban_home):
         "side_effectful_descendant",
         "contradictory_external_side_effect",
         "contradictory_merge_performed",
+        "case_variant_merge_performed",
         "contradictory_compound_action",
         "contradictory_action_count",
         "missing_prior_round_binding",
         "recursive_done_missing_prior_round_binding",
+        "recursive_done_body_prose_parent_id",
         "active_descendant_claim",
         "open_descendant_run",
         "stale_author_run",
@@ -441,12 +443,18 @@ def test_terminal_auditor_rearm_hostile_cases_are_zero_mutation(
                 "UPDATE task_runs SET metadata=? WHERE id=?",
                 (json.dumps(metadata), graph["fact_run"]),
             )
-        elif invalidity == "contradictory_merge_performed":
+        elif invalidity in {
+            "contradictory_merge_performed", "case_variant_merge_performed",
+        }:
             row = conn.execute(
                 "SELECT metadata FROM task_runs WHERE id=?", (graph["fact_run"],)
             ).fetchone()
             metadata = json.loads(row["metadata"])
-            metadata["merge_performed"] = True
+            metadata[
+                "MergePerformed"
+                if invalidity == "case_variant_merge_performed"
+                else "merge_performed"
+            ] = True
             conn.execute(
                 "UPDATE task_runs SET metadata=? WHERE id=?",
                 (json.dumps(metadata), graph["fact_run"]),
@@ -471,7 +479,10 @@ def test_terminal_auditor_rearm_hostile_cases_are_zero_mutation(
                 "UPDATE task_runs SET metadata=? WHERE id=?",
                 (json.dumps({"external_mutations_performed": []}), graph["fact_run"]),
             )
-        elif invalidity == "recursive_done_missing_prior_round_binding":
+        elif invalidity in {
+            "recursive_done_missing_prior_round_binding",
+            "recursive_done_body_prose_parent_id",
+        }:
             conn.execute(
                 "DELETE FROM task_links WHERE parent_id=? AND child_id=?",
                 (graph["auditor"], graph["fact"]),
@@ -484,6 +495,14 @@ def test_terminal_auditor_rearm_hostile_cases_are_zero_mutation(
                 "UPDATE task_runs SET metadata=? WHERE id=?",
                 (json.dumps({"external_mutations_performed": []}), graph["fact_run"]),
             )
+            if invalidity == "recursive_done_body_prose_parent_id":
+                conn.execute(
+                    "UPDATE tasks SET body=? WHERE id=?",
+                    (
+                        f"untyped caller prose mentions parent {graph['archived']}",
+                        graph["fact"],
+                    ),
+                )
         elif invalidity == "active_descendant_claim":
             conn.execute(
                 "UPDATE tasks SET claim_lock='active', claim_expires=9999999999 "
@@ -601,6 +620,47 @@ def test_terminal_auditor_rearm_hostile_cases_are_zero_mutation(
             reason=reason,
         ) is None
         assert "\n".join(conn.iterdump()) == before
+
+
+def test_recursive_done_descendant_accepts_native_created_parent_binding(
+    kanban_home,
+):
+    with kb.connect() as conn:
+        graph = _terminal_request_changes_graph(conn)
+        conn.execute(
+            "DELETE FROM task_links WHERE parent_id=? AND child_id=?",
+            (graph["auditor"], graph["fact"]),
+        )
+        conn.execute(
+            "INSERT INTO task_links(parent_id, child_id) VALUES (?, ?)",
+            (graph["archived"], graph["fact"]),
+        )
+        created = conn.execute(
+            "SELECT id, payload FROM task_events WHERE task_id=? AND kind='created'",
+            (graph["fact"],),
+        ).fetchone()
+        created_payload = json.loads(created["payload"])
+        created_payload["parents"] = [graph["archived"]]
+        conn.execute(
+            "UPDATE task_events SET payload=? WHERE id=?",
+            (json.dumps(created_payload), created["id"]),
+        )
+        conn.execute(
+            "UPDATE task_runs SET metadata=? WHERE id=?",
+            (
+                json.dumps({"external_mutations_performed": []}),
+                graph["fact_run"],
+            ),
+        )
+        conn.commit()
+
+        assert kb.request_review_handoff(
+            conn,
+            graph["author"],
+            expected_run_id=graph["fresh_author_run"],
+            review_task_id=graph["auditor"],
+            reason=REASON,
+        ) is not None
 
 
 def test_terminal_auditor_rearm_concurrent_replay_is_single_logical_handoff(

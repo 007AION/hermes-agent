@@ -7127,23 +7127,28 @@ def _metadata_attests_no_external_side_effect(metadata: Any) -> bool:
         value = stack.pop()
         if isinstance(value, dict):
             for key, nested in value.items():
-                if key in {"forbidden_actions_performed", "external_mutations_performed"}:
+                if type(key) is not str:
+                    return False
+                normalized_key = key.lower()
+                if normalized_key in {
+                    "forbidden_actions_performed", "external_mutations_performed",
+                }:
                     if not isinstance(nested, list) or nested:
                         return False
                     found = True
                 affirmative_action_flag = (
                     type(nested) is bool
                     and nested
-                    and any(token in key for token in action_tokens)
+                    and any(token in normalized_key for token in action_tokens)
                 )
                 positive_action_count = (
                     type(nested) is int
                     and nested != 0
-                    and key.endswith("_count")
-                    and any(token in key for token in action_tokens)
+                    and normalized_key.endswith("_count")
+                    and any(token in normalized_key for token in action_tokens)
                 )
                 if (
-                    (key in effect_flags and nested is not False)
+                    (normalized_key in effect_flags and nested is not False)
                     or affirmative_action_flag
                     or positive_action_count
                 ):
@@ -7206,8 +7211,8 @@ def _terminal_descendants_are_superseded(
         "current_run_id", "claim_lock", "claim_expires", "worker_pid",
         "worker_starttime", "fence_lineage", "fence_disposition",
     )
-    serialized_by_task: dict[str, str] = {}
     parents_by_task: dict[str, set[str]] = {}
+    native_parents_by_task: dict[str, set[str]] = {}
     directly_bound: set[str] = set()
     for task in descendants:
         task_id = str(task["id"])
@@ -7255,7 +7260,6 @@ def _terminal_descendants_are_superseded(
         )
         if current_head in serialized.lower():
             return False
-        serialized_by_task[task_id] = authority_serialized.lower()
         parents_by_task[task_id] = {
             str(row["parent_id"])
             for row in conn.execute(
@@ -7263,6 +7267,26 @@ def _terminal_descendants_are_superseded(
                 (task_id,),
             ).fetchall()
         }
+        created_rows = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'created'",
+            (task_id,),
+        ).fetchall()
+        if len(created_rows) != 1:
+            return False
+        try:
+            created_payload = json.loads(created_rows[0]["payload"] or "{}")
+            native_parents = created_payload["parents"]
+        except (KeyError, TypeError, ValueError):
+            return False
+        if (
+            not isinstance(created_payload, dict)
+            or not isinstance(native_parents, list)
+            or not native_parents
+            or any(type(parent_id) is not str or not parent_id for parent_id in native_parents)
+            or len(set(native_parents)) != len(native_parents)
+        ):
+            return False
+        native_parents_by_task[task_id] = set(native_parents)
         if task["status"] == "archived":
             if not _strict_terminal_archive_is_authenticated(conn, task_id):
                 return False
@@ -7298,6 +7322,7 @@ def _terminal_descendants_are_superseded(
             return False
         if not _metadata_attests_no_external_side_effect(metadata):
             return False
+
         if _done_descendant_matches_prior_audit(
                 metadata,
                 auditor_task_id=auditor_task_id,
@@ -7307,19 +7332,19 @@ def _terminal_descendants_are_superseded(
             directly_bound.add(task_id)
 
     # Every recursive task must either carry the exact prior-audit receipt or
-    # explicitly name an already-authenticated immediate parent.  The latter
+    # carry a typed binding to an already-authenticated immediate parent. The latter
     # preserves typed Native lineage for deeper review/finalizer branches
     # without requiring each immutable descendant to duplicate the root SHA.
     authenticated = {auditor_task_id, *directly_bound}
-    pending = set(serialized_by_task) - authenticated
+    pending = set(parents_by_task) - authenticated
     while pending:
         promoted = {
             task_id
             for task_id in pending
-            if any(
-                parent_id in authenticated
-                and parent_id.lower() in serialized_by_task[task_id]
-                for parent_id in parents_by_task[task_id]
+            if (
+                native_parents_by_task[task_id]
+                & parents_by_task[task_id]
+                & (authenticated - {auditor_task_id})
             )
         }
         if not promoted:
