@@ -1679,26 +1679,20 @@ def _handle_unlink(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
-            removed = kb.unlink_tasks(
+            readback = kb.unlink_tasks(
                 conn,
                 parent_id=parent_id,
                 child_id=child_id,
+                return_readback=True,
             )
-            if not removed:
+            if not readback:
                 return tool_error(
                     f"no such dependency link: {parent_id} -> {child_id}"
-                )
-            child = kb.get_task(conn, child_id)
-            if child is None:  # Defensive: a valid edge always has a child row.
-                raise RuntimeError(
-                    f"child {child_id} disappeared after dependency unlink"
                 )
             return _ok(
                 parent_id=parent_id,
                 child_id=child_id,
-                removed=True,
-                child_status=child.status,
-                remaining_parent_ids=kb.parent_ids(conn, child_id),
+                **readback,
             )
         finally:
             conn.close()

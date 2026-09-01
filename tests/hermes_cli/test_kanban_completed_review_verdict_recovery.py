@@ -375,7 +375,13 @@ def test_later_phase_recovery_rejects_caller_reason_drift_and_missing_edge(
         before = _snapshot(conn)
         assert not _recover_later(conn, fixture, reason="controller prose")
         assert _snapshot(conn) == before
-        kb.unlink_tasks(conn, fixture[0], fixture[1])
+        # Deliberately corrupt the fixture into the missing-edge case.  The
+        # supported unlink API now rejects terminal children before mutation.
+        conn.execute(
+            "DELETE FROM task_links WHERE parent_id = ? AND child_id = ?",
+            (fixture[0], fixture[1]),
+        )
+        conn.commit()
         before = _snapshot(conn)
         assert not _recover_later(conn, fixture)
         assert _snapshot(conn) == before

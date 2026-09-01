@@ -5106,6 +5106,107 @@ def test_unlink_tasks_triggers_recompute_ready(kanban_home):
         )
 
 
+def test_unlink_tasks_rejects_claimed_running_child_without_mutation(kanban_home):
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="done parent")
+        kb.complete_task(conn, parent)
+        child = kb.create_task(conn, title="claimed child", parents=[parent])
+        kb.claim_task(conn, child, claimer="worker:live")
+        before_events = list(kb.list_events(conn, child))
+
+        with pytest.raises(ValueError, match="not eligible|execution ownership"):
+            kb.unlink_tasks(conn, parent, child)
+
+        assert kb.parent_ids(conn, child) == [parent]
+        assert kb.get_task(conn, child).status == "running"
+        assert list(kb.list_events(conn, child)) == before_events
+
+
+@pytest.mark.parametrize(
+    ("column", "value"),
+    [
+        ("current_run_id", 987654),
+        ("claim_lock", "worker:drift"),
+        ("claim_expires", 9876543210),
+        ("worker_pid", 424242),
+        ("worker_starttime", 31337),
+        ("fence_lineage", "[]"),
+        ("fence_disposition", "ready"),
+    ],
+)
+def test_unlink_tasks_rejects_todo_child_with_execution_ownership_drift(
+    kanban_home, column, value
+):
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="open parent")
+        child = kb.create_task(conn, title="drifted child", parents=[parent])
+        conn.execute(f"UPDATE tasks SET {column} = ? WHERE id = ?", (value, child))
+        conn.commit()
+        before_events = list(kb.list_events(conn, child))
+
+        with pytest.raises(ValueError, match="execution ownership"):
+            kb.unlink_tasks(conn, parent, child)
+
+        assert kb.parent_ids(conn, child) == [parent]
+        assert kb.get_task(conn, child).status == "todo"
+        assert list(kb.list_events(conn, child)) == before_events
+
+
+def test_unlink_tasks_rejects_unpointed_running_run_without_mutation(kanban_home):
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="open parent")
+        child = kb.create_task(conn, title="run-drifted child", parents=[parent])
+        conn.execute(
+            "INSERT INTO task_runs (task_id, profile, status, started_at) "
+            "VALUES (?, 'worker', 'running', 1)",
+            (child,),
+        )
+        conn.commit()
+        before_events = list(kb.list_events(conn, child))
+
+        with pytest.raises(ValueError, match="execution ownership"):
+            kb.unlink_tasks(conn, parent, child)
+
+        assert kb.parent_ids(conn, child) == [parent]
+        assert kb.get_task(conn, child).status == "todo"
+        assert list(kb.list_events(conn, child)) == before_events
+
+
+def test_unlink_tasks_rejects_blocked_status_drift_without_mutation(kanban_home):
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="open parent")
+        child = kb.create_task(conn, title="blocked child", parents=[parent])
+        conn.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (child,))
+        conn.commit()
+        before_events = list(kb.list_events(conn, child))
+
+        with pytest.raises(ValueError, match="not eligible"):
+            kb.unlink_tasks(conn, parent, child)
+
+        assert kb.parent_ids(conn, child) == [parent]
+        assert kb.get_task(conn, child).status == "blocked"
+        assert list(kb.list_events(conn, child)) == before_events
+
+
+def test_unlink_tasks_rolls_back_when_postcondition_fails(kanban_home):
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="open parent")
+        child = kb.create_task(conn, title="child", parents=[parent])
+        before_events = list(kb.list_events(conn, child))
+        conn.execute(
+            "CREATE TEMP TRIGGER restore_unlinked_edge AFTER DELETE ON task_links "
+            "BEGIN INSERT INTO task_links(parent_id, child_id) "
+            "VALUES (OLD.parent_id, OLD.child_id); END"
+        )
+
+        with pytest.raises(RuntimeError, match="postcondition"):
+            kb.unlink_tasks(conn, parent, child)
+
+        assert kb.parent_ids(conn, child) == [parent]
+        assert kb.get_task(conn, child).status == "todo"
+        assert list(kb.list_events(conn, child)) == before_events
+
+
 def test_archive_task_triggers_recompute_ready_for_dependents(kanban_home):
     """Archiving a parent must immediately unblock its children.
 

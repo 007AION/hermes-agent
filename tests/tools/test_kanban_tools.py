@@ -1801,6 +1801,7 @@ def test_unlink_keeps_todo_with_another_open_parent_and_preserves_graph(
         unrelated_child = kb.create_task(
             conn, title="unrelated child", parents=[unrelated_parent]
         )
+        unrelated_events = list(kb.list_events(conn, unrelated_child))
 
     receipt = json.loads(kt._handle_unlink({
         "parent_id": removed_parent,
@@ -1815,6 +1816,7 @@ def test_unlink_keeps_todo_with_another_open_parent_and_preserves_graph(
         assert kb.get_task(conn, child).status == "todo"
         assert kb.parent_ids(conn, unrelated_child) == [unrelated_parent]
         assert kb.get_task(conn, unrelated_child).status == "todo"
+        assert list(kb.list_events(conn, unrelated_child)) == unrelated_events
 
 
 def test_unlink_missing_edge_fails_closed_without_mutation(monkeypatch, worker_env):
@@ -1837,6 +1839,74 @@ def test_unlink_missing_edge_fails_closed_without_mutation(monkeypatch, worker_e
     with kb.connect() as conn:
         assert kb.parent_ids(conn, child) == [actual_parent]
         assert kb.get_task(conn, child).status == "todo"
+        assert list(kb.list_events(conn, child)) == before_events
+
+
+def test_unlink_replay_fails_closed_without_mutation(monkeypatch, worker_env):
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent")
+        child = kb.create_task(conn, title="child", parents=[parent])
+
+    first = json.loads(kt._handle_unlink({
+        "parent_id": parent,
+        "child_id": child,
+    }))
+    assert first["ok"] is True
+
+    with kb.connect() as conn:
+        before_events = list(kb.list_events(conn, child))
+        before_status = kb.get_task(conn, child).status
+
+    replay = json.loads(kt._handle_unlink({
+        "parent_id": parent,
+        "child_id": child,
+    }))
+    assert "no such dependency link" in replay.get("error", "")
+    with kb.connect() as conn:
+        assert kb.parent_ids(conn, child) == []
+        assert kb.get_task(conn, child).status == before_status
+        assert list(kb.list_events(conn, child)) == before_events
+
+
+@pytest.mark.parametrize("drifted_status", ["running", "blocked"])
+def test_unlink_rejects_live_or_status_drifted_child_without_mutation(
+    monkeypatch, worker_env, drifted_status
+):
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent")
+        child = kb.create_task(conn, title="child", parents=[parent])
+        if drifted_status == "running":
+            conn.execute(
+                "UPDATE tasks SET status = 'running', claim_lock = 'live', "
+                "claim_expires = 9876543210, worker_pid = 424242 WHERE id = ?",
+                (child,),
+            )
+        else:
+            conn.execute(
+                "UPDATE tasks SET status = 'blocked' WHERE id = ?", (child,)
+            )
+        conn.commit()
+        before_events = list(kb.list_events(conn, child))
+
+    result = json.loads(kt._handle_unlink({
+        "parent_id": parent,
+        "child_id": child,
+    }))
+
+    assert "not eligible" in result.get("error", "") or (
+        "execution ownership" in result.get("error", "")
+    )
+    with kb.connect() as conn:
+        assert kb.parent_ids(conn, child) == [parent]
+        assert kb.get_task(conn, child).status == drifted_status
         assert list(kb.list_events(conn, child)) == before_events
 
 

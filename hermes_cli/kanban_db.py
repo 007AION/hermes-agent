@@ -4521,25 +4521,129 @@ def _would_cycle(conn: sqlite3.Connection, parent_id: str, child_id: str) -> boo
     return False
 
 
-def unlink_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> bool:
+def unlink_tasks(
+    conn: sqlite3.Connection,
+    parent_id: str,
+    child_id: str,
+    *,
+    return_readback: bool = False,
+) -> bool | dict[str, Any]:
+    """Remove one exact dependency from an idle ``todo`` child atomically.
+
+    Unlinking changes dispatch eligibility, so the child must not carry any
+    execution/fence ownership and must still be in the dependency-waiting
+    state when the write lock is acquired.  Guard, delete, event, exact-child
+    recompute, and postcondition readback all share one transaction.
+
+    ``return_readback`` preserves the historical bool API for CLI/dashboard
+    callers while allowing the orchestrator tool to return the readback that
+    was proven before commit.
+    """
+    ownership_columns = (
+        "current_run_id",
+        "claim_lock",
+        "claim_expires",
+        "worker_pid",
+        "worker_starttime",
+        "fence_lineage",
+        "fence_disposition",
+    )
     with write_txn(conn):
+        child = conn.execute(
+            "SELECT t.status, t.current_run_id, t.claim_lock, t.claim_expires, "
+            "t.worker_pid, t.worker_starttime, t.fence_lineage, "
+            "t.fence_disposition FROM tasks t "
+            "JOIN task_links l ON l.child_id = t.id "
+            "WHERE l.parent_id = ? AND l.child_id = ?",
+            (parent_id, child_id),
+        ).fetchone()
+        if child is None:
+            return False
+
+        active_run = conn.execute(
+            "SELECT 1 FROM task_runs WHERE task_id = ? AND status = 'running' "
+            "AND ended_at IS NULL LIMIT 1",
+            (child_id,),
+        ).fetchone()
+        if active_run is not None or any(
+            child[column] is not None for column in ownership_columns
+        ) or not _predecessor_process_exited(conn, child_id):
+            raise ValueError(
+                f"child {child_id} has current execution ownership; "
+                "dependency unlink refused"
+            )
+        if child["status"] != "todo":
+            raise ValueError(
+                f"child {child_id} status {child['status']!r} is not eligible "
+                "for dependency unlink; expected 'todo'"
+            )
+
         cur = conn.execute(
             "DELETE FROM task_links WHERE parent_id = ? AND child_id = ?",
             (parent_id, child_id),
         )
-        if cur.rowcount:
-            _append_event(
-                conn, child_id, "unlinked",
-                {"parent": parent_id, "child": child_id},
+        if cur.rowcount != 1:
+            raise RuntimeError("dependency unlink delete postcondition failed")
+        _append_event(
+            conn, child_id, "unlinked",
+            {"parent": parent_id, "child": child_id},
+        )
+
+        parents = conn.execute(
+            "SELECT t.id, t.status FROM tasks t "
+            "JOIN task_links l ON l.parent_id = t.id "
+            "WHERE l.child_id = ? ORDER BY t.id",
+            (child_id,),
+        ).fetchall()
+        should_promote = all(
+            _review_handoff_parent_satisfies_child(
+                conn, parent["id"], parent["status"], child_id
             )
-        removed = cur.rowcount > 0
-    if removed:
-        # Dependency edge removed — re-evaluate promotion eligibility for the
-        # child immediately.  Matches the contract of complete_task and
-        # unblock_task; without this the child stays stuck in todo until the
-        # next dispatcher tick or a manual `hermes kanban recompute` (issue #22459).
-        recompute_ready(conn)
-    return removed
+            for parent in parents
+        )
+        expected_status = "ready" if should_promote else "todo"
+        if should_promote:
+            promoted = conn.execute(
+                "UPDATE tasks SET status = 'ready' "
+                "WHERE id = ? AND status = 'todo'",
+                (child_id,),
+            )
+            if promoted.rowcount != 1:
+                raise RuntimeError("dependency unlink promotion postcondition failed")
+            _append_event(conn, child_id, "promoted", None)
+
+        post = conn.execute(
+            "SELECT status, current_run_id, claim_lock, claim_expires, worker_pid, "
+            "worker_starttime, fence_lineage, fence_disposition FROM tasks "
+            "WHERE id = ?",
+            (child_id,),
+        ).fetchone()
+        edge_remains = conn.execute(
+            "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ?",
+            (parent_id, child_id),
+        ).fetchone()
+        post_active_run = conn.execute(
+            "SELECT 1 FROM task_runs WHERE task_id = ? AND status = 'running' "
+            "AND ended_at IS NULL LIMIT 1",
+            (child_id,),
+        ).fetchone()
+        remaining_parent_ids = [parent["id"] for parent in parents]
+        if (
+            post is None
+            or edge_remains is not None
+            or post_active_run is not None
+            or any(post[column] is not None for column in ownership_columns)
+            or post["status"] != expected_status
+        ):
+            raise RuntimeError("dependency unlink atomic postcondition failed")
+
+        if return_readback:
+            return {
+                "removed": True,
+                "child_status": post["status"],
+                "remaining_parent_ids": remaining_parent_ids,
+            }
+        return True
 
 
 def parent_ids(conn: sqlite3.Connection, task_id: str) -> list[str]:
