@@ -6574,6 +6574,142 @@ def _historical_auditor_child_is_non_authoritative(
     return request_changes_rounds > 0 and seen_run_ids == set(run_by_id)
 
 
+def _ordered_multi_round_final_auditor_pass(
+    conn: sqlite3.Connection,
+    *,
+    author_task_id: str,
+    author_profile: str,
+    auditor_task_id: str,
+    auditor_profile: str,
+    latest_handoff: ReviewHandoffReceipt,
+) -> bool:
+    """Authenticate one reused final auditor's strict RC...RC -> PASS history.
+
+    This is deliberately narrower than historical-child selection: every author
+    run must have exactly one typed handoff to this same direct auditor, every
+    earlier round must end REQUEST_CHANGES, and only the final round may PASS.
+    Author verdict and auditor mirror rows must be globally adjacent, matching
+    the atomic order emitted by ``_record_review_verdict``.
+    """
+    handoff_rows = conn.execute(
+        "SELECT id, run_id, payload FROM task_events WHERE task_id = ? "
+        "AND kind = 'review_handoff' ORDER BY id",
+        (author_task_id,),
+    ).fetchall()
+    parsed_handoffs = [
+        _review_handoff_receipt_from_row(author_task_id, row)
+        for row in handoff_rows
+    ]
+    if any(handoff is None for handoff in parsed_handoffs):
+        return False
+    handoffs = [
+        handoff for handoff in parsed_handoffs if handoff is not None
+    ]
+    if (
+        len(handoffs) < 2
+        or handoffs[-1] != latest_handoff
+        or any(handoff.review_task_id != auditor_task_id for handoff in handoffs)
+    ):
+        return False
+
+    author_runs = conn.execute(
+        "SELECT id, profile, status, outcome, ended_at FROM task_runs "
+        "WHERE task_id = ? ORDER BY id",
+        (author_task_id,),
+    ).fetchall()
+    auditor_runs = conn.execute(
+        "SELECT id, profile, status, outcome, ended_at FROM task_runs "
+        "WHERE task_id = ? ORDER BY id",
+        (auditor_task_id,),
+    ).fetchall()
+    author_by_id = {int(row["id"]): row for row in author_runs}
+    auditor_by_id = {int(row["id"]): row for row in auditor_runs}
+    expected_author_ids = {handoff.expected_run_id for handoff in handoffs}
+    review_required_author_ids = {
+        int(row["id"])
+        for row in author_runs
+        if (row["status"], row["outcome"]) == (
+            "review_required", "review_required",
+        )
+    }
+    if (
+        expected_author_ids != review_required_author_ids
+        or len(expected_author_ids) != len(handoffs)
+        or len(auditor_runs) != len(handoffs)
+        or any(
+            row["profile"] != author_profile or row["ended_at"] is None
+            for row in author_runs
+        )
+    ):
+        return False
+
+    seen_auditor_runs: set[int] = set()
+    for index, handoff in enumerate(handoffs):
+        next_handoff_id = (
+            handoffs[index + 1].event_id
+            if index + 1 < len(handoffs)
+            else None
+        )
+        author_run = author_by_id.get(handoff.expected_run_id)
+        if (
+            author_run is None
+            or author_run["profile"] != author_profile
+            or author_run["status"] != "review_required"
+            or author_run["outcome"] != "review_required"
+            or author_run["ended_at"] is None
+        ):
+            return False
+        if next_handoff_id is None:
+            verdict_rows = conn.execute(
+                "SELECT id, run_id, payload, created_at FROM task_events "
+                "WHERE task_id = ? AND kind = 'review_verdict' AND id > ? ORDER BY id",
+                (author_task_id, handoff.event_id),
+            ).fetchall()
+        else:
+            verdict_rows = conn.execute(
+                "SELECT id, run_id, payload, created_at FROM task_events "
+                "WHERE task_id = ? AND kind = 'review_verdict' "
+                "AND id > ? AND id < ? ORDER BY id",
+                (author_task_id, handoff.event_id, next_handoff_id),
+            ).fetchall()
+        if len(verdict_rows) != 1:
+            return False
+        verdict_row = verdict_rows[0]
+        payload = _canonical_review_verdict_payload(verdict_row)
+        if payload is None or payload["review_task_id"] != auditor_task_id:
+            return False
+        review_run_id = int(payload["review_run_id"])
+        auditor_run = auditor_by_id.get(review_run_id)
+        expected_verdict = "pass" if index == len(handoffs) - 1 else "request_changes"
+        expected_run_state = (
+            ("done", "completed")
+            if expected_verdict == "pass"
+            else ("request_changes", "request_changes")
+        )
+        mirror = conn.execute(
+            "SELECT id, run_id, payload FROM task_events WHERE task_id = ? "
+            "AND kind = 'review_verdict' AND run_id = ? ORDER BY id",
+            (auditor_task_id, review_run_id),
+        ).fetchall()
+        if (
+            review_run_id in seen_auditor_runs
+            or payload["verdict"] != expected_verdict
+            or type(verdict_row["created_at"]) is not int
+            or auditor_run is None
+            or auditor_run["profile"] != auditor_profile
+            or (auditor_run["status"], auditor_run["outcome"]) != expected_run_state
+            or auditor_run["ended_at"] is None
+            or len(mirror) != 1
+            or int(mirror[0]["id"]) != int(verdict_row["id"]) + 1
+            or _canonical_review_verdict_payload(mirror[0]) != payload
+        ):
+            return False
+        if next_handoff_id is not None and int(mirror[0]["id"]) >= next_handoff_id:
+            return False
+        seen_auditor_runs.add(review_run_id)
+    return seen_auditor_runs == set(auditor_by_id)
+
+
 def _canonical_audit_receipt(
     conn: sqlite3.Connection,
     task_id: str,
@@ -6675,10 +6811,36 @@ def _canonical_audit_receipt(
         if historical_handoff is None:
             return None
         historical_handoff_ids.add(historical_handoff.review_task_id)
-    if (
-        auditor_task_id not in sibling_ids
-        or auditor_task_id in historical_handoff_ids
-        or not historical_handoff_ids.issubset(set(sibling_ids))
+    reused_current_auditor = auditor_task_id in historical_handoff_ids
+    if auditor_task_id not in sibling_ids:
+        return None
+    if reused_current_auditor:
+        if (
+            historical_handoff_ids != {auditor_task_id}
+            or not _ordered_multi_round_final_auditor_pass(
+                conn,
+                author_task_id=task_id,
+                author_profile=author_profile,
+                auditor_task_id=auditor_task_id,
+                auditor_profile=auditor_profile,
+                latest_handoff=handoff,
+            )
+            or any(
+                not _historical_auditor_child_is_non_authoritative(
+                    conn,
+                    author_task_id=task_id,
+                    author_profile=author_profile,
+                    auditor_task_id=sibling_id,
+                    auditor_profile=auditor_profile,
+                    latest_handoff_event_id=handoff.event_id,
+                )
+                for sibling_id in sibling_ids
+                if sibling_id != auditor_task_id
+            )
+        ):
+            return None
+    elif (
+        not historical_handoff_ids.issubset(set(sibling_ids))
         or any(
             not _historical_auditor_child_is_non_authoritative(
                 conn,
@@ -6732,7 +6894,8 @@ def _canonical_audit_receipt(
         else ("request_changes", "request_changes")
     )
     if (
-        len(auditor_runs) != 1
+        (not reused_current_auditor and len(auditor_runs) != 1)
+        or not auditor_runs
         or int(auditor_runs[0]["id"]) != auditor_run_id
         or auditor_runs[0]["profile"] != auditor_profile
         or (auditor_runs[0]["status"], auditor_runs[0]["outcome"]) != expected
