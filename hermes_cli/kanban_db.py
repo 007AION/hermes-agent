@@ -7105,7 +7105,24 @@ def _metadata_attests_no_external_side_effect(metadata: Any) -> bool:
         "external_write",
         "live_affected_task_mutation",
         "production_or_runtime_mutation",
+        "merge_performed",
+        "install_performed",
+        "activation_performed",
+        "restart_performed",
+        "deploy_performed",
+        "publish_performed",
+        "product_mutation",
+        "payment_mutation",
+        "customer_data_mutation",
+        "true_done",
     }
+    action_tokens = (
+        "external", "mutation", "side_effect", "consequence", "merge",
+        "install", "activation", "activated", "restart", "deploy",
+        "publish", "product", "payment", "customer_data", "runtime",
+        "drive", "timer", "retention", "gpg", "write", "dispatch",
+        "authorization", "control_plane",
+    )
     while stack:
         value = stack.pop()
         if isinstance(value, dict):
@@ -7114,7 +7131,22 @@ def _metadata_attests_no_external_side_effect(metadata: Any) -> bool:
                     if not isinstance(nested, list) or nested:
                         return False
                     found = True
-                if key in effect_flags and nested is not False:
+                affirmative_action_flag = (
+                    type(nested) is bool
+                    and nested
+                    and any(token in key for token in action_tokens)
+                )
+                positive_action_count = (
+                    type(nested) is int
+                    and nested != 0
+                    and key.endswith("_count")
+                    and any(token in key for token in action_tokens)
+                )
+                if (
+                    (key in effect_flags and nested is not False)
+                    or affirmative_action_flag
+                    or positive_action_count
+                ):
                     return False
                 stack.append(nested)
         elif isinstance(value, list):
@@ -7129,7 +7161,7 @@ def _done_descendant_matches_prior_audit(
     audit_run_id: int,
     receipt: dict[str, Any],
 ) -> bool:
-    """Authenticate a direct done child against the superseded audit round."""
+    """Authenticate one done descendant against the superseded audit round."""
     if not isinstance(metadata, dict):
         return False
     direct = (
@@ -7169,18 +7201,16 @@ def _terminal_descendants_are_superseded(
         "JOIN tasks task ON task.id = descendants.id ORDER BY task.id",
         (auditor_task_id,),
     ).fetchall()
-    direct_children = {
-        str(row["child_id"])
-        for row in conn.execute(
-            "SELECT child_id FROM task_links WHERE parent_id = ?",
-            (auditor_task_id,),
-        ).fetchall()
-    }
+
     identity_fields = (
         "current_run_id", "claim_lock", "claim_expires", "worker_pid",
         "worker_starttime", "fence_lineage", "fence_disposition",
     )
+    serialized_by_task: dict[str, str] = {}
+    parents_by_task: dict[str, set[str]] = {}
+    directly_bound: set[str] = set()
     for task in descendants:
+        task_id = str(task["id"])
         if (
             task["status"] not in {"done", "archived"}
             or int(task["created_at"]) > current_run_started_at
@@ -7199,7 +7229,7 @@ def _terminal_descendants_are_superseded(
             for row in runs
         ):
             return False
-        serialized = json.dumps(
+        authority_serialized = json.dumps(
             {
                 "body": task["body"],
                 "result": task["result"],
@@ -7210,27 +7240,47 @@ def _terminal_descendants_are_superseded(
             },
             sort_keys=True,
         )
+        serialized = json.dumps(
+            {
+                "authority": authority_serialized,
+                "events": [
+                    row["payload"]
+                    for row in conn.execute(
+                        "SELECT payload FROM task_events WHERE task_id = ? ORDER BY id",
+                        (task["id"],),
+                    ).fetchall()
+                ],
+            },
+            sort_keys=True,
+        )
         if current_head in serialized.lower():
             return False
+        serialized_by_task[task_id] = authority_serialized.lower()
+        parents_by_task[task_id] = {
+            str(row["parent_id"])
+            for row in conn.execute(
+                "SELECT parent_id FROM task_links WHERE child_id = ?",
+                (task_id,),
+            ).fetchall()
+        }
         if task["status"] == "archived":
-            if not _strict_terminal_archive_is_authenticated(conn, str(task["id"])):
+            if not _strict_terminal_archive_is_authenticated(conn, task_id):
                 return False
-            if str(task["id"]) in direct_children:
-                archive = conn.execute(
-                    "SELECT payload FROM task_events WHERE task_id = ? "
-                    "AND kind = 'archived'",
-                    (task["id"],),
-                ).fetchone()
-                try:
-                    archive_reason = str(json.loads(archive["payload"])["reason"])
-                except (KeyError, TypeError, ValueError):
-                    return False
-                archive_binding = f"{task['body']}\n{archive_reason}".lower()
-                if (
-                    prior_receipt["head"].lower() not in archive_binding
-                    or str(prior_receipt["github_review_id"]) not in archive_binding
-                ):
-                    return False
+            archive = conn.execute(
+                "SELECT payload FROM task_events WHERE task_id = ? "
+                "AND kind = 'archived'",
+                (task["id"],),
+            ).fetchone()
+            try:
+                archive_reason = str(json.loads(archive["payload"])["reason"])
+            except (KeyError, TypeError, ValueError):
+                return False
+            archive_binding = f"{task['body']}\n{archive_reason}".lower()
+            if (
+                prior_receipt["head"].lower() in archive_binding
+                and str(prior_receipt["github_review_id"]) in archive_binding
+            ):
+                directly_bound.add(task_id)
             continue
         if not runs or (runs[-1]["status"], runs[-1]["outcome"]) != (
             "done", "completed",
@@ -7248,16 +7298,34 @@ def _terminal_descendants_are_superseded(
             return False
         if not _metadata_attests_no_external_side_effect(metadata):
             return False
-        if (
-            str(task["id"]) in direct_children
-            and not _done_descendant_matches_prior_audit(
+        if _done_descendant_matches_prior_audit(
                 metadata,
                 auditor_task_id=auditor_task_id,
                 audit_run_id=prior_audit_run_id,
                 receipt=prior_receipt,
+            ):
+            directly_bound.add(task_id)
+
+    # Every recursive task must either carry the exact prior-audit receipt or
+    # explicitly name an already-authenticated immediate parent.  The latter
+    # preserves typed Native lineage for deeper review/finalizer branches
+    # without requiring each immutable descendant to duplicate the root SHA.
+    authenticated = {auditor_task_id, *directly_bound}
+    pending = set(serialized_by_task) - authenticated
+    while pending:
+        promoted = {
+            task_id
+            for task_id in pending
+            if any(
+                parent_id in authenticated
+                and parent_id.lower() in serialized_by_task[task_id]
+                for parent_id in parents_by_task[task_id]
             )
-        ):
+        }
+        if not promoted:
             return False
+        authenticated.update(promoted)
+        pending.difference_update(promoted)
     return True
 
 

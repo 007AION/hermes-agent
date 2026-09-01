@@ -56,7 +56,8 @@ def _archive(conn, task_id):
             conn,
             task_id,
             reason=(
-                f"superseded prior-head branch after run3732 and review {REVIEW_ID}; "
+                f"superseded prior-head {OLD_HEAD} branch after run3732 and "
+                f"review {REVIEW_ID}; "
                 "zero action"
             ),
             actor="kanban-orchestrator",
@@ -373,7 +374,11 @@ def test_rearms_same_terminal_request_changes_auditor_once(kanban_home):
         "nonterminal_descendant",
         "side_effectful_descendant",
         "contradictory_external_side_effect",
+        "contradictory_merge_performed",
+        "contradictory_compound_action",
+        "contradictory_action_count",
         "missing_prior_round_binding",
+        "recursive_done_missing_prior_round_binding",
         "active_descendant_claim",
         "open_descendant_run",
         "stale_author_run",
@@ -387,6 +392,7 @@ def test_rearms_same_terminal_request_changes_auditor_once(kanban_home):
         "archived_open_run",
         "descendant_missing_completion_event",
         "current_head_descendant",
+        "recursive_archive_current_head",
         "active_auditor_claim",
         "controller_nonterminal",
         "wrong_auditor_run_profile",
@@ -435,7 +441,45 @@ def test_terminal_auditor_rearm_hostile_cases_are_zero_mutation(
                 "UPDATE task_runs SET metadata=? WHERE id=?",
                 (json.dumps(metadata), graph["fact_run"]),
             )
+        elif invalidity == "contradictory_merge_performed":
+            row = conn.execute(
+                "SELECT metadata FROM task_runs WHERE id=?", (graph["fact_run"],)
+            ).fetchone()
+            metadata = json.loads(row["metadata"])
+            metadata["merge_performed"] = True
+            conn.execute(
+                "UPDATE task_runs SET metadata=? WHERE id=?",
+                (json.dumps(metadata), graph["fact_run"]),
+            )
+        elif invalidity in {
+            "contradictory_compound_action", "contradictory_action_count",
+        }:
+            row = conn.execute(
+                "SELECT metadata FROM task_runs WHERE id=?", (graph["fact_run"],)
+            ).fetchone()
+            metadata = json.loads(row["metadata"])
+            if invalidity == "contradictory_compound_action":
+                metadata["product_merge_install_drive_runtime_retention_or_gpg_action"] = True
+            else:
+                metadata["restart_count"] = 1
+            conn.execute(
+                "UPDATE task_runs SET metadata=? WHERE id=?",
+                (json.dumps(metadata), graph["fact_run"]),
+            )
         elif invalidity == "missing_prior_round_binding":
+            conn.execute(
+                "UPDATE task_runs SET metadata=? WHERE id=?",
+                (json.dumps({"external_mutations_performed": []}), graph["fact_run"]),
+            )
+        elif invalidity == "recursive_done_missing_prior_round_binding":
+            conn.execute(
+                "DELETE FROM task_links WHERE parent_id=? AND child_id=?",
+                (graph["auditor"], graph["fact"]),
+            )
+            conn.execute(
+                "INSERT INTO task_links(parent_id, child_id) VALUES (?, ?)",
+                (graph["archived"], graph["fact"]),
+            )
             conn.execute(
                 "UPDATE task_runs SET metadata=? WHERE id=?",
                 (json.dumps({"external_mutations_performed": []}), graph["fact_run"]),
@@ -519,6 +563,17 @@ def test_terminal_auditor_rearm_hostile_cases_are_zero_mutation(
                     }),
                     graph["fact_run"],
                 ),
+            )
+        elif invalidity == "recursive_archive_current_head":
+            archive = conn.execute(
+                "SELECT id, payload FROM task_events WHERE task_id=? AND kind='archived'",
+                (graph["nested"],),
+            ).fetchone()
+            payload = json.loads(archive["payload"])
+            payload["reason"] += f"; incorrectly bound to current head {NEW_HEAD}"
+            conn.execute(
+                "UPDATE task_events SET payload=? WHERE id=?",
+                (json.dumps(payload), archive["id"]),
             )
         elif invalidity == "controller_nonterminal":
             conn.execute(
