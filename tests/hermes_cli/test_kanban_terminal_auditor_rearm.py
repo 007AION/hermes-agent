@@ -55,7 +55,10 @@ def _archive(conn, task_id):
         assert kb.archive_task(
             conn,
             task_id,
-            reason="superseded prior-head branch; zero action",
+            reason=(
+                f"superseded prior-head branch after run3732 and review {REVIEW_ID}; "
+                "zero action"
+            ),
             actor="kanban-orchestrator",
             source="kanban_archive",
             fail_if_active_run=True,
@@ -163,11 +166,22 @@ def _terminal_request_changes_graph(conn):
         fact,
         expected_run_id=fact_run,
         summary="prior-head facts only",
-        metadata={"external_mutations_performed": [], "bound_head": OLD_HEAD},
+        metadata={
+            "external_mutations_performed": [],
+            "repository": receipt["repository"],
+            "pr": receipt["pr"],
+            "head": receipt["head"],
+            "review_id": receipt["github_review_id"],
+            "review_state": receipt["github_review_state"],
+        },
     )
 
     archived = kb.create_task(
-        conn, title="superseded merger", assignee="merger", parents=[auditor]
+        conn,
+        title="superseded merger",
+        body=f"prior audited head {OLD_HEAD}",
+        assignee="merger",
+        parents=[auditor],
     )
     archived_run = _claim_run(conn, archived)
     assert kb.block_task(
@@ -231,6 +245,12 @@ def _terminal_request_changes_graph(conn):
                 "external_side_effect": False,
             },
             "bound_head": OLD_HEAD,
+            "audit_binding": {
+                "review_task_id": auditor,
+                "review_run_id": second_audit_run,
+                "github_review_id": receipt["github_review_id"],
+                "github_review_state": receipt["github_review_state"],
+            },
         },
     )
 
@@ -352,6 +372,8 @@ def test_rearms_same_terminal_request_changes_auditor_once(kanban_home):
         "prior_pass_only",
         "nonterminal_descendant",
         "side_effectful_descendant",
+        "contradictory_external_side_effect",
+        "missing_prior_round_binding",
         "active_descendant_claim",
         "open_descendant_run",
         "stale_author_run",
@@ -402,6 +424,21 @@ def test_terminal_auditor_rearm_hostile_cases_are_zero_mutation(
             conn.execute(
                 "UPDATE task_runs SET metadata=? WHERE id=?",
                 (json.dumps({"forbidden_actions_performed": ["external write"]}), graph["fact_run"]),
+            )
+        elif invalidity == "contradictory_external_side_effect":
+            row = conn.execute(
+                "SELECT metadata FROM task_runs WHERE id=?", (graph["fact_run"],)
+            ).fetchone()
+            metadata = json.loads(row["metadata"])
+            metadata["external_side_effect"] = True
+            conn.execute(
+                "UPDATE task_runs SET metadata=? WHERE id=?",
+                (json.dumps(metadata), graph["fact_run"]),
+            )
+        elif invalidity == "missing_prior_round_binding":
+            conn.execute(
+                "UPDATE task_runs SET metadata=? WHERE id=?",
+                (json.dumps({"external_mutations_performed": []}), graph["fact_run"]),
             )
         elif invalidity == "active_descendant_claim":
             conn.execute(

@@ -7095,9 +7095,17 @@ def _strict_terminal_archive_is_authenticated(
 
 
 def _metadata_attests_no_external_side_effect(metadata: Any) -> bool:
-    """Require one explicit empty action list and reject any conflicting list."""
+    """Require an empty action list and reject contradictory effect flags."""
     found = False
     stack = [metadata]
+    effect_flags = {
+        "external_side_effect",
+        "external_consequence",
+        "external_mutation",
+        "external_write",
+        "live_affected_task_mutation",
+        "production_or_runtime_mutation",
+    }
     while stack:
         value = stack.pop()
         if isinstance(value, dict):
@@ -7106,10 +7114,39 @@ def _metadata_attests_no_external_side_effect(metadata: Any) -> bool:
                     if not isinstance(nested, list) or nested:
                         return False
                     found = True
+                if key in effect_flags and nested is not False:
+                    return False
                 stack.append(nested)
         elif isinstance(value, list):
             stack.extend(value)
     return found
+
+
+def _done_descendant_matches_prior_audit(
+    metadata: Any,
+    *,
+    auditor_task_id: str,
+    audit_run_id: int,
+    receipt: dict[str, Any],
+) -> bool:
+    """Authenticate a direct done child against the superseded audit round."""
+    if not isinstance(metadata, dict):
+        return False
+    direct = (
+        metadata.get("repository") == receipt["repository"]
+        and metadata.get("pr") == receipt["pr"]
+        and str(metadata.get("head", "")).lower() == receipt["head"].lower()
+        and metadata.get("review_id") == receipt["github_review_id"]
+        and metadata.get("review_state") == receipt["github_review_state"]
+    )
+    binding = metadata.get("audit_binding")
+    bound = isinstance(binding, dict) and binding == {
+        "review_task_id": auditor_task_id,
+        "review_run_id": audit_run_id,
+        "github_review_id": receipt["github_review_id"],
+        "github_review_state": receipt["github_review_state"],
+    }
+    return direct or bound
 
 
 def _terminal_descendants_are_superseded(
@@ -7117,6 +7154,10 @@ def _terminal_descendants_are_superseded(
     *,
     auditor_task_id: str,
     current_head: str,
+    current_run_id: int,
+    current_run_started_at: int,
+    prior_audit_run_id: int,
+    prior_receipt: dict[str, Any],
 ) -> bool:
     """Fail closed unless the whole prior-head branch is inert and terminal."""
     descendants = conn.execute(
@@ -7128,6 +7169,13 @@ def _terminal_descendants_are_superseded(
         "JOIN tasks task ON task.id = descendants.id ORDER BY task.id",
         (auditor_task_id,),
     ).fetchall()
+    direct_children = {
+        str(row["child_id"])
+        for row in conn.execute(
+            "SELECT child_id FROM task_links WHERE parent_id = ?",
+            (auditor_task_id,),
+        ).fetchall()
+    }
     identity_fields = (
         "current_run_id", "claim_lock", "claim_expires", "worker_pid",
         "worker_starttime", "fence_lineage", "fence_disposition",
@@ -7135,6 +7183,7 @@ def _terminal_descendants_are_superseded(
     for task in descendants:
         if (
             task["status"] not in {"done", "archived"}
+            or int(task["created_at"]) > current_run_started_at
             or any(task[field] is not None for field in identity_fields)
         ):
             return False
@@ -7144,7 +7193,9 @@ def _terminal_descendants_are_superseded(
             (task["id"],),
         ).fetchall()
         if any(
-            row["ended_at"] is None or row["profile"] != task["assignee"]
+            row["ended_at"] is None
+            or int(row["id"]) >= current_run_id
+            or row["profile"] != task["assignee"]
             for row in runs
         ):
             return False
@@ -7164,6 +7215,22 @@ def _terminal_descendants_are_superseded(
         if task["status"] == "archived":
             if not _strict_terminal_archive_is_authenticated(conn, str(task["id"])):
                 return False
+            if str(task["id"]) in direct_children:
+                archive = conn.execute(
+                    "SELECT payload FROM task_events WHERE task_id = ? "
+                    "AND kind = 'archived'",
+                    (task["id"],),
+                ).fetchone()
+                try:
+                    archive_reason = str(json.loads(archive["payload"])["reason"])
+                except (KeyError, TypeError, ValueError):
+                    return False
+                archive_binding = f"{task['body']}\n{archive_reason}".lower()
+                if (
+                    prior_receipt["head"].lower() not in archive_binding
+                    or str(prior_receipt["github_review_id"]) not in archive_binding
+                ):
+                    return False
             continue
         if not runs or (runs[-1]["status"], runs[-1]["outcome"]) != (
             "done", "completed",
@@ -7180,6 +7247,16 @@ def _terminal_descendants_are_superseded(
         except (TypeError, ValueError):
             return False
         if not _metadata_attests_no_external_side_effect(metadata):
+            return False
+        if (
+            str(task["id"]) in direct_children
+            and not _done_descendant_matches_prior_audit(
+                metadata,
+                auditor_task_id=auditor_task_id,
+                audit_run_id=prior_audit_run_id,
+                receipt=prior_receipt,
+            )
+        ):
             return False
     return True
 
@@ -7278,15 +7355,17 @@ def _terminal_request_changes_auditor_can_rearm(
         or len(recovery_rows) != 1
         or len(auditor_runs) != 2
         or any(row["profile"] != auditor["assignee"] for row in auditor_runs)
-        or _authenticated_same_auditor_terminal_correction_source_run_id(
-            conn,
-            author_task_id,
-            auditor_task_id,
-            int(auditor_runs[0]["id"]),
-            typed_verdicts,
-            auditor_runs,
-        ) is None
     ):
+        return False
+    prior_author_run_id = _authenticated_same_auditor_terminal_correction_source_run_id(
+        conn,
+        author_task_id,
+        auditor_task_id,
+        int(auditor_runs[0]["id"]),
+        typed_verdicts,
+        auditor_runs,
+    )
+    if prior_author_run_id is None:
         return False
     recovery_row, recovery_payload = recovery_rows[0]
     schema = {
@@ -7378,6 +7457,10 @@ def _terminal_request_changes_auditor_can_rearm(
         conn,
         auditor_task_id=auditor_task_id,
         current_head=current_head,
+        current_run_id=int(current_run["id"]),
+        current_run_started_at=int(current_run["started_at"]),
+        prior_audit_run_id=int(final_run["id"]),
+        prior_receipt=receipt,
     )
 
 
