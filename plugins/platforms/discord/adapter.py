@@ -1508,9 +1508,28 @@ class DiscordAdapter(BasePlatformAdapter):
         The sampler must not await itself through ``disconnect()``. Running the
         close and fatal callback in this sibling task also means the runner owns
         the bounded full teardown before it creates a replacement adapter.
+
+        The failed WebSocket is already known unhealthy. Abort its transport
+        before asking discord.py for a graceful close: aiohttp's close path can
+        otherwise monopolize the event loop, in which case the timeout around
+        ``client.close()`` cannot run and the gateway liveness watchdog exits 75.
         """
         failed_websocket = getattr(client, "ws", None)
         try:
+            transport_aborted = False
+            try:
+                transport_aborted = _abort_discord_websocket_transport(failed_websocket)
+                if transport_aborted:
+                    logger.warning(
+                        "[%s] Aborted unhealthy Discord WebSocket transport before client close",
+                        self.name,
+                    )
+            except Exception:
+                logger.debug(
+                    "[%s] Error aborting unhealthy Discord WebSocket transport",
+                    self.name,
+                    exc_info=True,
+                )
             close_task = asyncio.create_task(client.close())
             try:
                 done, _pending = await asyncio.wait({close_task}, timeout=1.0)
@@ -1530,18 +1549,19 @@ class DiscordAdapter(BasePlatformAdapter):
                     # cleanup attempt; the stale task remains owned by its
                     # done callback until it actually exits.
                     client._closing_task = None
-                try:
-                    if _abort_discord_websocket_transport(failed_websocket):
-                        logger.warning(
-                            "[%s] Aborted unresponsive Discord WebSocket transport",
+                if not transport_aborted:
+                    try:
+                        if _abort_discord_websocket_transport(failed_websocket):
+                            logger.warning(
+                                "[%s] Aborted unresponsive Discord WebSocket transport",
+                                self.name,
+                            )
+                    except Exception:
+                        logger.debug(
+                            "[%s] Error aborting unhealthy Discord WebSocket transport",
                             self.name,
+                            exc_info=True,
                         )
-                except Exception:
-                    logger.debug(
-                        "[%s] Error aborting unhealthy Discord WebSocket transport",
-                        self.name,
-                        exc_info=True,
-                    )
             except Exception:
                 logger.debug("[%s] Error closing unhealthy Discord client", self.name, exc_info=True)
             # The runner's bounded teardown can execute ``disconnect()`` inside

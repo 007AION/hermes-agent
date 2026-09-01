@@ -553,6 +553,55 @@ async def test_liveness_close_timeout_aborts_aiohttp_transport_before_fatal_noti
 
 
 @pytest.mark.asyncio
+async def test_liveness_recovery_aborts_stale_transport_before_client_close(monkeypatch):
+    """Forced recovery must not let stale aiohttp close monopolize the loop.
+
+    The production exit-75 stack showed the gateway event-loop thread inside
+    ``discord.Client.close`` -> ``aiohttp.ClientWebSocketResponse.close`` after
+    liveness had already forced a reconnect.  A timeout around ``client.close``
+    cannot fire if that coroutine's close path itself stops yielding, so abort
+    the known-stale transport before entering discord.py's graceful teardown.
+    """
+    adapter = _make_adapter(monkeypatch, interval=60, threshold=1, max_ack_age=1.0)
+    handler = AsyncMock()
+    adapter.set_fatal_error_handler(handler)
+    call_order = []
+
+    class _Transport:
+        def abort(self):
+            call_order.append("abort")
+
+    transport = _Transport()
+    websocket = SimpleNamespace(
+        socket=SimpleNamespace(
+            _response=SimpleNamespace(connection=None),
+            _conn=None,
+            _writer=SimpleNamespace(transport=transport),
+        )
+    )
+
+    class _Client:
+        def __init__(self):
+            self.ws = websocket
+            self._closing_task = None
+
+        async def close(self):
+            call_order.append("close")
+
+    client = _Client()
+    adapter._set_fatal_error(
+        "discord_websocket_health_stale",
+        "Discord Gateway WebSocket health check failed: latency_exceeded",
+        retryable=True,
+    )
+
+    await adapter._notify_liveness_fatal_error(client)
+
+    assert call_order == ["abort", "close"]
+    handler.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_disconnect_cancels_liveness_task(monkeypatch):
     """``disconnect()`` must cancel the probe so the gateway can shut down
     cleanly without leaking a background task."""
