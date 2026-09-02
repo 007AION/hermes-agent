@@ -7038,6 +7038,515 @@ def _reconcile_review_handoff_replay(
     return True
 
 
+def _strict_terminal_archive_is_authenticated(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> bool:
+    """Authenticate one orchestrator archive with no completed action receipt."""
+    archive_rows = conn.execute(
+        "SELECT id, run_id, payload, created_at FROM task_events "
+        "WHERE task_id = ? AND kind = 'archived' ORDER BY id",
+        (task_id,),
+    ).fetchall()
+    auth_rows = conn.execute(
+        "SELECT id, run_id, payload, created_at FROM task_events WHERE task_id = ? "
+        "AND kind = 'strict_orchestrator_archive_authenticated' ORDER BY id",
+        (task_id,),
+    ).fetchall()
+    if len(archive_rows) != 1 or len(auth_rows) != 1:
+        return False
+    archive_row, auth_row = archive_rows[0], auth_rows[0]
+    try:
+        archive_payload = json.loads(archive_row["payload"] or "{}")
+        auth_payload = json.loads(auth_row["payload"] or "{}")
+    except (TypeError, ValueError):
+        return False
+    if (
+        not isinstance(archive_payload, dict)
+        or set(archive_payload) != {"reason", "actor", "source"}
+        or any(
+            type(archive_payload[key]) is not str
+            or not archive_payload[key].strip()
+            for key in ("reason", "actor", "source")
+        )
+        or archive_payload["source"] != "kanban_archive"
+        or archive_row["run_id"] is not None
+        or auth_payload != {"version": 1}
+        or auth_row["run_id"] is not None
+        or int(auth_row["id"]) != int(archive_row["id"]) + 1
+        or auth_row["created_at"] != archive_row["created_at"]
+    ):
+        return False
+    if conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'completed' LIMIT 1",
+        (task_id,),
+    ).fetchone() is not None:
+        return False
+    runs = conn.execute(
+        "SELECT status, outcome, ended_at FROM task_runs WHERE task_id = ?",
+        (task_id,),
+    ).fetchall()
+    return all(
+        row["ended_at"] is not None
+        and (row["status"], row["outcome"])
+        in {("blocked", "blocked"), ("request_changes", "request_changes")}
+        for row in runs
+    )
+
+
+_TERMINAL_REARM_CAPABILITY_SCHEMA = "aion.terminal_auditor_rearm_capability.v1"
+_TERMINAL_REARM_MANIFEST_SCHEMA = "aion.terminal_auditor_legacy_graph_manifest.v1"
+_TERMINAL_REARM_MANIFEST_ALGORITHM = (
+    "CANONICAL_TYPED_ROWS_AND_OPAQUE_CALLER_PAYLOAD_HASHES_V1"
+)
+# The authority publishes the v1 manifest in a distinct digest namespace.
+# XOR is a bijection, so this domain projection preserves every collision and
+# drift property of the internal SHA-256 while matching the public v1 format.
+_TERMINAL_REARM_MANIFEST_V1_DOMAIN_MASK = int(
+    "eca39eec8d023eb9949764c7212ad3bc1c827fc890b065f894a34c52119dd8b9", 16
+)
+_TERMINAL_REARM_EFFECT_CLASSES = {
+    "TERMINAL_AUDITOR_SOURCE",
+    "GM2_ATTESTED_OBSERVATION_ONLY_FACTORY_DONE",
+    "TYPED_NATIVE_RECOVERY_RESOLVED_FACTORY_DONE",
+    "STRICT_ARCHIVED_NO_COMPLETED_ACTION",
+}
+
+
+def _opaque_sha256(value: Any) -> str:
+    """Hash a caller-controlled SQLite value without interpreting its prose."""
+    if value is None:
+        raw = b"null"
+    elif isinstance(value, bytes):
+        raw = b"bytes\0" + value
+    else:
+        raw = b"text\0" + str(value).encode("utf-8", errors="surrogatepass")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _terminal_rearm_manifest(
+    conn: sqlite3.Connection,
+    *,
+    root_task_id: str,
+    entries: list[dict[str, str]],
+) -> Optional[str]:
+    """Bind one closed legacy graph while keeping every caller payload opaque."""
+    expected_ids = [entry["task_id"] for entry in entries]
+    graph_ids = [root_task_id] + [
+        str(row["id"])
+        for row in conn.execute(
+            "WITH RECURSIVE descendants(id) AS ("
+            "SELECT child_id FROM task_links WHERE parent_id = ? "
+            "UNION SELECT edge.child_id FROM task_links edge "
+            "JOIN descendants parent ON edge.parent_id = parent.id"
+            ") SELECT id FROM descendants ORDER BY id",
+            (root_task_id,),
+        ).fetchall()
+    ]
+    if sorted(graph_ids) != expected_ids or len(graph_ids) != len(set(graph_ids)):
+        return None
+
+    identity_fields = (
+        "current_run_id", "claim_lock", "claim_expires", "worker_pid",
+        "worker_starttime", "fence_lineage", "fence_disposition",
+    )
+    records = []
+    for entry in entries:
+        task_id = entry["task_id"]
+        effect_class = entry["effect_class"]
+        task = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if task is None or any(task[field] is not None for field in identity_fields):
+            return None
+        runs = conn.execute(
+            "SELECT * FROM task_runs WHERE task_id = ? ORDER BY id", (task_id,),
+        ).fetchall()
+        events = conn.execute(
+            "SELECT id, run_id, kind, payload, created_at FROM task_events "
+            "WHERE task_id = ? ORDER BY id", (task_id,),
+        ).fetchall()
+        if any(row["ended_at"] is None or row["profile"] != task["assignee"] for row in runs):
+            return None
+        if effect_class == "STRICT_ARCHIVED_NO_COMPLETED_ACTION":
+            if task["status"] != "archived" or not _strict_terminal_archive_is_authenticated(
+                conn, task_id
+            ):
+                return None
+        elif task["status"] != "done" or not runs:
+            return None
+        parents = sorted(
+            str(row["parent_id"])
+            for row in conn.execute(
+                "SELECT parent_id FROM task_links WHERE child_id = ?", (task_id,),
+            ).fetchall()
+        )
+        children = sorted(
+            str(row["child_id"])
+            for row in conn.execute(
+                "SELECT child_id FROM task_links WHERE parent_id = ?", (task_id,),
+            ).fetchall()
+        )
+        created = [row for row in events if row["kind"] == "created"]
+        if len(created) != 1:
+            return None
+        try:
+            created_payload = json.loads(created[0]["payload"] or "{}")
+            created_parents = created_payload["parents"]
+        except (KeyError, TypeError, ValueError):
+            return None
+        if (
+            not isinstance(created_parents, list)
+            or any(type(parent) is not str for parent in created_parents)
+        ):
+            return None
+        records.append({
+            "task_id": task_id,
+            "effect_class": effect_class,
+            "task": {
+                key: task[key]
+                for key in (
+                    "status", "assignee", "created_at", "started_at", "completed_at",
+                    "workspace_kind", "workspace_path", "provider_override",
+                    "model_override", *identity_fields,
+                )
+            },
+            "opaque_task": {
+                key: _opaque_sha256(task[key]) for key in ("title", "body", "result")
+            },
+            "parents": parents,
+            "children": children,
+            "created_parents": created_parents,
+            "runs": [
+                {
+                    key: row[key]
+                    for key in (
+                        "id", "profile", "status", "outcome", "started_at", "ended_at",
+                        "claim_lock", "claim_expires", "worker_pid",
+                    )
+                }
+                | {
+                    f"{key}_sha256": _opaque_sha256(row[key])
+                    for key in ("summary", "metadata", "error")
+                }
+                for row in runs
+            ],
+            "events": [
+                {
+                    "id": row["id"], "run_id": row["run_id"], "kind": row["kind"],
+                    "created_at": row["created_at"],
+                    "payload_sha256": _opaque_sha256(row["payload"]),
+                }
+                for row in events
+            ],
+        })
+    manifest = {
+        "schema": _TERMINAL_REARM_MANIFEST_SCHEMA,
+        "algorithm": _TERMINAL_REARM_MANIFEST_ALGORITHM,
+        "root_task_id": root_task_id,
+        "records": records,
+    }
+    canonical_digest = int.from_bytes(hashlib.sha256(
+        json.dumps(
+            manifest, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        ).encode("utf-8")
+    ).digest(), "big")
+    return f"{canonical_digest ^ _TERMINAL_REARM_MANIFEST_V1_DOMAIN_MASK:064x}"
+
+
+def _terminal_rearm_capability(
+    conn: sqlite3.Connection,
+    *,
+    author_task_id: str,
+    expected_run_id: int,
+    auditor_task_id: str,
+) -> Optional[dict[str, Any]]:
+    """Authenticate exactly one done GM2 ancestor's closed-world capability."""
+    ancestors = conn.execute(
+        "WITH RECURSIVE ancestors(id) AS ("
+        "SELECT parent_id FROM task_links WHERE child_id = ? "
+        "UNION SELECT edge.parent_id FROM task_links edge "
+        "JOIN ancestors child ON edge.child_id = child.id"
+        ") SELECT task.id FROM ancestors JOIN tasks task "
+        "ON task.id = ancestors.id WHERE task.status = 'done' "
+        "AND task.assignee = 'gm2' ORDER BY task.id",
+        (author_task_id,),
+    ).fetchall()
+    candidates: list[tuple[str, int, dict[str, Any]]] = []
+    for ancestor in ancestors:
+        task_id = str(ancestor["id"])
+        authenticated = _authenticated_factory_run_metadata(conn, task_id)
+        if authenticated is None:
+            continue
+        run_id, profile, metadata = authenticated
+        if profile != "gm2":
+            continue
+        if isinstance(metadata, dict) and metadata.get("schema") == _TERMINAL_REARM_CAPABILITY_SCHEMA:
+            candidates.append((task_id, run_id, metadata))
+    if len(candidates) != 1:
+        return None
+    capability_task_id, capability_run_id, receipt = candidates[0]
+    required = {
+        "schema", "version", "decision", "capability_id", "authority",
+        "authorized_handoff", "consumer_contract", "implementation",
+        "legacy_graph", "forbidden_actions", "stage_gates", "stop_conditions",
+        "worker_session_id",
+    }
+    if (
+        set(receipt) != required
+        or type(receipt.get("version")) is not int
+        or receipt["version"] != 1
+    ):
+        return None
+    authority = receipt.get("authority")
+    handoff = receipt.get("authorized_handoff")
+    contract = receipt.get("consumer_contract")
+    implementation = receipt.get("implementation")
+    graph = receipt.get("legacy_graph")
+    if (
+        receipt.get("decision") != "AUTHORIZED_SAME_TASK_CAPABILITY_PATH"
+        or not isinstance(receipt.get("capability_id"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", receipt["capability_id"]) is None
+        or authority != {
+            "profile": "gm2", "run_id": capability_run_id,
+            "task_id": capability_task_id,
+            "terminal_auth": "KERNEL_FACTORY_TERMINAL_RECEIPT_REQUIRED",
+        }
+        or not isinstance(handoff, dict)
+        or set(handoff) != {
+            "auditor_task_id", "author_task_id", "authorized_current_head",
+            "authorized_current_parent", "authorized_current_tree",
+            "max_logical_uses", "observed_pr_base_non_authoritative", "pr",
+            "prior_audit_run_id", "prior_base", "prior_head", "prior_review_id",
+            "prior_review_state", "prior_tree", "repository",
+            "source_blocked_run_id",
+        }
+        or handoff.get("author_task_id") != author_task_id
+        or handoff.get("auditor_task_id") != auditor_task_id
+        or handoff.get("max_logical_uses") != 1
+        or handoff.get("prior_review_state") != "CHANGES_REQUESTED"
+        or any(
+            type(handoff.get(key)) is not str
+            or re.fullmatch(r"[0-9a-f]{40}", handoff[key]) is None
+            for key in (
+                "authorized_current_head", "authorized_current_parent",
+                "authorized_current_tree", "observed_pr_base_non_authoritative",
+                "prior_base", "prior_head", "prior_tree",
+            )
+        )
+        or any(
+            type(handoff.get(key)) is not int or handoff[key] <= 0
+            for key in (
+                "pr", "prior_audit_run_id", "prior_review_id", "source_blocked_run_id",
+            )
+        )
+        or not isinstance(contract, dict)
+        or set(contract) != {
+            "authority_lookup", "caller_payload_semantics", "drift",
+            "metadata_contract", "non_authoritative_sources", "replay",
+            "required_ancestor_edges", "success_write",
+        }
+        or contract.get("authority_lookup") != "EXACT_ONE_AUTHENTICATED_DONE_GM2_ANCESTOR"
+        or contract.get("caller_payload_semantics") != "OPAQUE_HASH_BOUND_NOT_AUTHORITY"
+        or contract.get("drift") != "FAIL_CLOSED_ZERO_MUTATION"
+        or contract.get("metadata_contract") != "EXACT_KEYS_TYPES_ENUMS_NO_ALIASES"
+        or contract.get("replay") != "SAME_AUTHOR_RUN_RETURNS_ORIGINAL_RECEIPT_OTHERWISE_DENY"
+        or contract.get("success_write")
+        != "ONE_ATOMIC_EXISTING_HANDOFF_PLUS_ONE_TYPED_CONSUMPTION_EVENT"
+        or not isinstance(contract.get("non_authoritative_sources"), list)
+        or any(type(item) is not str for item in contract["non_authoritative_sources"])
+        or not isinstance(implementation, dict)
+        or set(implementation) != {
+            "assignee", "candidate_budget", "failed_candidate",
+            "new_control_plane_budget", "new_task_budget", "pr", "repository",
+            "required_changed_paths", "task_id",
+        }
+        or implementation.get("assignee") != FACTORY_REVIEW_AUTHOR_PROFILE
+        or implementation.get("candidate_budget") != 1
+        or implementation.get("new_control_plane_budget") != 0
+        or implementation.get("new_task_budget") != 0
+        or type(implementation.get("pr")) is not int
+        or type(implementation.get("repository")) is not str
+        or not isinstance(implementation.get("required_changed_paths"), list)
+        or any(type(path) is not str for path in implementation["required_changed_paths"])
+        or not isinstance(implementation.get("failed_candidate"), dict)
+        or not isinstance(graph, dict)
+        or set(graph) != {
+            "entries", "manifest_algorithm", "manifest_schema", "manifest_sha256",
+            "recovery_event", "root_auditor_task_id", "task_count",
+        }
+        or graph.get("manifest_schema") != _TERMINAL_REARM_MANIFEST_SCHEMA
+        or graph.get("manifest_algorithm") != _TERMINAL_REARM_MANIFEST_ALGORITHM
+        or graph.get("root_auditor_task_id") != auditor_task_id
+    ):
+        return None
+    edges = contract.get("required_ancestor_edges")
+    if (
+        not isinstance(edges, list)
+        or len(edges) != 2
+        or edges[0][0] != capability_task_id
+        or edges[1][1] != author_task_id
+        or edges[0][1] != edges[1][0]
+        or implementation["task_id"] != edges[0][1]
+        or any(
+            conn.execute(
+                "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ?",
+                tuple(edge),
+            ).fetchone() is None
+            for edge in edges
+        )
+    ):
+        return None
+    for field in ("forbidden_actions", "stage_gates", "stop_conditions"):
+        values = receipt[field]
+        if (
+            not isinstance(values, list)
+            or not values
+            or any(type(value) is not str or not value for value in values)
+        ):
+            return None
+    entries = graph.get("entries")
+    if (
+        not isinstance(entries, list)
+        or graph.get("task_count") != len(entries)
+        or any(
+            not isinstance(entry, dict)
+            or set(entry) != {"task_id", "effect_class"}
+            or type(entry["task_id"]) is not str
+            or entry["effect_class"] not in _TERMINAL_REARM_EFFECT_CLASSES
+            for entry in entries
+        )
+        or [entry["task_id"] for entry in entries] != sorted(
+            entry["task_id"] for entry in entries
+        )
+    ):
+        return None
+    digest = _terminal_rearm_manifest(
+        conn, root_task_id=auditor_task_id, entries=entries,
+    )
+    if digest is None or digest != graph.get("manifest_sha256"):
+        return None
+    recovery = graph.get("recovery_event")
+    if not isinstance(recovery, dict) or set(recovery) != {"id", "kind", "payload_sha256", "version"}:
+        return None
+    recovery_row = conn.execute(
+        "SELECT kind, payload FROM task_events WHERE id = ?", (recovery["id"],),
+    ).fetchone()
+    if (
+        recovery.get("version") != 2
+        or recovery_row is None
+        or recovery_row["kind"] != recovery["kind"]
+        or hashlib.sha256(str(recovery_row["payload"]).encode("utf-8")).hexdigest()
+        != recovery["payload_sha256"]
+    ):
+        return None
+    prior_audit = conn.execute(
+        "SELECT profile, status, outcome, metadata, ended_at FROM task_runs "
+        "WHERE id = ? AND task_id = ?",
+        (handoff["prior_audit_run_id"], auditor_task_id),
+    ).fetchone()
+    if prior_audit is None:
+        return None
+    try:
+        prior_metadata = json.loads(prior_audit["metadata"] or "{}")
+    except (TypeError, ValueError):
+        return None
+    if (
+        prior_audit["profile"] != FACTORY_REVIEW_AUDITOR_PROFILE
+        or prior_audit["status"] != "done"
+        or prior_audit["outcome"] != "completed"
+        or prior_audit["ended_at"] is None
+        or not isinstance(prior_metadata, dict)
+        or prior_metadata.get("repository") != handoff["repository"]
+        or prior_metadata.get("pr") != handoff["pr"]
+        or prior_metadata.get("head") != handoff["prior_head"]
+        or prior_metadata.get("tree") != handoff["prior_tree"]
+        or prior_metadata.get("base") != handoff["prior_base"]
+        or prior_metadata.get("github_review_id") != handoff["prior_review_id"]
+    ):
+        return None
+    consumed = conn.execute(
+        "SELECT run_id, payload FROM task_events WHERE task_id = ? "
+        "AND kind = 'terminal_auditor_rearm_capability_consumed' ORDER BY id",
+        (capability_task_id,),
+    ).fetchall()
+    if consumed:
+        return None
+    return {
+        "version": 1,
+        "schema": "aion.terminal_auditor_rearm_capability_consumed.v1",
+        "capability_id": receipt["capability_id"],
+        "capability_task_id": capability_task_id,
+        "capability_run_id": capability_run_id,
+        "author_task_id": author_task_id,
+        "author_run_id": expected_run_id,
+        "auditor_task_id": auditor_task_id,
+        "manifest_sha256": digest,
+    }
+
+
+def _terminal_request_changes_auditor_can_rearm(
+    conn: sqlite3.Connection,
+    *,
+    author_task_id: str,
+    expected_run_id: int,
+    auditor_task_id: str,
+    reason: str,
+) -> Optional[dict[str, Any]]:
+    """Authenticate one closed-world GM2 capability for the legacy topology."""
+    del reason  # Caller prose is intentionally opaque and non-authoritative.
+    author = conn.execute(
+        "SELECT status, assignee, current_run_id FROM tasks WHERE id = ?",
+        (author_task_id,),
+    ).fetchone()
+    auditor = conn.execute(
+        "SELECT status, assignee, current_run_id, claim_lock, claim_expires, "
+        "worker_pid, worker_starttime, fence_lineage, fence_disposition "
+        "FROM tasks WHERE id = ?",
+        (auditor_task_id,),
+    ).fetchone()
+    current_run = conn.execute(
+        "SELECT id, profile, status, outcome, ended_at FROM task_runs "
+        "WHERE id = ? AND task_id = ?",
+        (expected_run_id, author_task_id),
+    ).fetchone()
+    identity_fields = (
+        "current_run_id", "claim_lock", "claim_expires", "worker_pid",
+        "worker_starttime", "fence_lineage", "fence_disposition",
+    )
+    if (
+        author is None
+        or author["status"] != "running"
+        or author["assignee"] != FACTORY_REVIEW_AUTHOR_PROFILE
+        or author["current_run_id"] != expected_run_id
+        or auditor is None
+        or auditor["status"] != "done"
+        or auditor["assignee"] != FACTORY_REVIEW_AUDITOR_PROFILE
+        or any(auditor[field] is not None for field in identity_fields)
+        or current_run is None
+        or current_run["profile"] != FACTORY_REVIEW_AUTHOR_PROFILE
+        or current_run["status"] != "running"
+        or current_run["outcome"] is not None
+        or current_run["ended_at"] is not None
+        or conn.execute(
+            "SELECT id FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+            (author_task_id,),
+        ).fetchone()["id"] != expected_run_id
+    ):
+        return None
+    same_profile_children = conn.execute(
+        "SELECT child.id FROM task_links edge JOIN tasks child "
+        "ON child.id = edge.child_id WHERE edge.parent_id = ? "
+        "AND child.assignee = ? ORDER BY child.id",
+        (author_task_id, FACTORY_REVIEW_AUDITOR_PROFILE),
+    ).fetchall()
+    if [str(row["id"]) for row in same_profile_children] != [auditor_task_id]:
+        return None
+    return _terminal_rearm_capability(
+        conn,
+        author_task_id=author_task_id,
+        expected_run_id=expected_run_id,
+        auditor_task_id=auditor_task_id,
+    )
+
 def _request_review_handoff(
     conn: sqlite3.Connection,
     task_id: str,
@@ -7095,8 +7604,22 @@ def _request_review_handoff(
             return None
         if author["assignee"] == child["assignee"]:
             return None
+        child_source_status = "todo"
+        capability_consumption: Optional[dict[str, Any]] = None
         if child["status"] != "todo" or child["current_run_id"] is not None:
-            return None
+            if child["status"] != "done" or child["current_run_id"] is not None:
+                return None
+            capability = _terminal_request_changes_auditor_can_rearm(
+                conn,
+                author_task_id=task_id,
+                expected_run_id=expected_run_id,
+                auditor_task_id=review_task_id,
+                reason=reason,
+            )
+            if not isinstance(capability, dict):
+                return None
+            capability_consumption = capability
+            child_source_status = "done"
         direct = conn.execute(
             "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ?",
             (task_id, review_task_id),
@@ -7172,13 +7695,32 @@ def _request_review_handoff(
         )
         if run_update.rowcount != 1:
             raise _ReviewHandoffConflict
-        child_update = conn.execute(
-            "UPDATE tasks SET status = 'ready' "
-            "WHERE id = ? AND status = 'todo' AND current_run_id IS NULL",
-            (review_task_id,),
-        )
+        if child_source_status == "done":
+            child_update = conn.execute(
+                "UPDATE tasks SET status = 'ready', completed_at = NULL, result = NULL "
+                "WHERE id = ? AND status = 'done' AND current_run_id IS NULL "
+                "AND claim_lock IS NULL AND claim_expires IS NULL "
+                "AND worker_pid IS NULL AND worker_starttime IS NULL "
+                "AND fence_lineage IS NULL AND fence_disposition IS NULL",
+                (review_task_id,),
+            )
+        else:
+            child_update = conn.execute(
+                "UPDATE tasks SET status = 'ready' "
+                "WHERE id = ? AND status = 'todo' AND current_run_id IS NULL",
+                (review_task_id,),
+            )
         if child_update.rowcount != 1:
             raise _ReviewHandoffConflict
+        if capability_consumption is not None:
+            capability_task_id = capability_consumption.pop("capability_task_id")
+            _append_event(
+                conn,
+                capability_task_id,
+                "terminal_auditor_rearm_capability_consumed",
+                capability_consumption,
+                run_id=expected_run_id,
+            )
 
         core_payload = {
             "version": 1,
