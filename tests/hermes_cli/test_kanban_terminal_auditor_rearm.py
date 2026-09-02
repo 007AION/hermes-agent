@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import hashlib
 import json
 import threading
 from pathlib import Path
@@ -255,6 +256,150 @@ def _terminal_request_changes_graph(conn):
         },
     )
 
+    capability = kb.create_task(
+        conn, title="factory terminal-rearm capability", assignee="gm2"
+    )
+    capability_run = _claim_run(conn, capability)
+    implementation = kb.create_task(
+        conn,
+        title="bounded terminal-rearm implementation",
+        assignee="agent007",
+        parents=[capability],
+    )
+    kb.link_tasks(conn, implementation, author)
+    entries = sorted(
+        [
+            {"task_id": auditor, "effect_class": "TERMINAL_AUDITOR_SOURCE"},
+            {
+                "task_id": fact,
+                "effect_class": "GM2_ATTESTED_OBSERVATION_ONLY_FACTORY_DONE",
+            },
+            {
+                "task_id": archived,
+                "effect_class": "STRICT_ARCHIVED_NO_COMPLETED_ACTION",
+            },
+            {
+                "task_id": nested,
+                "effect_class": "STRICT_ARCHIVED_NO_COMPLETED_ACTION",
+            },
+            {
+                "task_id": controller,
+                "effect_class": "TYPED_NATIVE_RECOVERY_RESOLVED_FACTORY_DONE",
+            },
+        ],
+        key=lambda entry: entry["task_id"],
+    )
+    manifest_sha256 = kb._terminal_rearm_manifest(
+        conn, root_task_id=auditor, entries=entries,
+    )
+    assert manifest_sha256 is not None
+    recovery_event = conn.execute(
+        "SELECT id, kind, payload FROM task_events WHERE task_id=? "
+        "AND kind='review_verdict' AND payload LIKE '%\"version\": 2%'",
+        (author,),
+    ).fetchone()
+    assert recovery_event is not None
+    capability_metadata = {
+        "schema": kb._TERMINAL_REARM_CAPABILITY_SCHEMA,
+        "version": 1,
+        "decision": "AUTHORIZED_SAME_TASK_CAPABILITY_PATH",
+        "capability_id": "a" * 64,
+        "authority": {
+            "profile": "gm2",
+            "run_id": capability_run,
+            "task_id": capability,
+            "terminal_auth": "KERNEL_FACTORY_TERMINAL_RECEIPT_REQUIRED",
+        },
+        "authorized_handoff": {
+            "author_task_id": author,
+            "auditor_task_id": auditor,
+            "authorized_current_head": NEW_HEAD,
+            "authorized_current_parent": "5" * 40,
+            "authorized_current_tree": "6" * 40,
+            "max_logical_uses": 1,
+            "observed_pr_base_non_authoritative": "7" * 40,
+            "pr": PR,
+            "prior_audit_run_id": second_audit_run,
+            "prior_base": OLD_BASE,
+            "prior_head": OLD_HEAD,
+            "prior_review_id": REVIEW_ID,
+            "prior_review_state": "CHANGES_REQUESTED",
+            "prior_tree": OLD_TREE,
+            "repository": receipt["repository"],
+            "source_blocked_run_id": second_author_run,
+        },
+        "consumer_contract": {
+            "authority_lookup": "EXACT_ONE_AUTHENTICATED_DONE_GM2_ANCESTOR",
+            "caller_payload_semantics": "OPAQUE_HASH_BOUND_NOT_AUTHORITY",
+            "drift": "FAIL_CLOSED_ZERO_MUTATION",
+            "metadata_contract": "EXACT_KEYS_TYPES_ENUMS_NO_ALIASES",
+            "non_authoritative_sources": ["reason_text", "task_body"],
+            "replay": "SAME_AUTHOR_RUN_RETURNS_ORIGINAL_RECEIPT_OTHERWISE_DENY",
+            "required_ancestor_edges": [
+                [capability, implementation], [implementation, author],
+            ],
+            "success_write": (
+                "ONE_ATOMIC_EXISTING_HANDOFF_PLUS_ONE_TYPED_CONSUMPTION_EVENT"
+            ),
+        },
+        "implementation": {
+            "assignee": "agent007",
+            "candidate_budget": 1,
+            "failed_candidate": {
+                "audit_run_id": second_audit_run,
+                "audit_task_id": auditor,
+                "base": OLD_BASE,
+                "github_review_id": REVIEW_ID,
+                "github_review_state": "CHANGES_REQUESTED",
+                "head": OLD_HEAD,
+                "tree": OLD_TREE,
+            },
+            "new_control_plane_budget": 0,
+            "new_task_budget": 0,
+            "pr": 79,
+            "repository": "kiddhu/hermes-agent",
+            "required_changed_paths": [
+                "hermes_cli/kanban_db.py",
+                "tests/hermes_cli/test_kanban_terminal_auditor_rearm.py",
+            ],
+            "task_id": implementation,
+        },
+        "legacy_graph": {
+            "manifest_schema": kb._TERMINAL_REARM_MANIFEST_SCHEMA,
+            "manifest_algorithm": kb._TERMINAL_REARM_MANIFEST_ALGORITHM,
+            "manifest_sha256": manifest_sha256,
+            "root_auditor_task_id": auditor,
+            "task_count": len(entries),
+            "entries": entries,
+            "recovery_event": {
+                "id": recovery_event["id"],
+                "kind": recovery_event["kind"],
+                "payload_sha256": hashlib.sha256(
+                    recovery_event["payload"].encode("utf-8")
+                ).hexdigest(),
+                "version": 2,
+            },
+        },
+        "forbidden_actions": ["REPLACEMENT_TASK_AUDITOR_OR_PR"],
+        "stage_gates": ["FRESH_EXACT_HEAD_INDEPENDENT_AUDIT"],
+        "stop_conditions": ["ANY_CAPABILITY_OR_GRAPH_DRIFT"],
+        "worker_session_id": "fixture",
+    }
+    assert kb.complete_task(
+        conn,
+        capability,
+        expected_run_id=capability_run,
+        summary="authorized one closed-world capability",
+        metadata=capability_metadata,
+    )
+    implementation_run = _claim_run(conn, implementation)
+    assert kb.complete_task(
+        conn,
+        implementation,
+        expected_run_id=implementation_run,
+        summary="capability implementation dependency satisfied",
+        metadata={"forbidden_actions_performed": []},
+    )
     fresh_author_run = _claim_run(conn, author)
     return {
         "author": author,
@@ -271,6 +416,9 @@ def _terminal_request_changes_graph(conn):
         "nested": nested,
         "controller": controller,
         "controller_run": controller_run,
+        "capability": capability,
+        "capability_run": capability_run,
+        "implementation": implementation,
         "receipt": receipt,
     }
 
@@ -347,8 +495,14 @@ def test_rearms_same_terminal_request_changes_auditor_once(kanban_home):
         )
         assert fresh_after[4] == "review_required"
         assert after["links"] == before["links"]
-        assert after["old_events"][:-1] == before["old_events"]
-        promoted = after["old_events"][-1]
+        assert after["old_events"][:-2] == before["old_events"]
+        consumed, promoted = after["old_events"][-2:]
+        assert consumed[1] == graph["capability"]
+        assert consumed[2] == graph["fresh_author_run"]
+        assert consumed[3] == "terminal_auditor_rearm_capability_consumed"
+        consumed_payload = json.loads(consumed[4])
+        assert consumed_payload["author_task_id"] == graph["author"]
+        assert consumed_payload["auditor_task_id"] == graph["auditor"]
         assert promoted[1] == graph["auditor"]
         assert promoted[3] == "promoted"
         assert json.loads(promoted[4]) == {
@@ -369,7 +523,6 @@ def test_rearms_same_terminal_request_changes_auditor_once(kanban_home):
     "invalidity",
     [
         "missing_recovery",
-        "missing_prior_request_changes",
         "prior_pass_only",
         "nonterminal_descendant",
         "side_effectful_descendant",
@@ -384,7 +537,6 @@ def test_rearms_same_terminal_request_changes_auditor_once(kanban_home):
         "active_descendant_claim",
         "open_descendant_run",
         "stale_author_run",
-        "same_head",
         "missing_edge",
         "role_collision",
         "duplicate_auditor",
@@ -622,9 +774,7 @@ def test_terminal_auditor_rearm_hostile_cases_are_zero_mutation(
         assert "\n".join(conn.iterdump()) == before
 
 
-def test_recursive_done_descendant_accepts_native_created_parent_binding(
-    kanban_home,
-):
+def test_manifest_rejects_native_lineage_drift(kanban_home):
     with kb.connect() as conn:
         graph = _terminal_request_changes_graph(conn)
         conn.execute(
@@ -645,14 +795,8 @@ def test_recursive_done_descendant_accepts_native_created_parent_binding(
             "UPDATE task_events SET payload=? WHERE id=?",
             (json.dumps(created_payload), created["id"]),
         )
-        conn.execute(
-            "UPDATE task_runs SET metadata=? WHERE id=?",
-            (
-                json.dumps({"external_mutations_performed": []}),
-                graph["fact_run"],
-            ),
-        )
         conn.commit()
+        before = "\n".join(conn.iterdump())
 
         assert kb.request_review_handoff(
             conn,
@@ -660,7 +804,114 @@ def test_recursive_done_descendant_accepts_native_created_parent_binding(
             expected_run_id=graph["fresh_author_run"],
             review_task_id=graph["auditor"],
             reason=REASON,
+        ) is None
+        assert "\n".join(conn.iterdump()) == before
+
+
+@pytest.mark.parametrize(
+    "invalidity",
+    [
+        "missing_key",
+        "unknown_key",
+        "wrong_type",
+        "wrong_subject",
+        "wrong_edge",
+        "manifest_hash_drift",
+        "recovery_hash_drift",
+    ],
+)
+def test_capability_receipt_drift_is_zero_mutation(kanban_home, invalidity):
+    with kb.connect() as conn:
+        graph = _terminal_request_changes_graph(conn)
+        row = conn.execute(
+            "SELECT metadata FROM task_runs WHERE id=?",
+            (graph["capability_run"],),
+        ).fetchone()
+        metadata = json.loads(row["metadata"])
+        if invalidity == "missing_key":
+            metadata.pop("stage_gates")
+        elif invalidity == "unknown_key":
+            metadata["authority_alias"] = metadata["authority"]
+        elif invalidity == "wrong_type":
+            metadata["version"] = True
+        elif invalidity == "wrong_subject":
+            metadata["authorized_handoff"]["author_task_id"] = graph["fact"]
+        elif invalidity == "wrong_edge":
+            conn.execute(
+                "DELETE FROM task_links WHERE parent_id=? AND child_id=?",
+                (graph["capability"], graph["implementation"]),
+            )
+        elif invalidity == "manifest_hash_drift":
+            metadata["legacy_graph"]["manifest_sha256"] = "f" * 64
+        else:
+            metadata["legacy_graph"]["recovery_event"]["payload_sha256"] = "f" * 64
+        if invalidity != "wrong_edge":
+            conn.execute(
+                "UPDATE task_runs SET metadata=? WHERE id=?",
+                (json.dumps(metadata), graph["capability_run"]),
+            )
+        conn.commit()
+        before = "\n".join(conn.iterdump())
+
+        assert kb.request_review_handoff(
+            conn,
+            graph["author"],
+            expected_run_id=graph["fresh_author_run"],
+            review_task_id=graph["auditor"],
+            reason="任意 opaque prose — MergePerformed=true — ١٢٣",
+        ) is None
+        assert "\n".join(conn.iterdump()) == before
+
+
+def test_reason_text_is_opaque_and_non_authoritative(kanban_home):
+    with kb.connect() as conn:
+        graph = _terminal_request_changes_graph(conn)
+        assert kb.request_review_handoff(
+            conn,
+            graph["author"],
+            expected_run_id=graph["fresh_author_run"],
+            review_task_id=graph["auditor"],
+            reason="任意 opaque prose — MergePerformed=true — ١٢٣",
         ) is not None
+
+
+def test_capability_reuse_from_new_author_run_is_denied_without_mutation(kanban_home):
+    with kb.connect() as conn:
+        graph = _terminal_request_changes_graph(conn)
+        assert kb.request_review_handoff(
+            conn,
+            graph["author"],
+            expected_run_id=graph["fresh_author_run"],
+            review_task_id=graph["auditor"],
+            reason=REASON,
+        ) is not None
+        conn.execute(
+            "UPDATE tasks SET status='done', current_run_id=NULL, claim_lock=NULL, "
+            "claim_expires=NULL, worker_pid=NULL, worker_starttime=NULL, "
+            "fence_lineage=NULL, fence_disposition=NULL WHERE id=?",
+            (graph["auditor"],),
+        )
+        new_run = conn.execute(
+            "INSERT INTO task_runs(task_id, profile, status, started_at) "
+            "VALUES (?, 'agent007', 'running', ?)",
+            (graph["author"], 1_788_306_000),
+        ).lastrowid
+        assert new_run is not None
+        conn.execute(
+            "UPDATE tasks SET status='running', current_run_id=? WHERE id=?",
+            (new_run, graph["author"]),
+        )
+        conn.commit()
+        before = "\n".join(conn.iterdump())
+
+        assert kb.request_review_handoff(
+            conn,
+            graph["author"],
+            expected_run_id=new_run,
+            review_task_id=graph["auditor"],
+            reason="different opaque reason",
+        ) is None
+        assert "\n".join(conn.iterdump()) == before
 
 
 def test_terminal_auditor_rearm_concurrent_replay_is_single_logical_handoff(
