@@ -7265,9 +7265,7 @@ def _terminal_rearm_capability(
         "SELECT parent_id FROM task_links WHERE child_id = ? "
         "UNION SELECT edge.parent_id FROM task_links edge "
         "JOIN ancestors child ON edge.child_id = child.id"
-        ") SELECT task.id, task.current_run_id, task.claim_lock, task.claim_expires, "
-        "task.worker_pid, task.worker_starttime, task.fence_lineage, "
-        "task.fence_disposition FROM ancestors JOIN tasks task "
+        ") SELECT task.id FROM ancestors JOIN tasks task "
         "ON task.id = ancestors.id WHERE task.status = 'done' "
         "AND task.assignee = 'gm2' ORDER BY task.id",
         (author_task_id,),
@@ -7275,34 +7273,14 @@ def _terminal_rearm_capability(
     candidates: list[tuple[str, int, dict[str, Any]]] = []
     for ancestor in ancestors:
         task_id = str(ancestor["id"])
-        if any(
-            ancestor[field] is not None
-            for field in (
-                "current_run_id", "claim_lock", "claim_expires", "worker_pid",
-                "worker_starttime", "fence_lineage", "fence_disposition",
-            )
-        ):
+        authenticated = _authenticated_factory_run_metadata(conn, task_id)
+        if authenticated is None:
             continue
-        runs = conn.execute(
-            "SELECT id, profile, status, outcome, metadata, ended_at FROM task_runs "
-            "WHERE task_id = ? ORDER BY id DESC", (task_id,),
-        ).fetchall()
-        if not runs:
-            continue
-        latest = runs[0]
-        if (
-            latest["profile"] != "gm2"
-            or latest["status"] != "done"
-            or latest["outcome"] != "completed"
-            or latest["ended_at"] is None
-        ):
-            continue
-        try:
-            metadata = json.loads(latest["metadata"] or "{}")
-        except (TypeError, ValueError):
+        run_id, profile, metadata = authenticated
+        if profile != "gm2":
             continue
         if isinstance(metadata, dict) and metadata.get("schema") == _TERMINAL_REARM_CAPABILITY_SCHEMA:
-            candidates.append((task_id, int(latest["id"]), metadata))
+            candidates.append((task_id, run_id, metadata))
     if len(candidates) != 1:
         return None
     capability_task_id, capability_run_id, receipt = candidates[0]

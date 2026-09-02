@@ -68,7 +68,42 @@ def _archive(conn, task_id):
         )
 
 
-def _terminal_request_changes_graph(conn):
+def _bind_kernel_factory_receipt(conn, task_id, run_id):
+    receipt = {
+        "schema": kb.FACTORY_RECEIPT_SCHEMA,
+        "verdict": kb.FACTORY_VERDICT_ACCEPTED,
+        "conditions": {key: True for key in kb.FACTORY_CONDITION_KEYS},
+        "contract_hash_sha256": kb.FACTORY_CONTRACT_HASH_SHA256,
+        "kernel_version": "fixture-kernel-v1",
+        "adapter_type_and_version": "fixture-adapter-v1",
+        "exact_source_refs": {"fixture": True},
+        "target_identity": {"task_id": task_id},
+        "before_digest": "1" * 64,
+        "action_receipt_ref": {
+            "actor_identity_source": "provider_runtime_metadata",
+            "actor_role": "action_executor",
+        },
+        "after_digest": "2" * 64,
+        "head_epoch_or_run_binding": {"run_id": run_id},
+        "acquired_at": 1_788_306_000,
+    }
+    raw = json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode()
+    digest = hashlib.sha256(raw).hexdigest()
+    kb.store_attachment_bytes(
+        conn,
+        task_id,
+        "aion_monarch_receipt.json",
+        raw,
+        content_type="application/json",
+        uploaded_by="aion_monarch_proof_kernel",
+    )
+    conn.execute(
+        "UPDATE tasks SET factory_terminal_receipt_sha256=? WHERE id=?",
+        (digest, task_id),
+    )
+
+
+def _terminal_request_changes_graph(conn, *, authenticated_capability=True):
     author = kb.create_task(
         conn,
         title="same reviewed author",
@@ -257,9 +292,14 @@ def _terminal_request_changes_graph(conn):
     )
 
     capability = kb.create_task(
-        conn, title="factory terminal-rearm capability", assignee="gm2"
+        conn,
+        title="factory terminal-rearm capability",
+        assignee="gm2",
+        factory_build_gate=1 if authenticated_capability else 0,
     )
     capability_run = _claim_run(conn, capability)
+    if authenticated_capability:
+        _bind_kernel_factory_receipt(conn, capability, capability_run)
     implementation = kb.create_task(
         conn,
         title="bounded terminal-rearm implementation",
@@ -873,6 +913,30 @@ def test_reason_text_is_opaque_and_non_authoritative(kanban_home):
             review_task_id=graph["auditor"],
             reason="任意 opaque prose — MergePerformed=true — ١٢٣",
         ) is not None
+
+
+def test_self_attested_done_gm2_capability_is_zero_mutation(kanban_home):
+    with kb.connect() as conn:
+        graph = _terminal_request_changes_graph(
+            conn, authenticated_capability=False,
+        )
+        capability = conn.execute(
+            "SELECT factory_build_gate, factory_terminal_receipt_sha256, "
+            "factory_challenge_semantic_receipt_sha256, "
+            "factory_preflight_receipt_sha256 FROM tasks WHERE id=?",
+            (graph["capability"],),
+        ).fetchone()
+        assert tuple(capability) == (0, None, None, None)
+        before = "\n".join(conn.iterdump())
+
+        assert kb.request_review_handoff(
+            conn,
+            graph["author"],
+            expected_run_id=graph["fresh_author_run"],
+            review_task_id=graph["auditor"],
+            reason=REASON,
+        ) is None
+        assert "\n".join(conn.iterdump()) == before
 
 
 def test_capability_reuse_from_new_author_run_is_denied_without_mutation(kanban_home):
