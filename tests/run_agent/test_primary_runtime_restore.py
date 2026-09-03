@@ -489,6 +489,25 @@ class TestTryRecoverPrimaryTransport:
 
         assert result is True
 
+    def test_recovers_on_builtin_timeout_error_from_stream_watchdog(self):
+        """The Codex SSE watchdog raises built-in TimeoutError.
+
+        With api_max_retries=1 the exhausted-loop recovery gate is the only
+        reconnect path, so this error must be treated as transient transport.
+        """
+        agent = _make_agent(provider="openai-codex")
+        error = TimeoutError(
+            "Codex stream produced no SSE events for 12s after first byte"
+        )
+
+        with patch("run_agent.OpenAI", return_value=MagicMock()), \
+             patch("time.sleep"):
+            result = agent._try_recover_primary_transport(
+                error, retry_count=1, max_retries=1,
+            )
+
+        assert result is True
+
     def test_skipped_when_already_on_fallback(self):
         agent = _make_agent(provider="custom")
         agent._fallback_activated = True
