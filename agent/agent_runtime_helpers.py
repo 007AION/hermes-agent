@@ -1613,6 +1613,7 @@ def restore_primary_runtime(agent) -> bool:
 # Which error types indicate a transient transport failure worth
 # one more attempt with a rebuilt client / connection pool.
 _TRANSIENT_TRANSPORT_ERRORS = frozenset({
+    "TimeoutError",  # built-in timeout raised by Hermes stream watchdogs
     "ReadTimeout", "ConnectTimeout", "PoolTimeout",
     "ConnectError", "RemoteProtocolError",
     "APIConnectionError", "APITimeoutError",
