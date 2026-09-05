@@ -128,6 +128,50 @@ VALID_INITIAL_STATUSES = {"running", "blocked"}
 # ``None`` = legacy/un-typed block (treated as a generic human blocker).
 VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 
+# ---------------------------------------------------------------------------
+# GM directive -> Native binding prefix events (AION-GM-DIRECTIVE-NATIVE-
+# CONTINUITY-R1).  The existing native lifecycle already persists the suffix
+# ``created -> claimed -> spawned -> heartbeat -> terminal|typed_blocker``.
+# The three event kinds below make the *pre-claim* prefix durable so an
+# authoritative external GM directive is deterministically visible and bound to
+# exactly one native task before the dispatcher claims it:
+#
+#   directive_observed    -> an authenticated GM patrol read the authoritative
+#                            source (requires source_ref + immutable id +
+#                            observer profile + timestamp; prose alone cannot
+#                            emit it).
+#   directive_selected    -> the GM actually selected this directive for
+#                            execution now (awareness is NOT selection).
+#   directive_bound_native-> one directive idempotently bound to exactly one
+#                            native task; duplicate/ambiguous binding fails
+#                            closed.
+#
+# These are stored on the existing ``task_events`` surface (kind/payload); no
+# new table, queue, scheduler, or store is introduced.  Emitting these events
+# never claims or dispatches a task — the existing dispatcher remains the sole
+# executor of record.
+# ---------------------------------------------------------------------------
+DIRECTIVE_OBSERVED_KIND = "directive_observed"
+DIRECTIVE_SELECTED_KIND = "directive_selected"
+DIRECTIVE_BOUND_NATIVE_KIND = "directive_bound_native"
+DIRECTIVE_EVENT_KINDS = frozenset(
+    {
+        DIRECTIVE_OBSERVED_KIND,
+        DIRECTIVE_SELECTED_KIND,
+        DIRECTIVE_BOUND_NATIVE_KIND,
+    }
+)
+
+# Only the authenticated resident GM patrol lane may observe/select a
+# directive. Anything outside this set is not an authoritative observer and
+# cannot produce an executable binding.
+DIRECTIVE_OBSERVER_PROFILES = frozenset({"gm", "gm2"})
+
+# ``directive_selected`` disposition is a real execution selection, not
+# awareness. The only value that authorises a subsequent native binding is
+# ``EXECUTE``.
+DIRECTIVE_EXECUTE_DISPOSITION = "EXECUTE"
+
 # After a task has been blocked, unblocked, and re-blocked this many times for
 # the same (truly-blocked) reason, the unblock-loop breaker stops trusting the
 # unblocker (usually a cron) and routes the task to ``triage`` instead of back
@@ -4994,6 +5038,198 @@ def _append_event(
         "VALUES (?, ?, ?, ?, ?)",
         (task_id, run_id, kind, pl, now),
     )
+
+
+def _record_directive_intake_locked(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    source_ref: str,
+    source_sha_or_immutable_id: str,
+    observer_profile: str,
+    selector_profile: str,
+    assignee: str,
+    disposition: str = DIRECTIVE_EXECUTE_DISPOSITION,
+    idempotency_key: Optional[str] = None,
+    created_at: Optional[int] = None,
+) -> dict:
+    """Record the pre-claim directive prefix on ``task_id`` (existing txn).
+
+    Emits three durable ``task_events`` rows in order — ``directive_observed``,
+    ``directive_selected``, ``directive_bound_native`` — so an authoritative
+    external GM directive is deterministically visible and idempotently bound
+    to exactly one native task before the dispatcher claims it.  Must be called
+    from within an open ``write_txn``.
+
+    Fail-closed semantics:
+
+    * ``source_ref`` and ``source_sha_or_immutable_id`` are required; prose
+      alone can never fabricate an observation.
+    * ``observer_profile`` / ``selector_profile`` must be an authenticated GM
+      patrol profile (``gm``/``gm2``); anything else cannot observe/select.
+    * ``disposition`` must be ``EXECUTE`` — awareness is not selection.
+    * One ``source_sha_or_immutable_id`` binds exactly one task.  Re-emitting
+      for the *same* task is idempotent (returns the existing lineage, no
+      duplicate rows).  Re-emitting for a *different* task raises — an
+      ambiguous/double binding must fail closed rather than silently
+      overwrite.
+
+    Returns a dict with ``task_id``, ``source_ref``, ``source_sha``, and the
+    three event ``kind``/``payload`` records that are now durable.
+    """
+    if not source_ref or not str(source_ref).strip():
+        raise ValueError("directive_observed requires a non-empty source_ref")
+    if not source_sha_or_immutable_id or not str(source_sha_or_immutable_id).strip():
+        raise ValueError(
+            "directive_observed requires a non-empty source_sha_or_immutable_id"
+        )
+    if not task_id or not str(task_id).strip():
+        raise ValueError("directive binding requires a non-empty task_id")
+    if not assignee or not str(assignee).strip():
+        raise ValueError("directive binding requires a non-empty assignee")
+    if observer_profile not in DIRECTIVE_OBSERVER_PROFILES:
+        raise PermissionError(
+            f"directive_observed may only be emitted by the authenticated GM "
+            f"patrol lane (gm|gm2); got observer_profile={observer_profile!r}"
+        )
+    if selector_profile not in DIRECTIVE_OBSERVER_PROFILES:
+        raise PermissionError(
+            f"directive_selected may only be emitted by the authenticated GM "
+            f"patrol lane (gm|gm2); got selector_profile={selector_profile!r}"
+        )
+    if disposition != DIRECTIVE_EXECUTE_DISPOSITION:
+        raise ValueError(
+            f"directive_selected disposition must be {DIRECTIVE_EXECUTE_DISPOSITION!r} "
+            f"(execution selection), got {disposition!r}"
+        )
+
+    source_ref = str(source_ref).strip()
+    source_sha = str(source_sha_or_immutable_id).strip()
+    assignee = str(assignee).strip()
+
+    # Idempotency + fail-closed single-binding: one immutable directive id maps
+    # to exactly one task.  Scan existing directive_bound_native events (low
+    # volume) and refuse a second task for the same id.
+    rows = conn.execute(
+        "SELECT task_id, payload FROM task_events WHERE kind = ?",
+        (DIRECTIVE_BOUND_NATIVE_KIND,),
+    ).fetchall()
+    for row in rows:
+        try:
+            pl = json.loads(row["payload"]) if row["payload"] else None
+        except Exception:
+            pl = None
+        if not pl or pl.get("source_sha_or_immutable_id") != source_sha:
+            continue
+        if row["task_id"] == task_id:
+            # Same directive already bound to this exact task: idempotent.
+            return {
+                "task_id": task_id,
+                "source_ref": source_ref,
+                "source_sha": source_sha,
+                "already_bound": True,
+                "events": [],
+            }
+        raise RuntimeError(
+            f"directive {source_sha!r} is already bound to a different native "
+            f"task {row['task_id']!r}; ambiguous/double binding fails closed"
+        )
+
+    # Verify the target task exists so we never write dangling events.
+    exists = conn.execute(
+        "SELECT 1 FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if not exists:
+        raise ValueError(f"cannot bind directive to unknown task {task_id!r}")
+
+    now = int(time.time()) if created_at is None else created_at
+
+    observed_payload = {
+        "source_ref": source_ref,
+        "source_sha_or_immutable_id": source_sha,
+        "observer_profile": observer_profile,
+        "observed_at": now,
+    }
+    selected_payload = {
+        "source_ref": source_ref,
+        "selector_profile": selector_profile,
+        "disposition": disposition,
+        "selected_at": now,
+    }
+    bound_payload = {
+        "source_ref": source_ref,
+        "source_sha_or_immutable_id": source_sha,
+        "task_id": task_id,
+        "assignee": assignee,
+        "idempotency_key_or_existing_task_binding": idempotency_key,
+        "bound_at": now,
+    }
+
+    _append_event(
+        conn, task_id, DIRECTIVE_OBSERVED_KIND, observed_payload, created_at=now
+    )
+    _append_event(
+        conn, task_id, DIRECTIVE_SELECTED_KIND, selected_payload, created_at=now
+    )
+    _append_event(
+        conn, task_id, DIRECTIVE_BOUND_NATIVE_KIND, bound_payload, created_at=now
+    )
+
+    return {
+        "task_id": task_id,
+        "source_ref": source_ref,
+        "source_sha": source_sha,
+        "already_bound": False,
+        "events": [
+            {"kind": DIRECTIVE_OBSERVED_KIND, "payload": observed_payload},
+            {"kind": DIRECTIVE_SELECTED_KIND, "payload": selected_payload},
+            {"kind": DIRECTIVE_BOUND_NATIVE_KIND, "payload": bound_payload},
+        ],
+    }
+
+
+def record_directive_intake(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    source_ref: str,
+    source_sha_or_immutable_id: str,
+    observer_profile: str,
+    selector_profile: str,
+    assignee: str,
+    disposition: str = DIRECTIVE_EXECUTE_DISPOSITION,
+    idempotency_key: Optional[str] = None,
+    created_at: Optional[int] = None,
+) -> dict:
+    """Public entry point: open a write txn and record the directive prefix."""
+    with write_txn(conn):
+        return _record_directive_intake_locked(
+            conn,
+            task_id=task_id,
+            source_ref=source_ref,
+            source_sha_or_immutable_id=source_sha_or_immutable_id,
+            observer_profile=observer_profile,
+            selector_profile=selector_profile,
+            assignee=assignee,
+            disposition=disposition,
+            idempotency_key=idempotency_key,
+            created_at=created_at,
+        )
+
+
+def directive_binding_lineage(
+    conn: sqlite3.Connection, task_id: str
+) -> list[Event]:
+    """Return the directive prefix events for ``task_id``, oldest first.
+
+    A reader can reconstruct ``observed -> selected -> bound_native`` purely
+    from persisted events without any prose summary.
+    """
+    return [
+        ev
+        for ev in list_events(conn, task_id)
+        if ev.kind in DIRECTIVE_EVENT_KINDS
+    ]
 
 
 def _end_run(

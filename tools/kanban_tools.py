@@ -1329,6 +1329,19 @@ def _handle_create(args: dict, **kw) -> str:
     if bool_error:
         return tool_error(bool_error)
     idempotency_key = args.get("idempotency_key")
+    directive_source_ref = args.get("directive_source_ref")
+    directive_source_sha = args.get("directive_source_sha")
+    directive_observer_profile = args.get("directive_observer_profile")
+    directive_selector_profile = args.get("directive_selector_profile")
+    directive_disposition = args.get("directive_disposition") or "EXECUTE"
+    if directive_source_ref and not directive_source_sha:
+        return tool_error(
+            "directive_source_sha is required when directive_source_ref is set"
+        )
+    if directive_source_sha and not directive_source_ref:
+        return tool_error(
+            "directive_source_ref is required when directive_source_sha is set"
+        )
     max_runtime_seconds = args.get("max_runtime_seconds")
     initial_status = args.get("initial_status") or "running"
     skills = args.get("skills")
@@ -1397,6 +1410,19 @@ def _handle_create(args: dict, **kw) -> str:
                 session_id=session_id,
             )
             new_task = kb.get_task(conn, new_tid)
+            directive_binding = None
+            if directive_source_ref:
+                directive_binding = kb.record_directive_intake(
+                    conn,
+                    task_id=new_tid,
+                    source_ref=directive_source_ref,
+                    source_sha_or_immutable_id=directive_source_sha,
+                    observer_profile=directive_observer_profile,
+                    selector_profile=directive_selector_profile,
+                    assignee=str(assignee),
+                    disposition=directive_disposition,
+                    idempotency_key=idempotency_key,
+                )
             subscribed = _maybe_auto_subscribe(conn, new_tid)
             return _ok(
                 task_id=new_tid,
@@ -1405,6 +1431,7 @@ def _handle_create(args: dict, **kw) -> str:
                 workspace_path=new_task.workspace_path if new_task else None,
                 project_id=new_task.project_id if new_task else None,
                 subscribed=subscribed,
+                directive_binding=directive_binding,
             )
         finally:
             conn.close()
@@ -2270,6 +2297,50 @@ KANBAN_CREATE_SCHEMA = {
                     "If a non-archived task with this key already "
                     "exists, return that task's id instead of creating "
                     "a duplicate. Useful for retry-safe automation."
+                ),
+            },
+            "directive_source_ref": {
+                "type": "string",
+                "description": (
+                    "Optional authoritative external directive source "
+                    "reference (exact GitHub issue/comment URL or other "
+                    "canonical ref) to bind to this task. When set with "
+                    "directive_source_sha, records durable "
+                    "directive_observed -> directive_selected -> "
+                    "directive_bound_native events on the task. "
+                    "Observer/selector profiles must be 'gm' or 'gm2'."
+                ),
+            },
+            "directive_source_sha": {
+                "type": "string",
+                "description": (
+                    "Optional immutable id/digest of the directive source "
+                    "(comment node id or content SHA). Required when "
+                    "directive_source_ref is set; one source id binds "
+                    "exactly one task (duplicate binding fails closed)."
+                ),
+            },
+            "directive_observer_profile": {
+                "type": "string",
+                "enum": ["gm", "gm2"],
+                "description": (
+                    "The authenticated GM patrol profile that read the "
+                    "directive source. Only 'gm' or 'gm2'."
+                ),
+            },
+            "directive_selector_profile": {
+                "type": "string",
+                "enum": ["gm", "gm2"],
+                "description": (
+                    "The GM profile selecting this directive for "
+                    "execution now. Only 'gm' or 'gm2'."
+                ),
+            },
+            "directive_disposition": {
+                "type": "string",
+                "description": (
+                    "Execution disposition. Must be 'EXECUTE' for a real "
+                    "selection (awareness is not selection)."
                 ),
             },
             "max_runtime_seconds": {
