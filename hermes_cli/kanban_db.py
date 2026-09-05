@@ -1078,12 +1078,20 @@ def _reap_worker_descendants(
     # a group leader (e.g. a synthetic worker pid that happens to be a live
     # process in the caller's own group). ``os.getpgid(pid) == pid`` is the
     # group-leader test; a dead pid raises and is skipped (nothing to reap).
-    try:
-        if _pid != os.getpid() and os.getpgid(_pid) == _pid:
-            os.killpg(_pid, _signal.SIGTERM)
-            info["killpg_attempted"] = True
-    except (ProcessLookupError, OSError, PermissionError):
-        pass
+    # ``os.getpgid`` / ``os.killpg`` are POSIX-only and absent on Windows
+    # (accessing them raises AttributeError), so resolve them via getattr and
+    # skip the killpg fallback cleanly there — Windows has no POSIX process
+    # groups to signal; the /proc descendant walk below is itself POSIX-only
+    # and already degrades to an empty set on Windows.
+    _getpgid = getattr(os, "getpgid", None)
+    _killpg = getattr(os, "killpg", None)
+    if _getpgid is not None and _killpg is not None:
+        try:
+            if _pid != os.getpid() and _getpgid(_pid) == _pid:
+                _killpg(_pid, _signal.SIGTERM)
+                info["killpg_attempted"] = True
+        except (ProcessLookupError, OSError, PermissionError):
+            pass
 
     for d in sorted(descendants):
         if d == _pid:

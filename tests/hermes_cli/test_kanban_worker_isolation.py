@@ -260,6 +260,31 @@ def test_reap_worker_descendants_skips_killpg_for_non_group_leader(monkeypatch):
     assert info["descendants"] == 1
 
 
+def test_reap_worker_descendants_windows_no_killpg_no_raise(monkeypatch):
+    # RED/GREEN Windows-footgun guard: os.killpg / os.getpgid are POSIX-only
+    # and absent on Windows, where bare access raises AttributeError. Simulate
+    # their absence (monkeypatch.delattr) and prove the fallback path degrades
+    # to a clean no-op for the killpg primitive — killpg_attempted stays False,
+    # no AttributeError escapes — while the /proc descendant walk still runs.
+    monkeypatch.setattr(kb, "_worker_cgroup_path", lambda task_id: None)
+    monkeypatch.setattr(
+        kb, "_read_process_identity",
+        lambda pid: {"starttime": 123, "cwd": "/", "pgid": 1},
+    )
+    monkeypatch.setattr(
+        kb, "_discover_descendant_pids",
+        lambda pid, expected_starttime=None: {111},
+    )
+    monkeypatch.setattr(kb, "_signal_pid_ladder", lambda *a, **k: "terminated")
+    monkeypatch.delattr(os, "killpg", raising=False)
+    monkeypatch.delattr(os, "getpgid", raising=False)
+
+    info = kb._reap_worker_descendants(4242, task_id="t1", signal_fn=lambda p, s: None)
+    assert info["killpg_attempted"] is False
+    assert info["descendants"] == 1
+    assert info["terminated"] == 1
+
+
 # ---------------------------------------------------------------------------
 # R06-C — wiring into termination paths
 # ---------------------------------------------------------------------------
