@@ -196,6 +196,9 @@ def test_reap_worker_descendants_fallback_killpg_and_walk(monkeypatch):
 
     monkeypatch.setattr(kb, "_signal_pid_ladder", fake_ladder)
     monkeypatch.setattr(os, "killpg", lambda *a, **k: None)
+    # 4242 is a synthetic worker pid in a different (group-leader) session, so
+    # the killpg guard passes: it is not our own pid and os.getpgid(4242)==4242.
+    monkeypatch.setattr(os, "getpgid", lambda pid: pid)
 
     info = kb._reap_worker_descendants(4242, task_id="t1", signal_fn=lambda p, s: None)
     assert info["killpg_attempted"] is True
@@ -212,6 +215,49 @@ def test_reap_worker_descendants_noop_without_pid_or_cgroup(monkeypatch):
     info = kb._reap_worker_descendants(None, task_id="t1", signal_fn=lambda p, s: None)
     assert info["pid"] is None
     assert info["cgroup_reaped"] == 0
+
+
+def test_reap_worker_descendants_never_killpg_own_group(monkeypatch):
+    # A synthetic worker pid equal to the caller's own pid must never trigger
+    # killpg: in a session-leader process (e.g. the test runner) that would
+    # SIGTERM our own process group mid-run. The guard short-circuits.
+    monkeypatch.setattr(kb, "_worker_cgroup_path", lambda task_id: None)
+    monkeypatch.setattr(
+        kb, "_read_process_identity",
+        lambda pid: {"starttime": 123, "cwd": "/", "pgid": 1},
+    )
+    monkeypatch.setattr(kb, "_discover_descendant_pids", lambda pid, expected_starttime=None: set())
+    monkeypatch.setattr(kb, "_signal_pid_ladder", lambda *a, **k: "gone")
+    killpg_calls = []
+    monkeypatch.setattr(os, "killpg", lambda pgid, sig: killpg_calls.append(pgid))
+
+    info = kb._reap_worker_descendants(os.getpid(), task_id="t1", signal_fn=lambda p, s: None)
+    assert info["killpg_attempted"] is False
+    assert killpg_calls == []
+
+
+def test_reap_worker_descendants_skips_killpg_for_non_group_leader(monkeypatch):
+    # A synthetic worker pid that is NOT a process-group leader (pgid != pid)
+    # must not be killpg'd — that would signal an unrelated group (possibly our
+    # own). The /proc descendant walk still runs.
+    monkeypatch.setattr(kb, "_worker_cgroup_path", lambda task_id: None)
+    monkeypatch.setattr(
+        kb, "_read_process_identity",
+        lambda pid: {"starttime": 123, "cwd": "/", "pgid": 1},
+    )
+    monkeypatch.setattr(
+        kb, "_discover_descendant_pids",
+        lambda pid, expected_starttime=None: {111},
+    )
+    monkeypatch.setattr(kb, "_signal_pid_ladder", lambda *a, **k: "terminated")
+    killpg_calls = []
+    monkeypatch.setattr(os, "killpg", lambda pgid, sig: killpg_calls.append(pgid))
+    monkeypatch.setattr(os, "getpgid", lambda pid: 1)  # not pid -> not a leader
+
+    info = kb._reap_worker_descendants(4242, task_id="t1", signal_fn=lambda p, s: None)
+    assert info["killpg_attempted"] is False
+    assert killpg_calls == []
+    assert info["descendants"] == 1
 
 
 # ---------------------------------------------------------------------------

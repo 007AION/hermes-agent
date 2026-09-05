@@ -1071,9 +1071,17 @@ def _reap_worker_descendants(
         descendants = _discover_descendant_pids(
             _pid, expected_starttime=ident["starttime"],
         )
+    # killpg(pid) only targets the worker's process group, and only when the
+    # worker is its own group leader (a worker spawned with start_new_session
+    # has pgid == pid). Guard two hazards: never signal our own process group
+    # (pid == os.getpid()), and never signal an unrelated group when pid is not
+    # a group leader (e.g. a synthetic worker pid that happens to be a live
+    # process in the caller's own group). ``os.getpgid(pid) == pid`` is the
+    # group-leader test; a dead pid raises and is skipped (nothing to reap).
     try:
-        os.killpg(_pid, _signal.SIGTERM)
-        info["killpg_attempted"] = True
+        if _pid != os.getpid() and os.getpgid(_pid) == _pid:
+            os.killpg(_pid, _signal.SIGTERM)
+            info["killpg_attempted"] = True
     except (ProcessLookupError, OSError, PermissionError):
         pass
 
