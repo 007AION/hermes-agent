@@ -172,6 +172,13 @@ DIRECTIVE_OBSERVER_PROFILES = frozenset({"gm", "gm2"})
 # ``EXECUTE``.
 DIRECTIVE_EXECUTE_DISPOSITION = "EXECUTE"
 
+# A directive binding may only be recorded while the carrier task is still
+# pre-claim (not yet claimed/run by the dispatcher). Once a task is ``running``,
+# ``blocked``, ``review``, ``fenced``, ``done``, or ``archived`` — or already
+# carries a ``current_run_id`` — a fresh authoritative binding would silently
+# rewrite a live (or already-executed) task's provenance, so it fails closed.
+DIRECTIVE_PRE_CLAIM_STATUSES = frozenset({"triage", "todo", "scheduled", "ready"})
+
 # After a task has been blocked, unblocked, and re-blocked this many times for
 # the same (truly-blocked) reason, the unblock-loop breaker stops trusting the
 # unblocker (usually a cron) and routes the task to ``triage`` instead of back
@@ -5040,42 +5047,69 @@ def _append_event(
     )
 
 
+def _authenticated_gm_profile() -> str:
+    """Return the kernel-authenticated executing profile, fail-closed.
+
+    The observer/selector identity of a directive prefix is *not* caller
+    supplied: it is the authenticated Hermes profile under which this code is
+    running (``HERMES_PROFILE``, set by ``_apply_profile_override`` before
+    module imports). Only the resident GM patrol lanes (``gm``/``gm2``) may
+    observe/select a directive; any other authenticated profile — or no
+    authenticated profile at all — fails closed, so a non-GM caller can never
+    assert GM authority.
+    """
+    profile = (os.environ.get("HERMES_PROFILE") or "").strip()
+    if profile not in DIRECTIVE_OBSERVER_PROFILES:
+        raise PermissionError(
+            "directive_observed/directive_selected may only be emitted by the "
+            "authenticated GM patrol lane (gm|gm2); authenticated "
+            f"profile={profile!r}"
+        )
+    return profile
+
+
 def _record_directive_intake_locked(
     conn: sqlite3.Connection,
     *,
     task_id: str,
     source_ref: str,
     source_sha_or_immutable_id: str,
-    observer_profile: str,
-    selector_profile: str,
-    assignee: str,
-    disposition: str = DIRECTIVE_EXECUTE_DISPOSITION,
+    disposition: Optional[str] = None,
     idempotency_key: Optional[str] = None,
     created_at: Optional[int] = None,
 ) -> dict:
     """Record the pre-claim directive prefix on ``task_id`` (existing txn).
 
-    Emits three durable ``task_events`` rows in order — ``directive_observed``,
-    ``directive_selected``, ``directive_bound_native`` — so an authoritative
-    external GM directive is deterministically visible and idempotently bound
-    to exactly one native task before the dispatcher claims it.  Must be called
-    from within an open ``write_txn``.
+    Emits the durable ``task_events`` prefix so an authoritative external GM
+    directive is deterministically visible and idempotently bound to exactly
+    one native task before the dispatcher claims it.  Must be called from
+    within an open ``write_txn``.
+
+    Awareness and selection are distinct decisions:
+
+    * ``disposition=None`` (omitted) records only ``directive_observed`` — the
+      GM patrol read the source but has NOT selected it for execution.
+    * ``disposition="EXECUTE"`` records ``directive_observed`` ->
+      ``directive_selected`` -> ``directive_bound_native``.
 
     Fail-closed semantics:
 
     * ``source_ref`` and ``source_sha_or_immutable_id`` are required; prose
       alone can never fabricate an observation.
-    * ``observer_profile`` / ``selector_profile`` must be an authenticated GM
-      patrol profile (``gm``/``gm2``); anything else cannot observe/select.
-    * ``disposition`` must be ``EXECUTE`` — awareness is not selection.
+    * Observer/selector identity is the kernel-authenticated ``HERMES_PROFILE``
+      (must be ``gm``/``gm2``); it is never caller-asserted.
+    * ``disposition`` other than ``None``/``EXECUTE`` raises — awareness is
+      not selection, and no other value authorises binding.
+    * The carrier task must exist AND still be pre-claim (no ``current_run_id``,
+      status in ``DIRECTIVE_PRE_CLAIM_STATUSES``).
     * One ``source_sha_or_immutable_id`` binds exactly one task.  Re-emitting
-      for the *same* task is idempotent (returns the existing lineage, no
-      duplicate rows).  Re-emitting for a *different* task raises — an
-      ambiguous/double binding must fail closed rather than silently
-      overwrite.
+      for the *same* task is idempotent; re-emitting for a *different* task
+      raises (ambiguous/double binding fails closed).
+    * Any malformed/empty existing ``directive_bound_native`` payload fails
+      closed (never silently skipped).
 
-    Returns a dict with ``task_id``, ``source_ref``, ``source_sha``, and the
-    three event ``kind``/``payload`` records that are now durable.
+    Returns a dict with ``task_id``, ``source_ref``, ``source_sha``,
+    ``selected``, ``already_bound``, and the durable ``events``.
     """
     if not source_ref or not str(source_ref).strip():
         raise ValueError("directive_observed requires a non-empty source_ref")
@@ -5085,62 +5119,92 @@ def _record_directive_intake_locked(
         )
     if not task_id or not str(task_id).strip():
         raise ValueError("directive binding requires a non-empty task_id")
-    if not assignee or not str(assignee).strip():
-        raise ValueError("directive binding requires a non-empty assignee")
-    if observer_profile not in DIRECTIVE_OBSERVER_PROFILES:
-        raise PermissionError(
-            f"directive_observed may only be emitted by the authenticated GM "
-            f"patrol lane (gm|gm2); got observer_profile={observer_profile!r}"
-        )
-    if selector_profile not in DIRECTIVE_OBSERVER_PROFILES:
-        raise PermissionError(
-            f"directive_selected may only be emitted by the authenticated GM "
-            f"patrol lane (gm|gm2); got selector_profile={selector_profile!r}"
-        )
-    if disposition != DIRECTIVE_EXECUTE_DISPOSITION:
+    if disposition not in (None, DIRECTIVE_EXECUTE_DISPOSITION):
         raise ValueError(
-            f"directive_selected disposition must be {DIRECTIVE_EXECUTE_DISPOSITION!r} "
-            f"(execution selection), got {disposition!r}"
+            f"directive disposition must be {DIRECTIVE_EXECUTE_DISPOSITION!r} "
+            f"(explicit execution selection) or None (awareness only), "
+            f"got {disposition!r}"
         )
+
+    # Kernel-authenticated observer/selector identity — never caller-asserted.
+    observer_profile = _authenticated_gm_profile()
+    selector_profile = observer_profile
 
     source_ref = str(source_ref).strip()
     source_sha = str(source_sha_or_immutable_id).strip()
-    assignee = str(assignee).strip()
+    selected = disposition == DIRECTIVE_EXECUTE_DISPOSITION
 
-    # Idempotency + fail-closed single-binding: one immutable directive id maps
-    # to exactly one task.  Scan existing directive_bound_native events (low
-    # volume) and refuse a second task for the same id.
-    rows = conn.execute(
-        "SELECT task_id, payload FROM task_events WHERE kind = ?",
-        (DIRECTIVE_BOUND_NATIVE_KIND,),
-    ).fetchall()
-    for row in rows:
-        try:
-            pl = json.loads(row["payload"]) if row["payload"] else None
-        except Exception:
-            pl = None
-        if not pl or pl.get("source_sha_or_immutable_id") != source_sha:
-            continue
-        if row["task_id"] == task_id:
-            # Same directive already bound to this exact task: idempotent.
-            return {
-                "task_id": task_id,
-                "source_ref": source_ref,
-                "source_sha": source_sha,
-                "already_bound": True,
-                "events": [],
-            }
-        raise RuntimeError(
-            f"directive {source_sha!r} is already bound to a different native "
-            f"task {row['task_id']!r}; ambiguous/double binding fails closed"
+    # Verify the target task exists AND is still pre-claim so we never write
+    # dangling events nor silently rewrite a live/already-executed task's
+    # provenance. The assignee is read from the task row (source of truth),
+    # never from a caller-supplied value.
+    task_row = conn.execute(
+        "SELECT assignee, status, current_run_id FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if task_row is None:
+        raise ValueError(f"cannot bind directive to unknown task {task_id!r}")
+    task_status = task_row["status"]
+    if (
+        task_row["current_run_id"] is not None
+        or task_status not in DIRECTIVE_PRE_CLAIM_STATUSES
+    ):
+        raise ValueError(
+            f"directive binding requires a pre-claim task; task {task_id!r} has "
+            f"status={task_status!r} current_run_id={task_row['current_run_id']!r}"
+        )
+    assignee = (task_row["assignee"] or "").strip()
+    if not assignee:
+        raise ValueError(
+            f"directive binding requires the carrier task {task_id!r} to have "
+            "a non-empty assignee"
         )
 
-    # Verify the target task exists so we never write dangling events.
-    exists = conn.execute(
-        "SELECT 1 FROM tasks WHERE id = ?", (task_id,),
-    ).fetchone()
-    if not exists:
-        raise ValueError(f"cannot bind directive to unknown task {task_id!r}")
+    # Idempotency + fail-closed single-binding (only when selecting/binding):
+    # one immutable directive id maps to exactly one task.  Scan existing
+    # directive_bound_native events (low volume) and refuse a second task for
+    # the same id.  Malformed/empty payloads fail closed rather than being
+    # silently skipped.
+    if selected:
+        bound_rows = conn.execute(
+            "SELECT task_id, payload FROM task_events WHERE kind = ?",
+            (DIRECTIVE_BOUND_NATIVE_KIND,),
+        ).fetchall()
+        for brow in bound_rows:
+            if not brow["payload"]:
+                raise RuntimeError(
+                    "malformed directive_bound_native event (empty payload); "
+                    "failing closed"
+                )
+            try:
+                pl = json.loads(brow["payload"])
+            except Exception as exc:  # noqa: BLE001 — fail closed on corrupt row
+                raise RuntimeError(
+                    "malformed directive_bound_native event (unparseable "
+                    "payload); failing closed"
+                ) from exc
+            if not isinstance(pl, dict) or not pl.get("source_sha_or_immutable_id"):
+                raise RuntimeError(
+                    "malformed directive_bound_native event (missing "
+                    "source_sha_or_immutable_id); failing closed"
+                )
+            if pl["source_sha_or_immutable_id"] != source_sha:
+                continue
+            if brow["task_id"] == task_id:
+                # Same directive already bound to this exact task: idempotent.
+                return {
+                    "task_id": task_id,
+                    "source_ref": source_ref,
+                    "source_sha": source_sha,
+                    "selected": True,
+                    "already_bound": True,
+                    "events": [],
+                }
+            raise RuntimeError(
+                f"directive {source_sha!r} is already bound to a different "
+                f"native task {brow['task_id']!r}; ambiguous/double binding "
+                "fails closed"
+            )
 
     now = int(time.time()) if created_at is None else created_at
 
@@ -5150,41 +5214,73 @@ def _record_directive_intake_locked(
         "observer_profile": observer_profile,
         "observed_at": now,
     }
-    selected_payload = {
-        "source_ref": source_ref,
-        "selector_profile": selector_profile,
-        "disposition": disposition,
-        "selected_at": now,
-    }
-    bound_payload = {
-        "source_ref": source_ref,
-        "source_sha_or_immutable_id": source_sha,
-        "task_id": task_id,
-        "assignee": assignee,
-        "idempotency_key_or_existing_task_binding": idempotency_key,
-        "bound_at": now,
-    }
+    events: list[dict] = []
 
-    _append_event(
-        conn, task_id, DIRECTIVE_OBSERVED_KIND, observed_payload, created_at=now
-    )
-    _append_event(
-        conn, task_id, DIRECTIVE_SELECTED_KIND, selected_payload, created_at=now
-    )
-    _append_event(
-        conn, task_id, DIRECTIVE_BOUND_NATIVE_KIND, bound_payload, created_at=now
-    )
+    # directive_observed is idempotent per (task, source id): re-reading the
+    # same authoritative source must not mint a duplicate observed row (one
+    # logical lineage per task). Malformed observed payloads fail closed
+    # rather than being silently skipped.
+    observed_rows = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = ?",
+        (task_id, DIRECTIVE_OBSERVED_KIND),
+    ).fetchall()
+    observed_exists = False
+    for orow in observed_rows:
+        if not orow["payload"]:
+            raise RuntimeError(
+                "malformed directive_observed event (empty payload); failing closed"
+            )
+        try:
+            opl = json.loads(orow["payload"])
+        except Exception as exc:  # noqa: BLE001 — fail closed on corrupt row
+            raise RuntimeError(
+                "malformed directive_observed event (unparseable payload); "
+                "failing closed"
+            ) from exc
+        if not isinstance(opl, dict) or not opl.get("source_sha_or_immutable_id"):
+            raise RuntimeError(
+                "malformed directive_observed event (missing "
+                "source_sha_or_immutable_id); failing closed"
+            )
+        if opl["source_sha_or_immutable_id"] == source_sha:
+            observed_exists = True
+    if not observed_exists:
+        _append_event(
+            conn, task_id, DIRECTIVE_OBSERVED_KIND, observed_payload, created_at=now
+        )
+        events.append({"kind": DIRECTIVE_OBSERVED_KIND, "payload": observed_payload})
+
+    if selected:
+        selected_payload = {
+            "source_ref": source_ref,
+            "selector_profile": selector_profile,
+            "disposition": disposition,
+            "selected_at": now,
+        }
+        bound_payload = {
+            "source_ref": source_ref,
+            "source_sha_or_immutable_id": source_sha,
+            "task_id": task_id,
+            "assignee": assignee,
+            "idempotency_key_or_existing_task_binding": idempotency_key,
+            "bound_at": now,
+        }
+        events.append({"kind": DIRECTIVE_SELECTED_KIND, "payload": selected_payload})
+        events.append({"kind": DIRECTIVE_BOUND_NATIVE_KIND, "payload": bound_payload})
+        _append_event(
+            conn, task_id, DIRECTIVE_SELECTED_KIND, selected_payload, created_at=now
+        )
+        _append_event(
+            conn, task_id, DIRECTIVE_BOUND_NATIVE_KIND, bound_payload, created_at=now
+        )
 
     return {
         "task_id": task_id,
         "source_ref": source_ref,
         "source_sha": source_sha,
+        "selected": selected,
         "already_bound": False,
-        "events": [
-            {"kind": DIRECTIVE_OBSERVED_KIND, "payload": observed_payload},
-            {"kind": DIRECTIVE_SELECTED_KIND, "payload": selected_payload},
-            {"kind": DIRECTIVE_BOUND_NATIVE_KIND, "payload": bound_payload},
-        ],
+        "events": events,
     }
 
 
@@ -5194,23 +5290,23 @@ def record_directive_intake(
     task_id: str,
     source_ref: str,
     source_sha_or_immutable_id: str,
-    observer_profile: str,
-    selector_profile: str,
-    assignee: str,
-    disposition: str = DIRECTIVE_EXECUTE_DISPOSITION,
+    disposition: Optional[str] = None,
     idempotency_key: Optional[str] = None,
     created_at: Optional[int] = None,
 ) -> dict:
-    """Public entry point: open a write txn and record the directive prefix."""
+    """Public entry point: open a write txn and record the directive prefix.
+
+    ``disposition`` is an explicit execution-selection decision, never a
+    default: ``None`` (omitted) records only ``directive_observed``
+    (awareness); ``"EXECUTE"`` records the full observed -> selected ->
+    bound_native lineage.
+    """
     with write_txn(conn):
         return _record_directive_intake_locked(
             conn,
             task_id=task_id,
             source_ref=source_ref,
             source_sha_or_immutable_id=source_sha_or_immutable_id,
-            observer_profile=observer_profile,
-            selector_profile=selector_profile,
-            assignee=assignee,
             disposition=disposition,
             idempotency_key=idempotency_key,
             created_at=created_at,
@@ -5222,14 +5318,34 @@ def directive_binding_lineage(
 ) -> list[Event]:
     """Return the directive prefix events for ``task_id``, oldest first.
 
-    A reader can reconstruct ``observed -> selected -> bound_native`` purely
-    from persisted events without any prose summary.
+    Validates the persisted lineage is a well-formed prefix of the canonical
+    ``observed -> selected -> bound_native`` order — no duplicates, no gaps, no
+    out-of-order events.  A malformed lineage raises instead of being silently
+    projected as if authoritative.  A task with only ``observed`` (awareness,
+    no selection) returns a single-element lineage.
     """
-    return [
+    canonical = (
+        DIRECTIVE_OBSERVED_KIND,
+        DIRECTIVE_SELECTED_KIND,
+        DIRECTIVE_BOUND_NATIVE_KIND,
+    )
+    events = [
         ev
         for ev in list_events(conn, task_id)
         if ev.kind in DIRECTIVE_EVENT_KINDS
     ]
+    if len(events) > len(canonical):
+        raise ValueError(
+            f"malformed directive lineage for {task_id!r}: {len(events)} "
+            f"directive events exceed the canonical {len(canonical)}-event prefix"
+        )
+    for idx, ev in enumerate(events):
+        if ev.kind != canonical[idx]:
+            raise ValueError(
+                f"malformed directive lineage for {task_id!r}: expected "
+                f"{canonical[idx]!r} at position {idx}, got {ev.kind!r}"
+            )
+    return events
 
 
 def _end_run(

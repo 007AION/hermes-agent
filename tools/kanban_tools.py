@@ -1331,9 +1331,10 @@ def _handle_create(args: dict, **kw) -> str:
     idempotency_key = args.get("idempotency_key")
     directive_source_ref = args.get("directive_source_ref")
     directive_source_sha = args.get("directive_source_sha")
-    directive_observer_profile = args.get("directive_observer_profile")
-    directive_selector_profile = args.get("directive_selector_profile")
-    directive_disposition = args.get("directive_disposition") or "EXECUTE"
+    # Observer/selector identity is kernel-authenticated (HERMES_PROFILE), never
+    # caller-asserted — a non-GM caller cannot forge gm/gm2 authority. Selection
+    # is explicit: no default is synthesised from the observation fields.
+    directive_disposition = args.get("directive_disposition")
     if directive_source_ref and not directive_source_sha:
         return tool_error(
             "directive_source_sha is required when directive_source_ref is set"
@@ -1417,9 +1418,6 @@ def _handle_create(args: dict, **kw) -> str:
                     task_id=new_tid,
                     source_ref=directive_source_ref,
                     source_sha_or_immutable_id=directive_source_sha,
-                    observer_profile=directive_observer_profile,
-                    selector_profile=directive_selector_profile,
-                    assignee=str(assignee),
                     disposition=directive_disposition,
                     idempotency_key=idempotency_key,
                 )
@@ -2305,10 +2303,10 @@ KANBAN_CREATE_SCHEMA = {
                     "Optional authoritative external directive source "
                     "reference (exact GitHub issue/comment URL or other "
                     "canonical ref) to bind to this task. When set with "
-                    "directive_source_sha, records durable "
-                    "directive_observed -> directive_selected -> "
-                    "directive_bound_native events on the task. "
-                    "Observer/selector profiles must be 'gm' or 'gm2'."
+                    "directive_source_sha, records durable directive intake "
+                    "events on the task. Observer/selector identity is the "
+                    "authenticated executing profile (HERMES_PROFILE), which "
+                    "must be 'gm' or 'gm2' — it is not caller-supplied."
                 ),
             },
             "directive_source_sha": {
@@ -2320,27 +2318,13 @@ KANBAN_CREATE_SCHEMA = {
                     "exactly one task (duplicate binding fails closed)."
                 ),
             },
-            "directive_observer_profile": {
-                "type": "string",
-                "enum": ["gm", "gm2"],
-                "description": (
-                    "The authenticated GM patrol profile that read the "
-                    "directive source. Only 'gm' or 'gm2'."
-                ),
-            },
-            "directive_selector_profile": {
-                "type": "string",
-                "enum": ["gm", "gm2"],
-                "description": (
-                    "The GM profile selecting this directive for "
-                    "execution now. Only 'gm' or 'gm2'."
-                ),
-            },
             "directive_disposition": {
                 "type": "string",
+                "enum": ["EXECUTE"],
                 "description": (
-                    "Execution disposition. Must be 'EXECUTE' for a real "
-                    "selection (awareness is not selection)."
+                    "Explicit execution selection. Must be 'EXECUTE' for a real "
+                    "selection — awareness is not selection, and omitting this "
+                    "field records only directive_observed (no binding)."
                 ),
             },
             "max_runtime_seconds": {
