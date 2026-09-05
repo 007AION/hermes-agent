@@ -576,6 +576,147 @@ def _resolve_rate_limit_cooldown_seconds() -> int:
     return DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS
 
 
+# ---------------------------------------------------------------------------
+# R06 A — pre-spawn resource admission (aggregate host + cgroup memory
+# headroom). A worker that spawns into a memory-exhausted host/cgroup is the
+# canonical resource-pressure failure (t_e690dcc1). The admission floor below
+# lets the dispatcher refuse to spawn a new worker while aggregate headroom is
+# under the configured byte count, leaving the task ``ready`` for a later tick
+# instead of failing it. Disabled by default (0).
+# ---------------------------------------------------------------------------
+DEFAULT_SPAWN_ADMISSION_MIN_FREE_BYTES = 0
+# Sentinel returned when neither /proc nor the cgroup headroom is readable:
+# unknown headroom must never gate (fail-open, no admission refusal).
+_SPAWN_ADMISSION_UNKNOWN_HEADROOM = 1 << 62
+
+
+def _resolve_spawn_admission_min_free_bytes() -> int:
+    """Return the pre-spawn admission floor in bytes (0 = disabled)."""
+    raw = os.environ.get(
+        "HERMES_KANBAN_SPAWN_ADMISSION_MIN_FREE_BYTES", ""
+    ).strip()
+    if raw:
+        try:
+            parsed = int(raw)
+        except ValueError:
+            parsed = -1
+        if parsed >= 0:
+            return parsed
+    return DEFAULT_SPAWN_ADMISSION_MIN_FREE_BYTES
+
+
+def _read_meminfo_memavailable_bytes() -> "int | None":
+    """Best-effort read of ``/proc/meminfo`` MemAvailable (bytes); None if absent."""
+    try:
+        with open("/proc/meminfo", "r", encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("MemAvailable:"):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        return int(parts[1]) * 1024
+    except Exception:
+        return None
+    return None
+
+
+def _read_cgroup_memory_headroom_bytes() -> "int | None":
+    """Best-effort cgroup v2 headroom = max(0, memory.high - memory.current)."""
+    for base in ("/sys/fs/cgroup",):
+        try:
+            with open(os.path.join(base, "memory.high"), "r", encoding="utf-8") as fh:
+                high = fh.read().strip()
+            with open(os.path.join(base, "memory.current"), "r", encoding="utf-8") as fh:
+                current = fh.read().strip()
+        except Exception:
+            continue
+        if not high or high == "max":
+            continue
+        try:
+            return max(0, int(high) - int(current))
+        except ValueError:
+            continue
+    return None
+
+
+def _read_cgroup_attribution(pid: Optional[int] = None) -> dict:
+    """Best-effort resource attribution for a worker: cgroup path + memory.
+
+    Returns a dict with ``cgroup_path``, ``memory_current``, ``memory_high``,
+    and ``memory_max`` (each possibly ``None``). Never raises — unreadable
+    cgroup facts simply yield ``None`` fields so attribution degrades to the
+    PID/starttime identity already recorded (R06-C).
+    """
+    out: dict = {
+        "cgroup_path": None,
+        "memory_current": None,
+        "memory_high": None,
+        "memory_max": None,
+    }
+    cgroup_path = None
+    cgroup_source = f"/proc/{pid}/cgroup" if pid else "/proc/self/cgroup"
+    try:
+        with open(cgroup_source, "r", encoding="utf-8") as fh:
+            for line in fh:
+                # cgroup v2: "0::/path"; v1: "9:memory:/path"
+                parts = line.strip().split(":", 2)
+                if len(parts) == 3 and parts[2]:
+                    cgroup_path = parts[2]
+                    break
+    except Exception:
+        cgroup_path = None
+    out["cgroup_path"] = cgroup_path
+
+    # Read memory.current / memory.high / memory.max from the worker's own
+    # cgroup when resolvable, else from the root cgroup.
+    for base in ("/sys/fs/cgroup",):
+        rel = cgroup_path.lstrip("/") if cgroup_path else ""
+        root = os.path.join(base, rel) if rel else base
+        for key, filename in (
+            ("memory_current", "memory.current"),
+            ("memory_high", "memory.high"),
+            ("memory_max", "memory.max"),
+        ):
+            try:
+                with open(os.path.join(root, filename), "r", encoding="utf-8") as fh:
+                    val = fh.read().strip()
+            except Exception:
+                continue
+            if not val or val == "max":
+                continue
+            try:
+                out[key] = int(val)
+            except ValueError:
+                continue
+    return out
+
+
+def _spawn_resource_headroom_bytes(headroom_fn=None) -> int:
+    """Aggregate admission headroom = min(host MemAvailable, cgroup headroom).
+
+    ``headroom_fn`` is an injectable probe for tests; by default it reads the
+    real /proc + cgroup sources. When neither source is readable the sentinel
+    (``_SPAWN_ADMISSION_UNKNOWN_HEADROOM``) is returned so unknown headroom
+    never gates a spawn (fail-open).
+    """
+    if headroom_fn is not None:
+        return int(headroom_fn())
+    values = []
+    host = _read_meminfo_memavailable_bytes()
+    if host is not None:
+        values.append(host)
+    cgroup = _read_cgroup_memory_headroom_bytes()
+    if cgroup is not None:
+        values.append(cgroup)
+    if not values:
+        return _SPAWN_ADMISSION_UNKNOWN_HEADROOM
+    return min(values)
+
+
+def _spawn_admission_defers(headroom_bytes: int, min_free_bytes: int) -> bool:
+    """True when aggregate headroom is below the admission floor."""
+    return min_free_bytes > 0 and headroom_bytes < min_free_bytes
+
+
 # Worker-context caps so build_worker_context() stays bounded on
 # pathological boards (retry-heavy tasks, comment storms, giant
 # summaries). Values chosen to fit a typical 100k-char LLM prompt with
@@ -16078,6 +16219,15 @@ class DispatchResult:
     (EX_TEMPFAIL sentinel exit) and were released back to ``ready`` WITHOUT
     counting a failure. These never trip the circuit breaker — a long quota
     window just makes the task bounce cheaply until the window clears."""
+    resource_deferred: list[tuple[str, int, int]] = field(default_factory=list)
+    """Tasks deferred this tick by R06 A pre-spawn resource admission, as
+    ``(task_id, min_free_bytes, headroom_bytes)`` triples. The task is left
+    ``ready``/unclaimed with no failure counted — the next dispatcher tick
+    re-reads headroom and admits it once the floor is met."""
+    terminal_runs_reconciled: int = 0
+    """Count of orphaned open ``task_runs`` rows closed this tick because their
+    source task is terminal (``done``/``archived``) with ``current_run_id``
+    NULL (R06-C terminal cleanup / reaping). Idempotent and bounded."""
     session_capped: list[str] = field(default_factory=list)
     """Task ids whose workers were refused active-session admission (the
     assignee profile's canonical registry was saturated by a concurrent live
@@ -16843,6 +16993,45 @@ def detect_stale_running(
         # spawn_failed / timed_out / crashed counters.
 
     return reclaimed
+
+
+def reconcile_terminal_runs(conn: sqlite3.Connection) -> int:
+    """Close orphaned open task_runs for terminal tasks (R06-C terminal cleanup).
+
+    A task that reached ``done``/``archived`` must not still carry an open
+    ``task_runs`` row (``status='running'``, ``ended_at IS NULL``). Such rows
+    are historical artifacts from pre-``_end_run`` code paths, or a crash that
+    terminalized the task without closing its active run (canonical incident
+    t_e690dcc1 — the run664/2056/2061 projection fixture). This bounded,
+    idempotent pass closes them as ``reclaimed`` so the terminal task<->run
+    projection is consistent and downstream run-history readers never see
+    phantom live work.
+
+    Only touches rows whose source task has ``current_run_id IS NULL`` — an
+    open run still pointed to by the task is closed by ``_end_run``, not here.
+
+    Returns the number of runs closed.
+    """
+    now = int(time.time())
+    rows = conn.execute(
+        "SELECT r.id FROM task_runs r "
+        "JOIN tasks t ON t.id = r.task_id "
+        "WHERE r.ended_at IS NULL AND r.status = 'running' "
+        "  AND t.status IN ('done', 'archived') "
+        "  AND t.current_run_id IS NULL"
+    ).fetchall()
+    closed = 0
+    for row in rows:
+        with write_txn(conn):
+            cur = conn.execute(
+                "UPDATE task_runs SET status = 'reclaimed', outcome = 'reclaimed', "
+                "summary = COALESCE(summary, 'terminal task with orphaned open run'), "
+                "ended_at = ?, claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
+                "WHERE id = ? AND ended_at IS NULL",
+                (now, row["id"]),
+            )
+            closed += cur.rowcount
+    return closed
 
 
 def _error_fingerprint(error_text: str) -> str:
@@ -18022,7 +18211,13 @@ def _record_spawn_failure(
     )
 
 
-def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
+def _set_worker_pid(
+    conn: sqlite3.Connection,
+    task_id: str,
+    pid: int,
+    *,
+    resource_admission_verdict: str = "disabled",
+) -> None:
     """Record the spawned child's pid + emit a ``spawned`` event.
 
     The event's payload carries the pid so a human reading ``hermes kanban
@@ -18032,7 +18227,9 @@ def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
     Also captures the process's starttime from ``/proc/<pid>/stat`` so
     downstream ownership checks can distinguish a recycled PID from the
     original spawned process (#AION-RL2-CORE-04, bafuxunan audit
-    t_86c15b21).
+    t_86c15b21), plus R06-C resource attribution (cgroup path + memory
+    envelope + dispatcher/assignee profile + admission verdict) so this
+    class of defect is machine-visible without host archaeology.
     """
     # Capture process identity for PID reuse detection.
     identity = _read_process_identity(int(pid))
@@ -18040,7 +18237,28 @@ def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
     if identity is not None:
         spawn_payload["starttime"] = identity["starttime"]
 
+    # R06-C resource attribution: cgroup path + memory envelope at spawn.
+    attribution = _read_cgroup_attribution(int(pid))
+    if attribution.get("cgroup_path") is not None:
+        spawn_payload["cgroup_path"] = attribution["cgroup_path"]
+    if attribution.get("memory_current") is not None:
+        spawn_payload["memory_current_at_spawn"] = attribution["memory_current"]
+    memory_high_or_max = attribution.get("memory_high") or attribution.get("memory_max")
+    if memory_high_or_max is not None:
+        spawn_payload["memory_high_or_max"] = memory_high_or_max
+    _dispatcher_profile = os.environ.get("HERMES_PROFILE")
+    if _dispatcher_profile:
+        spawn_payload["dispatcher_profile"] = _dispatcher_profile
+    # Admission verdict is passed by the dispatcher (admitted when the
+    # pre-spawn gate ran and passed, disabled when no gate was configured).
+    spawn_payload["resource_admission_verdict"] = resource_admission_verdict
+
     with write_txn(conn):
+        _assignee_row = conn.execute(
+            "SELECT assignee FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if _assignee_row is not None and _assignee_row["assignee"]:
+            spawn_payload["assignee_profile"] = _assignee_row["assignee"]
         conn.execute(
             "UPDATE tasks SET worker_pid = ? WHERE id = ?",
             (int(pid), task_id),
@@ -18052,6 +18270,19 @@ def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
                 (int(pid), run_id),
             )
         _append_event(conn, task_id, "spawned", spawn_payload, run_id=run_id)
+        # R06-B automatic first heartbeat evidence: record that the worker
+        # booted, distinct from the progress heartbeat that ``heartbeat_worker``
+        # writes once the worker makes actual progress. We deliberately do NOT
+        # touch ``last_heartbeat_at`` here — that field stays a pure progress
+        # signal so ``detect_stale_running`` can still distinguish "booted but
+        # no progress" (last_heartbeat_at NULL) from "progressed then stalled"
+        # (last_heartbeat_at stale). The bounded no-progress reclaim is already
+        # enforced by ``detect_stale_running``.
+        _append_event(
+            conn, task_id, "heartbeat",
+            {"automatic": True, "phase": "spawn"},
+            run_id=run_id,
+        )
 
 
 def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
@@ -18910,6 +19141,7 @@ def dispatch_once(
     lifecycle_request_fn: Optional[
         Callable[[Task, NativeLifecycleRequest], NativeLifecycleDecision]
     ] = None,
+    spawn_admission_min_free_bytes: Optional[int] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -18945,6 +19177,7 @@ def dispatch_once(
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
             lifecycle_request_fn=lifecycle_request_fn,
+            spawn_admission_min_free_bytes=spawn_admission_min_free_bytes,
         )
     with _dispatch_tick_lock(db_path) as held:
         if not held:
@@ -18962,6 +19195,7 @@ def dispatch_once(
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
             lifecycle_request_fn=lifecycle_request_fn,
+            spawn_admission_min_free_bytes=spawn_admission_min_free_bytes,
         )
         # Still under the dispatch lock: opportunistically truncate the WAL
         # at a coarse interval so it cannot grow unbounded between restarts.
@@ -18985,6 +19219,7 @@ def _dispatch_once_locked(
     lifecycle_request_fn: Optional[
         Callable[[Task, NativeLifecycleRequest], NativeLifecycleDecision]
     ] = None,
+    spawn_admission_min_free_bytes: Optional[int] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -19024,6 +19259,9 @@ def _dispatch_once_locked(
         conn, stale_timeout_seconds=stale_timeout_seconds,
     )
     result.crashed = detect_crashed_workers(conn)
+    # R06-C terminal cleanup: close orphaned open runs for terminal tasks so
+    # the terminal task<->run projection stays consistent (t_e690dcc1).
+    result.terminal_runs_reconciled = reconcile_terminal_runs(conn)
     # detect_crashed_workers stashes protocol-violation auto-blocks on
     # itself so the public list-return stays stable. Pull them into the
     # DispatchResult here so telemetry / tests see the trip.
@@ -19321,6 +19559,32 @@ def _dispatch_once_locked(
                             },
                         )
             continue
+        # R06 A — pre-spawn resource admission: refuse to spawn a new worker
+        # while aggregate host+cgroup memory headroom is below the configured
+        # floor. The task stays ready/unclaimed with no failure counted, so a
+        # later tick can spawn once headroom recovers. The floor is resolved
+        # from the dispatcher parameter (config.yaml kanban.*) first, then the
+        # internal env-var bridge for tests/back-compat.
+        _min_free = (
+            spawn_admission_min_free_bytes
+            if spawn_admission_min_free_bytes is not None
+            else _resolve_spawn_admission_min_free_bytes()
+        )
+        _admission_verdict = "admitted" if _min_free > 0 else "disabled"
+        if _min_free > 0:
+            _headroom = _spawn_resource_headroom_bytes()
+            if _spawn_admission_defers(_headroom, _min_free):
+                result.resource_deferred.append((row["id"], _min_free, _headroom))
+                if not dry_run:
+                    with write_txn(conn):
+                        _append_event(
+                            conn, row["id"], "spawn_deferred_resource",
+                            {
+                                "min_free_bytes": _min_free,
+                                "headroom_bytes": _headroom,
+                            },
+                        )
+                continue
         if dry_run:
             result.spawned.append((row["id"], row_assignee, ""))
             # Increment per-profile counter even in dry_run so the cap
@@ -19369,7 +19633,10 @@ def _dispatch_once_locked(
             except (TypeError, ValueError):
                 pid = _spawn(claimed, str(workspace))
             if pid:
-                _set_worker_pid(conn, claimed.id, int(pid))
+                _set_worker_pid(
+                    conn, claimed.id, int(pid),
+                    resource_admission_verdict=_admission_verdict,
+                )
             # NOTE: we intentionally do NOT reset consecutive_failures
             # here. A successful spawn proves the worker can start but
             # doesn't prove the run will succeed. Under unified

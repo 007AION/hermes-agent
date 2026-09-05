@@ -1629,6 +1629,22 @@ class GatewayKanbanWatchersMixin:
                         max_in_progress_per_profile,
                     )
 
+        # R06-A pre-spawn admission floor (bytes; 0 = disabled). Refuses to
+        # spawn a worker while aggregate host+cgroup memory headroom is below
+        # this floor, leaving the task ready for a later tick.
+        raw_admission = kanban_cfg.get("spawn_admission_min_free_bytes", 0)
+        try:
+            spawn_admission_min_free_bytes = int(raw_admission or 0)
+        except (TypeError, ValueError):
+            spawn_admission_min_free_bytes = 0
+        if spawn_admission_min_free_bytes < 0:
+            spawn_admission_min_free_bytes = 0
+        if spawn_admission_min_free_bytes:
+            logger.info(
+                "kanban dispatcher: spawn_admission_min_free_bytes=%d",
+                spawn_admission_min_free_bytes,
+            )
+
         # Initial delay so the gateway finishes wiring adapters before the
         # dispatcher spawns workers (those workers may hit gateway notify
         # subscriptions etc.). Matches the notifier watcher's delay.
@@ -1723,6 +1739,7 @@ class GatewayKanbanWatchersMixin:
                     default_assignee=default_assignee,
                     max_in_progress_per_profile=max_in_progress_per_profile,
                     lifecycle_request_fn=_evaluate_native_lifecycle_restart_request,
+                    spawn_admission_min_free_bytes=spawn_admission_min_free_bytes,
                 )
             except sqlite3.DatabaseError as exc:
                 if _is_corrupt_board_db_error(exc):

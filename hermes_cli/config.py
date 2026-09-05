@@ -3051,6 +3051,14 @@ DEFAULT_CONFIG = {
         # worker process (if still running host-locally) is terminated
         # before the reclaim.  0 disables stale detection entirely.
         "dispatch_stale_timeout_seconds": 14400,
+        # R06-A pre-spawn resource admission: refuse to spawn a new worker
+        # while aggregate host+cgroup memory headroom (MemAvailable and the
+        # gateway cgroup's memory.high - memory.current) is below this many
+        # bytes. The task stays ``ready``/unclaimed with no failure counted,
+        # so a later tick spawns it once headroom recovers. 0 (default)
+        # disables the gate. Derive from measured worker envelope + baseline,
+        # not a gateway-only guess.
+        "spawn_admission_min_free_bytes": 0,
     },
 
     # execute_code settings — controls the tool used for programmatic tool calls.
