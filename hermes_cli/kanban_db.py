@@ -717,6 +717,380 @@ def _spawn_admission_defers(headroom_bytes: int, min_free_bytes: int) -> bool:
     return min_free_bytes > 0 and headroom_bytes < min_free_bytes
 
 
+# ---------------------------------------------------------------------------
+# R06 B/C — per-worker cgroup isolation (resource limits) + process-level
+# descendant reaping. The canonical defect (t_e690dcc1) is a worker whose
+# detached descendants (background procs, LSP servers, temp subprocesses)
+# survive the worker's own termination and keep holding memory/swap in the
+# gateway cgroup for hours. A per-worker cgroup v2 gives both a deterministic
+# reaping primitive (kill every PID still listed in the cgroup) AND the bounded
+# isolation the auditor requires (memory.high / memory.max / pids.max). Every
+# operation here is best-effort and fail-open: when cgroup v2 is unavailable,
+# unwritable, or unprivileged, we degrade to a process-group + /proc descendant
+# reaping so the defect is still bounded. No second control plane.
+# ---------------------------------------------------------------------------
+DEFAULT_WORKER_ISOLATION_ENABLED = False
+DEFAULT_WORKER_MEMORY_HIGH_BYTES = 0
+DEFAULT_WORKER_MEMORY_MAX_BYTES = 0
+DEFAULT_WORKER_PIDS_MAX = 0
+_CGROUP_FS_ROOT = "/sys/fs/cgroup"
+_WORKER_CGROUP_PREFIX = "hermes-kanban-"
+
+
+def _resolve_worker_isolation_settings() -> dict:
+    """Resolve per-worker cgroup isolation settings from the env bridge.
+
+    config.yaml ``kanban.worker_isolation_enabled`` and the limit keys are
+    resolved by the dispatcher caller (``hermes_cli/kanban.py`` and
+    ``gateway/kanban_watchers.py``) and passed to ``_default_spawn`` as explicit
+    keyword arguments; these env vars are the test / back-compat bridge that
+    mirrors the R06-A admission-floor pattern. Returned limits are all ``0``
+    (disabled) unless a non-negative integer is present.
+    """
+    def _env_bool(key: str, default: bool) -> bool:
+        raw = os.environ.get(key, "").strip().lower()
+        if raw in ("1", "true", "yes", "on"):
+            return True
+        if raw in ("0", "false", "no", "off"):
+            return False
+        return default
+
+    def _env_nonneg(key: str, default: int) -> int:
+        raw = os.environ.get(key, "").strip()
+        if not raw:
+            return default
+        try:
+            return int(raw) if int(raw) >= 0 else default
+        except ValueError:
+            return default
+
+    return {
+        "enabled": _env_bool(
+            "HERMES_KANBAN_WORKER_ISOLATION", DEFAULT_WORKER_ISOLATION_ENABLED
+        ),
+        "memory_high_bytes": _env_nonneg(
+            "HERMES_KANBAN_WORKER_MEMORY_HIGH_BYTES", DEFAULT_WORKER_MEMORY_HIGH_BYTES
+        ),
+        "memory_max_bytes": _env_nonneg(
+            "HERMES_KANBAN_WORKER_MEMORY_MAX_BYTES", DEFAULT_WORKER_MEMORY_MAX_BYTES
+        ),
+        "pids_max": _env_nonneg(
+            "HERMES_KANBAN_WORKER_PIDS_MAX", DEFAULT_WORKER_PIDS_MAX
+        ),
+    }
+
+
+def _dispatcher_cgroup_path() -> Optional[str]:
+    """Return this process's cgroup v2 path (e.g. ``/system.slice/foo.service``).
+
+    Only cgroup v2's unified hierarchy (``0::/path``) is recognized. Returns
+    ``None`` on cgroup v1, an unreadable ``/proc``, or a non-cgroup host.
+    """
+    try:
+        with open("/proc/self/cgroup", "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if line.startswith("0::"):
+                    return line[3:] or "/"
+    except Exception:
+        return None
+    return None
+
+
+def _worker_cgroup_name(task_id: str) -> str:
+    """Stable, sanitized cgroup directory name for a task (task-scoped)."""
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", task_id)
+    return f"{_WORKER_CGROUP_PREFIX}{safe}"
+
+
+def _worker_cgroup_path(task_id: Optional[str]) -> Optional[str]:
+    """Absolute cgroup v2 path (relative to the fs root) for a task's worker."""
+    if not task_id:
+        return None
+    parent = _dispatcher_cgroup_path()
+    if parent is None:
+        return None
+    return f"{parent.rstrip('/')}/{_worker_cgroup_name(task_id)}"
+
+
+def _cgroup_fs_path(cgroup_path: str) -> str:
+    """Map a cgroup v2 path to its filesystem directory under ``/sys/fs/cgroup``."""
+    return os.path.join(_CGROUP_FS_ROOT, cgroup_path.lstrip("/"))
+
+
+def _cgroup_exists(cgroup_path: str) -> bool:
+    return os.path.isdir(_cgroup_fs_path(cgroup_path))
+
+
+def _ensure_subtree_controllers(parent_path: str) -> bool:
+    """Enable ``memory`` + ``pids`` in *parent_path*'s ``cgroup.subtree_control``.
+
+    A child cgroup only exposes ``memory.high`` / ``pids.max`` when its parent
+    has the corresponding controller enabled in ``subtree_control``. This is a
+    best-effort write: if the controllers aren't available at this level, or the
+    file is unwritable, it returns without raising (the child cgroup is still
+    created for reaping; only the limits are skipped). Returns True when no
+    further action is needed or the enable succeeded; False on a hard failure
+    (which the caller treats as "limits unavailable", never fatal).
+    """
+    root = _cgroup_fs_path(parent_path)
+    controllers_file = os.path.join(root, "cgroup.controllers")
+    subtree_file = os.path.join(root, "cgroup.subtree_control")
+    try:
+        with open(controllers_file, "r", encoding="utf-8") as fh:
+            available = set(fh.read().split())
+    except Exception:
+        return False
+    wanted = {"memory", "pids"}
+    if not wanted.issubset(available):
+        # Controllers not delegated to this level → cannot enable them here.
+        return False
+    try:
+        with open(subtree_file, "r", encoding="utf-8") as fh:
+            enabled = set(fh.read().split())
+    except Exception:
+        enabled = set()
+    missing = wanted - enabled
+    if not missing:
+        return True
+    try:
+        with open(subtree_file, "w", encoding="utf-8") as fh:
+            fh.write(" ".join(f"+{c}" for c in sorted(missing)))
+        return True
+    except Exception:
+        return False
+
+
+def _create_worker_cgroup(
+    task_id: str,
+    *,
+    memory_high: int = 0,
+    memory_max: int = 0,
+    pids_max: int = 0,
+) -> Optional[str]:
+    """Best-effort create of a per-worker cgroup v2 dir with resource limits.
+
+    Returns the cgroup path on success, or ``None`` on any failure (the caller
+    degrades to process-group + /proc reaping). When a stale cgroup from a prior
+    run already exists, its contents are reaped and it is reused. Limits are
+    only written when greater than zero (0 = leave the controller unbounded).
+    Never raises.
+    """
+    cgroup_path = _worker_cgroup_path(task_id)
+    if cgroup_path is None:
+        return None
+    parent = _dispatcher_cgroup_path()
+    if parent is None:
+        return None
+    fs_dir = _cgroup_fs_path(cgroup_path)
+    try:
+        # Enable the controllers we intend to apply. Failure is non-fatal: the
+        # cgroup is still created for reaping even when limits can't apply.
+        _ensure_subtree_controllers(parent)
+        os.makedirs(fs_dir, exist_ok=True)
+        for value, filename in (
+            (memory_high, "memory.high"),
+            (memory_max, "memory.max"),
+            (pids_max, "pids.max"),
+        ):
+            if value > 0:
+                try:
+                    with open(os.path.join(fs_dir, filename), "w", encoding="utf-8") as fh:
+                        fh.write(str(int(value)))
+                except Exception:
+                    continue
+        return cgroup_path
+    except Exception:
+        return None
+
+
+def _assign_pid_to_cgroup(pid: int, cgroup_path: str) -> bool:
+    """Move *pid* into *cgroup_path* via ``cgroup.procs``. Returns success."""
+    if not pid or pid <= 0:
+        return False
+    try:
+        with open(
+            os.path.join(_cgroup_fs_path(cgroup_path), "cgroup.procs"),
+            "w", encoding="utf-8",
+        ) as fh:
+            fh.write(str(int(pid)))
+        return True
+    except Exception:
+        return False
+
+
+def _read_cgroup_pids(cgroup_path: str) -> list[int]:
+    """Read ``cgroup.procs`` for *cgroup_path* (empty on any failure)."""
+    try:
+        with open(
+            os.path.join(_cgroup_fs_path(cgroup_path), "cgroup.procs"),
+            "r", encoding="utf-8",
+        ) as fh:
+            pids: list[int] = []
+            for line in fh.read().splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    pids.append(int(line))
+                except ValueError:
+                    continue
+            return pids
+    except Exception:
+        return []
+
+
+def _signal_pid_ladder(pid: int, kill, *, signal, time) -> str:
+    """TERM → bounded wait → KILL for a single PID; returns an outcome token."""
+    if pid <= 0:
+        return "gone"
+    try:
+        kill(pid, signal.SIGTERM)
+    except (ProcessLookupError, OSError):
+        return "gone"
+    for _ in range(10):
+        if not _pid_alive(pid):
+            return "terminated"
+        time.sleep(0.2)
+    try:
+        _sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
+        kill(pid, _sigkill)
+    except (ProcessLookupError, OSError):
+        return "gone"
+    time.sleep(0.5)
+    if not _pid_alive(pid):
+        return "killed"
+    return "survivor"
+
+
+def _reap_worker_cgroup(cgroup_path: str, *, kill, signal, time) -> int:
+    """TERM→KILL every PID still in *cgroup_path* other than self.
+
+    Cgroup membership is inherited by every descendant — including ones that
+    detached into their own session — so this deterministically reaps the whole
+    worker tree even after the worker root has already exited. Returns the
+    number of PIDs signalled.
+    """
+    own = os.getpid()
+    signalled = 0
+    for pid in _read_cgroup_pids(cgroup_path):
+        if pid == own:
+            continue
+        _signal_pid_ladder(pid, kill, signal=signal, time=time)
+        signalled += 1
+    return signalled
+
+
+def _remove_worker_cgroup(cgroup_path: str) -> bool:
+    """Remove an emptied worker cgroup (best-effort; non-empty stays for retry)."""
+    try:
+        os.rmdir(_cgroup_fs_path(cgroup_path))
+        return True
+    except OSError:
+        return False
+
+
+def _reap_worker_descendants(
+    pid: Optional[int],
+    *,
+    task_id: Optional[str] = None,
+    signal_fn=None,
+) -> dict:
+    """Reap a terminated/crashed worker's descendant processes (R06-C).
+
+    The canonical defect (t_e690dcc1) is a worker whose detached descendants
+    (background procs, LSP servers, temp subprocesses) survive the worker's own
+    termination and keep holding memory/swap in the gateway cgroup for hours.
+    This is the process-level counterpart to ``reconcile_terminal_runs`` (which
+    only closes DB rows): it actually kills the descendants.
+
+    Primitive order:
+
+      1. Per-worker cgroup — when a cgroup exists (created at spawn), kill every
+         PID still listed in ``cgroup.procs``. Cgroup membership is inherited by
+         every descendant, including ones that detached into their own session,
+         so this is deterministic and race-free even after the worker root died.
+      2. Process-group + /proc descendant walk — the fallback. ``killpg(pid)``
+         catches the worker + same-group children; a transitive /proc ppid walk
+         (identity-guarded via ``_discover_descendant_pids``) catches detached
+         descendants still traceable while the worker is alive.
+
+    Never raises; any failure degrades to a no-op with evidence recorded. The
+    worker root PID is NOT signalled here: every caller already terminates the
+    root itself (``_terminate_reclaimed_worker`` / the inline TERM→KILL in
+    ``enforce_max_runtime`` / ``_fence_worker_by_identity``), or the root is
+    already dead (``detect_crashed_workers`` / ``reconcile_terminal_runs``). The
+    fallback ``killpg(pid)`` covers the root plus its same-group children; the
+    cgroup path covers the root via membership. Re-signalling the root here
+    would double-signal and break the callers' exact-signal contracts.
+    """
+    import signal as _signal
+    import time as _time
+
+    kill = signal_fn if signal_fn is not None else (
+        os.kill if hasattr(os, "kill") else None
+    )
+    info: dict = {
+        "pid": int(pid) if pid else None,
+        "task_id": task_id,
+        "cgroup_path": None,
+        "cgroup_reaped": 0,
+        "killpg_attempted": False,
+        "descendants": 0,
+        "terminated": 0,
+        "killed": 0,
+        "survivors": 0,
+    }
+    if kill is None:
+        return info
+
+    # Cgroup reaping is independent of the worker root PID: cgroup membership
+    # survives the root's exit, so a caller that only knows the task (e.g.
+    # reconcile_terminal_runs with pid=None) can still reap a leaked worker
+    # tree by cgroup alone.
+    cgroup_path = _worker_cgroup_path(task_id)
+    if cgroup_path is not None and _cgroup_exists(cgroup_path):
+        info["cgroup_path"] = cgroup_path
+        info["cgroup_reaped"] = _reap_worker_cgroup(
+            cgroup_path, kill=kill, signal=_signal, time=_time,
+        )
+        _remove_worker_cgroup(cgroup_path)
+        return info
+
+    # Fallback: snapshot descendants while the worker is (possibly) still alive,
+    # then killpg (root + same-group children), then TERM→KILL the detached
+    # descendants. The worker root itself is intentionally NOT re-signalled
+    # here — the caller already terminated it, and killpg(pid) already covers
+    # it (start_new_session makes the worker its own group leader).
+    if not pid or pid <= 0:
+        return info
+    _pid = int(pid)
+    ident = _read_process_identity(_pid)
+    descendants: set[int] = set()
+    if ident is not None:
+        descendants = _discover_descendant_pids(
+            _pid, expected_starttime=ident["starttime"],
+        )
+    try:
+        os.killpg(_pid, _signal.SIGTERM)
+        info["killpg_attempted"] = True
+    except (ProcessLookupError, OSError, PermissionError):
+        pass
+
+    for d in sorted(descendants):
+        if d == _pid:
+            continue
+        outcome = _signal_pid_ladder(d, kill, signal=_signal, time=_time)
+        info["descendants"] += 1
+        if outcome == "terminated" or outcome == "gone":
+            info["terminated"] += 1
+        elif outcome == "killed":
+            info["killed"] += 1
+        else:
+            info["survivors"] += 1
+    return info
+
+
 # Worker-context caps so build_worker_context() stays bounded on
 # pathological boards (retry-heavy tasks, comment storms, giant
 # summaries). Values chosen to fit a typical 100k-char LLM prompt with
@@ -9582,6 +9956,11 @@ def release_stale_claims(
         termination = _terminate_reclaimed_worker(
             row["worker_pid"], row["claim_lock"], signal_fn=signal_fn,
         )
+        # R06-C — reap the worker's detached descendants alongside the root so
+        # a TTL reclaim cannot leak background procs / LSP servers (t_e690dcc1).
+        termination["descendants"] = _reap_worker_descendants(
+            row["worker_pid"], task_id=row["id"], signal_fn=signal_fn,
+        )
         # Never release a claim while our own worker is still alive: that would
         # spawn a duplicate beside it. Hold the claim and retry next tick.
         if _worker_survived_termination(termination):
@@ -9661,6 +10040,11 @@ def reclaim_task(
     prev_lock = row["claim_lock"]
     termination = _terminate_reclaimed_worker(
         row["worker_pid"], prev_lock, signal_fn=signal_fn,
+    )
+    # R06-C — reap the worker's detached descendants alongside the root so an
+    # operator reclaim cannot leak background procs / LSP servers (t_e690dcc1).
+    termination["descendants"] = _reap_worker_descendants(
+        row["worker_pid"], task_id=task_id, signal_fn=signal_fn,
     )
     with write_txn(conn):
         cur = conn.execute(
@@ -16816,6 +17200,12 @@ def enforce_max_runtime(
                 except (ProcessLookupError, OSError):
                     pass
 
+        # R06-C — process-level descendant reaping: the worker PID above may
+        # exit while its detached descendants (background procs, LSP servers,
+        # temp subprocesses) survive in the gateway cgroup. Reap them so a
+        # max-runtime timeout cannot leak processes (canonical t_e690dcc1).
+        descendants = _reap_worker_descendants(pid, task_id=tid, signal_fn=kill)
+
         with write_txn(conn):
             cur = conn.execute(
                 "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
@@ -16832,6 +17222,7 @@ def enforce_max_runtime(
                     "limit_seconds": int(row["max_runtime_seconds"]),
                     "sigkill": killed,
                 }
+                payload["descendants"] = descendants
                 run_id = _end_run(
                     conn, tid,
                     outcome="timed_out", status="timed_out",
@@ -16932,6 +17323,11 @@ def detect_stale_running(
         termination = _terminate_reclaimed_worker(
             pid, lock, signal_fn=signal_fn,
         )
+        # R06-C — reap the worker's detached descendants alongside the root so
+        # a no-heartbeat reclaim cannot leak background procs (t_e690dcc1).
+        termination["descendants"] = _reap_worker_descendants(
+            pid, task_id=tid, signal_fn=signal_fn,
+        )
 
         # Never release a claim while our own worker is still alive: that would
         # spawn a duplicate beside it. Hold the claim and retry next tick.
@@ -17014,7 +17410,7 @@ def reconcile_terminal_runs(conn: sqlite3.Connection) -> int:
     """
     now = int(time.time())
     rows = conn.execute(
-        "SELECT r.id FROM task_runs r "
+        "SELECT r.id, r.task_id FROM task_runs r "
         "JOIN tasks t ON t.id = r.task_id "
         "WHERE r.ended_at IS NULL AND r.status = 'running' "
         "  AND t.status IN ('done', 'archived') "
@@ -17031,6 +17427,12 @@ def reconcile_terminal_runs(conn: sqlite3.Connection) -> int:
                 (now, row["id"]),
             )
             closed += cur.rowcount
+        # R06-C — a terminal task's per-worker cgroup may still hold detached
+        # descendants (background procs / LSP servers) whose worker root already
+        # exited. Cgroup membership survives the root's exit, so reap it here —
+        # this closes the "worker completed cleanly but left children" survivor
+        # case that a /proc ppid walk cannot see after reparenting (t_e690dcc1).
+        _reap_worker_descendants(None, task_id=row["task_id"])
     return closed
 
 
@@ -17179,6 +17581,12 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 continue
 
             pid = int(row["worker_pid"])
+            # R06-C — the worker root is gone, but its detached descendants
+            # (background procs, LSP servers, temp subprocesses) may still be
+            # alive in the cgroup, holding memory/swap (canonical t_e690dcc1).
+            # Reap them by cgroup membership (which survives the root's exit)
+            # or, failing that, by process-group + /proc walk.
+            _reap_worker_descendants(pid, task_id=row["id"])
             kind, code = _classify_worker_exit(pid)
             rate_limited_exit = False
             session_capped_exit = False
@@ -17873,6 +18281,12 @@ def release_fenced_workers(
             _fence_worker_by_identity(pid, starttime, signal_fn=signal_fn)
             _persist_fence_lineage(conn, tid, [])
 
+        # R06-C — a per-worker cgroup (created at spawn) catches detached
+        # descendants whose cwd is outside the workspace, which the
+        # cwd-containment fence above cannot see. Best-effort; no-op without a
+        # cgroup.
+        _reap_worker_descendants(pid, task_id=tid, signal_fn=signal_fn)
+
         if _read_process_identity(pid) is None and survivors == 0:
             _release_fenced(conn, tid, reason="predecessor_fenced", target=target)
             if target == "ready":
@@ -18217,6 +18631,7 @@ def _set_worker_pid(
     pid: int,
     *,
     resource_admission_verdict: str = "disabled",
+    worker_isolation: Optional[dict] = None,
 ) -> None:
     """Record the spawned child's pid + emit a ``spawned`` event.
 
@@ -18252,6 +18667,34 @@ def _set_worker_pid(
     # Admission verdict is passed by the dispatcher (admitted when the
     # pre-spawn gate ran and passed, disabled when no gate was configured).
     spawn_payload["resource_admission_verdict"] = resource_admission_verdict
+    # R06 B/C — record the worker isolation verdict + configured limits so a
+    # reader of `hermes kanban tail` can see whether the worker was placed in
+    # a bounded cgroup (isolated) or ran un-isolated (degraded), without host
+    # archaeology. The cgroup_path field above already reflects the worker's
+    # actual cgroup: it ends with the hermes-kanban-<task> leaf when the spawn
+    # successfully moved the worker into its per-task cgroup. Use the same
+    # isolation dict the spawn actually consumed (config.yaml-driven, passed
+    # down from ``_dispatch_once_locked``) rather than re-reading env vars, so
+    # the verdict can never disagree with what ``_default_spawn`` did.
+    _iso = worker_isolation if worker_isolation is not None else (
+        _resolve_worker_isolation_settings()
+    )
+    spawn_payload["worker_isolation_enabled"] = bool(_iso.get("enabled"))
+    spawn_payload["worker_isolation"] = (
+        "cgroup"
+        if _iso.get("enabled")
+        and spawn_payload.get("cgroup_path", "").endswith(
+            _worker_cgroup_name(task_id)
+        )
+        else "degraded"
+    )
+    for _k, _v in (
+        ("worker_memory_high_bytes", _iso.get("memory_high_bytes")),
+        ("worker_memory_max_bytes", _iso.get("memory_max_bytes")),
+        ("worker_pids_max", _iso.get("pids_max")),
+    ):
+        if _v:
+            spawn_payload[_k] = _v
 
     with write_txn(conn):
         _assignee_row = conn.execute(
@@ -19142,6 +19585,7 @@ def dispatch_once(
         Callable[[Task, NativeLifecycleRequest], NativeLifecycleDecision]
     ] = None,
     spawn_admission_min_free_bytes: Optional[int] = None,
+    worker_isolation: Optional[dict] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -19178,6 +19622,7 @@ def dispatch_once(
             max_in_progress_per_profile=max_in_progress_per_profile,
             lifecycle_request_fn=lifecycle_request_fn,
             spawn_admission_min_free_bytes=spawn_admission_min_free_bytes,
+            worker_isolation=worker_isolation,
         )
     with _dispatch_tick_lock(db_path) as held:
         if not held:
@@ -19196,6 +19641,7 @@ def dispatch_once(
             max_in_progress_per_profile=max_in_progress_per_profile,
             lifecycle_request_fn=lifecycle_request_fn,
             spawn_admission_min_free_bytes=spawn_admission_min_free_bytes,
+            worker_isolation=worker_isolation,
         )
         # Still under the dispatch lock: opportunistically truncate the WAL
         # at a coarse interval so it cannot grow unbounded between restarts.
@@ -19220,6 +19666,7 @@ def _dispatch_once_locked(
         Callable[[Task, NativeLifecycleRequest], NativeLifecycleDecision]
     ] = None,
     spawn_admission_min_free_bytes: Optional[int] = None,
+    worker_isolation: Optional[dict] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -19252,6 +19699,12 @@ def _dispatch_once_locked(
     # Reap zombie children from previously spawned workers. See
     # reap_worker_zombies() for the full rationale.
     reap_worker_zombies()
+
+    # R06 B/C — resolve per-worker cgroup isolation settings once per tick
+    # (explicit caller config wins; else the env bridge / defaults).
+    _iso = worker_isolation if worker_isolation is not None else (
+        _resolve_worker_isolation_settings()
+    )
 
     result = DispatchResult()
     result.reclaimed = release_stale_claims(conn)
@@ -19626,16 +20079,19 @@ def _dispatch_once_locked(
             import inspect
             try:
                 sig = inspect.signature(_spawn)
+                _kwargs = {}
                 if "board" in sig.parameters:
-                    pid = _spawn(claimed, str(workspace), board=board)
-                else:
-                    pid = _spawn(claimed, str(workspace))
+                    _kwargs["board"] = board
+                if "worker_isolation" in sig.parameters:
+                    _kwargs["worker_isolation"] = _iso
+                pid = _spawn(claimed, str(workspace), **_kwargs)
             except (TypeError, ValueError):
                 pid = _spawn(claimed, str(workspace))
             if pid:
                 _set_worker_pid(
                     conn, claimed.id, int(pid),
                     resource_admission_verdict=_admission_verdict,
+                    worker_isolation=_iso,
                 )
             # NOTE: we intentionally do NOT reset consecutive_failures
             # here. A successful spawn proves the worker can start but
@@ -19727,14 +20183,18 @@ def _dispatch_once_locked(
             import inspect
             try:
                 sig = inspect.signature(_spawn)
+                _kwargs = {}
                 if "board" in sig.parameters:
-                    pid = _spawn(claimed, str(workspace), board=board)
-                else:
-                    pid = _spawn(claimed, str(workspace))
+                    _kwargs["board"] = board
+                if "worker_isolation" in sig.parameters:
+                    _kwargs["worker_isolation"] = _iso
+                pid = _spawn(claimed, str(workspace), **_kwargs)
             except (TypeError, ValueError):
                 pid = _spawn(claimed, str(workspace))
             if pid:
-                _set_worker_pid(conn, claimed.id, int(pid))
+                _set_worker_pid(
+                    conn, claimed.id, int(pid), worker_isolation=_iso,
+                )
             result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
             spawned += 1
         except Exception as exc:
@@ -20014,6 +20474,7 @@ def _default_spawn(
     workspace: str,
     *,
     board: Optional[str] = None,
+    worker_isolation: Optional[dict] = None,
 ) -> Optional[int]:
     """Fire-and-forget ``hermes -p <profile> chat -q ...`` subprocess.
 
@@ -20217,6 +20678,32 @@ def _default_spawn(
     # handle is kept alive by the child's inheritance.  The parent's
     # reference goes out of scope and is GC'd, but the OS-level FD stays
     # open in the child until the child exits.
+
+    # R06 B/C — per-worker cgroup isolation (resource limits) + reaping
+    # primitive. Best-effort: when worker isolation is enabled, create a
+    # per-task cgroup v2, apply the configured memory/pids limits, and move
+    # the freshly-spawned worker into it so every descendant — including ones
+    # that later detach into their own session (background procs, LSP servers,
+    # temp subprocesses) — is deterministically reaped at termination via
+    # cgroup membership. Any failure degrades to the process-group + /proc
+    # descendant reaping in ``_reap_worker_descendants``. Never raises; the
+    # worker still spawns un-isolated when cgroup setup is unavailable.
+    _iso = worker_isolation if worker_isolation is not None else (
+        _resolve_worker_isolation_settings()
+    )
+    try:
+        if _iso.get("enabled"):
+            _cgroup_path = _create_worker_cgroup(
+                task.id,
+                memory_high=int(_iso.get("memory_high_bytes", 0) or 0),
+                memory_max=int(_iso.get("memory_max_bytes", 0) or 0),
+                pids_max=int(_iso.get("pids_max", 0) or 0),
+            )
+            if _cgroup_path is not None:
+                _assign_pid_to_cgroup(proc.pid, _cgroup_path)
+    except Exception:
+        # Isolation is an optimization + hardening, never a spawn blocker.
+        pass
     return proc.pid
 
 
