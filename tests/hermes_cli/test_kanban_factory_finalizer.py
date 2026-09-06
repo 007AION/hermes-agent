@@ -279,6 +279,67 @@ def test_pr917_module_drift_fails_closed_with_zero_mutation(
 
 
 # ---------------------------------------------------------------------------
+# Loader regression — pinned single-read loader must register the module in
+# ``sys.modules`` BEFORE ``exec``.
+#
+# The PR #947 binder (``scripts/aion_monarch_receipt_binder.py``) is a
+# ``@dataclass(frozen=True)`` module with ``from __future__ import
+# annotations``. During ``exec``, ``dataclasses._is_type`` resolves string
+# field annotations via ``sys.modules.get(cls.__module__).__dict__``. When the
+# pinned loader exec's the module BEFORE registering it in ``sys.modules``,
+# that lookup returns ``None`` and dataclass raises
+# ``AttributeError: 'NoneType' object has no attribute '__dict__'``, blocking
+# TASK_TERMINAL finalization. The loader must register the module under its
+# pinned name before ``exec`` so self-referential dataclass annotations
+# resolve. This is independent of the authority pin values: any
+# ``@dataclass(frozen=True)`` + ``from __future__ import annotations`` module
+# hits the same path.
+# ---------------------------------------------------------------------------
+
+def test_pinned_loader_registers_module_before_exec_for_dataclass_annotations(
+    tmp_path,
+):
+    source = (
+        "from __future__ import annotations\n"
+        "from dataclasses import dataclass\n"
+        "\n"
+        "@dataclass(frozen=True)\n"
+        "class CanonicalGitHubRepository:\n"
+        "    owner: str\n"
+        "    name: str\n"
+        "\n"
+        "    @property\n"
+        "    def full_name(self) -> str:\n"
+        "        return f'{self.owner}/{self.name}'\n"
+        "\n"
+        "@dataclass(frozen=True)\n"
+        "class CanonicalImplementationIdentity:\n"
+        "    repository: CanonicalGitHubRepository\n"
+        "    pull_request_number: int\n"
+        "    merge_commit_sha: str\n"
+    )
+    rel = "synth_receipt_binder.py"
+    (tmp_path / rel).write_bytes(source.encode("utf-8"))
+    expected_sha = hashlib.sha256(source.encode("utf-8")).hexdigest()
+    module_name = "scripts.aion_synth_receipt_binder_regression"
+
+    module = kb._load_pinned_aion_module(tmp_path, rel, expected_sha, module_name)
+
+    # The loader registered the module under its pinned name BEFORE exec, so
+    # dataclass could resolve its own forward-reference annotations.
+    assert sys.modules.get(module_name) is module
+    repo_cls = getattr(module, "CanonicalGitHubRepository")
+    identity_cls = getattr(module, "CanonicalImplementationIdentity")
+    identity = identity_cls(
+        repository=repo_cls(owner="kiddhu", name="hermes-agent"),
+        pull_request_number=947,
+        merge_commit_sha="0" * 40,
+    )
+    assert identity.repository.full_name == "kiddhu/hermes-agent"
+    assert identity.pull_request_number == 947
+
+
+# ---------------------------------------------------------------------------
 # T1 RED — finalizer disabled -> FAIL_CLOSED zero mutation
 # ---------------------------------------------------------------------------
 

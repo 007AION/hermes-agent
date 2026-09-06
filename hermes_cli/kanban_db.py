@@ -10782,6 +10782,14 @@ def _load_pinned_aion_module(
         )
     module = _types.ModuleType(module_name)
     module.__file__ = str(path)
+    # Register the module in sys.modules BEFORE exec so that, under
+    # ``from __future__ import annotations``, ``dataclasses._is_type`` (and
+    # any other resolver that reaches ``sys.modules.get(cls.__module__)``) can
+    # resolve the class's own module namespace for forward-reference field
+    # annotations. Without this, the lookup returns None and dataclass raises
+    # ``AttributeError: 'NoneType' object has no attribute '__dict__'``,
+    # blocking load of frozen-dataclass modules (e.g. the PR #947 binder).
+    sys.modules[module_name] = module
     code = compile(data, str(path), "exec")
     exec(code, module.__dict__)
     return module
