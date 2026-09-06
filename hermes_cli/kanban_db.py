@@ -7301,11 +7301,14 @@ def _historical_auditor_child_is_non_authoritative(
     ):
         return False
     if not runs:
-        return (
-            archive_event_id is not None
-            and archive_event_id < latest_handoff_event_id
-            and authenticated_archive is True
-        )
+        # A run-less child has never claimed or executed, so it can never have
+        # emitted an authoritative verdict. Its archive timing relative to the
+        # latest handoff is therefore immaterial: only the strict-orchestrator
+        # archive authentication (a genuine "superseded duplicate" declaration)
+        # authorizes treating it as non-authoritative. This accommodates the
+        # legacy superseded-duplicate pattern where the duplicate guard archived
+        # a run-less child AFTER the author's handoff to a running auditor.
+        return archive_event_id is not None and authenticated_archive is True
     if child["status"] == "done":
         return _completed_recovery_history_is_non_authoritative(
             conn,
@@ -7320,7 +7323,7 @@ def _historical_auditor_child_is_non_authoritative(
         return False
 
     post_handoff_events = conn.execute(
-        "SELECT id FROM task_events WHERE task_id = ? AND id > ? ORDER BY id",
+        "SELECT id, kind FROM task_events WHERE task_id = ? AND id > ? ORDER BY id",
         (auditor_task_id, latest_handoff_event_id),
     ).fetchall()
     allowed_post_ids = set()
@@ -7333,7 +7336,17 @@ def _historical_auditor_child_is_non_authoritative(
         ).fetchone()
         if auth_row is not None:
             allowed_post_ids.add(int(auth_row["id"]))
-    if any(int(row["id"]) not in allowed_post_ids for row in post_handoff_events):
+    # Benign, non-authoritative events (comments, attachments) may legitimately
+    # appear after the latest handoff on a superseded historical auditor; they
+    # change no state and cannot manufacture authority. Everything else that
+    # occurs after the latest handoff (verdict, handoff, block, claim, status,
+    # promotion, ...) stays fail-closed.
+    _benign_post_handoff_kinds = {"commented", "attached"}
+    if any(
+        int(row["id"]) not in allowed_post_ids
+        and row["kind"] not in _benign_post_handoff_kinds
+        for row in post_handoff_events
+    ):
         return False
 
     handoff_rows = conn.execute(
@@ -7394,38 +7407,42 @@ def _historical_auditor_child_is_non_authoritative(
             (auditor_task_id, prior_handoff.event_id, next_event_id),
         ).fetchall()
         if blocked:
-            if (
-                index != 0
-                or precursor_seen
-                or len(blocked) != 1
-                or blocked[0]["run_id"] is None
-                or (matching and int(blocked[0]["id"]) >= int(matching[0][0]["id"]))
-            ):
-                return False
-            precursor_run_id = int(blocked[0]["run_id"])
-            precursor_run = run_by_id.get(precursor_run_id)
-            try:
-                blocked_payload = json.loads(blocked[0]["payload"] or "{}")
-            except (TypeError, ValueError):
-                return False
-            if (
-                precursor_run is None
-                or precursor_run_id in seen_run_ids
-                or precursor_run["status"] != "blocked"
-                or precursor_run["outcome"] != "blocked"
-                or set(blocked_payload) != {"reason", "kind", "recurrences"}
-                or not isinstance(blocked_payload["reason"], str)
-                or not blocked_payload["reason"].strip()
-                or blocked_payload["kind"] not in {
-                    None, "dependency", "needs_input", "capability", "transient",
-                }
-                or type(blocked_payload["recurrences"]) is not int
-                or blocked_payload["recurrences"] != 1
-                or precursor_run["summary"] != blocked_payload["reason"]
-            ):
-                return False
-            seen_run_ids.add(precursor_run_id)
-            precursor_seen = True
+            # A blocked run is accepted only as infra-failure noise (e.g. a
+            # provider_failure re-arm) that emitted no verdict in this window.
+            # Legacy chains may carry these at any handoff boundary, not just
+            # the initial precursor, so iterate every blocked event and require
+            # each to be a terminal blocked/blocked run with no verdict.
+            for blocked_row in blocked:
+                if blocked_row["run_id"] is None:
+                    return False
+                precursor_run_id = int(blocked_row["run_id"])
+                precursor_run = run_by_id.get(precursor_run_id)
+                try:
+                    blocked_payload = json.loads(blocked_row["payload"] or "{}")
+                except (TypeError, ValueError):
+                    return False
+                if (
+                    precursor_run is None
+                    or precursor_run_id in seen_run_ids
+                    or precursor_run["status"] != "blocked"
+                    or precursor_run["outcome"] != "blocked"
+                    or set(blocked_payload) != {"reason", "kind", "recurrences"}
+                    or not isinstance(blocked_payload["reason"], str)
+                    or not blocked_payload["reason"].strip()
+                    or blocked_payload["kind"] not in {
+                        None, "dependency", "needs_input", "capability", "transient",
+                    }
+                    or type(blocked_payload["recurrences"]) is not int
+                    or blocked_payload["recurrences"] != 1
+                    or precursor_run["summary"] != blocked_payload["reason"]
+                ):
+                    return False
+                # The blocked attempt must precede the authoritative verdict for
+                # this window (the verdict was emitted after the failed re-arm).
+                if matching and int(blocked_row["id"]) >= int(matching[0][0]["id"]):
+                    return False
+                seen_run_ids.add(precursor_run_id)
+                precursor_seen = True
         if not matching:
             if index != 0 or not precursor_seen:
                 return False
@@ -7593,6 +7610,160 @@ def _ordered_multi_round_final_auditor_pass(
     return seen_auditor_runs == set(auditor_by_id)
 
 
+def _legacy_reused_auditor_final_pass(
+    conn: sqlite3.Connection,
+    *,
+    author_task_id: str,
+    author_profile: str,
+    auditor_task_id: str,
+    auditor_profile: str,
+    latest_handoff: ReviewHandoffReceipt,
+) -> bool:
+    """Accommodate legacy reused-final-auditor chains with mid-chain PASS.
+
+    The pre-strict-resolution machinery allowed an auditor to emit a PASS and
+    later self-correct it (block the emitting run -> re-arm -> emit
+    REQUEST_CHANGES on a fresh run bound to the SAME handoff). That leaves extra
+    auditor runs, multiple verdicts per handoff window, and mid-chain PASS
+    verdicts whose emitting run ends ``blocked`` rather than ``done``. Event
+    rows are immutable, so such chains can never satisfy the strict
+    RC...RC->PASS shape. This narrower validator accepts them ONLY when the
+    FINAL verdict is PASS, every earlier verdict is a request_changes or a PASS
+    superseded by a later request_changes, every verdict is mirrored adjacently,
+    and every auditor run is either bound to a verdict or an infra-failure
+    (blocked/stale/timed_out/spawn_failed).
+    """
+    handoff_rows = conn.execute(
+        "SELECT id, run_id, payload FROM task_events WHERE task_id = ? "
+        "AND kind = 'review_handoff' ORDER BY id",
+        (author_task_id,),
+    ).fetchall()
+    parsed_handoffs = [
+        _review_handoff_receipt_from_row(author_task_id, row)
+        for row in handoff_rows
+    ]
+    if any(handoff is None for handoff in parsed_handoffs):
+        return False
+    handoffs = [h for h in parsed_handoffs if h is not None]
+    if (
+        len(handoffs) < 2
+        or handoffs[-1] != latest_handoff
+        or any(h.review_task_id != auditor_task_id for h in handoffs)
+    ):
+        return False
+
+    author_runs = conn.execute(
+        "SELECT id, profile, status, outcome, ended_at FROM task_runs "
+        "WHERE task_id = ? ORDER BY id",
+        (author_task_id,),
+    ).fetchall()
+    auditor_runs = conn.execute(
+        "SELECT id, profile, status, outcome, ended_at FROM task_runs "
+        "WHERE task_id = ? ORDER BY id",
+        (auditor_task_id,),
+    ).fetchall()
+    author_by_id = {int(row["id"]): row for row in author_runs}
+    auditor_by_id = {int(row["id"]): row for row in auditor_runs}
+    if any(
+        row["profile"] != auditor_profile or row["ended_at"] is None
+        for row in auditor_runs
+    ):
+        return False
+    expected_author_ids = {h.expected_run_id for h in handoffs}
+    review_required_author_ids = {
+        int(row["id"])
+        for row in author_runs
+        if (row["status"], row["outcome"]) == ("review_required", "review_required")
+    }
+    if (
+        expected_author_ids != review_required_author_ids
+        or any(
+            author_by_id.get(rid) is None
+            or author_by_id[rid]["profile"] != author_profile
+            or author_by_id[rid]["status"] != "review_required"
+            or author_by_id[rid]["outcome"] != "review_required"
+            or author_by_id[rid]["ended_at"] is None
+            for rid in expected_author_ids
+        )
+    ):
+        return False
+
+    verdict_rows = conn.execute(
+        "SELECT id, run_id, payload, created_at FROM task_events "
+        "WHERE task_id = ? AND kind = 'review_verdict' ORDER BY id",
+        (author_task_id,),
+    ).fetchall()
+    verdicts: list[tuple[sqlite3.Row, dict[str, Any]]] = []
+    for row in verdict_rows:
+        payload = _canonical_review_verdict_payload(row)
+        if payload is None or payload["review_task_id"] != auditor_task_id:
+            return False
+        verdicts.append((row, payload))
+    if not verdicts or verdicts[-1][1]["verdict"] != "pass":
+        return False
+
+    seen_verdict_runs: set[int] = set()
+    verdict_run_ids: set[int] = set()
+    for index, (row, payload) in enumerate(verdicts):
+        review_run_id = int(payload["review_run_id"])
+        if (
+            review_run_id in seen_verdict_runs
+            or row["run_id"] != review_run_id
+            or type(row["created_at"]) is not int
+        ):
+            return False
+        seen_verdict_runs.add(review_run_id)
+        verdict_run_ids.add(review_run_id)
+        run = auditor_by_id.get(review_run_id)
+        if run is None or run["profile"] != auditor_profile or run["ended_at"] is None:
+            return False
+        if index == len(verdicts) - 1:
+            if (run["status"], run["outcome"]) != ("done", "completed"):
+                return False
+        elif payload["verdict"] == "request_changes":
+            if (run["status"], run["outcome"]) != ("request_changes", "request_changes"):
+                return False
+        elif payload["verdict"] == "pass":
+            # A superseded mid-chain PASS: the emitting run was self-corrected
+            # into blocked before a later request_changes superseded it.
+            if (run["status"], run["outcome"]) != ("blocked", "blocked"):
+                return False
+        else:
+            return False
+        mirror = conn.execute(
+            "SELECT id, run_id, payload FROM task_events WHERE task_id = ? "
+            "AND kind = 'review_verdict' AND run_id = ? ORDER BY id",
+            (auditor_task_id, review_run_id),
+        ).fetchall()
+        if (
+            len(mirror) != 1
+            or int(mirror[0]["id"]) != int(row["id"]) + 1
+            or _canonical_review_verdict_payload(mirror[0]) != payload
+        ):
+            return False
+
+    # A mid-chain PASS is acceptable only when a later REQUEST_CHANGES supersedes
+    # it before the final PASS. An unsuperseded mid-chain PASS stays fail-closed.
+    for index, (row, payload) in enumerate(verdicts[:-1]):
+        if payload["verdict"] == "pass" and not any(
+            later[1]["verdict"] == "request_changes"
+            for later in verdicts[index + 1:]
+        ):
+            return False
+
+    infra_run_states = {
+        ("blocked", "blocked"), ("stale", "stale"),
+        ("timed_out", "timed_out"), ("spawn_failed", "spawn_failed"),
+    }
+    if any(
+        (run["status"], run["outcome"]) not in infra_run_states
+        for rid, run in auditor_by_id.items()
+        if rid not in verdict_run_ids
+    ):
+        return False
+    return True
+
+
 def _canonical_audit_receipt(
     conn: sqlite3.Connection,
     task_id: str,
@@ -7700,13 +7871,23 @@ def _canonical_audit_receipt(
     if reused_current_auditor:
         if (
             historical_handoff_ids != {auditor_task_id}
-            or not _ordered_multi_round_final_auditor_pass(
-                conn,
-                author_task_id=task_id,
-                author_profile=author_profile,
-                auditor_task_id=auditor_task_id,
-                auditor_profile=auditor_profile,
-                latest_handoff=handoff,
+            or not (
+                _ordered_multi_round_final_auditor_pass(
+                    conn,
+                    author_task_id=task_id,
+                    author_profile=author_profile,
+                    auditor_task_id=auditor_task_id,
+                    auditor_profile=auditor_profile,
+                    latest_handoff=handoff,
+                )
+                or _legacy_reused_auditor_final_pass(
+                    conn,
+                    author_task_id=task_id,
+                    author_profile=author_profile,
+                    auditor_task_id=auditor_task_id,
+                    auditor_profile=auditor_profile,
+                    latest_handoff=handoff,
+                )
             )
             or any(
                 not _historical_auditor_child_is_non_authoritative(

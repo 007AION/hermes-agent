@@ -6162,3 +6162,306 @@ def test_detached_controller_opaque_nonlanded_commit_rolls_back_and_retries(
         child_row = kb.get_task(conn, child)
         assert parent_row is not None and parent_row.status == "done"
         assert child_row is not None and child_row.status == "ready"
+
+
+# ---------------------------------------------------------------------------
+# AION-CORE-LEGACY-REVIEWED-AUTHOR-TERMINAL-RESOLVER-V1
+# Legacy reviewed-author chains produced by the pre-strict-resolution machinery
+# carry terminal-evidence-complete but chain-shape "debris" (mid-chain PASS that
+# was self-corrected, infra-blocked provider_failure rounds, run-less
+# superseded-duplicate archives) that the strict ordered-chain validation
+# rejects. These fixtures reproduce each legacy shape natively and must
+# terminalize WITHOUT weakening the fail-closed strict validation for clean
+# new chains (covered by the hostile-drift suites above).
+# ---------------------------------------------------------------------------
+
+
+def _legacy_reused_auditor_mid_chain_pass_chain(conn):
+    """t_ff0f4582-shaped: reused final auditor with a mid-chain erroneous PASS
+    that the auditor self-corrected (blocked -> corrective REQUEST_CHANGES on a
+    fresh run) before the final PASS."""
+    author = kb.create_task(
+        conn, title="legacy reused author", factory_build_gate=1, assignee="agent007",
+    )
+    reviewer = kb.create_task(
+        conn, title="legacy reused auditor", factory_build_gate=1,
+        assignee="bafuxunan", parents=[author],
+    )
+    child = kb.create_task(
+        conn, title="legacy downstream", factory_build_gate=1, assignee="gm2",
+        parents=[author],
+    )
+    # Round 0: handoff -> erroneous PASS -> self-correct -> corrective RC.
+    author_run_0 = _claim_and_run_id(conn, author)
+    handoff_0 = kb.request_review_handoff(
+        conn, author, expected_run_id=author_run_0, review_task_id=reviewer,
+        reason="candidate 0",
+    )
+    assert handoff_0 is not None
+    reviewer_run_0 = _claim_and_run_id(conn, reviewer)
+    assert kb.record_review_verdict(
+        conn, author, review_task_id=reviewer,
+        expected_review_run_id=reviewer_run_0, verdict="pass",
+        reason="ERRONEOUS_PASS_0",
+    )
+    assert kb.block_task(
+        conn, reviewer, reason="erroneous pass self-corrected", kind="needs_input",
+        expected_run_id=reviewer_run_0,
+    )
+    assert kb.unblock_task(conn, reviewer)
+    with kb.write_txn(conn):
+        assert conn.execute(
+            "UPDATE tasks SET status='ready' WHERE id=? AND status='todo'",
+            (reviewer,),
+        ).rowcount == 1
+        kb._append_event(conn, reviewer, "promoted", None)
+    reviewer_run_1 = _claim_and_run_id(conn, reviewer)
+    assert kb.record_review_verdict(
+        conn, author, review_task_id=reviewer,
+        expected_review_run_id=reviewer_run_1, verdict="request_changes",
+        reason="CORRECTIVE_RC_0",
+    )
+    # Round 1: handoff -> final PASS.
+    author_run_1 = _claim_and_run_id(conn, author)
+    handoff_1 = kb.request_review_handoff(
+        conn, author, expected_run_id=author_run_1, review_task_id=reviewer,
+        reason="candidate 1",
+    )
+    assert handoff_1 is not None
+    reviewer_run_2 = _claim_and_run_id(conn, reviewer)
+    assert kb.record_review_verdict(
+        conn, author, review_task_id=reviewer,
+        expected_review_run_id=reviewer_run_2, verdict="pass",
+        reason="FINAL_PASS",
+    )
+    assert kb.complete_task(
+        conn, reviewer, expected_run_id=reviewer_run_2,
+        summary="final independent audit passed",
+    )
+    return {
+        "author": author, "reviewer": reviewer, "child": child,
+        "author_run_0": author_run_0, "author_run_1": author_run_1,
+        "handoff_0": handoff_0, "handoff_1": handoff_1,
+        "reviewer_run_0": reviewer_run_0, "reviewer_run_1": reviewer_run_1,
+        "reviewer_run_2": reviewer_run_2,
+    }
+
+
+def test_canonical_audit_receipt_authenticates_legacy_mid_chain_pass(
+    kanban_home, aion_gov_src,
+):
+    with kb.connect() as conn:
+        chain = _legacy_reused_auditor_mid_chain_pass_chain(conn)
+        before = _native_state_snapshot(conn)
+
+        receipt = kb._canonical_audit_receipt(conn, chain["author"])
+
+        assert receipt is not None
+        assert receipt["verdict"] == "PASS"
+        assert receipt["auditor_task_id"] == chain["reviewer"]
+        assert receipt["auditor_run_id"] == chain["reviewer_run_2"]
+        assert kb._reviewed_author_finalizer_run_id(
+            conn, chain["author"],
+        ) == chain["author_run_1"]
+        assert _native_state_snapshot(conn) == before
+        assert kb.complete_task(
+            conn, chain["author"], summary="legacy reused-auditor terminalized",
+        )
+        author_task = kb.get_task(conn, chain["author"])
+        child_task = kb.get_task(conn, chain["child"])
+        assert author_task is not None and author_task.status == "done"
+        assert child_task is not None and child_task.status == "ready"
+
+
+def test_canonical_audit_receipt_rejects_unsuperseded_mid_chain_pass(
+    kanban_home, aion_gov_src,
+):
+    """A mid-chain PASS with no later REQUEST_CHANGES must stay fail-closed."""
+    with kb.connect() as conn:
+        chain = _legacy_reused_auditor_mid_chain_pass_chain(conn)
+        # Remove the corrective RC round entirely, leaving the mid-chain PASS
+        # unsuperseded before the final PASS.
+        for task_id in (chain["author"], chain["reviewer"]):
+            conn.execute(
+                "DELETE FROM task_events WHERE task_id=? AND kind='review_verdict' "
+                "AND run_id=?",
+                (task_id, chain["reviewer_run_1"]),
+            )
+        conn.execute(
+            "DELETE FROM task_runs WHERE id=? AND task_id=?",
+            (chain["reviewer_run_1"], chain["reviewer"]),
+        )
+        conn.commit()
+        before = _native_state_snapshot(conn)
+
+        assert kb._canonical_audit_receipt(conn, chain["author"]) is None
+        assert kb._reviewed_author_finalizer_run_id(conn, chain["author"]) is None
+        with pytest.raises(kb.FactoryTerminalReceiptRequiredError):
+            kb.complete_task(conn, chain["author"], summary="reject unsuperseded pass")
+        assert _native_state_snapshot(conn) == before
+
+
+def _legacy_superseded_duplicate_post_handoff_archive_chain(conn):
+    """t_9168252c/t_4eac3fb7-shaped: clean single-round PASS plus a run-less
+    duplicate audit child created and authenticated-archived AFTER the handoff."""
+    author = kb.create_task(
+        conn, title="clean reviewed author", factory_build_gate=1, assignee="agent007",
+    )
+    reviewer = kb.create_task(
+        conn, title="role-separated audit", factory_build_gate=1,
+        assignee="bafuxunan", parents=[author],
+    )
+    child = kb.create_task(
+        conn, title="downstream", factory_build_gate=1, assignee="gm2",
+        parents=[author],
+    )
+    author_run = _claim_and_run_id(conn, author)
+    handoff = kb.request_review_handoff(
+        conn, author, expected_run_id=author_run, review_task_id=reviewer,
+        reason="exact native receipt audit",
+    )
+    assert handoff is not None
+    reviewer_run = _claim_and_run_id(conn, reviewer)
+    assert kb.record_review_verdict(
+        conn, author, review_task_id=reviewer,
+        expected_review_run_id=reviewer_run, verdict="pass", reason="PASS_EXACT",
+    )
+    assert kb.complete_task(
+        conn, reviewer, expected_run_id=reviewer_run, summary="passed",
+    )
+    duplicate = kb.create_task(
+        conn, title="superseded duplicate audit", factory_build_gate=1,
+        assignee="bafuxunan", parents=[author],
+    )
+    with kb._authenticated_strict_orchestrator_archive():
+        assert kb.archive_task(
+            conn, duplicate,
+            reason="superseded duplicate: author already handed off to running child",
+            actor="kanban-orchestrator", source="kanban_archive",
+            fail_if_active_run=True, expected_status="todo",
+        )
+    return {
+        "author": author, "reviewer": reviewer, "child": child,
+        "duplicate": duplicate, "author_run": author_run,
+        "handoff": handoff, "reviewer_run": reviewer_run,
+    }
+
+
+def test_canonical_audit_receipt_ignores_post_handoff_superseded_duplicate(
+    kanban_home, aion_gov_src,
+):
+    with kb.connect() as conn:
+        chain = _legacy_superseded_duplicate_post_handoff_archive_chain(conn)
+        before = _native_state_snapshot(conn)
+
+        assert kb._historical_auditor_child_is_non_authoritative(
+            conn,
+            author_task_id=chain["author"],
+            author_profile="agent007",
+            auditor_task_id=chain["duplicate"],
+            auditor_profile="bafuxunan",
+            latest_handoff_event_id=chain["handoff"].event_id,
+        )
+        receipt = kb._canonical_audit_receipt(conn, chain["author"])
+
+        assert receipt is not None
+        assert receipt["auditor_task_id"] == chain["reviewer"]
+        assert _native_state_snapshot(conn) == before
+        assert kb.complete_task(
+            conn, chain["author"], summary="clean author with superseded duplicate",
+        )
+        author_task = kb.get_task(conn, chain["author"])
+        assert author_task is not None and author_task.status == "done"
+
+
+def _legacy_historical_auditor_blocked_provider_failure_chain(conn):
+    """t_e93991d8-shaped: final auditor differs from a historical auditor whose
+    chain contains a mid-chain provider_failure blocked run (no verdict)."""
+    author = kb.create_task(
+        conn, title="legacy multi-auditor author", factory_build_gate=1,
+        assignee="agent007",
+    )
+    historical = kb.create_task(
+        conn, title="historical auditor", factory_build_gate=1,
+        assignee="bafuxunan", parents=[author],
+    )
+    reviewer = kb.create_task(
+        conn, title="final auditor", factory_build_gate=1,
+        assignee="bafuxunan", parents=[author],
+    )
+    child = kb.create_task(
+        conn, title="downstream", factory_build_gate=1, assignee="gm2",
+        parents=[author],
+    )
+    # Round 0 (historical): handoff -> blocked provider_failure -> unblock -> RC.
+    author_run_0 = _claim_and_run_id(conn, author)
+    h0 = kb.request_review_handoff(
+        conn, author, expected_run_id=author_run_0, review_task_id=historical,
+        reason="round 0",
+    )
+    assert h0 is not None
+    hr0 = _claim_and_run_id(conn, historical)
+    assert kb.block_task(
+        conn, historical, reason="provider failure", kind="transient",
+        expected_run_id=hr0,
+    )
+    assert kb.unblock_task(conn, historical)
+    with kb.write_txn(conn):
+        assert conn.execute(
+            "UPDATE tasks SET status='ready' WHERE id=? AND status='todo'",
+            (historical,),
+        ).rowcount == 1
+        kb._append_event(conn, historical, "promoted", None)
+    hr1 = _claim_and_run_id(conn, historical)
+    assert kb.record_review_verdict(
+        conn, author, review_task_id=historical,
+        expected_review_run_id=hr1, verdict="request_changes", reason="RC_0",
+    )
+    # Final round: handoff to a fresh final auditor -> PASS.
+    author_run_1 = _claim_and_run_id(conn, author)
+    h1 = kb.request_review_handoff(
+        conn, author, expected_run_id=author_run_1, review_task_id=reviewer,
+        reason="final",
+    )
+    assert h1 is not None
+    fr = _claim_and_run_id(conn, reviewer)
+    assert kb.record_review_verdict(
+        conn, author, review_task_id=reviewer,
+        expected_review_run_id=fr, verdict="pass", reason="FINAL_PASS",
+    )
+    assert kb.complete_task(
+        conn, reviewer, expected_run_id=fr, summary="final independent pass",
+    )
+    return {
+        "author": author, "historical": historical, "reviewer": reviewer,
+        "child": child, "author_run_0": author_run_0, "author_run_1": author_run_1,
+        "handoff_0": h0, "handoff_1": h1, "hr0": hr0, "hr1": hr1, "fr": fr,
+    }
+
+
+def test_canonical_audit_receipt_authenticates_legacy_blocked_provider_failure(
+    kanban_home, aion_gov_src,
+):
+    with kb.connect() as conn:
+        chain = _legacy_historical_auditor_blocked_provider_failure_chain(conn)
+        before = _native_state_snapshot(conn)
+
+        assert kb._historical_auditor_child_is_non_authoritative(
+            conn,
+            author_task_id=chain["author"],
+            author_profile="agent007",
+            auditor_task_id=chain["historical"],
+            auditor_profile="bafuxunan",
+            latest_handoff_event_id=chain["handoff_1"].event_id,
+        )
+        receipt = kb._canonical_audit_receipt(conn, chain["author"])
+
+        assert receipt is not None
+        assert receipt["auditor_task_id"] == chain["reviewer"]
+        assert receipt["verdict"] == "PASS"
+        assert _native_state_snapshot(conn) == before
+        assert kb.complete_task(
+            conn, chain["author"], summary="legacy multi-auditor terminalized",
+        )
+        author_task = kb.get_task(conn, chain["author"])
+        assert author_task is not None and author_task.status == "done"
