@@ -235,7 +235,7 @@ def _append_post_kanban_terminal_skips(
             name,
             (
                 f"[Tool execution skipped — {name} was not started because "
-                "this worker's kanban_complete/kanban_block already succeeded]"
+                "this worker's terminal board tool already succeeded]"
             ),
             tool_call.id,
             effect_disposition="none",

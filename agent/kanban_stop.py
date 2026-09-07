@@ -1,7 +1,8 @@
 """Turn-end guard for kanban workers.
 
-Kanban workers must end with ``kanban_complete`` or ``kanban_block``. Models
-(especially GLM / Qwen families) sometimes narrate the next step
+Kanban workers must end with a terminal board tool: ``kanban_complete``,
+``kanban_block``, ``kanban_request_review``, or ``kanban_review_verdict``.
+Models (especially GLM / Qwen families) sometimes narrate the next step
 ("Let me write the report now") and stop with ``finish_reason=stop`` and no
 tool calls. Hermes treats that as a clean exit → ``rc=0`` → dispatcher
 ``protocol_violation``.
@@ -9,6 +10,14 @@ tool calls. Hermes treats that as a clean exit → ``rc=0`` → dispatcher
 This module is policy-only: when a kanban worker tries to finish without a
 terminal board tool, return a bounded synthetic nudge so the conversation
 loop continues instead of exiting.
+
+The two review tools are lifecycle-ending in exactly the same sense as
+``kanban_complete`` / ``kanban_block``: a successful ``kanban_request_review``
+atomically ends the author run as ``review_required`` and a successful
+``kanban_review_verdict`` records the bound auditor verdict. Treating them as
+non-terminal leaves the worker nudged to "complete or block" an already-ended
+run — the worker never exits cleanly, its PID/owned descendants stay alive,
+and the Dispatcher cannot reconcile the task's ``predecessor_exited`` fence.
 """
 
 from __future__ import annotations
@@ -18,7 +27,12 @@ import os
 from typing import Any, Iterable, Optional
 
 
-_TERMINAL_KANBAN_TOOLS = frozenset({"kanban_complete", "kanban_block"})
+_TERMINAL_KANBAN_TOOLS = frozenset({
+    "kanban_complete",
+    "kanban_block",
+    "kanban_request_review",
+    "kanban_review_verdict",
+})
 
 _DEFAULT_MAX_ATTEMPTS = 2
 
@@ -142,11 +156,16 @@ def build_kanban_stop_nudge(
         "terminal state for the board.\n\n"
         f"Task `{tid}` is still `running`. Ending now without a board tool "
         "causes a protocol violation (clean exit with no "
-        "`kanban_complete` / `kanban_block`).\n\n"
+        "`kanban_complete` / `kanban_block` / `kanban_request_review` / "
+        "`kanban_review_verdict`).\n\n"
         "Do this immediately in your next response — do not narrate intent:\n"
         "1. Finish any remaining deliverable (write the required file(s) now).\n"
         "2. Call `kanban_complete(summary=..., artifacts=[...])` if the work "
-        "is done, OR `kanban_block(reason=...)` if you are blocked.\n\n"
+        "is done, `kanban_block(reason=...)` if you are blocked, "
+        "`kanban_request_review(review_task_id=..., reason=...)` to hand this "
+        "author run to an independent child for audit, or "
+        "`kanban_review_verdict(author_task_id=..., verdict=..., reason=...)` "
+        "to record your bound audit verdict.\n\n"
         "Never end a turn with only a promise of future action. Repeated "
         "protocol violations will block this task and require manual intervention.]"
     )

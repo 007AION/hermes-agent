@@ -136,6 +136,72 @@ def test_terminal_success_requires_exact_worker_task(clear_kanban_env):
     ) is False
 
 
+def test_review_terminal_tools_recognized_as_terminal(clear_kanban_env):
+    """kanban_request_review and kanban_review_verdict are lifecycle-ending
+    tools: a successful call for the exact worker task must stop the loop
+    instead of being treated as a still-running worker that needs a nudge."""
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
+
+    assert successful_kanban_terminal_result(
+        "kanban_request_review",
+        '{"ok": true, "task_id": "t_abc", "review_task_id": "t_review"}',
+    ) is True
+    assert successful_kanban_terminal_result(
+        "kanban_review_verdict",
+        '{"ok": true, "task_id": "t_abc", "author_task_id": "t_author", '
+        '"verdict": "pass"}',
+    ) is True
+
+
+def test_review_terminal_success_suppresses_nudge(clear_kanban_env):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
+    messages = [
+        {
+            "role": "assistant",
+            "tool_calls": [{"function": {"name": "kanban_request_review"}}],
+        },
+        {
+            "role": "tool",
+            "name": "kanban_request_review",
+            "content": '{"ok": true, "task_id": "t_abc", "review_task_id": "t_review"}',
+        },
+    ]
+    assert session_called_kanban_terminal(messages) is True
+    assert session_succeeded_kanban_terminal(messages) is True
+    assert build_kanban_stop_nudge(messages=messages) is None
+
+
+def test_review_terminal_failure_does_not_count_as_terminal(clear_kanban_env):
+    """A rejected/refused review call (tool_error, no ok:true) must not count
+    as terminal — the worker still needs a nudge to finish its run."""
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
+    messages = [
+        {
+            "role": "tool",
+            "name": "kanban_request_review",
+            "content": '{"error": "review handoff refused: stale run"}',
+        },
+    ]
+    assert session_called_kanban_terminal(messages) is True
+    assert session_succeeded_kanban_terminal(messages) is False
+    assert build_kanban_stop_nudge(messages=messages) is not None
+
+
+def test_review_terminal_foreign_task_does_not_count(clear_kanban_env):
+    """The exact worker-task ownership gate still applies to review tools: a
+    successful call for a different task must not count as this worker's
+    terminal."""
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
+    assert successful_kanban_terminal_result(
+        "kanban_review_verdict",
+        '{"ok": true, "task_id": "t_other", "author_task_id": "t_author"}',
+    ) is False
+    assert successful_kanban_terminal_result(
+        "kanban_request_review",
+        '{"ok": true, "task_id": "t_other", "review_task_id": "t_review"}',
+    ) is False
+
+
 def test_nudge_budget_exhausted(clear_kanban_env):
     clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
     assert build_kanban_stop_nudge(messages=[], attempts=2) is None
