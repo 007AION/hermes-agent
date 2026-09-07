@@ -14002,7 +14002,9 @@ def complete_task(
     # Classify and clean the exact terminal workspace, then persist the receipt.
     # The receipt is deliberately written after the terminal CAS committed so
     # it can describe the real post-actuation state without widening the CAS.
-    process_hygiene = _cleanup_workspace_on_completion(conn, task_id)
+    process_hygiene = _cleanup_workspace_on_completion(
+        conn, task_id, run_id=run_id,
+    )
     hygiene = _cleanup_workspace(
         conn,
         task_id,
@@ -15255,6 +15257,14 @@ def block_task(
         )
     routed_to = "blocked"
     recurrences = 0
+    # Resolve the exact run being blocked for shared-dir ownership gating.
+    # ``_end_run`` inside the txn below clears ``tasks.current_run_id``, so
+    # capture the binding up front. ``expected_run_id`` wins when the caller
+    # pins the exact run; otherwise the current run is authoritative.
+    blocked_run_id: Optional[int] = (
+        int(expected_run_id) if expected_run_id is not None
+        else _current_run_id(conn, task_id)
+    )
     with write_txn(conn):
         cur_row = conn.execute(
             "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?",
@@ -15444,7 +15454,9 @@ def block_task(
                 _wk = _wp_row["workspace_kind"] or "scratch"
                 _owned: set[int] | None = None
                 if _wk == "dir":
-                    _owned, _refusal = _derive_shared_dir_owned_pids(conn, task_id)
+                    _owned, _refusal = _derive_shared_dir_owned_pids(
+                        conn, task_id, run_id=blocked_run_id,
+                    )
                     if _owned is None:
                         # Fail closed: ownership cannot be proven from the
                         # canonical spawn identity. Never signal shared-dir
@@ -22665,36 +22677,62 @@ def merge_with_gate_cas(
 
 
 def _derive_shared_dir_owned_pids(
-    conn: sqlite3.Connection, task_id: str,
+    conn: sqlite3.Connection,
+    task_id: str,
+    run_id: Optional[int] = None,
 ) -> tuple[set[int] | None, str | None]:
-    """Resolve the exact task/run owned worker lineage for a shared-dir task.
+    """Resolve the exact run's owned worker lineage for a shared-dir task.
 
-    The canonical ownership source is the most recent ``spawned`` event in
-    ``task_events``, whose payload carries ``pid`` + ``/proc`` ``starttime``
-    (written by :func:`_set_worker_pid`). Both fields are required to prove
-    ownership; descendants are re-discovered via
+    Ownership is bound to the exact ``run_id`` — the run being blocked or
+    completed — never "the most recent ``spawned`` event task-wide". A task
+    is retried across multiple runs, and a bare ``ORDER BY id DESC LIMIT 1``
+    can pick a stale spawn identity from an older run (or one of several
+    distinct identities on the same run), which is exactly the shared-dir
+    collateral-signalling defect.
+
+    The canonical ownership source is the ``spawned`` event(s) whose
+    ``run_id`` matches *run_id*, each payload carrying ``pid`` + ``/proc``
+    ``starttime`` (written by :func:`_set_worker_pid`). Both fields are
+    required to prove ownership; descendants are re-discovered via
     :func:`_discover_descendant_pids` with ``expected_starttime`` so a
     recycled PID is rejected as unowned.
 
     Returns ``(owned_pids, refusal_reason)``. ``owned_pids`` is the exact
     worker PID + descendant set when ownership is provable (else ``None``).
     ``refusal_reason`` is a short machine-readable code when ownership
-    cannot be proven — ``no_provable_spawn_identity``, ``recycled_pid`` or
-    ``worker_exited`` — and ``None`` otherwise.
+    cannot be proven — ``no_run_identity``, ``no_provable_spawn_identity``,
+    ``ambiguous_spawn_identity``, ``recycled_pid`` or ``worker_exited`` —
+    and ``None`` otherwise.
     """
-    spawn_row = conn.execute(
+    if run_id is None:
+        # No binding to an exact run: nothing can authoritatively own this
+        # shared directory. Never fall back to task-wide spawn history.
+        return None, "no_run_identity"
+    spawn_rows = conn.execute(
         "SELECT json_extract(payload, '$.pid') as pid,"
         " json_extract(payload, '$.starttime') as starttime"
         " FROM task_events"
-        " WHERE task_id = ? AND kind = 'spawned'"
-        " ORDER BY id DESC LIMIT 1",
-        (task_id,),
-    ).fetchone()
-    if not (spawn_row and spawn_row["pid"] is not None
-            and spawn_row["starttime"] is not None):
+        " WHERE task_id = ? AND kind = 'spawned' AND run_id = ?"
+        " ORDER BY id DESC",
+        (task_id, int(run_id)),
+    ).fetchall()
+    # Collapse duplicate (pid, starttime) rows into the distinct identities
+    # actually recorded for this run. Two distinct live spawn identities on
+    # the same run is ambiguous ownership — refuse rather than guess.
+    identities: list[tuple[int, int]] = []
+    for row in spawn_rows:
+        if row["pid"] is None or row["starttime"] is None:
+            continue
+        ident = (int(row["pid"]), int(row["starttime"]))
+        if ident not in identities:
+            identities.append(ident)
+    if not identities:
+        # This run has no provable spawn identity (even if an older run left
+        # spawn history behind) — fail closed.
         return None, "no_provable_spawn_identity"
-    spawn_pid = int(spawn_row["pid"])
-    spawn_starttime = int(spawn_row["starttime"])
+    if len(identities) != 1:
+        return None, "ambiguous_spawn_identity"
+    spawn_pid, spawn_starttime = identities[0]
     owned = _discover_descendant_pids(
         spawn_pid, expected_starttime=spawn_starttime,
     )
@@ -22709,7 +22747,7 @@ def _derive_shared_dir_owned_pids(
 
 
 def _cleanup_workspace_on_completion(
-    conn: sqlite3.Connection, task_id: str,
+    conn: sqlite3.Connection, task_id: str, *, run_id: Optional[int] = None,
 ) -> dict:
     """Close processes whose cwd is inside the task's workspace.
 
@@ -22731,9 +22769,11 @@ def _cleanup_workspace_on_completion(
 
     **Fail-closed shared-dir ownership** (mirrors :func:`_cleanup_workspace`):
 
-    - Only the most recent ``spawned`` event with BOTH a valid ``pid`` AND a
-      well-formed ``/proc`` ``starttime`` can prove ownership. Missing /
-      legacy / malformed / unreadable starttime → safe refusal (no signals).
+    - Only the ``spawned`` event(s) bound to the exact *run_id* with BOTH a
+      valid ``pid`` AND a well-formed ``/proc`` ``starttime`` can prove
+      ownership. Missing / legacy / malformed / unreadable starttime, a run
+      with no spawn identity, or two distinct spawn identities on the same
+      run → safe refusal (no signals).
     - Descendants are discovered via :func:`_discover_descendant_pids` with
       ``expected_starttime``, so a recycled PID is rejected as unowned.
     - There is no bare-PID fallback that can authorize shared-dir signals.
@@ -22774,7 +22814,9 @@ def _cleanup_workspace_on_completion(
         # to this task.
         owned_pids: set[int] | None = None
         if wk == "dir":
-            owned_pids, _refusal = _derive_shared_dir_owned_pids(conn, task_id)
+            owned_pids, _refusal = _derive_shared_dir_owned_pids(
+                conn, task_id, run_id=run_id,
+            )
             if owned_pids is None:
                 # Fail closed: ownership cannot be proven from the canonical
                 # spawn identity (missing/legacy/malformed starttime, recycled

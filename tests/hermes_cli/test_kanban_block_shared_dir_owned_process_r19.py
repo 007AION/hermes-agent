@@ -80,15 +80,33 @@ def _worker_spawn_payload(proc: subprocess.Popen) -> dict:
     return {"pid": proc.pid, "starttime": identity["starttime"]}
 
 
-def _make_dir_task(conn, ws: Path, *, spawn_payload: dict | None = None) -> str:
-    """Create a blockable ``dir``-workspace task, optionally with a spawned event."""
+def _make_dir_task(
+    conn, ws: Path, *, spawn_payload: dict | None = None,
+    spawn_payloads: list | None = None,
+) -> str:
+    """Create a *claimed* ``dir``-workspace task with canonical spawn identity.
+
+    Claims the task so it has a current run, then emits the spawn event(s)
+    bound to that exact run — mirroring ``claim_task`` + ``_set_worker_pid``
+    in the real dispatch path. This is what makes ``block_task``'s shared-dir
+    ownership gate bind to the exact run rather than task-wide spawn history.
+    """
     tid = kb.create_task(conn, title="block-dir-cleanup", assignee="a")
     conn.execute(
         "UPDATE tasks SET workspace_kind='dir', workspace_path=? WHERE id=?",
         (str(ws), tid),
     )
-    if spawn_payload is not None:
-        kb._append_event(conn, tid, "spawned", spawn_payload)
+    claimed = kb.claim_task(conn, tid, claimer="host:test")
+    assert claimed is not None
+    run_id = claimed.current_run_id
+    if spawn_payloads is not None:
+        payloads = list(spawn_payloads)
+    elif spawn_payload is not None:
+        payloads = [spawn_payload]
+    else:
+        payloads = []
+    for payload in payloads:
+        kb._append_event(conn, tid, "spawned", payload, run_id=run_id)
     conn.commit()
     return tid
 
@@ -235,6 +253,102 @@ def test_block_dir_workspace_recycled_pid_fails_closed(kanban_home, tmp_path):
 
         assert unrelated.poll() is None, (
             "recycled PID was signalled despite starttime mismatch"
+        )
+    finally:
+        _kill(unrelated)
+
+
+def test_block_dir_workspace_two_same_run_spawn_identities_fails_closed(
+    kanban_home, tmp_path,
+):
+    """Two distinct live spawn identities on one run are ambiguous — fail closed.
+
+    A task-wide ``ORDER BY id DESC LIMIT 1`` would pick the later of the two
+    identities and SIGTERM it (the auditor's exact probe). Bound to the run
+    with uniqueness enforced, ownership is ambiguous, so neither same-dir
+    worker may be signalled.
+    """
+    ws = tmp_path / "shared"
+    ws.mkdir()
+
+    worker_a = _spawn_worker(ws)
+    worker_b = _spawn_worker(ws)
+    try:
+        time.sleep(0.1)
+        payload_a = _worker_spawn_payload(worker_a)
+        payload_b = _worker_spawn_payload(worker_b)
+        assert (payload_a["pid"], payload_a["starttime"]) != (
+            payload_b["pid"], payload_b["starttime"],
+        )
+
+        with kb.connect() as conn:
+            tid = _make_dir_task(
+                conn, ws, spawn_payloads=[payload_a, payload_b],
+            )
+            assert kb.block_task(conn, tid, reason="test", kind="transient")
+
+        assert worker_a.poll() is None, (
+            "worker_a signalled despite ambiguous same-run ownership"
+        )
+        assert worker_b.poll() is None, (
+            "worker_b signalled despite ambiguous same-run ownership"
+        )
+    finally:
+        _kill(worker_a, worker_b)
+
+
+def test_block_dir_workspace_current_run_missing_spawn_with_older_history_fails_closed(
+    kanban_home, tmp_path,
+):
+    """A current run with no spawn identity must not reuse an older run's.
+
+    The older run leaves a live spawn identity in ``task_events``. A task-wide
+    ``ORDER BY id DESC LIMIT 1`` would pick that older identity and signal the
+    unrelated live worker. Bound to the exact current run (which has no spawn
+    identity of its own), block_task fails closed and the worker survives.
+    """
+    ws = tmp_path / "shared"
+    ws.mkdir()
+    unrelated = _spawn_worker(ws)
+    try:
+        time.sleep(0.1)
+        payload = _worker_spawn_payload(unrelated)
+
+        with kb.connect() as conn:
+            tid = kb.create_task(conn, title="block-dir-cleanup", assignee="a")
+            conn.execute(
+                "UPDATE tasks SET workspace_kind='dir', workspace_path=? WHERE id=?",
+                (str(ws), tid),
+            )
+            now = int(time.time())
+            # Older (ended) run whose spawn identity is the live worker.
+            cur = conn.execute(
+                "INSERT INTO task_runs (task_id, status, started_at, ended_at,"
+                " outcome) VALUES (?, 'done', ?, ?, 'completed')",
+                (tid, now - 100, now - 50),
+            )
+            older_run_id = cur.lastrowid
+            kb._append_event(
+                conn, tid, "spawned", payload, run_id=older_run_id,
+            )
+            # Current run with NO spawn identity of its own.
+            cur = conn.execute(
+                "INSERT INTO task_runs (task_id, status, started_at)"
+                " VALUES (?, 'running', ?)",
+                (tid, now),
+            )
+            current_run_id = cur.lastrowid
+            conn.execute(
+                "UPDATE tasks SET current_run_id = ?, status = 'running'"
+                " WHERE id = ?",
+                (current_run_id, tid),
+            )
+            conn.commit()
+
+            assert kb.block_task(conn, tid, reason="test", kind="transient")
+
+        assert unrelated.poll() is None, (
+            "unrelated process signalled via stale older-run spawn history"
         )
     finally:
         _kill(unrelated)

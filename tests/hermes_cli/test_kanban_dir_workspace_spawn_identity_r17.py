@@ -84,14 +84,23 @@ def _worker_spawn_payload(proc: subprocess.Popen) -> dict:
 
 
 def _make_dir_task(conn, ws: Path, *, spawn_payload: dict | None = None) -> str:
-    """Create a dir-workspace task, optionally attaching a spawned event."""
+    """Create a *claimed* dir-workspace task with canonical spawn identity.
+
+    Claims the task so it has a current run, then emits the spawn event bound
+    to that exact run — mirroring ``claim_task`` + ``_set_worker_pid`` in the
+    real dispatch path. Callers pass the current run id to
+    ``_cleanup_workspace_on_completion`` so ownership binds to the exact run.
+    """
     tid = kb.create_task(conn, title="r17-dir-cleanup", assignee="a")
     conn.execute(
         "UPDATE tasks SET workspace_kind='dir', workspace_path=? WHERE id=?",
         (str(ws), tid),
     )
+    claimed = kb.claim_task(conn, tid, claimer="host:test")
+    assert claimed is not None
+    run_id = claimed.current_run_id
     if spawn_payload is not None:
-        kb._append_event(conn, tid, "spawned", spawn_payload)
+        kb._append_event(conn, tid, "spawned", spawn_payload, run_id=run_id)
     conn.commit()
     return tid
 
@@ -134,7 +143,7 @@ def test_dir_completion_closes_owned_worker_via_canonical_spawn_identity(
 
         with kb.connect() as conn:
             tid = _make_dir_task(conn, ws, spawn_payload=payload)
-            result = kb._cleanup_workspace_on_completion(conn, tid)
+            result = kb._cleanup_workspace_on_completion(conn, tid, run_id=kb._current_run_id(conn, tid))
 
         # Deterministic evidence contract, not a silent None.
         assert result is not None, (
@@ -178,7 +187,7 @@ def test_dir_completion_closes_descendant_process(kanban_home, tmp_path):
 
         with kb.connect() as conn:
             tid = _make_dir_task(conn, ws, spawn_payload=payload)
-            result = kb._cleanup_workspace_on_completion(conn, tid)
+            result = kb._cleanup_workspace_on_completion(conn, tid, run_id=kb._current_run_id(conn, tid))
 
         assert result["outcome"] == "success"
         # worker + its grandchild were both signalled.
@@ -211,7 +220,7 @@ def test_dir_completion_preserves_unrelated_same_dir_worker(
 
         with kb.connect() as conn:
             tid = _make_dir_task(conn, ws, spawn_payload=payload)
-            result = kb._cleanup_workspace_on_completion(conn, tid)
+            result = kb._cleanup_workspace_on_completion(conn, tid, run_id=kb._current_run_id(conn, tid))
 
         assert result["outcome"] == "success"
         assert result["evidence"]["skipped_unowned"] >= 1
@@ -239,7 +248,7 @@ def test_dir_completion_no_spawn_legacy_task_safe_refusal(kanban_home, tmp_path)
         time.sleep(0.1)
         with kb.connect() as conn:
             tid = _make_dir_task(conn, ws, spawn_payload=None)
-            result = kb._cleanup_workspace_on_completion(conn, tid)
+            result = kb._cleanup_workspace_on_completion(conn, tid, run_id=kb._current_run_id(conn, tid))
 
         assert result["outcome"] == "safe_refusal"
         assert result["reason"] == "no_provable_spawn_identity"
@@ -270,7 +279,7 @@ def test_dir_completion_legacy_missing_starttime_safe_refusal(
                 conn, ws,
                 spawn_payload={"pid": unrelated.pid},
             )
-            result = kb._cleanup_workspace_on_completion(conn, tid)
+            result = kb._cleanup_workspace_on_completion(conn, tid, run_id=kb._current_run_id(conn, tid))
 
         assert result["outcome"] == "safe_refusal"
         assert result["reason"] == "no_provable_spawn_identity"
@@ -306,7 +315,7 @@ def test_dir_completion_recycled_pid_identity_mismatch(kanban_home, tmp_path):
                     "starttime": wrong_starttime,
                 },
             )
-            result = kb._cleanup_workspace_on_completion(conn, tid)
+            result = kb._cleanup_workspace_on_completion(conn, tid, run_id=kb._current_run_id(conn, tid))
 
         assert result["outcome"] == "identity_mismatch"
         assert result["reason"] == "recycled_pid"
@@ -333,8 +342,8 @@ def test_dir_completion_repeated_is_idempotent(kanban_home, tmp_path):
 
         with kb.connect() as conn:
             tid = _make_dir_task(conn, ws, spawn_payload=payload)
-            first = kb._cleanup_workspace_on_completion(conn, tid)
-            second = kb._cleanup_workspace_on_completion(conn, tid)
+            first = kb._cleanup_workspace_on_completion(conn, tid, run_id=kb._current_run_id(conn, tid))
+            second = kb._cleanup_workspace_on_completion(conn, tid, run_id=kb._current_run_id(conn, tid))
 
         assert first is not None and second is not None
         assert first["outcome"] == "success"
@@ -363,7 +372,7 @@ def test_scratch_completion_still_closes_without_ownership(kanban_home, tmp_path
                 (str(ws), tid),
             )
             conn.commit()
-            result = kb._cleanup_workspace_on_completion(conn, tid)
+            result = kb._cleanup_workspace_on_completion(conn, tid, run_id=kb._current_run_id(conn, tid))
 
         assert result["outcome"] == "success"
         child.wait(timeout=5)
@@ -400,7 +409,7 @@ def test_completion_remains_terminal_when_cleanup_fails(kanban_home, tmp_path, m
             (str(ws), tid),
         )
         conn.commit()
-        result = kb._cleanup_workspace_on_completion(conn, tid)
+        result = kb._cleanup_workspace_on_completion(conn, tid, run_id=kb._current_run_id(conn, tid))
         assert result["outcome"] == "internal_error"
         assert "simulated cleanup failure" in result["error"]
 
