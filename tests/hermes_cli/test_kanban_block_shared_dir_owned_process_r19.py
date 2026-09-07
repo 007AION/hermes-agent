@@ -354,6 +354,145 @@ def test_block_dir_workspace_current_run_missing_spawn_with_older_history_fails_
         _kill(unrelated)
 
 
+def test_block_dir_workspace_stringly_identity_fails_closed(
+    kanban_home, tmp_path,
+):
+    """A spawn identity whose pid/starttime are JSON strings is malformed.
+
+    The committed base int()-coerced ``"<pid>"``/``"<starttime>"`` into an
+    authority set, so a stringly identity that numerically matched a live
+    same-dir sentinel authorized SIGTERM/-15 against it. Strict canonical
+    validation treats any text (or real/bool) payload value as malformed
+    evidence and refuses the whole authority set — never ``int()``-coerce.
+    """
+    ws = tmp_path / "shared"
+    ws.mkdir()
+
+    unrelated = _spawn_worker(ws)
+    try:
+        time.sleep(0.1)
+        identity = kb._read_process_identity(unrelated.pid)
+        assert identity is not None
+        # Stringly pid/starttime that numerically match the live sentinel.
+        stringly = {
+            "pid": str(unrelated.pid),
+            "starttime": str(identity["starttime"]),
+        }
+
+        with kb.connect() as conn:
+            tid = _make_dir_task(conn, ws, spawn_payload=stringly)
+            assert kb.block_task(conn, tid, reason="test", kind="transient")
+
+        assert unrelated.poll() is None, (
+            "stringly spawn identity authorized a signal against the "
+            "same-dir sentinel"
+        )
+    finally:
+        _kill(unrelated)
+
+
+def test_block_dir_workspace_mixed_malformed_same_run_fails_closed(
+    kanban_home, tmp_path,
+):
+    """A valid identity co-resident with an unprovable one refuses the set.
+
+    The committed base *discarded* the unprovable row (missing/null
+    ``starttime``) via ``continue`` and signalled the co-resident valid
+    process. Strict validation poisons the entire exact-run authority set
+    when ANY event is malformed/unprovable — never guess around it.
+    """
+    ws = tmp_path / "shared"
+    ws.mkdir()
+
+    worker = _spawn_worker(ws)
+    try:
+        time.sleep(0.1)
+        valid = _worker_spawn_payload(worker)
+        # A spawn event that recorded pid but failed to record starttime.
+        unprovable = {"pid": worker.pid}
+
+        with kb.connect() as conn:
+            tid = _make_dir_task(
+                conn, ws, spawn_payloads=[valid, unprovable],
+            )
+            assert kb.block_task(conn, tid, reason="test", kind="transient")
+
+        assert worker.poll() is None, (
+            "valid identity was signalled despite a co-resident unprovable "
+            "spawn event on the same run"
+        )
+    finally:
+        _kill(worker)
+
+
+def test_block_dir_workspace_signals_ended_run_not_stale_read(
+    kanban_home, tmp_path, monkeypatch,
+):
+    """The run actually ended inside the txn owns cleanup, not a stale pre-read.
+
+    Reproduces the TOCTOU run-switch deterministically: the committed base
+    captured ``blocked_run_id`` from ``_current_run_id`` *before* the write
+    txn. A concurrent run-switch between that read and ``_end_run`` would make
+    ``_end_run`` close run B while cleanup still derived ``owned_pids`` from
+    the stale run A — signalling run A's old worker (SIGTERM/-15) and leaving
+    run B's live worker untouched.
+
+    Here ``_current_run_id`` is monkeypatched to report the stale run A, but
+    the fixed ``block_task`` never consults it up front — it uses the run
+    ``_end_run`` actually ends inside the transaction (run B). Run B's worker
+    is signalled; run A's worker survives.
+    """
+    ws = tmp_path / "shared"
+    ws.mkdir()
+
+    worker_a = _spawn_worker(ws)
+    worker_b = _spawn_worker(ws)
+    try:
+        time.sleep(0.1)
+        payload_a = _worker_spawn_payload(worker_a)
+        payload_b = _worker_spawn_payload(worker_b)
+
+        with kb.connect() as conn:
+            tid = kb.create_task(conn, title="block-dir-cleanup", assignee="a")
+            conn.execute(
+                "UPDATE tasks SET workspace_kind='dir', workspace_path=? "
+                "WHERE id=?",
+                (str(ws), tid),
+            )
+            # Current run B (the run that will actually be ended inside the
+            # txn), claimed first so the predecessor-exit guard doesn't block.
+            claimed = kb.claim_task(conn, tid, claimer="host:test")
+            assert claimed is not None
+            run_b = claimed.current_run_id
+            kb._append_event(conn, tid, "spawned", payload_b, run_id=run_b)
+            # Stale older run A with its own distinct (live) worker identity.
+            now = int(time.time())
+            cur = conn.execute(
+                "INSERT INTO task_runs (task_id, status, started_at, ended_at,"
+                " outcome) VALUES (?, 'done', ?, ?, 'completed')",
+                (tid, now - 100, now - 50),
+            )
+            run_a = cur.lastrowid
+            kb._append_event(conn, tid, "spawned", payload_a, run_id=run_a)
+            conn.commit()
+
+            # Simulate the stale pre-txn read reporting run A. The fixed
+            # block_task never reads _current_run_id up front; it derives
+            # ownership from the run _end_run actually ended (run B).
+            monkeypatch.setattr(kb, "_current_run_id", lambda c, t: run_a)
+            assert kb.block_task(conn, tid, reason="test", kind="transient")
+
+        worker_b.wait(timeout=5)
+        assert worker_b.returncode != 0, (
+            "current run's worker was not signalled (stale run identity used)"
+        )
+        assert worker_a.poll() is None, (
+            "stale run's worker was signalled by block_task"
+        )
+    finally:
+        _kill(worker_a, worker_b)
+
+
 # ── Descendant closure (owned child/descendant still closes) ───────────────
 
 

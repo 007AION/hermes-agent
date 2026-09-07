@@ -15257,14 +15257,11 @@ def block_task(
         )
     routed_to = "blocked"
     recurrences = 0
-    # Resolve the exact run being blocked for shared-dir ownership gating.
-    # ``_end_run`` inside the txn below clears ``tasks.current_run_id``, so
-    # capture the binding up front. ``expected_run_id`` wins when the caller
-    # pins the exact run; otherwise the current run is authoritative.
-    blocked_run_id: Optional[int] = (
-        int(expected_run_id) if expected_run_id is not None
-        else _current_run_id(conn, task_id)
-    )
+    # NOTE: the exact run being blocked is resolved *inside* the write txn via
+    # ``_end_run`` (which reads and clears ``tasks.current_run_id`` atomically),
+    # NOT read before the txn. A pre-txn read is TOCTOU-unsafe: a concurrent
+    # run-switch could make it stale, so shared-dir cleanup would signal the
+    # old run's worker instead of the run actually ended here.
     with write_txn(conn):
         cur_row = conn.execute(
             "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?",
@@ -15455,7 +15452,7 @@ def block_task(
                 _owned: set[int] | None = None
                 if _wk == "dir":
                     _owned, _refusal = _derive_shared_dir_owned_pids(
-                        conn, task_id, run_id=blocked_run_id,
+                        conn, task_id, run_id=run_id,
                     )
                     if _owned is None:
                         # Fail closed: ownership cannot be proven from the
@@ -22701,8 +22698,16 @@ def _derive_shared_dir_owned_pids(
     worker PID + descendant set when ownership is provable (else ``None``).
     ``refusal_reason`` is a short machine-readable code when ownership
     cannot be proven — ``no_run_identity``, ``no_provable_spawn_identity``,
-    ``ambiguous_spawn_identity``, ``recycled_pid`` or ``worker_exited`` —
-    and ``None`` otherwise.
+    ``malformed_spawn_identity``, ``ambiguous_spawn_identity``,
+    ``recycled_pid`` or ``worker_exited`` — and ``None`` otherwise.
+
+    Strict canonical validation: a spawn identity is only provable when
+    ``json_type`` reports BOTH ``pid`` and ``starttime`` as JSON integers.
+    A text/real/true/false value is malformed evidence and must never be
+    coerced via ``int()`` — a stringly ``"123"`` would otherwise authorize a
+    signal. Any malformed or unprovable (missing/null) event in the exact
+    run's spawn history refuses the entire authority set rather than being
+    discarded in favour of a co-resident valid identity.
     """
     if run_id is None:
         # No binding to an exact run: nothing can authoritatively own this
@@ -22710,25 +22715,44 @@ def _derive_shared_dir_owned_pids(
         return None, "no_run_identity"
     spawn_rows = conn.execute(
         "SELECT json_extract(payload, '$.pid') as pid,"
-        " json_extract(payload, '$.starttime') as starttime"
+        " json_extract(payload, '$.starttime') as starttime,"
+        " json_type(payload, '$.pid') as pid_type,"
+        " json_type(payload, '$.starttime') as starttime_type"
         " FROM task_events"
         " WHERE task_id = ? AND kind = 'spawned' AND run_id = ?"
         " ORDER BY id DESC",
         (task_id, int(run_id)),
     ).fetchall()
+    if not spawn_rows:
+        # This run has no spawn event at all (even if an older run left spawn
+        # history behind) — fail closed.
+        return None, "no_provable_spawn_identity"
     # Collapse duplicate (pid, starttime) rows into the distinct identities
-    # actually recorded for this run. Two distinct live spawn identities on
-    # the same run is ambiguous ownership — refuse rather than guess.
+    # actually recorded for this run, but only after every event passes strict
+    # canonical type validation. A single malformed/unprovable event poisons
+    # the whole run's authority set — never guess around it.
     identities: list[tuple[int, int]] = []
     for row in spawn_rows:
-        if row["pid"] is None or row["starttime"] is None:
-            continue
-        ident = (int(row["pid"]), int(row["starttime"]))
+        pid_type = row["pid_type"]
+        st_type = row["starttime_type"]
+        # Missing key or explicit JSON null → no provable identity.
+        if pid_type is None or pid_type == "null" \
+                or st_type is None or st_type == "null":
+            return None, "no_provable_spawn_identity"
+        # text / real / true / false are malformed — refuse, never int()-coerce.
+        if pid_type != "integer" or st_type != "integer":
+            return None, "malformed_spawn_identity"
+        pid = row["pid"]
+        st = row["starttime"]
+        if not isinstance(pid, int) or isinstance(pid, bool) \
+                or not isinstance(st, int) or isinstance(st, bool):
+            return None, "malformed_spawn_identity"
+        if pid <= 0 or st <= 0:
+            return None, "malformed_spawn_identity"
+        ident = (pid, st)
         if ident not in identities:
             identities.append(ident)
     if not identities:
-        # This run has no provable spawn identity (even if an older run left
-        # spawn history behind) — fail closed.
         return None, "no_provable_spawn_identity"
     if len(identities) != 1:
         return None, "ambiguous_spawn_identity"
