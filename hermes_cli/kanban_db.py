@@ -363,27 +363,27 @@ FACTORY_ACTOR_ROLES = frozenset({
 # back to zero mutation. The worker toolset can NEVER stamp the kernel identity;
 # only this host-level finalizer code does.
 
-# Immutable authority for this module set: aion-governance PR #917, independently
+# Immutable authority for this module set: aion-governance PR #947, independently
 # approved at the exact head below and merged as the exact commit below. The
 # source-byte hashes are verified BEFORE compile/exec; a module merely
 # self-declaring the expected contract constant is insufficient — both the bytes
 # and the contract hash are independently verified.
-AION_GOVERNANCE_AUTHORITY_PR = 917
-AION_GOVERNANCE_AUTHORITY_HEAD = "44d4c221468d4035e078a6bfbcd4e8a25de4850a"
-AION_GOVERNANCE_AUTHORITY_COMMIT = "15e6c82f4020c53cdba511c1e7ca31bab1bfe6bb"
+AION_GOVERNANCE_AUTHORITY_PR = 947
+AION_GOVERNANCE_AUTHORITY_HEAD = "339312bcdc9794fe996f28aadb3309a1d46b3b4e"
+AION_GOVERNANCE_AUTHORITY_COMMIT = "256bf3e56869d7219b5712d45066e96ce4ec2c6d"
 AION_GOVERNANCE_KERNEL_SHA256 = (
-    "402d7882786093a96826601bfa443fa24efa681b18d94f7d3e8ed1d0cc4d32dc"
+    "249a0fde7d5f9dfc4f3a2fc00d3f2c691041720f9215fac7b61269d4b55962f2"
 )
 AION_GOVERNANCE_TYPED_ADAPTERS_SHA256 = (
-    "fc36d5b6d9b0edf1148ab99e2288f02b960abb3a9ebfd6ea2ef0d4b7b494b092"
+    "dd411bb7151837b45271151e2190cd95c405831773b7f0c591f9d824d5ea0327"
 )
 AION_GOVERNANCE_RECEIPT_BINDER_SHA256 = (
-    "5c8e6b517a390fd2d826d464036fc4e4da3f8ed4a9d1d0313f809bac3b1682be"
+    "b477aea2afe6eb3c23f778dc347be552e0d28b081b597559d9da1bb7841c004c"
 )
 
 # Deterministic frozen-install contract for the pinned modules. Never implicitly
 # select the mutable /root/aion-governance checkout: operators may install the
-# exact PR #917 merge bytes at this content-addressed path, or explicitly point
+# exact PR #947 merge bytes at this content-addressed path, or explicitly point
 # AION_GOVERNANCE_SOURCE_DIR at another byte source. In either case the approved
 # per-module hashes above — not the directory or working-tree state — are the
 # semantic authority.
@@ -10733,7 +10733,7 @@ def _aion_governance_source_dir() -> Optional[Path]:
     """Resolve the pinned aion-governance source directory.
 
     An explicit ``AION_GOVERNANCE_SOURCE_DIR`` wins; otherwise resolve only the
-    content-addressed frozen-install path for the approved PR #917 merge. The
+    content-addressed frozen-install path for the approved PR #947 merge. The
     mutable checkout is deliberately not an implicit candidate. The loader then
     single-reads and sha-verifies every module before compile/exec, so any source
     drift still fails closed.
