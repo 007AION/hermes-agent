@@ -42,16 +42,16 @@ import pytest
 from hermes_cli import kanban_db as kb
 
 
-_PR917_AUTHORITY_COMMIT = "15e6c82f4020c53cdba511c1e7ca31bab1bfe6bb"
-_PR917_MODULES = {
+_PR947_AUTHORITY_COMMIT = "256bf3e56869d7219b5712d45066e96ce4ec2c6d"
+_PR947_MODULES = {
     "scripts/aion_monarch_outcome_proof_gate.py": (
-        "402d7882786093a96826601bfa443fa24efa681b18d94f7d3e8ed1d0cc4d32dc"
+        "249a0fde7d5f9dfc4f3a2fc00d3f2c691041720f9215fac7b61269d4b55962f2"
     ),
     "scripts/aion_monarch_typed_adapters.py": (
-        "fc36d5b6d9b0edf1148ab99e2288f02b960abb3a9ebfd6ea2ef0d4b7b494b092"
+        "dd411bb7151837b45271151e2190cd95c405831773b7f0c591f9d824d5ea0327"
     ),
     "scripts/aion_monarch_receipt_binder.py": (
-        "5c8e6b517a390fd2d826d464036fc4e4da3f8ed4a9d1d0313f809bac3b1682be"
+        "b477aea2afe6eb3c23f778dc347be552e0d28b081b597559d9da1bb7841c004c"
     ),
 }
 
@@ -80,15 +80,15 @@ def kanban_home(tmp_path, monkeypatch):
         yield home
 
 
-def _materialize_pr917_git_object(tmp_path: Path) -> Path | None:
-    """Materialize PR #917's immutable merge object without reading its worktree."""
+def _materialize_pr947_git_object(tmp_path: Path) -> Path | None:
+    """Materialize PR #947's immutable merge object without reading its worktree."""
     repo = Path(os.environ.get("HOME", "")) / "aion-governance"
     if not repo.is_dir():
         return None
-    dest = tmp_path / _PR917_AUTHORITY_COMMIT
-    for rel_path, expected_sha in _PR917_MODULES.items():
+    dest = tmp_path / _PR947_AUTHORITY_COMMIT
+    for rel_path, expected_sha in _PR947_MODULES.items():
         proc = subprocess.run(
-            ["git", "-C", str(repo), "show", f"{_PR917_AUTHORITY_COMMIT}:{rel_path}"],
+            ["git", "-C", str(repo), "show", f"{_PR947_AUTHORITY_COMMIT}:{rel_path}"],
             capture_output=True,
             timeout=30,
         )
@@ -101,9 +101,9 @@ def _materialize_pr917_git_object(tmp_path: Path) -> Path | None:
 
 
 def _aion_gov_source_dir(tmp_path: Path | None = None) -> Path | None:
-    """Resolve only a byte-exact PR #917 authority source for integration tests."""
+    """Resolve only a byte-exact PR #947 authority source for integration tests."""
     if tmp_path is not None:
-        immutable = _materialize_pr917_git_object(tmp_path)
+        immutable = _materialize_pr947_git_object(tmp_path)
         if immutable is not None:
             return immutable
     raw = os.environ.get("AION_GOVERNANCE_SOURCE_DIR")
@@ -119,15 +119,15 @@ def _aion_gov_source_dir(tmp_path: Path | None = None) -> Path | None:
 
 @pytest.fixture
 def aion_gov_src(monkeypatch, tmp_path):
-    """Point the finalizer at immutable PR #917 bytes, or skip if unavailable."""
+    """Point the finalizer at immutable PR #947 bytes, or skip if unavailable."""
     src = _aion_gov_source_dir(tmp_path)
     if src is None:
         pytest.skip("AION_GOVERNANCE_SOURCE_DIR not configured")
     monkeypatch.setenv("AION_GOVERNANCE_SOURCE_DIR", str(src))
-    for rel_path, expected_sha in _PR917_MODULES.items():
+    for rel_path, expected_sha in _PR947_MODULES.items():
         module_bytes = (src / rel_path).read_bytes()
         if hashlib.sha256(module_bytes).hexdigest() != expected_sha:
-            pytest.skip(f"aion-governance module {rel_path} does not match PR #917")
+            pytest.skip(f"aion-governance module {rel_path} does not match PR #947")
     return src
 
 
@@ -213,36 +213,36 @@ def _kernel_receipt_doc(task_id: str, run_id: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# PR #917 immutable authority and source-drift fence
+# PR #947 immutable authority and source-drift fence
 # ---------------------------------------------------------------------------
 
-def test_pr917_authority_is_exact_and_mutable_checkout_is_not_a_default():
-    assert kb.AION_GOVERNANCE_AUTHORITY_PR == 917
+def test_pr947_authority_is_exact_and_mutable_checkout_is_not_a_default():
+    assert kb.AION_GOVERNANCE_AUTHORITY_PR == 947
     assert kb.AION_GOVERNANCE_AUTHORITY_HEAD == (
-        "44d4c221468d4035e078a6bfbcd4e8a25de4850a"
+        "339312bcdc9794fe996f28aadb3309a1d46b3b4e"
     )
-    assert kb.AION_GOVERNANCE_AUTHORITY_COMMIT == _PR917_AUTHORITY_COMMIT
-    assert kb.AION_GOVERNANCE_KERNEL_SHA256 == _PR917_MODULES[
+    assert kb.AION_GOVERNANCE_AUTHORITY_COMMIT == _PR947_AUTHORITY_COMMIT
+    assert kb.AION_GOVERNANCE_KERNEL_SHA256 == _PR947_MODULES[
         "scripts/aion_monarch_outcome_proof_gate.py"
     ]
-    assert kb.AION_GOVERNANCE_TYPED_ADAPTERS_SHA256 == _PR917_MODULES[
+    assert kb.AION_GOVERNANCE_TYPED_ADAPTERS_SHA256 == _PR947_MODULES[
         "scripts/aion_monarch_typed_adapters.py"
     ]
-    assert kb.AION_GOVERNANCE_RECEIPT_BINDER_SHA256 == _PR917_MODULES[
+    assert kb.AION_GOVERNANCE_RECEIPT_BINDER_SHA256 == _PR947_MODULES[
         "scripts/aion_monarch_receipt_binder.py"
     ]
     assert all(
-        _PR917_AUTHORITY_COMMIT in source_dir
+        _PR947_AUTHORITY_COMMIT in source_dir
         for source_dir in kb.AION_GOVERNANCE_DEFAULT_SOURCE_DIRS
     )
     assert "/root/aion-governance" not in kb.AION_GOVERNANCE_DEFAULT_SOURCE_DIRS
 
 
-def test_pr917_module_drift_fails_closed_with_zero_mutation(
+def test_pr947_module_drift_fails_closed_with_zero_mutation(
     kanban_home, aion_gov_src, tmp_path, monkeypatch,
 ):
-    drifted = tmp_path / "drifted-pr917"
-    for rel_path in _PR917_MODULES:
+    drifted = tmp_path / "drifted-pr947"
+    for rel_path in _PR947_MODULES:
         target = drifted / rel_path
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes((aion_gov_src / rel_path).read_bytes())
