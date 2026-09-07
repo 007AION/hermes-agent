@@ -8452,6 +8452,11 @@ def test_block_task_cleans_workspace_processes(kanban_home, tmp_path):
             _time.sleep(0.2)
             assert child.poll() is None  # child alive
 
+            # Record the canonical spawn identity so the child is the exact
+            # owned worker lineage (a dir workspace requires provable
+            # ownership before block_task may signal it).
+            kb._set_worker_pid(conn, t, child.pid)
+
             # Block the task — should clean up child
             ok = kb.block_task(
                 conn, t, reason="test",
@@ -8469,10 +8474,11 @@ def test_block_task_cleans_workspace_processes(kanban_home, tmp_path):
 
 
 def test_block_task_child_survival_without_fix(kanban_home, tmp_path):
-    """RED/GREEN: without cleanup, child survives block.
+    """RED/GREEN: an owned child does not survive the block.
 
     Before the fix, child_after_block_alive would be True.
-    After the fix, child is terminated by block_task workspace cleanup.
+    After the fix, the owned child is terminated by block_task workspace
+    cleanup (the spawn identity proves ownership on a dir workspace).
     """
     ws = tmp_path / "ws"
     ws.mkdir()
@@ -8495,13 +8501,16 @@ def test_block_task_child_survival_without_fix(kanban_home, tmp_path):
             _time.sleep(0.2)
             assert child.poll() is None  # alive before block
 
+            # Record the canonical spawn identity (dir workspace ownership).
+            kb._set_worker_pid(conn, t, child.pid)
+
             kb.block_task(conn, t, reason="test", kind="capability")
 
-            # After the fix, child should NOT survive
+            # After the fix, the owned child should NOT survive
             child.wait(timeout=3)
             child_after_block_alive = child.poll() is None
             assert child_after_block_alive is False, (
-                "child survived block — effect reconciliation failed"
+                "owned child survived block — effect reconciliation failed"
             )
         finally:
             if child.poll() is None:

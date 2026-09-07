@@ -480,6 +480,9 @@ def test_completion_closes_workspace_child_process(kanban_home, tmp_path):
                 "UPDATE tasks SET workspace_kind='dir', workspace_path=? WHERE id=?",
                 (str(ws), tid),
             )
+            # Claim first so the spawn identity binds to the exact run.
+            claimed = kb.claim_task(conn, tid)
+            assert claimed is not None
             # Insert a spawn event with the test process's PID + starttime
             # so the dir-workspace ownership gate can discover owned
             # descendants (#AION-RL2-CORE-04 R3: spawn event starttime
@@ -487,9 +490,9 @@ def test_completion_closes_workspace_child_process(kanban_home, tmp_path):
             kb._append_event(
                 conn, tid, "spawned",
                 {"pid": _os.getpid(), "starttime": worker_identity["starttime"]},
+                run_id=claimed.current_run_id,
             )
             conn.commit()
-            kb.claim_task(conn, tid)
             assert kb.complete_task(conn, tid, result="done")
 
         # Child should be killed by workspace process closure.
@@ -670,13 +673,15 @@ def test_completion_preserves_caller_inside_workspace(kanban_home, tmp_path):
                 # owned descendants.
                 # Insert a spawn event with PID + starttime for the
                 # ownership gate (#AION-RL2-CORE-04 R3).
+                claimed = kb.claim_task(conn, tid)
+                assert claimed is not None
                 kb._append_event(
                     conn, tid, "spawned",
                     {"pid": _os.getpid(),
                      "starttime": kb._read_process_identity(_os.getpid())["starttime"]},
+                    run_id=claimed.current_run_id,
                 )
                 conn.commit()
-                kb.claim_task(conn, tid)
                 # complete_task triggers _cleanup_workspace which calls
                 # close_workspace_processes — caller is inside the workspace
                 # so self-preservation must work.
@@ -816,13 +821,15 @@ def test_completion_caller_same_pgid_children_closed(kanban_home, tmp_path):
                 # owned descendants.
                 # Insert a spawn event with PID + starttime for the
                 # ownership gate (#AION-RL2-CORE-04 R3).
+                claimed = kb.claim_task(conn, tid)
+                assert claimed is not None
                 kb._append_event(
                     conn, tid, "spawned",
                     {"pid": _os.getpid(),
                      "starttime": kb._read_process_identity(_os.getpid())["starttime"]},
+                    run_id=claimed.current_run_id,
                 )
                 conn.commit()
-                kb.claim_task(conn, tid)
                 # complete_task triggers _cleanup_workspace → close_workspace_processes.
                 # Caller is inside workspace and shares PGID with children.
                 assert kb.complete_task(conn, tid, result="done")
@@ -1243,13 +1250,15 @@ def test_dir_workspace_live_run_closes_owned_child_unrelated_survives(
                 (str(ws), tid),
             )
             # Insert spawn event with PID + starttime for ownership gate.
+            claimed = kb.claim_task(conn, tid)
+            assert claimed is not None
             kb._append_event(
                 conn, tid, "spawned",
                 {"pid": _os.getpid(),
                  "starttime": kb._read_process_identity(_os.getpid())["starttime"]},
+                run_id=claimed.current_run_id,
             )
             conn.commit()
-            kb.claim_task(conn, tid)
             assert kb.complete_task(conn, tid, result="done")
 
         # Owned child was signalled (it is a descendant of the worker PID).
@@ -1315,13 +1324,15 @@ def test_dir_workspace_owned_grandchild_closed_unrelated_survives(
                 (str(ws), tid),
             )
             # Insert spawn event with PID + starttime for ownership gate.
+            claimed = kb.claim_task(conn, tid)
+            assert claimed is not None
             kb._append_event(
                 conn, tid, "spawned",
                 {"pid": _os.getpid(),
                  "starttime": kb._read_process_identity(_os.getpid())["starttime"]},
+                run_id=claimed.current_run_id,
             )
             conn.commit()
-            kb.claim_task(conn, tid)
             assert kb.complete_task(conn, tid, result="done")
 
         # Owned child and grandchild were signalled.
@@ -1529,15 +1540,17 @@ def test_completion_closes_owned_child_with_correct_starttime(
                 (str(ws), tid),
             )
             # Insert a spawn event with the CORRECT worker PID + starttime.
+            claimed = kb.claim_task(conn, tid)
+            assert claimed is not None
             kb._append_event(
                 conn, tid, "spawned",
                 {
                     "pid": _os.getpid(),
                     "starttime": worker_identity["starttime"],
                 },
+                run_id=claimed.current_run_id,
             )
             conn.commit()
-            kb.claim_task(conn, tid)
             assert kb.complete_task(conn, tid, result="done")
 
         # Owned child must have been signalled.
