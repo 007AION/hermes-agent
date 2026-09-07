@@ -6620,6 +6620,44 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     return True if created_intent is None else created_intent
 
 
+def _has_protocol_violation_fence(conn: sqlite3.Connection, task_id: str) -> bool:
+    """True when the task's most recent ``gave_up`` was a clean-exit
+    protocol-violation breaker trip.
+
+    Protocol violations use a *separate* bounded-retry budget from the unified
+    ``consecutive_failures`` counter: ``detect_crashed_workers`` counts a
+    clean-exit-without-terminal-call streak against
+    ``_PROTOCOL_VIOLATION_FAILURE_LIMIT`` and, on reaching it, calls
+    ``_record_task_failure(force_trip=True)`` — which bumps
+    ``consecutive_failures`` by exactly one, not to the limit. The generic
+    ``consecutive_failures >= failure_limit`` guard in ``recompute_ready``
+    therefore does *not* hold for these tasks and would re-promote a
+    freshly-fenced task, leaking extra runs past the intended bound (canonical
+    t_7db28a8b runs 4155-4158). Detect the fence from the ``gave_up`` payload,
+    which carries ``protocol_violations`` / ``protocol_violation_limit``.
+    """
+    row = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'gave_up' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if not row or not row["payload"]:
+        return False
+    try:
+        data = json.loads(row["payload"])
+    except (ValueError, TypeError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    try:
+        violations = int(data.get("protocol_violations") or 0)
+        limit = int(data.get("protocol_violation_limit") or 0)
+    except (ValueError, TypeError):
+        return False
+    return limit > 0 and violations >= limit
+
+
 def recompute_ready(
     conn: sqlite3.Connection, failure_limit: int = None,
 ) -> int:
@@ -6700,6 +6738,13 @@ def recompute_ready(
                 for parent in parents
             ):
                 if cur_status == "blocked":
+                    if _has_protocol_violation_fence(conn, task_id):
+                        # Clean-exit protocol-violation breaker trip. The fence
+                        # is non-auto-recoverable (explicit ``unblock_task``
+                        # only); the generic ``consecutive_failures`` guard
+                        # below cannot see it because ``force_trip`` counted a
+                        # single unified failure, not the violation streak.
+                        continue
                     # Don't auto-recover tasks that have hit the
                     # circuit-breaker failure limit.  Without this
                     # guard, a task that repeatedly exhausts its

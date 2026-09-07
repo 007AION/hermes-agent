@@ -2124,6 +2124,88 @@ def test_recompute_ready_per_task_max_retries_overrides_dispatcher(kanban_home):
         assert task.consecutive_failures == 2
 
 
+def test_recompute_ready_skips_protocol_violation_fence(kanban_home):
+    """recompute_ready must not re-promote a task fenced by the clean-exit
+    protocol-violation breaker (canonical t_7db28a8b runs 4155-4158).
+
+    Protocol violations use a separate streak budget
+    (``_PROTOCOL_VIOLATION_FAILURE_LIMIT``) and trip via
+    ``_record_task_failure(force_trip=True)``, which bumps
+    ``consecutive_failures`` by exactly one — below the unified
+    ``kanban.failure_limit``. Without this guard, ``recompute_ready``
+    re-promotes the freshly-fenced task and leaks extra runs past the bound.
+    """
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="task", assignee="a")
+
+        # Replicate exactly what detect_crashed_workers does once the streak
+        # reaches the bound: force_trip with the violation limit, the streak
+        # markers in the gave_up payload, no claim release (the crash reaper
+        # already released it) and no end_run (the reaper already closed it).
+        kb._record_task_failure(
+            conn, t,
+            error=(
+                "worker exited cleanly (rc=0) without calling "
+                "kanban_complete or kanban_block — protocol violation. "
+                "If the prior run already did the work, verify it and report "
+                "the result via kanban_complete; a run that ends without a "
+                "terminal kanban call counts as failed no matter what it did."
+            ),
+            outcome="crashed",
+            failure_limit=kb._PROTOCOL_VIOLATION_FAILURE_LIMIT,
+            force_trip=True,
+            release_claim=False,
+            end_run=False,
+            event_payload_extra={
+                "pid": 12345,
+                "claimer": "host:pid",
+                "protocol_violations": 3,
+                "protocol_violation_limit": 3,
+            },
+        )
+        task = kb.get_task(conn, t)
+        assert task.status == "blocked"
+        # force_trip counts only ONE unified failure, not the streak of 3.
+        assert task.consecutive_failures == 1
+
+        # The protocol-violation fence is non-auto-recoverable: recompute_ready
+        # must NOT re-promote the just-fenced task.
+        promoted = kb.recompute_ready(conn)
+        assert promoted == 0
+        assert kb.get_task(conn, t).status == "blocked"
+
+        # Explicit unblock is the only exit, and a later valid lifecycle call
+        # terminalizes the SAME task.
+        assert kb.unblock_task(conn, t)
+        assert kb.get_task(conn, t).status == "ready"
+        kb.claim_task(conn, t)
+        kb.complete_task(conn, t, summary="done")
+        assert kb.get_task(conn, t).status == "done"
+
+
+def test_protocol_violation_fence_ignores_plain_gave_up(kanban_home):
+    """A non-protocol-violation ``gave_up`` (no streak markers) is NOT a
+    protocol-violation fence, so it must not wrongly stick a task whose
+    unified counter is still below the failure limit."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="task", assignee="a")
+        # A plain crash trip (e.g. timeout) emits a gave_up with no
+        # protocol_violations / protocol_violation_limit keys.
+        kb._record_task_failure(
+            conn, t,
+            error="pid 999 killed by signal 9",
+            outcome="crashed",
+            failure_limit=2,
+            force_trip=True,
+            release_claim=False,
+            end_run=False,
+        )
+        assert kb.get_task(conn, t).status == "blocked"
+        # helper must NOT classify this as a protocol-violation fence.
+        with kb.connect() as conn2:
+            assert kb._has_protocol_violation_fence(conn2, t) is False
+
+
 # ---------------------------------------------------------------------------
 # Parent-completion invariant at the claim gate (RCA t_a6acd07d)
 # ---------------------------------------------------------------------------
