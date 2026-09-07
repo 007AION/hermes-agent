@@ -2675,9 +2675,9 @@ def test_resolve_workspace_rejects_relative_worktree_path(kanban_home):
 
 def test_build_worker_context_caps_prior_attempts(kanban_home):
     """When a task has more than _CTX_MAX_PRIOR_ATTEMPTS runs, only
-    the most recent N are shown in full; earlier attempts are summarised
-    in a one-line marker so the worker knows more exist without
-    blowing the prompt."""
+    the most recent N are shown in full; older attempts are superseded
+    history collapsed into a one-line marker (count + outcome
+    distribution) without re-injecting their full summaries."""
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="retry", assignee="worker")
@@ -2698,20 +2698,225 @@ def test_build_worker_context_caps_prior_attempts(kanban_home):
         assert attempt_count == kb._CTX_MAX_PRIOR_ATTEMPTS, (
             f"expected {kb._CTX_MAX_PRIOR_ATTEMPTS} attempts shown, got {attempt_count}"
         )
-        # And the "omitted" marker appears with the right count
-        omitted_count = 25 - kb._CTX_MAX_PRIOR_ATTEMPTS
-        assert f"{omitted_count} earlier attempt" in ctx, (
-            f"expected omitted-count marker, got ctx=\n{ctx[:2000]}"
+        # Superseded marker reports the count AND the outcome distribution
+        superseded_count = 25 - kb._CTX_MAX_PRIOR_ATTEMPTS
+        assert f"{superseded_count} earlier attempt" in ctx, (
+            f"expected superseded-count marker, got ctx=\n{ctx[:2000]}"
+        )
+        assert f"reclaimed x{superseded_count}" in ctx
+        # Superseded attempts' full summaries are NOT re-injected
+        assert "attempt 0 summary" not in ctx
+        # The latest attempt IS shown in full
+        assert "attempt 24 summary" in ctx
+        # Attempt numbering is the real index (not renumbered)
+        assert "Attempt 25 " in ctx, (
+            "latest attempt should be numbered 25"
         )
         # Total size is bounded — empirically we expect << 100KB even
         # for 1000 attempts (capped to N * ~500 chars)
         assert len(ctx) < 20_000, (
             f"context should be bounded even at 25 runs, got {len(ctx)} chars"
         )
-        # Attempt numbering starts at the real index (not renumbered)
-        assert "Attempt 16 " in ctx, (
-            "first-shown attempt should be numbered 16 (25 - 10 + 1)"
+    finally:
+        conn.close()
+
+
+def test_build_worker_context_bounds_superseded_refusal_history(kanban_home):
+    """RED/GREEN: a retry-heavy task whose prior attempts each carry a
+    refusal-shaped summary must NOT re-inject every superseded summary
+    verbatim into the next worker prompt. Only the latest attempt's full
+    text survives; older refusals collapse to a count + outcome marker.
+    Synthetic public-safe fixture — no provider payload is read or emitted."""
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="audit", assignee="auditor")
+        refusal = (
+            "Goal-mode worker was refused by the model provider's content "
+            "policy filter (content_policy_blocked) at turn 1; deterministic "
+            "for the unchanged prompt"
         )
+        for _ in range(3):
+            kb.claim_task(conn, tid)
+            kb._end_run(conn, tid, outcome="blocked", summary=refusal)
+            conn.execute(
+                "UPDATE tasks SET status='ready', claim_lock=NULL, "
+                "claim_expires=NULL WHERE id=?", (tid,),
+            )
+            conn.commit()
+
+        # Latest attempt carries the current evidence a retry must build on.
+        kb.claim_task(conn, tid)
+        kb._end_run(conn, tid, outcome="blocked",
+                    summary="LATEST-EXACT-EVIDENCE-MARKER")
+        conn.execute(
+            "UPDATE tasks SET status='ready', claim_lock=NULL, "
+            "claim_expires=NULL WHERE id=?", (tid,),
+        )
+        conn.commit()
+
+        kb.claim_task(conn, tid)
+        ctx = kb.build_worker_context(conn, tid)
+
+        # Latest exact evidence preserved in full.
+        assert "LATEST-EXACT-EVIDENCE-MARKER" in ctx
+        # Superseded refusal text does NOT dominate the prompt.
+        assert ctx.count("content_policy_blocked") == 0, (
+            "superseded refusal summaries must not be re-injected verbatim"
+        )
+        # One-line marker conveys the superseded count + outcome distribution.
+        assert "3 earlier attempts superseded" in ctx
+        assert "blocked x3" in ctx
+        # Latest attempt numbered at its true position.
+        assert "Attempt 4 " in ctx
+    finally:
+        conn.close()
+
+
+def test_build_worker_context_latest_prior_attempt_never_dropped(kanban_home):
+    """Hostile omission: no matter how many superseded attempts accumulate,
+    the latest exact run's full summary is always retained in the context."""
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="retry", assignee="worker")
+        for i in range(30):
+            kb.claim_task(conn, tid)
+            kb._end_run(conn, tid, outcome="blocked", summary=f"stale {i}")
+            conn.execute(
+                "UPDATE tasks SET status='ready', claim_lock=NULL, "
+                "claim_expires=NULL WHERE id=?", (tid,),
+            )
+            conn.commit()
+
+        # The single most-recent run is the evidence that must survive.
+        kb.claim_task(conn, tid)
+        kb._end_run(conn, tid, outcome="completed",
+                    summary="FINAL-RESULT-NEVER-DROPPED")
+        conn.execute(
+            "UPDATE tasks SET status='ready', claim_lock=NULL, "
+            "claim_expires=NULL WHERE id=?", (tid,),
+        )
+        conn.commit()
+
+        kb.claim_task(conn, tid)
+        ctx = kb.build_worker_context(conn, tid)
+        assert "FINAL-RESULT-NEVER-DROPPED" in ctx
+        assert "stale 29" not in ctx  # superseded, collapsed
+        assert "30 earlier attempts superseded" in ctx
+    finally:
+        conn.close()
+
+
+def test_build_worker_context_latest_outcome_unambiguous(kanban_home):
+    """Hostile ambiguity: when the latest attempt's outcome differs from
+    older superseded attempts, the context unambiguously privileges the
+    latest (no ambiguity about which state is current)."""
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="audit", assignee="auditor")
+        for outcome in ("blocked", "timed_out", "blocked"):
+            kb.claim_task(conn, tid)
+            kb._end_run(conn, tid, outcome=outcome, summary=f"old {outcome}")
+            conn.execute(
+                "UPDATE tasks SET status='ready', claim_lock=NULL, "
+                "claim_expires=NULL WHERE id=?", (tid,),
+            )
+            conn.commit()
+
+        kb.claim_task(conn, tid)
+        kb._end_run(conn, tid, outcome="completed", summary="CURRENT-DONE")
+        conn.execute(
+            "UPDATE tasks SET status='ready', claim_lock=NULL, "
+            "claim_expires=NULL WHERE id=?", (tid,),
+        )
+        conn.commit()
+
+        kb.claim_task(conn, tid)
+        ctx = kb.build_worker_context(conn, tid)
+
+        # Latest (completed) is shown in full with its evidence.
+        assert "CURRENT-DONE" in ctx
+        assert "### Attempt 4 — completed" in ctx
+        # Superseded mixed outcomes are collapsed into the marker.
+        assert "3 earlier attempts superseded" in ctx
+        assert "blocked x2" in ctx
+        assert "timed_out x1" in ctx
+        # Superseded full summaries are not re-injected.
+        assert "old blocked" not in ctx
+        assert "old timed_out" not in ctx
+    finally:
+        conn.close()
+
+
+def test_build_worker_context_preserves_unresolved_review_finding(kanban_home):
+    """RED/GREEN regression for the review lifecycle: an unresolved
+    ``request_changes`` finding is immutable review evidence and must stay
+    available to the worker until independently re-tested, even when the
+    age-based window has collapsed every other older attempt. Sequence:
+    ``request_changes(open finding) -> review_required(author rework) ->
+    [re-arm refusals] -> review_required -> re-audit``."""
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="audit", assignee="auditor")
+
+        # Reviewer's still-open blocking finding (immutable review evidence).
+        kb.claim_task(conn, tid)
+        kb._end_run(conn, tid, outcome="request_changes",
+                    summary="OPEN-REVIEW-FINDING-MUST-BE-RETESTED")
+        conn.execute(
+            "UPDATE tasks SET status='ready', claim_lock=NULL, "
+            "claim_expires=NULL WHERE id=?", (tid,),
+        )
+        conn.commit()
+
+        # Author's first rework handoff (ordinary history).
+        kb.claim_task(conn, tid)
+        kb._end_run(conn, tid, outcome="review_required",
+                    summary="AUTHOR-REWORK-HANDOFF-1")
+        conn.execute(
+            "UPDATE tasks SET status='ready', claim_lock=NULL, "
+            "claim_expires=NULL WHERE id=?", (tid,),
+        )
+        conn.commit()
+
+        # Intervening re-arm refusals that would otherwise push the open
+        # finding far out of the age window.
+        for i in range(10):
+            kb.claim_task(conn, tid)
+            kb._end_run(conn, tid, outcome="blocked", summary=f"refusal {i}")
+            conn.execute(
+                "UPDATE tasks SET status='ready', claim_lock=NULL, "
+                "claim_expires=NULL WHERE id=?", (tid,),
+            )
+            conn.commit()
+
+        # Author's latest rework handoff (the most-recent ordinary run).
+        kb.claim_task(conn, tid)
+        kb._end_run(conn, tid, outcome="review_required",
+                    summary="AUTHOR-REWORK-HANDOFF-LATEST")
+        conn.execute(
+            "UPDATE tasks SET status='ready', claim_lock=NULL, "
+            "claim_expires=NULL WHERE id=?", (tid,),
+        )
+        conn.commit()
+
+        kb.claim_task(conn, tid)
+        ctx = kb.build_worker_context(conn, tid)
+
+        # The open review finding survives the age window.
+        assert "OPEN-REVIEW-FINDING-MUST-BE-RETESTED" in ctx, (
+            "unresolved request_changes finding must not be dropped by age"
+        )
+        assert "### Attempt 1 — request_changes" in ctx
+        # The latest ordinary attempt is shown in full.
+        assert "AUTHOR-REWORK-HANDOFF-LATEST" in ctx
+        assert "### Attempt 13 — review_required" in ctx
+        # Intervening ordinary refusals collapse to a superseded marker and
+        # are not re-injected verbatim.
+        assert "11 earlier attempts superseded" in ctx
+        assert "blocked x10" in ctx
+        assert "refusal 0" not in ctx
+        # The older author handoff is ordinary history, so it collapses too.
+        assert "AUTHOR-REWORK-HANDOFF-1" not in ctx
     finally:
         conn.close()
 

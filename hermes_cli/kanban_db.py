@@ -1112,7 +1112,17 @@ def _reap_worker_descendants(
 # summaries). Values chosen to fit a typical 100k-char LLM prompt with
 # plenty of headroom. Each constant is tuned independently so users
 # who need to relax one don't have to relax all of them.
-_CTX_MAX_PRIOR_ATTEMPTS = 10      # most recent N prior runs shown in full
+#
+# Prior attempts are age-bounded: only the SINGLE most-recent prior run is
+# rendered in full (the "latest exact run / evidence" a retry worker must
+# build on). Older runs are superseded history and collapse to a one-line
+# outcome marker, so a retry-heavy task cannot let superseded terminal
+# summaries dominate the assembled prompt. (Unresolved review findings —
+# outcome ``request_changes`` — are immutable review evidence and are
+# preserved in full independently of this window; see build_worker_context.)
+# Keep this at 1 unless a concrete need for a multi-attempt detail window
+# exists.
+_CTX_MAX_PRIOR_ATTEMPTS = 1       # most recent N prior runs shown in full
 _CTX_MAX_COMMENTS       = 30      # most recent N comments shown in full
 _CTX_MAX_FIELD_BYTES    = 4 * 1024   # 4 KB per summary/error/metadata/result
 _CTX_MAX_BODY_BYTES     = 8 * 1024   # 8 KB per task.body (opening post)
@@ -21010,8 +21020,13 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     Order:
       1. Task title (mandatory).
       2. Task body (optional opening post, capped at 8 KB).
-      3. Prior attempts on THIS task (most recent ``_CTX_MAX_PRIOR_ATTEMPTS``
-         shown; older attempts collapsed into a one-line summary).
+      3. Prior attempts on THIS task. Ordinary history is age-bounded to the
+         most recent ``_CTX_MAX_PRIOR_ATTEMPTS`` runs shown in full; older
+         ordinary runs collapse into a one-line superseded marker (count +
+         outcome distribution) without re-injecting their full text.
+         Unresolved review findings (outcome ``request_changes``) are
+         immutable review evidence and are always rendered in full,
+         independently of that age window.
          Each attempt's ``summary`` / ``error`` / ``metadata`` capped at
          ``_CTX_MAX_FIELD_BYTES`` each.
       4. Structured handoff results of every done parent task. Prefers
@@ -21092,33 +21107,68 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
 
     # Prior attempts — show closed runs so a retrying worker sees the
     # history. Skip the currently-active run (that's this worker).
-    # Cap at _CTX_MAX_PRIOR_ATTEMPTS most-recent closed runs; older
-    # attempts get collapsed into a one-line marker so the worker knows
-    # more exist without bloating the prompt.
+    #
+    # Two classes of closed history render differently:
+    #   * Immutable review evidence — runs whose outcome is
+    #     ``request_changes`` (a reviewer's still-open blocking finding) —
+    #     is ALWAYS rendered in full, independent of the age window. A
+    #     requested-change finding must stay available to the worker until
+    #     it has been independently re-tested, no matter how many newer
+    #     attempts intervened.
+    #   * Ordinary history (every other closed run) is age-bounded: only the
+    #     most-recent _CTX_MAX_PRIOR_ATTEMPTS runs render in full (summary /
+    #     error / metadata); older ordinary runs are SUPERSEDED and collapse
+    #     to a one-line marker (count + outcome distribution) WITHOUT
+    #     re-injecting their full text. This keeps retry-heavy tasks bounded
+    #     so superseded terminal summaries cannot dominate the assembled
+    #     prompt, while the latest outcome a retry must build on is never
+    #     dropped.
     all_prior = [r for r in list_runs(conn, task_id) if r.ended_at is not None]
-    # list_runs returns ascending by started_at; "most recent" = last N
-    if len(all_prior) > _CTX_MAX_PRIOR_ATTEMPTS:
-        omitted = len(all_prior) - _CTX_MAX_PRIOR_ATTEMPTS
-        shown = all_prior[-_CTX_MAX_PRIOR_ATTEMPTS:]
-        first_shown_idx = omitted + 1
+    # list_runs returns ascending by started_at; "most recent" = last N.
+    index_by_id = {r.id: i + 1 for i, r in enumerate(all_prior)}
+
+    def _outcome(run: Run) -> str:
+        return run.outcome or run.status or "unknown"
+
+    review_findings = [r for r in all_prior if _outcome(r) == "request_changes"]
+    ordinary = [r for r in all_prior if _outcome(r) != "request_changes"]
+
+    if len(ordinary) > _CTX_MAX_PRIOR_ATTEMPTS:
+        superseded = ordinary[:-_CTX_MAX_PRIOR_ATTEMPTS]
+        shown_ordinary = ordinary[-_CTX_MAX_PRIOR_ATTEMPTS:]
     else:
-        omitted = 0
-        shown = all_prior
-        first_shown_idx = 1
+        superseded = []
+        shown_ordinary = ordinary
+
+    # Full-detail runs: immutable review findings (always) + the recent
+    # ordinary window, in chronological order.
+    shown = review_findings + shown_ordinary
+    shown.sort(key=lambda r: index_by_id[r.id])
+
     if shown:
         lines.append("## Prior attempts on this task")
-        if omitted:
-            lines.append(
-                f"_({omitted} earlier attempt{'s' if omitted != 1 else ''} "
-                f"omitted; showing most recent {len(shown)})_"
+        if superseded:
+            outcome_counts: dict[str, int] = {}
+            for run in superseded:
+                label = _outcome(run)
+                outcome_counts[label] = outcome_counts.get(label, 0) + 1
+            distribution = ", ".join(
+                f"{label} x{count}"
+                for label, count in sorted(outcome_counts.items())
             )
-        for offset, run in enumerate(shown):
-            idx = first_shown_idx + offset
+            lines.append(
+                f"_({len(superseded)} earlier attempt"
+                f"{'s' if len(superseded) != 1 else ''} superseded: "
+                f"{distribution}; showing most recent {len(shown_ordinary)} in full "
+                f"below)_"
+            )
+        for run in shown:
+            idx = index_by_id[run.id]
             ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(run.started_at))
             age = _relative_age(run.started_at, _now)
             ts_disp = f"{ts}, {age}" if age else ts
             profile = run.profile or "(unknown)"
-            outcome = run.outcome or run.status
+            outcome = _outcome(run)
             lines.append(f"### Attempt {idx} — {outcome} ({profile}, {ts_disp})")
             if run.summary and run.summary.strip():
                 lines.append(_cap(run.summary))
