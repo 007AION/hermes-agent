@@ -2921,6 +2921,115 @@ def test_build_worker_context_preserves_unresolved_review_finding(kanban_home):
         conn.close()
 
 
+def test_build_worker_context_bounds_superseded_review_findings(kanban_home):
+    """RED/GREEN: a long-running audit whose reviewer returns request_changes
+    many times accumulates superseded review verdicts. Only the LATEST
+    request_changes is the unresolved finding the worker must re-test; every
+    earlier request_changes was already reworked and re-verified by a newer
+    verdict, so it is SUPERSEDED review history and must collapse to the
+    one-line marker — NOT be re-injected in full into the next prompt.
+    Synthetic public-safe fixture — no provider payload read/emitted."""
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="audit", assignee="auditor")
+        # Three successive request_changes verdicts (author reworked between
+        # each; each newer verdict supersedes the prior one).
+        for i in range(3):
+            kb.claim_task(conn, tid)
+            kb._end_run(conn, tid, outcome="request_changes",
+                        summary=f"REVIEW-VERDICT-{i}")
+            conn.execute(
+                "UPDATE tasks SET status='ready', claim_lock=NULL, "
+                "claim_expires=NULL WHERE id=?", (tid,),
+            )
+            conn.commit()
+
+        # The latest run is the current exact evidence a retry builds on.
+        kb.claim_task(conn, tid)
+        kb._end_run(conn, tid, outcome="blocked",
+                    summary="LATEST-EXACT-RUN-EVIDENCE")
+        conn.execute(
+            "UPDATE tasks SET status='ready', claim_lock=NULL, "
+            "claim_expires=NULL WHERE id=?", (tid,),
+        )
+        conn.commit()
+
+        kb.claim_task(conn, tid)
+        ctx = kb.build_worker_context(conn, tid)
+
+        # Latest exact run preserved in full.
+        assert "LATEST-EXACT-RUN-EVIDENCE" in ctx
+        assert "### Attempt 4 — blocked" in ctx
+        # The latest (unresolved) request_changes finding is preserved in full.
+        assert "REVIEW-VERDICT-2" in ctx
+        assert "### Attempt 3 — request_changes" in ctx
+        # Superseded request_changes verdicts are NOT re-injected in full.
+        assert "REVIEW-VERDICT-0" not in ctx
+        assert "REVIEW-VERDICT-1" not in ctx
+        # One-line marker reports the superseded count + outcome distribution.
+        assert "2 earlier attempts superseded" in ctx
+        assert "request_changes x2" in ctx
+    finally:
+        conn.close()
+
+
+def test_build_worker_context_latest_review_finding_survives_supersession_storm(kanban_home):
+    """Hostile omission: even when a review-heavy task accumulates a large
+    number of superseded request_changes verdicts, the single most-recent
+    request_changes (the unresolved finding) and the latest exact run are
+    always retained in full; every superseded verdict collapses to a marker.
+    Synthetic public-safe fixture — no provider payload read/emitted."""
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="audit", assignee="auditor")
+        for i in range(20):
+            kb.claim_task(conn, tid)
+            kb._end_run(conn, tid, outcome="request_changes",
+                        summary=f"STALE-VERDICT-{i}")
+            conn.execute(
+                "UPDATE tasks SET status='ready', claim_lock=NULL, "
+                "claim_expires=NULL WHERE id=?", (tid,),
+            )
+            conn.commit()
+
+        # Latest unresolved finding (the one the worker must still re-test).
+        kb.claim_task(conn, tid)
+        kb._end_run(conn, tid, outcome="request_changes",
+                    summary="LATEST-OPEN-FINDING")
+        conn.execute(
+            "UPDATE tasks SET status='ready', claim_lock=NULL, "
+            "claim_expires=NULL WHERE id=?", (tid,),
+        )
+        conn.commit()
+
+        # Latest exact run.
+        kb.claim_task(conn, tid)
+        kb._end_run(conn, tid, outcome="blocked",
+                    summary="LATEST-RUN-EVIDENCE")
+        conn.execute(
+            "UPDATE tasks SET status='ready', claim_lock=NULL, "
+            "claim_expires=NULL WHERE id=?", (tid,),
+        )
+        conn.commit()
+
+        kb.claim_task(conn, tid)
+        ctx = kb.build_worker_context(conn, tid)
+
+        # Both retained items survive.
+        assert "LATEST-OPEN-FINDING" in ctx
+        assert "LATEST-RUN-EVIDENCE" in ctx
+        assert "### Attempt 21 — request_changes" in ctx
+        assert "### Attempt 22 — blocked" in ctx
+        # All superseded verdicts collapse; none re-injected in full.
+        assert "STALE-VERDICT-0" not in ctx
+        assert "STALE-VERDICT-19" not in ctx
+        # Marker reports the superseded count + outcome distribution.
+        assert "20 earlier attempts superseded" in ctx
+        assert "request_changes x20" in ctx
+    finally:
+        conn.close()
+
+
 def test_build_worker_context_renders_author_with_safe_framing(kanban_home):
     """Author rendering wraps the operator-controlled author in code fences
     + "comment from worker" prefix so a misleading HERMES_PROFILE name

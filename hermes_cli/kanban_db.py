@@ -1113,16 +1113,18 @@ def _reap_worker_descendants(
 # plenty of headroom. Each constant is tuned independently so users
 # who need to relax one don't have to relax all of them.
 #
-# Prior attempts are age-bounded: only the SINGLE most-recent prior run is
-# rendered in full (the "latest exact run / evidence" a retry worker must
-# build on). Older runs are superseded history and collapse to a one-line
+# Prior attempts are age-bounded: only the SINGLE most-recent ordinary prior
+# run is rendered in full (the "latest exact run / evidence" a retry worker
+# must build on). Older runs are superseded history and collapse to a one-line
 # outcome marker, so a retry-heavy task cannot let superseded terminal
-# summaries dominate the assembled prompt. (Unresolved review findings —
-# outcome ``request_changes`` — are immutable review evidence and are
-# preserved in full independently of this window; see build_worker_context.)
-# Keep this at 1 unless a concrete need for a multi-attempt detail window
-# exists.
-_CTX_MAX_PRIOR_ATTEMPTS = 1       # most recent N prior runs shown in full
+# summaries dominate the assembled prompt. Review findings are treated the
+# same way: only the SINGLE most-recent ``request_changes`` verdict is the
+# unresolved finding and is preserved in full; older ``request_changes``
+# verdicts were already reworked and re-verified by a newer verdict, so they
+# are superseded review history and collapse to the marker too (see
+# build_worker_context). Keep this at 1 unless a concrete need for a
+# multi-attempt detail window exists.
+_CTX_MAX_PRIOR_ATTEMPTS = 1       # most recent N ordinary prior runs shown in full
 _CTX_MAX_COMMENTS       = 30      # most recent N comments shown in full
 _CTX_MAX_FIELD_BYTES    = 4 * 1024   # 4 KB per summary/error/metadata/result
 _CTX_MAX_BODY_BYTES     = 8 * 1024   # 8 KB per task.body (opening post)
@@ -21023,10 +21025,11 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
       3. Prior attempts on THIS task. Ordinary history is age-bounded to the
          most recent ``_CTX_MAX_PRIOR_ATTEMPTS`` runs shown in full; older
          ordinary runs collapse into a one-line superseded marker (count +
-         outcome distribution) without re-injecting their full text.
-         Unresolved review findings (outcome ``request_changes``) are
-         immutable review evidence and are always rendered in full,
-         independently of that age window.
+         outcome distribution) without re-injecting their full text. The
+         single most-recent unresolved review finding (outcome
+         ``request_changes``) is immutable review evidence and is rendered
+         in full; older ``request_changes`` verdicts are superseded review
+         history and collapse into the same marker.
          Each attempt's ``summary`` / ``error`` / ``metadata`` capped at
          ``_CTX_MAX_FIELD_BYTES`` each.
       4. Structured handoff results of every done parent task. Prefers
@@ -21109,12 +21112,13 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     # history. Skip the currently-active run (that's this worker).
     #
     # Two classes of closed history render differently:
-    #   * Immutable review evidence — runs whose outcome is
-    #     ``request_changes`` (a reviewer's still-open blocking finding) —
-    #     is ALWAYS rendered in full, independent of the age window. A
-    #     requested-change finding must stay available to the worker until
-    #     it has been independently re-tested, no matter how many newer
-    #     attempts intervened.
+    #   * The latest unresolved review finding — the SINGLE most-recent run
+    #     whose outcome is ``request_changes`` (a reviewer's still-open
+    #     blocking finding) — is rendered in full. It must stay available to
+    #     the worker until it has been independently re-tested, no matter how
+    #     many newer attempts intervened. Older ``request_changes`` verdicts
+    #     were already reworked and re-verified by a newer verdict, so they
+    #     are SUPERSEDED review history and collapse like ordinary history.
     #   * Ordinary history (every other closed run) is age-bounded: only the
     #     most-recent _CTX_MAX_PRIOR_ATTEMPTS runs render in full (summary /
     #     error / metadata); older ordinary runs are SUPERSEDED and collapse
@@ -21130,19 +21134,29 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     def _outcome(run: Run) -> str:
         return run.outcome or run.status or "unknown"
 
+    # Only the SINGLE most-recent request_changes verdict is the unresolved
+    # finding a worker must still re-test. Every earlier request_changes
+    # verdict was already reworked and re-verified by a newer verdict, so it
+    # is SUPERSEDED review history and collapses exactly like superseded
+    # ordinary history. (A long-running role-separated audit can accumulate
+    # 6..17 request_changes verdicts; re-injecting all of them in full is the
+    # same "superseded history dominates the prompt" defect the ordinary
+    # window already guards against.)
     review_findings = [r for r in all_prior if _outcome(r) == "request_changes"]
-    ordinary = [r for r in all_prior if _outcome(r) != "request_changes"]
+    unresolved_rc = review_findings[-1:] if review_findings else []
+    superseded_rc = review_findings[:-1] if review_findings else []
 
+    ordinary = [r for r in all_prior if _outcome(r) != "request_changes"]
     if len(ordinary) > _CTX_MAX_PRIOR_ATTEMPTS:
-        superseded = ordinary[:-_CTX_MAX_PRIOR_ATTEMPTS]
+        superseded = superseded_rc + ordinary[:-_CTX_MAX_PRIOR_ATTEMPTS]
         shown_ordinary = ordinary[-_CTX_MAX_PRIOR_ATTEMPTS:]
     else:
-        superseded = []
+        superseded = superseded_rc
         shown_ordinary = ordinary
 
-    # Full-detail runs: immutable review findings (always) + the recent
+    # Full-detail runs: the latest unresolved review finding + the recent
     # ordinary window, in chronological order.
-    shown = review_findings + shown_ordinary
+    shown = unresolved_rc + shown_ordinary
     shown.sort(key=lambda r: index_by_id[r.id])
 
     if shown:
@@ -21159,8 +21173,8 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
             lines.append(
                 f"_({len(superseded)} earlier attempt"
                 f"{'s' if len(superseded) != 1 else ''} superseded: "
-                f"{distribution}; showing most recent {len(shown_ordinary)} in full "
-                f"below)_"
+                f"{distribution}; latest exact run and latest unresolved "
+                f"request_changes finding shown in full below)_"
             )
         for run in shown:
             idx = index_by_id[run.id]
