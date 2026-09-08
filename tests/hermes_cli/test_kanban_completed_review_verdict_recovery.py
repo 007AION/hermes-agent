@@ -568,6 +568,9 @@ def test_tool_recovery_binds_live_controller_context(kanban_home, monkeypatch):
         "recovery_receipt": RECEIPT,
     }))
     assert result["ok"] is True
+    # The recovery controller's own task is exposed as ``task_id`` so the
+    # turn-end stop guard can recognize this exact terminal call.
+    assert result["task_id"] == fixture[3]
     with kb.connect() as conn:
         author = kb.get_task(conn, fixture[0])
         assert author is not None and author.status == "ready"

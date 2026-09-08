@@ -891,7 +891,11 @@ def test_review_verdict_request_changes_resumes_bound_author(
         "reason": "fix rollback",
     })
 
-    assert json.loads(out)["ok"] is True
+    data = json.loads(out)
+    assert data["ok"] is True
+    # The worker's own task (the audit child) is exposed as ``task_id`` so the
+    # turn-end stop guard can recognize this exact terminal call.
+    assert data["task_id"] == review_task
     with kb.connect() as conn:
         author = kb.get_task(conn, worker_env)
         assert author is not None
