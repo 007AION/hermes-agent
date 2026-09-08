@@ -7171,16 +7171,27 @@ _PLAIN_CRASH_NO_SIDE_EFFECT_KEYS = {
     "broad_signal_count", "manual_claim", "manual_dispatch", "raw_db_write",
     "replacement_task_count", "secret_exposure",
 }
+# Closed producer-origin crash-attribution grammar: the only exit kinds the
+# reap registry stamps for a genuine (non-protocol-violation) crash.  Any
+# other value — empty/whitespace/arbitrary string, a non-string, or an
+# explicit ``protocol_violation`` marker (true OR false) — is not a
+# producer-origin plain crash and fails closed.
+_PLAIN_CRASH_EXIT_KINDS = {
+    "unknown", "nonzero_exit", "signaled", "session_limit_exit",
+}
 
 
 def _run_is_plain_crash(row: sqlite3.Row) -> bool:
     """True when a closed run is a plain (non-protocol-violation) crash.
 
     A plain crash is a ``crashed``/``crashed`` run whose metadata carries an
-    explicit ``exit_kind`` attribution (``unknown``/``nonzero_exit``/
-    ``signaled``/``session_limit_exit``) and no ``protocol_violation`` marker.
-    It is the complement of ``_run_is_protocol_violation`` and is recoverable
-    only when the latest terminal run's typed metadata additionally binds
+    explicit ``exit_kind`` attribution drawn from the closed producer-origin
+    grammar (``unknown``/``nonzero_exit``/``signaled``/``session_limit_exit``)
+    and no ``protocol_violation`` marker — any present marker (true OR false)
+    is rejected, so an explicit ``protocol_violation: false`` is not a
+    plain-crash attribution.  It is the complement of
+    ``_run_is_protocol_violation`` and is recoverable only when the latest
+    terminal run's typed metadata additionally binds
     ``prior_bound_review_run_id`` to it and carries a PASS-type
     ``audit_outcome`` (see ``_run_is_authenticated_crashed_predecessor``).
     """
@@ -7193,10 +7204,9 @@ def _run_is_plain_crash(row: sqlite3.Row) -> bool:
         meta = json.loads(raw)
     except (TypeError, ValueError):
         return False
-    if not isinstance(meta, dict) or meta.get("protocol_violation"):
+    if not isinstance(meta, dict) or "protocol_violation" in meta:
         return False
-    exit_kind = meta.get("exit_kind")
-    return isinstance(exit_kind, str) and bool(exit_kind)
+    return meta.get("exit_kind") in _PLAIN_CRASH_EXIT_KINDS
 
 
 def _run_is_authenticated_crashed_predecessor(
@@ -9944,16 +9954,19 @@ def _authenticated_predecessor_crashed_pass_run_id(
     auditor_profile: str,
     terminal_run_id: int,
     terminal_receipt: dict[str, Any],
+    handoff_event_id: int,
     lane: str = "protocol",
 ) -> Optional[int]:
-    """Authenticate the crashed protocol-violation PASS before a terminal PASS.
+    """Authenticate the crashed predecessor PASS before a terminal PASS.
 
     Returns the predecessor run id only when the auditor has exactly two closed
-    runs — a latest completed terminal run and a single crashed
-    protocol-violation predecessor — and the predecessor emitted exactly one
-    version-1 PASS verdict, mirrored byte-identically on author and child,
-    whose prose reason re-states the identical head/tree/base commit identity
-    of the terminal receipt.
+    runs — a latest completed terminal run and a single crashed predecessor —
+    and the predecessor emitted exactly one version-1 PASS verdict, mirrored
+    byte-identically on author and child, whose prose reason re-states the
+    identical head/tree/base commit identity of the terminal receipt.  Both the
+    author-side verdict and its auditor-side mirror must postdate the current
+    signed review-handoff (event id strictly greater than ``handoff_event_id``),
+    so a predecessor PASS minted under a superseded handoff never authenticates.
     """
     runs = conn.execute(
         "SELECT id, profile, status, outcome, metadata, ended_at FROM task_runs "
@@ -9977,7 +9990,8 @@ def _authenticated_predecessor_crashed_pass_run_id(
 
     author_verdicts = conn.execute(
         "SELECT id, run_id, payload FROM task_events WHERE task_id = ? "
-        "AND kind = 'review_verdict' ORDER BY id", (author_task_id,),
+        "AND kind = 'review_verdict' AND id > ? ORDER BY id",
+        (author_task_id, handoff_event_id),
     ).fetchall()
     matched = []
     for row in author_verdicts:
@@ -9994,8 +10008,8 @@ def _authenticated_predecessor_crashed_pass_run_id(
         return None
     child_verdicts = conn.execute(
         "SELECT run_id, payload FROM task_events WHERE task_id = ? "
-        "AND kind = 'review_verdict' AND run_id = ? ORDER BY id",
-        (auditor_task_id, predecessor_run_id),
+        "AND kind = 'review_verdict' AND run_id = ? AND id > ? ORDER BY id",
+        (auditor_task_id, predecessor_run_id, handoff_event_id),
     ).fetchall()
     if len(child_verdicts) != 1:
         return None
@@ -10050,6 +10064,15 @@ def _recover_completed_pass_verdict(
         (controller_run_id, controller_task_id, controller_profile, controller_profile),
     ).fetchone() is None:
         return False
+
+    # A current signed review-handoff must bind the author to this exact
+    # auditor child before any recovery PASS is minted; without it the recovery
+    # would grant typed PASS authority with no signed handoff, and a predecessor
+    # PASS minted under a superseded handoff would otherwise authenticate.
+    handoff = _review_handoff_event_for_child(conn, task_id, review_task_id)
+    if handoff is None:
+        return False
+    handoff_event_id = int(handoff["id"])
 
     author = conn.execute(
         "SELECT status, assignee, current_run_id FROM tasks WHERE id = ?", (task_id,)
@@ -10139,6 +10162,7 @@ def _recover_completed_pass_verdict(
         auditor_profile=FACTORY_REVIEW_AUDITOR_PROFILE,
         terminal_run_id=expected_review_run_id,
         terminal_receipt=predecessor_receipt,
+        handoff_event_id=handoff_event_id,
         lane=lane,
     )
     if predecessor_run_id is None:

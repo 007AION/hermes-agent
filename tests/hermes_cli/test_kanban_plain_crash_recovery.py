@@ -317,3 +317,143 @@ def test_plain_crash_recovery_rejects_unauthorized_controller(kanban_home):
         fixture = _plain_crash_fixture(conn, controller_profile="agent007")
         assert _recover(conn, fixture, profile="agent007") is False
         assert len(_recovered_verdicts(conn, fixture)) == 1
+
+
+# --- HOSTILE: signed handoff / event ordering ----------------------------
+
+
+def test_plain_crash_recovery_requires_signed_handoff(kanban_home):
+    # The recovery path must mint typed PASS authority only when a current
+    # signed review-handoff binds the author to this exact auditor child.
+    with kb.connect() as conn:
+        fixture = _plain_crash_fixture(conn)
+        with kb.write_txn(conn):
+            conn.execute(
+                "DELETE FROM task_events WHERE task_id = ? AND kind = 'review_handoff'",
+                (fixture["author"],),
+            )
+        assert _recover(conn, fixture) is False
+        assert len(_recovered_verdicts(conn, fixture)) == 1
+
+
+def _predating_handoff_fixture(conn):
+    """Build a plain-crash recovery whose predecessor PASS predates the handoff.
+
+    The predecessor v1 PASS is emitted under a first signed handoff, then the
+    author re-arms and issues a second (newer) signed handoff before the
+    terminal run completes.  The predecessor's author/mirror verdict events
+    therefore predate the current (latest) signed handoff, which the recovery
+    must reject even though the terminal 5-key plain-crash binding is exact.
+    """
+    author = kb.create_task(
+        conn, title="implementation", factory_build_gate=1, assignee="agent007",
+    )
+    author_run = _claim(conn, author)
+    audit = kb.create_task(
+        conn, title="exact-head audit", assignee="bafuxunan", parents=[author],
+    )
+    first_handoff = kb.request_review_handoff(
+        conn, author, expected_run_id=author_run, review_task_id=audit,
+        reason=f"PR kiddhu/hermes-agent#{PR} first head {HEAD}",
+    )
+    assert first_handoff is not None
+    precursor_run = _claim(conn, audit)
+    assert kb.record_review_verdict(
+        conn, author, review_task_id=audit, expected_review_run_id=precursor_run,
+        verdict="pass", reason=PRECURSOR_REASON,
+    )
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE task_runs SET status='crashed', outcome='crashed', summary=NULL, "
+            "metadata=?, ended_at=11111, claim_lock=NULL, claim_expires=NULL, "
+            "worker_pid=NULL WHERE id=?",
+            (json.dumps({"pid": 1, "claimer": "x", "exit_kind": "unknown"}), precursor_run),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='todo', current_run_id=NULL, claim_lock=NULL, "
+            "claim_expires=NULL, worker_pid=NULL WHERE id=?",
+            (audit,),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='ready', current_run_id=NULL, claim_lock=NULL, "
+            "claim_expires=NULL, worker_pid=NULL WHERE id=?",
+            (author,),
+        )
+    second_author_run = _claim(conn, author)
+    second_handoff = kb.request_review_handoff(
+        conn, author, expected_run_id=second_author_run, review_task_id=audit,
+        reason=f"PR kiddhu/hermes-agent#{PR} second head {HEAD}",
+    )
+    assert second_handoff is not None
+    assert second_handoff.event_id > first_handoff.event_id
+    terminal_run = _claim(conn, audit)
+    metadata = {
+        "audit_outcome": "PASS_EXACT_HEAD",
+        "head": HEAD,
+        "tree": TREE,
+        "base": BASE,
+        "prior_bound_review_run_id": precursor_run,
+        "no_side_effect_receipt": NO_SIDE_EFFECT,
+        "recovery_run_verification": ["prose that must never grant authority"],
+        "auditor": "GemAION",
+        "author": "007AION",
+        "worker_session_id": "s",
+    }
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE task_runs SET status='done', outcome='completed', summary=?, "
+            "metadata=?, ended_at=22222, claim_lock=NULL, claim_expires=NULL, "
+            "worker_pid=NULL WHERE id=?",
+            (TERMINAL_SUMMARY, json.dumps(metadata), terminal_run),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='done', current_run_id=NULL, claim_lock=NULL, "
+            "claim_expires=NULL, worker_pid=NULL WHERE id=?",
+            (audit,),
+        )
+    controller = kb.create_task(conn, title="controller", assignee="gm2")
+    controller_run = _claim(conn, controller)
+    return {
+        "author": author,
+        "audit": audit,
+        "precursor_run": precursor_run,
+        "terminal_run": terminal_run,
+        "controller": controller,
+        "controller_run": controller_run,
+    }
+
+
+def test_plain_crash_recovery_rejects_predecessor_verdict_predating_handoff(kanban_home):
+    with kb.connect() as conn:
+        fixture = _predating_handoff_fixture(conn)
+        assert _recover(conn, fixture) is False
+        assert len(_recovered_verdicts(conn, fixture)) == 1
+
+
+# --- HOSTILE: closed crash-attribution grammar ---------------------------
+
+
+@pytest.mark.parametrize(
+    "exit_kind",
+    ["   ", "gibberish", "unknown ", "UNKNOWN", "false", "not-an-exit-kind", "unknown\n"],
+)
+def test_plain_crash_lane_rejects_loose_exit_kind(kanban_home, exit_kind):
+    with kb.connect() as conn:
+        fixture = _plain_crash_fixture(
+            conn, predecessor_metadata={"pid": 1, "claimer": "x", "exit_kind": exit_kind},
+        )
+        assert _recover(conn, fixture) is False
+        assert len(_recovered_verdicts(conn, fixture)) == 1
+
+
+def test_plain_crash_lane_rejects_explicit_false_protocol_violation(kanban_home):
+    with kb.connect() as conn:
+        fixture = _plain_crash_fixture(
+            conn,
+            predecessor_metadata={
+                "pid": 1, "claimer": "x", "exit_kind": "unknown",
+                "protocol_violation": False,
+            },
+        )
+        assert _recover(conn, fixture) is False
+        assert len(_recovered_verdicts(conn, fixture)) == 1
