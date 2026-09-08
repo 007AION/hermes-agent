@@ -837,12 +837,17 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     # --- review-verdict (terminal-audit recovery; worker controller only) ---
     p_verdict = sub.add_parser(
         "review-verdict",
-        help="Recover one omitted REQUEST_CHANGES from an exact completed audit",
+        help="Recover one omitted REQUEST_CHANGES or PASS from an exact completed audit",
     )
     p_verdict.add_argument("author_task_id")
     p_verdict.add_argument("review_task_id")
     p_verdict.add_argument("expected_review_run_id", type=int)
     p_verdict.add_argument("--reason", required=True)
+    p_verdict.add_argument(
+        "--verdict", choices=("pass", "request_changes"),
+        default="request_changes",
+        help="Recovered verdict kind (default: request_changes)",
+    )
     p_verdict.add_argument(
         "--recovery-receipt-json", required=True,
         help="Closed JSON receipt copied from exact terminal audit run metadata",
@@ -1525,7 +1530,7 @@ def _cmd_review_verdict(args: argparse.Namespace) -> int:
             args.author_task_id,
             review_task_id=args.review_task_id,
             expected_review_run_id=args.expected_review_run_id,
-            verdict="request_changes",
+            verdict=getattr(args, "verdict", "request_changes"),
             reason=args.reason,
             recovery_receipt=receipt,
             controller_task_id=controller_task_id,
@@ -1536,7 +1541,8 @@ def _cmd_review_verdict(args: argparse.Namespace) -> int:
         print("completed review verdict recovery refused", file=sys.stderr)
         return 1
     print(
-        f"Recovered REQUEST_CHANGES for {args.author_task_id} "
+        f"Recovered {getattr(args, 'verdict', 'request_changes').upper()} "
+        f"for {args.author_task_id} "
         f"from {args.review_task_id}/run{args.expected_review_run_id}"
     )
     return 0

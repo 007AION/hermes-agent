@@ -942,7 +942,13 @@ def _handle_review_verdict(args: dict, **kw) -> str:
                     "review verdict refused: the author/child/run binding is "
                     "missing, stale, or conflicts with an existing verdict"
                 )
+            # The worker's own task is the review child on the ordinary path
+            # and the live controller on the recovery path; surfacing it as
+            # ``task_id`` keeps the exact-worker ownership gate consistent with
+            # the other terminal handlers.
+            own_task_id = controller_task_id if recovery_receipt is not None else review_task_id
             return _ok(
+                task_id=own_task_id,
                 author_task_id=author_task_id,
                 review_task_id=review_task_id,
                 review_run_id=review_run_id,
@@ -2018,12 +2024,15 @@ KANBAN_REVIEW_VERDICT_SCHEMA = {
             "recovery_receipt": {
                 "type": "object",
                 "description": (
-                    "Closed commit-bound REQUEST_CHANGES receipt copied from the "
+                    "Closed commit-bound review receipt copied from the "
                     "terminal auditor run metadata. Presence selects fail-closed "
-                    "completed-audit recovery and requires a live gm/gm2 controller run."
+                    "completed-audit recovery and requires a live gm/gm2 controller run. "
+                    "REQUEST_CHANGES_EXACT_HEAD/CHANGES_REQUESTED recovers an omitted "
+                    "REQUEST_CHANGES; approved/APPROVED recovers an omitted PASS after a "
+                    "crashed protocol-violation predecessor emitted the identical PASS."
                 ),
                 "properties": {
-                    "review_outcome": {"type": "string", "enum": ["REQUEST_CHANGES_EXACT_HEAD"]},
+                    "review_outcome": {"type": "string", "enum": ["REQUEST_CHANGES_EXACT_HEAD", "approved"]},
                     "repository": {"type": "string"},
                     "pr": {"type": "integer"},
                     "head": {"type": "string"},
@@ -2031,7 +2040,7 @@ KANBAN_REVIEW_VERDICT_SCHEMA = {
                     "base": {"type": "string"},
                     "github_review_id": {"type": "integer"},
                     "github_review_url": {"type": "string"},
-                    "github_review_state": {"type": "string", "enum": ["CHANGES_REQUESTED"]},
+                    "github_review_state": {"type": "string", "enum": ["CHANGES_REQUESTED", "APPROVED"]},
                 },
                 "required": [
                     "review_outcome", "repository", "pr", "head", "tree", "base",
