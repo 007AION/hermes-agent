@@ -7081,6 +7081,78 @@ def _canonical_completed_recovery_receipt(receipt: Any) -> Optional[dict[str, An
     return {key: receipt[key] for key in sorted(_COMPLETED_RECOVERY_RECEIPT_KEYS)}
 
 
+def _canonical_completed_pass_recovery_receipt(
+    receipt: Any,
+) -> Optional[dict[str, Any]]:
+    """Return one strictly closed completed-audit PASS recovery receipt.
+
+    The PASS family is the approved twin of the REQUEST_CHANGES family:
+    ``review_outcome == "approved"`` and ``github_review_state == "APPROVED"``,
+    with the same closed key set and the same repository/PR/head/tree/base/
+    review-id/url integrity checks.  A PASS receipt is only ever sourced from
+    the exact latest terminal auditor run metadata, never from caller prose.
+    """
+    if not isinstance(receipt, dict) or set(receipt) != _COMPLETED_RECOVERY_RECEIPT_KEYS:
+        return None
+    review_id = receipt.get("github_review_id")
+    pr_number = receipt.get("pr")
+    if (
+        receipt.get("review_outcome") != "approved"
+        or receipt.get("repository") != FACTORY_REVIEW_REPOSITORY
+        or isinstance(pr_number, bool)
+        or not isinstance(pr_number, int)
+        or pr_number <= 0
+        or any(
+            not isinstance(receipt.get(key), str)
+            or re.fullmatch(r"[0-9a-fA-F]{40}", receipt[key]) is None
+            for key in ("head", "tree", "base")
+        )
+        or isinstance(review_id, bool)
+        or not isinstance(review_id, int)
+        or review_id <= 0
+        or receipt.get("github_review_state") != "APPROVED"
+        or receipt.get("github_review_url") != (
+            f"https://github.com/{FACTORY_REVIEW_REPOSITORY}/pull/{pr_number}"
+            f"#pullrequestreview-{review_id}"
+        )
+    ):
+        return None
+    return {key: receipt[key] for key in sorted(_COMPLETED_RECOVERY_RECEIPT_KEYS)}
+
+
+def _reason_bears_commit_identity(reason: Any, receipt: dict[str, Any]) -> bool:
+    """True when the prose reason carries the exact head/tree/base SHAs.
+
+    The crashed predecessor's version-1 PASS is only authoritative when its
+    prose reason re-states the identical commit identity recorded in the latest
+    terminal receipt.  Any head/tree/base drift fails this check.
+    """
+    if not isinstance(reason, str) or not reason:
+        return False
+    return all(
+        isinstance(receipt.get(key), str) and receipt[key] in reason
+        for key in ("head", "tree", "base")
+    )
+
+
+def _run_is_protocol_violation(row: sqlite3.Row) -> bool:
+    """True when a closed run is a clean-exit protocol-violation crash.
+
+    Mirrors the ``detect_crashed_workers`` marker read by
+    ``_protocol_violation_streak``: a ``crashed`` run whose metadata carries
+    ``protocol_violation: true``.
+    """
+    if row["status"] != "crashed" or row["outcome"] != "crashed":
+        return False
+    raw = row["metadata"]
+    if not raw:
+        return False
+    try:
+        return bool(json.loads(raw).get("protocol_violation"))
+    except (TypeError, ValueError):
+        return False
+
+
 def _canonical_completed_recovery_payload(row: sqlite3.Row) -> Optional[dict[str, Any]]:
     """Parse the exact version-2 event minted by completed-audit recovery."""
     try:
@@ -7108,6 +7180,52 @@ def _canonical_completed_recovery_payload(row: sqlite3.Row) -> Optional[dict[str
         or not payload["reason"].strip()
         or row["run_id"] != payload["review_run_id"]
         or _canonical_completed_recovery_receipt(payload["recovery_receipt"]) is None
+    ):
+        return None
+    controller = payload["controller"]
+    controller_schema = {"task_id": str, "run_id": int, "profile": str}
+    if (
+        set(controller) != set(controller_schema)
+        or any(
+            type(controller[key]) is not expected
+            for key, expected in controller_schema.items()
+        )
+        or not controller["task_id"].strip()
+        or controller["profile"] not in FACTORY_REVIEW_VERDICT_RECOVERY_CONTROLLER_PROFILES
+    ):
+        return None
+    return payload
+
+
+def _canonical_completed_pass_recovery_payload(
+    row: sqlite3.Row,
+) -> Optional[dict[str, Any]]:
+    """Parse the exact version-2 PASS event minted by completed-audit recovery."""
+    try:
+        payload = json.loads(row["payload"] or "{}")
+    except (TypeError, ValueError):
+        return None
+    schema = {
+        "version": int,
+        "review_task_id": str,
+        "review_run_id": int,
+        "verdict": str,
+        "reason": str,
+        "recovery": bool,
+        "recovery_receipt": dict,
+        "controller": dict,
+    }
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != set(schema)
+        or any(type(payload[key]) is not expected for key, expected in schema.items())
+        or payload["version"] != 2
+        or payload["verdict"] != "pass"
+        or payload["recovery"] is not True
+        or not payload["review_task_id"].strip()
+        or not payload["reason"].strip()
+        or row["run_id"] != payload["review_run_id"]
+        or _canonical_completed_pass_recovery_receipt(payload["recovery_receipt"]) is None
     ):
         return None
     controller = payload["controller"]
@@ -7970,6 +8088,19 @@ def _canonical_audit_receipt(
         "WHERE task_id = ? AND kind = 'review_verdict' AND id > ? ORDER BY id",
         (task_id, handoff.event_id),
     ).fetchall()
+    if len(verdict_rows) == 2:
+        recovered = _recovered_pass_audit_receipt(
+            conn,
+            verdict_rows,
+            task_id=task_id,
+            author_run_id=author_run_id,
+            author_profile=author_profile,
+            auditor_task_id=auditor_task_id,
+            auditor_profile=auditor_profile,
+            handoff=handoff,
+        )
+        if recovered is not None:
+            return recovered
     if len(verdict_rows) != 1:
         return None
     verdict_row = verdict_rows[0]
@@ -8024,6 +8155,119 @@ def _canonical_audit_receipt(
         "auditor_profile": auditor_profile,
         "verdict": "PASS" if raw_verdict == "pass" else "REQUEST_CHANGES",
         "issued_at": int(verdict_row["created_at"]),
+    }
+    receipt_hash = hashlib.sha256(
+        json.dumps(
+            receipt, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    return {**receipt, "receipt_hash": receipt_hash, "authenticated": True}
+
+
+def _recovered_pass_audit_receipt(
+    conn: sqlite3.Connection,
+    verdict_rows: list[sqlite3.Row],
+    *,
+    task_id: str,
+    author_run_id: int,
+    author_profile: str,
+    auditor_task_id: str,
+    auditor_profile: str,
+    handoff: Any,
+) -> Optional[dict[str, Any]]:
+    """Resolve one authoritative PASS from a crashed-precursor + recovery pair.
+
+    The exact shape this accepts is the completed-audit PASS recovery emitted by
+    ``_recover_completed_pass_verdict``: a version-1 PASS bound to a crashed
+    protocol-violation run, followed by a version-2 recovery PASS bound to the
+    latest completed terminal run whose APPROVED receipt matches byte-for-byte
+    and whose commit identity is re-stated by the predecessor's reason.  Any
+    other two-verdict shape fails closed.
+    """
+    if len(verdict_rows) != 2:
+        return None
+    precursor_row, recovery_row = verdict_rows
+    precursor = _canonical_review_verdict_payload(precursor_row)
+    if (
+        precursor is None
+        or precursor["verdict"] != "pass"
+        or precursor["review_task_id"] != auditor_task_id
+        or precursor_row["run_id"] != precursor["review_run_id"]
+    ):
+        return None
+    recovery = _canonical_completed_pass_recovery_payload(recovery_row)
+    if (
+        recovery is None
+        or recovery["review_task_id"] != auditor_task_id
+        or recovery_row["run_id"] != recovery["review_run_id"]
+        or type(recovery_row["created_at"]) is not int
+    ):
+        return None
+    terminal_run_id = int(recovery["review_run_id"])
+    precursor_run_id = int(precursor["review_run_id"])
+
+    auditor_runs = conn.execute(
+        "SELECT id, profile, status, outcome, summary, metadata, ended_at "
+        "FROM task_runs WHERE task_id = ? ORDER BY id DESC", (auditor_task_id,),
+    ).fetchall()
+    if len(auditor_runs) != 2:
+        return None
+    terminal, precursor_run = auditor_runs[0], auditor_runs[1]
+    if (
+        int(terminal["id"]) != terminal_run_id
+        or int(precursor_run["id"]) != precursor_run_id
+        or terminal["profile"] != auditor_profile
+        or terminal["status"] != "done"
+        or terminal["outcome"] != "completed"
+        or terminal["ended_at"] is None
+        or precursor_run["profile"] != auditor_profile
+        or precursor_run["ended_at"] is None
+        or not _run_is_protocol_violation(precursor_run)
+    ):
+        return None
+    try:
+        metadata = json.loads(terminal["metadata"] or "{}")
+    except (TypeError, ValueError):
+        return None
+    receipt, receipt_family = _closed_completed_audit_recovery_receipt(
+        metadata, _COMPLETED_RECOVERY_RECEIPT_KEYS,
+    )
+    if (
+        receipt_family != "top_level"
+        or receipt is None
+        or receipt != _canonical_completed_pass_recovery_receipt(
+            recovery["recovery_receipt"]
+        )
+    ):
+        return None
+    if recovery["reason"] != terminal["summary"]:
+        return None
+    if not _reason_bears_commit_identity(precursor["reason"], receipt):
+        return None
+
+    mirrors = conn.execute(
+        "SELECT run_id, payload FROM task_events WHERE task_id = ? "
+        "AND kind = 'review_verdict' AND run_id = ? AND id > ? ORDER BY id",
+        (auditor_task_id, terminal_run_id, handoff.event_id),
+    ).fetchall()
+    if len(mirrors) != 1:
+        return None
+    mirror = _canonical_completed_pass_recovery_payload(mirrors[0])
+    if mirror is None or mirror != recovery:
+        return None
+
+    receipt = {
+        "task_id": task_id,
+        "subject_id": f"{task_id}/{author_run_id}",
+        "subject_version_or_exact_hash": handoff.receipt_sha256,
+        "author_task_id": task_id,
+        "author_run_id": author_run_id,
+        "author_profile": author_profile,
+        "auditor_task_id": auditor_task_id,
+        "auditor_run_id": terminal_run_id,
+        "auditor_profile": auditor_profile,
+        "verdict": "PASS",
+        "issued_at": int(recovery_row["created_at"]),
     }
     receipt_hash = hashlib.sha256(
         json.dumps(
@@ -8915,6 +9159,19 @@ def _record_review_verdict(
         return False
     with write_txn(conn):
         if recovery_receipt is not None:
+            if verdict == "pass":
+                return _recover_completed_pass_verdict(
+                    conn,
+                    task_id,
+                    review_task_id=review_task_id,
+                    expected_review_run_id=expected_review_run_id,
+                    verdict=verdict,
+                    reason=reason,
+                    recovery_receipt=recovery_receipt,
+                    controller_task_id=controller_task_id,
+                    controller_run_id=controller_run_id,
+                    controller_profile=controller_profile,
+                )
             return _recover_completed_review_verdict(
                 conn,
                 task_id,
@@ -9533,6 +9790,240 @@ def _recover_completed_review_verdict(
         raise _ReviewHandoffConflict
     _append_event(
         conn, task_id, "review_verdict", payload, run_id=expected_review_run_id,
+    )
+    return True
+
+
+def _authenticated_predecessor_crashed_pass_run_id(
+    conn: sqlite3.Connection,
+    *,
+    author_task_id: str,
+    auditor_task_id: str,
+    auditor_profile: str,
+    terminal_run_id: int,
+    terminal_receipt: dict[str, Any],
+) -> Optional[int]:
+    """Authenticate the crashed protocol-violation PASS before a terminal PASS.
+
+    Returns the predecessor run id only when the auditor has exactly two closed
+    runs — a latest completed terminal run and a single crashed
+    protocol-violation predecessor — and the predecessor emitted exactly one
+    version-1 PASS verdict, mirrored byte-identically on author and child,
+    whose prose reason re-states the identical head/tree/base commit identity
+    of the terminal receipt.
+    """
+    runs = conn.execute(
+        "SELECT id, profile, status, outcome, metadata, ended_at FROM task_runs "
+        "WHERE task_id = ? ORDER BY id DESC", (auditor_task_id,),
+    ).fetchall()
+    if len(runs) != 2:
+        return None
+    terminal, predecessor = runs[0], runs[1]
+    if (
+        int(terminal["id"]) != terminal_run_id
+        or terminal["profile"] != auditor_profile
+        or terminal["status"] != "done"
+        or terminal["outcome"] != "completed"
+        or terminal["ended_at"] is None
+        or predecessor["profile"] != auditor_profile
+        or predecessor["ended_at"] is None
+        or not _run_is_protocol_violation(predecessor)
+    ):
+        return None
+    predecessor_run_id = int(predecessor["id"])
+
+    author_verdicts = conn.execute(
+        "SELECT id, run_id, payload FROM task_events WHERE task_id = ? "
+        "AND kind = 'review_verdict' ORDER BY id", (author_task_id,),
+    ).fetchall()
+    matched = []
+    for row in author_verdicts:
+        payload = _canonical_review_verdict_payload(row)
+        if (
+            payload is not None
+            and payload["review_task_id"] == auditor_task_id
+            and payload["review_run_id"] == predecessor_run_id
+            and payload["verdict"] == "pass"
+            and row["run_id"] == predecessor_run_id
+        ):
+            matched.append(payload)
+    if len(matched) != 1:
+        return None
+    child_verdicts = conn.execute(
+        "SELECT run_id, payload FROM task_events WHERE task_id = ? "
+        "AND kind = 'review_verdict' AND run_id = ? ORDER BY id",
+        (auditor_task_id, predecessor_run_id),
+    ).fetchall()
+    if len(child_verdicts) != 1:
+        return None
+    child_payload = _canonical_review_verdict_payload(child_verdicts[0])
+    if child_payload is None or child_payload != matched[0]:
+        return None
+    if not _reason_bears_commit_identity(matched[0]["reason"], terminal_receipt):
+        return None
+    return predecessor_run_id
+
+
+def _recover_completed_pass_verdict(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    review_task_id: str,
+    expected_review_run_id: int,
+    verdict: str,
+    reason: str,
+    recovery_receipt: dict,
+    controller_task_id: Optional[str],
+    controller_run_id: Optional[int],
+    controller_profile: Optional[str],
+) -> bool:
+    """Recover one authenticated PASS from a terminal audit run.
+
+    Only a live gm/gm2 controller may bind an omitted PASS to the exact latest
+    terminal direct-auditor run after a predecessor same-child run emitted the
+    identical PASS and then crashed from a proven protocol-violation retry.
+    PASS leaves the author nonterminal (status ``review``), so the author is
+    never resumed here.
+    """
+    if (
+        verdict != "pass"
+        or not isinstance(recovery_receipt, dict)
+        or not controller_task_id
+        or controller_run_id is None
+        or controller_profile
+        not in FACTORY_REVIEW_VERDICT_RECOVERY_CONTROLLER_PROFILES
+    ):
+        return False
+    try:
+        controller_run_id = int(controller_run_id)
+    except (TypeError, ValueError):
+        return False
+    if conn.execute(
+        "SELECT 1 FROM tasks task JOIN task_runs run "
+        "ON run.id = ? AND run.task_id = task.id "
+        "WHERE task.id = ? AND task.assignee = ? AND task.status = 'running' "
+        "AND task.current_run_id = run.id AND run.profile = ? "
+        "AND run.status = 'running' AND run.outcome IS NULL AND run.ended_at IS NULL",
+        (controller_run_id, controller_task_id, controller_profile, controller_profile),
+    ).fetchone() is None:
+        return False
+
+    author = conn.execute(
+        "SELECT status, assignee, current_run_id FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    child = conn.execute(
+        "SELECT status, assignee, current_run_id FROM tasks WHERE id = ?",
+        (review_task_id,),
+    ).fetchone()
+    if (
+        author is None
+        or author["assignee"] != FACTORY_REVIEW_AUTHOR_PROFILE
+        or author["current_run_id"] is not None
+        or author["status"] != "review"
+        or child is None
+        or child["assignee"] != FACTORY_REVIEW_AUDITOR_PROFILE
+        or child["status"] not in {"done", "archived"}
+        or child["current_run_id"] is not None
+        or conn.execute(
+            "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ?",
+            (task_id, review_task_id),
+        ).fetchone() is None
+    ):
+        return False
+
+    runs = conn.execute(
+        "SELECT id, profile, status, outcome, summary, metadata, ended_at "
+        "FROM task_runs WHERE task_id = ? ORDER BY id DESC", (review_task_id,),
+    ).fetchall()
+    if (
+        not runs
+        or int(runs[0]["id"]) != expected_review_run_id
+        or any(row["ended_at"] is None for row in runs)
+    ):
+        return False
+    review_run = runs[0]
+    if (
+        review_run["profile"] != FACTORY_REVIEW_AUDITOR_PROFILE
+        or review_run["status"] != "done"
+        or review_run["outcome"] != "completed"
+        or review_run["ended_at"] is None
+        or review_run["summary"] != reason
+    ):
+        return False
+    try:
+        metadata = json.loads(review_run["metadata"] or "{}")
+    except (TypeError, ValueError):
+        return False
+    expected_receipt = _canonical_completed_pass_recovery_receipt(recovery_receipt)
+    receipt, receipt_family = _closed_completed_audit_recovery_receipt(
+        metadata, _COMPLETED_RECOVERY_RECEIPT_KEYS,
+    )
+    if (
+        expected_receipt is None
+        or receipt_family != "top_level"
+        or receipt != expected_receipt
+    ):
+        return False
+
+    predecessor_run_id = _authenticated_predecessor_crashed_pass_run_id(
+        conn,
+        author_task_id=task_id,
+        auditor_task_id=review_task_id,
+        auditor_profile=FACTORY_REVIEW_AUDITOR_PROFILE,
+        terminal_run_id=expected_review_run_id,
+        terminal_receipt=receipt,
+    )
+    if predecessor_run_id is None:
+        return False
+
+    payload = {
+        "version": 2,
+        "review_task_id": review_task_id,
+        "review_run_id": expected_review_run_id,
+        "verdict": verdict,
+        "reason": reason,
+        "recovery": True,
+        "recovery_receipt": receipt,
+        "controller": {
+            "task_id": controller_task_id,
+            "run_id": controller_run_id,
+            "profile": controller_profile,
+        },
+    }
+    prior = conn.execute(
+        "SELECT id, run_id, payload FROM task_events WHERE task_id = ? "
+        "AND kind = 'review_verdict' ORDER BY id", (task_id,),
+    ).fetchall()
+    replay_seen = False
+    for row in prior:
+        try:
+            prior_payload = json.loads(row["payload"] or "{}")
+        except (TypeError, ValueError):
+            return False
+        if not isinstance(prior_payload, dict):
+            return False
+        if prior_payload.get("review_task_id") != review_task_id:
+            continue
+        if prior_payload == payload and row["run_id"] == expected_review_run_id:
+            replay_seen = True
+            continue
+        # Any other verdict for this auditor child is a conflict unless it is
+        # the authenticated crashed predecessor PASS.
+        if (
+            row["run_id"] != predecessor_run_id
+            or _canonical_review_verdict_payload(row) is None
+            or prior_payload["verdict"] != "pass"
+        ):
+            return False
+    if replay_seen:
+        return True
+
+    _append_event(
+        conn, task_id, "review_verdict", payload, run_id=expected_review_run_id,
+    )
+    _append_event(
+        conn, review_task_id, "review_verdict", payload,
+        run_id=expected_review_run_id,
     )
     return True
 
