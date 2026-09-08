@@ -6924,37 +6924,46 @@ def _review_handoff_event_for_child(
     task_id: str,
     review_task_id: str,
 ) -> Optional[sqlite3.Row]:
-    """Return the latest typed handoff binding ``task_id`` to this child."""
+    """Return the latest typed handoff binding ``task_id`` to this child.
+
+    Only the latest handoff may bind: a missing, hash-invalid, or malformed
+    latest handoff, or one that binds a different auditor child, fails closed.
+    No fallback to an older valid handoff is permitted — an older handoff was
+    superseded by the latest review round and must never re-grant authority.
+    """
     rows = conn.execute(
         "SELECT id, run_id, payload FROM task_events "
-        "WHERE task_id = ? AND kind = 'review_handoff' ORDER BY id DESC",
+        "WHERE task_id = ? AND kind = 'review_handoff' ORDER BY id DESC LIMIT 1",
         (task_id,),
     ).fetchall()
-    for row in rows:
-        receipt = _review_handoff_receipt_from_row(task_id, row)
-        if receipt is None:
-            continue
-        if receipt.review_task_id != review_task_id:
-            return None
-        provenance = conn.execute(
-            "SELECT 1 FROM tasks author "
-            "JOIN tasks child ON child.id = ? "
-            "JOIN task_links edge ON edge.parent_id = author.id "
-            " AND edge.child_id = child.id "
-            "JOIN task_runs run ON run.id = ? AND run.task_id = author.id "
-            "WHERE author.id = ? AND author.status = 'review' "
-            "AND author.current_run_id IS NULL "
-            "AND author.claim_lock IS NULL AND author.claim_expires IS NULL "
-            "AND author.worker_pid IS NULL AND author.worker_starttime IS NULL "
-            "AND author.fence_lineage IS NULL AND author.fence_disposition IS NULL "
-            "AND author.assignee IS NOT NULL AND child.assignee IS NOT NULL "
-            "AND author.assignee != child.assignee "
-            "AND run.status = 'review_required' "
-            "AND run.outcome = 'review_required' AND run.ended_at IS NOT NULL",
-            (review_task_id, receipt.expected_run_id, task_id),
-        ).fetchone()
-        return row if provenance is not None else None
-    return None
+    if not rows:
+        return None
+    row = rows[0]
+    receipt = _review_handoff_receipt_from_row(task_id, row)
+    if receipt is None:
+        return None
+    if receipt.review_task_id != review_task_id:
+        return None
+    provenance = conn.execute(
+        "SELECT 1 FROM tasks author "
+        "JOIN tasks child ON child.id = ? "
+        "JOIN task_links edge ON edge.parent_id = author.id "
+        " AND edge.child_id = child.id "
+        "JOIN task_runs run ON run.id = ? AND run.task_id = author.id "
+        "WHERE author.id = ? AND author.status = 'review' "
+        "AND author.current_run_id IS NULL "
+        "AND author.claim_lock IS NULL AND author.claim_expires IS NULL "
+        "AND author.worker_pid IS NULL AND author.worker_starttime IS NULL "
+        "AND author.fence_lineage IS NULL AND author.fence_disposition IS NULL "
+        "AND author.assignee IS NOT NULL AND child.assignee IS NOT NULL "
+        "AND author.assignee != child.assignee "
+        "AND run.status = 'review_required' "
+        "AND run.outcome = 'review_required' AND run.ended_at IS NOT NULL "
+        "AND run.id = (SELECT MAX(r2.id) FROM task_runs r2 "
+        "              WHERE r2.task_id = author.id)",
+        (review_task_id, receipt.expected_run_id, task_id),
+    ).fetchone()
+    return row if provenance is not None else None
 
 
 def _review_handoff_parent_satisfies_child(

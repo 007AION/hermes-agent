@@ -430,6 +430,72 @@ def test_plain_crash_recovery_rejects_predecessor_verdict_predating_handoff(kanb
         assert len(_recovered_verdicts(conn, fixture)) == 1
 
 
+def _latest_handoff_row(conn, author):
+    return conn.execute(
+        "SELECT id, run_id, payload FROM task_events WHERE task_id=? "
+        "AND kind='review_handoff' ORDER BY id DESC LIMIT 1",
+        (author,),
+    ).fetchone()
+
+
+def test_review_handoff_event_for_child_does_not_fallback_on_deleted_latest(kanban_home):
+    # A missing latest handoff must fail closed, not fall back to an older
+    # valid handoff that bound a superseded review round.
+    with kb.connect() as conn:
+        fixture = _predating_handoff_fixture(conn)
+        latest = _latest_handoff_row(conn, fixture["author"])
+        with kb.write_txn(conn):
+            conn.execute("DELETE FROM task_events WHERE id=?", (latest["id"],))
+        assert kb._review_handoff_event_for_child(
+            conn, fixture["author"], fixture["audit"]
+        ) is None
+        assert _recover(conn, fixture) is False
+        assert len(_recovered_verdicts(conn, fixture)) == 1
+
+
+def test_review_handoff_event_for_child_does_not_fallback_on_hash_invalid_latest(kanban_home):
+    # A hash-invalid latest handoff must fail closed, not fall back to an
+    # older valid handoff that bound a superseded review round.
+    with kb.connect() as conn:
+        fixture = _predating_handoff_fixture(conn)
+        latest = _latest_handoff_row(conn, fixture["author"])
+        payload = json.loads(latest["payload"])
+        payload["receipt_sha256"] = "0" * 64
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_events SET payload=? WHERE id=?",
+                (json.dumps(payload), latest["id"]),
+            )
+        assert kb._review_handoff_event_for_child(
+            conn, fixture["author"], fixture["audit"]
+        ) is None
+        assert _recover(conn, fixture) is False
+        assert len(_recovered_verdicts(conn, fixture)) == 1
+
+
+def test_review_handoff_event_for_child_binds_only_latest_review_run(kanban_home):
+    # Only the handoff binding the author's latest review-required run may
+    # authenticate.  After deleting the latest handoff, the older handoff (for
+    # an earlier run) must not bind, even though both runs are review_required.
+    with kb.connect() as conn:
+        fixture = _predating_handoff_fixture(conn)
+        latest = _latest_handoff_row(conn, fixture["author"])
+        with kb.write_txn(conn):
+            conn.execute("DELETE FROM task_events WHERE id=?", (latest["id"],))
+        # The older handoff is still present and structurally valid.
+        older = conn.execute(
+            "SELECT id, run_id, payload FROM task_events WHERE task_id=? "
+            "AND kind='review_handoff' ORDER BY id",
+            (fixture["author"],),
+        ).fetchone()
+        assert older is not None
+        assert kb._review_handoff_receipt_from_row(fixture["author"], older) is not None
+        # ...but it must not bind because it names a superseded run.
+        assert kb._review_handoff_event_for_child(
+            conn, fixture["author"], fixture["audit"]
+        ) is None
+
+
 # --- HOSTILE: closed crash-attribution grammar ---------------------------
 
 
