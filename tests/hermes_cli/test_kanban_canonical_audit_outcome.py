@@ -754,3 +754,126 @@ def test_finalizer_fails_closed_on_malformed_present_v3(kanban_home):
         assert kb._resolved_canonical_audit_outcome(conn, fx["author"]) is None
         # Fail closed: no legacy fallthrough.
         assert kb._reviewed_author_finalizer_run_id(conn, fx["author"]) is None
+
+
+# ---------------------------------------------------------------------------
+# Round-4 resolver hardening: bind event rows to exact live run/profile
+# provenance and enforce exact live disposition/continuation-set equality.
+# ---------------------------------------------------------------------------
+
+def test_resolver_rejects_drifted_author_run_profile(kanban_home):
+    """The author run must reference a live task_runs row bound to the
+    author's live assignee; a drifted profile fails closed."""
+    with kb.connect() as conn:
+        fx = _bound_fixture(conn)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_runs SET profile = ? WHERE id = ?",
+                ("evil_author", fx["author_run"]),
+            )
+        assert kb._resolved_canonical_audit_outcome(conn, fx["author"]) is None
+        assert kb._reviewed_author_finalizer_run_id(conn, fx["author"]) is None
+
+
+def test_resolver_rejects_drifted_audit_run_profile(kanban_home):
+    """The audit run must reference a live task_runs row bound to the
+    auditor's live assignee; a drifted profile fails closed."""
+    with kb.connect() as conn:
+        fx = _bound_fixture(conn)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_runs SET profile = ? WHERE id = ?",
+                ("evil_auditor", fx["audit_run"]),
+            )
+        assert kb._resolved_canonical_audit_outcome(conn, fx["author"]) is None
+
+
+def test_resolver_rejects_missing_author_run_row(kanban_home):
+    """A fabricated author run id (no live task_runs row) fails closed."""
+    with kb.connect() as conn:
+        fx = _bound_fixture(conn)
+        with kb.write_txn(conn):
+            conn.execute("DELETE FROM task_runs WHERE id = ?", (fx["author_run"],))
+        assert kb._resolved_canonical_audit_outcome(conn, fx["author"]) is None
+
+
+def test_resolver_rejects_missing_audit_run_row(kanban_home):
+    """A fabricated audit run id (no live task_runs row) fails closed."""
+    with kb.connect() as conn:
+        fx = _bound_fixture(conn)
+        with kb.write_txn(conn):
+            conn.execute("DELETE FROM task_runs WHERE id = ?", (fx["audit_run"],))
+        assert kb._resolved_canonical_audit_outcome(conn, fx["author"]) is None
+
+
+def test_resolver_rejects_drifted_author_envelope_event_run(kanban_home):
+    """The author envelope event must be bound to the exact author run; a
+    drifted event run fails closed."""
+    with kb.connect() as conn:
+        fx = _bound_fixture(conn)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_events SET run_id = ? WHERE task_id = ? AND kind = ?",
+                (fx["author_run"] + 999, fx["author"], kb.CANONICAL_AUDIT_OUTCOME_EVENT),
+            )
+        assert kb._resolved_canonical_audit_outcome(conn, fx["author"]) is None
+
+
+def test_resolver_rejects_drifted_audit_envelope_mirror_run(kanban_home):
+    """The audit envelope mirror event must be bound to the exact audit run;
+    a drifted event run fails closed."""
+    with kb.connect() as conn:
+        fx = _bound_fixture(conn)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_events SET run_id = ? WHERE task_id = ? AND kind = ?",
+                (fx["audit_run"] + 999, fx["audit"], kb.CANONICAL_AUDIT_OUTCOME_EVENT),
+            )
+        assert kb._resolved_canonical_audit_outcome(conn, fx["author"]) is None
+
+
+def test_resolver_rejects_drifted_author_changed_fact_run(kanban_home):
+    """The author changed_fact mirror must be bound to the exact author run."""
+    with kb.connect() as conn:
+        fx = _bound_fixture(conn)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_events SET run_id = ? WHERE task_id = ? AND kind = ?",
+                (fx["author_run"] + 999, fx["author"], kb.CHANGED_FACT_EVENT),
+            )
+        assert kb._resolved_canonical_audit_outcome(conn, fx["author"]) is None
+
+
+def test_resolver_rejects_drifted_audit_changed_fact_run(kanban_home):
+    """The audit changed_fact mirror must be bound to the exact audit run."""
+    with kb.connect() as conn:
+        fx = _bound_fixture(conn)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_events SET run_id = ? WHERE task_id = ? AND kind = ?",
+                (fx["audit_run"] + 999, fx["audit"], kb.CHANGED_FACT_EVENT),
+            )
+        assert kb._resolved_canonical_audit_outcome(conn, fx["author"]) is None
+
+
+def test_resolver_rejects_late_final_accepted_child(kanban_home):
+    """A FINAL_ACCEPTED envelope that later gains a live child must fail
+    closed (the recorded disposition no longer matches the live graph)."""
+    with kb.connect() as conn:
+        fx = _bound_fixture(conn)  # FINAL_ACCEPTED (no continuation child)
+        kb.create_task(
+            conn, title="late merge", assignee="merger", parents=[fx["author"]],
+        )
+        assert kb._resolved_canonical_audit_outcome(conn, fx["author"]) is None
+        assert kb._reviewed_author_finalizer_run_id(conn, fx["author"]) is None
+
+
+def test_resolver_rejects_non_exhaustive_continuation_subset(kanban_home):
+    """A CONTINUATION_COMMITTED envelope whose recorded continuation is a
+    non-exhaustive subset of the live children must fail closed."""
+    with kb.connect() as conn:
+        fx = _bound_fixture(conn, continuation_child=True)  # [merge1]
+        kb.create_task(
+            conn, title="second merge", assignee="merger", parents=[fx["author"]],
+        )
+        assert kb._resolved_canonical_audit_outcome(conn, fx["author"]) is None

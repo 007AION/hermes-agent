@@ -8416,17 +8416,29 @@ def _bind_canonical_audit_outcome(
 def _latest_changed_fact(
     conn: sqlite3.Connection,
     task_id: str,
+    *,
+    run_id: Optional[int] = None,
 ) -> Optional[dict[str, Any]]:
     """Return the latest parsed ``changed_fact`` event for a task, or None.
 
+    When ``run_id`` is given, the event must be bound to exactly that run: the
+    terminal writer records the changed-fact under the author/audit run it
+    belongs to, so a drifted event under a foreign run must not be trusted.
     Only a ``dict`` payload is returned; malformed payloads fail closed to
     ``None`` so the resolver never trusts unparseable producer state.
     """
-    row = conn.execute(
-        "SELECT payload FROM task_events WHERE task_id = ? AND kind = ? "
-        "ORDER BY id DESC LIMIT 1",
-        (task_id, CHANGED_FACT_EVENT),
-    ).fetchone()
+    if run_id is not None:
+        row = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND kind = ? "
+            "AND run_id = ? ORDER BY id DESC LIMIT 1",
+            (task_id, CHANGED_FACT_EVENT, run_id),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND kind = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id, CHANGED_FACT_EVENT),
+        ).fetchone()
     if row is None:
         return None
     try:
@@ -8455,6 +8467,27 @@ def _canonical_audit_outcome_event_present(
     ).fetchone() is not None
 
 
+def _task_run_matches(
+    conn: sqlite3.Connection,
+    run_id: int,
+    task_id: str,
+    profile: str,
+) -> bool:
+    """True when ``run_id`` references a live task_runs row for ``task_id``
+    bound to ``profile`` (exact run/profile provenance).
+
+    The terminal writer records the envelope under the author and audit runs
+    it belongs to; a fabricated or cross-task run id — or a run row whose
+    ``profile`` drifts from the task's live assignee — must not be trusted to
+    grant finalizer authority.
+    """
+    row = conn.execute(
+        "SELECT profile FROM task_runs WHERE id = ? AND task_id = ?",
+        (run_id, task_id),
+    ).fetchone()
+    return row is not None and row["profile"] == profile
+
+
 def _resolved_canonical_audit_outcome(
     conn: sqlite3.Connection,
     author_task_id: str,
@@ -8462,7 +8495,7 @@ def _resolved_canonical_audit_outcome(
     """Return the latest persisted canonical audit-outcome envelope for an
     author, if it is a strictly valid version-3 envelope."""
     row = conn.execute(
-        "SELECT payload FROM task_events WHERE task_id = ? AND kind = ? "
+        "SELECT run_id, payload FROM task_events WHERE task_id = ? AND kind = ? "
         "ORDER BY id DESC LIMIT 1",
         (author_task_id, CANONICAL_AUDIT_OUTCOME_EVENT),
     ).fetchone()
@@ -8513,6 +8546,11 @@ def _resolved_canonical_audit_outcome(
         or not isinstance(handoff_event_id, int)
     ):
         return None
+    # The author envelope event must itself be bound to the exact author run
+    # it records (the terminal writer stamps every event with the run it
+    # belongs to); a drifted event under a foreign run must not be trusted.
+    if row["run_id"] != author_run_id:
+        return None
     # audit_task_id must be a live direct child of the author.
     if conn.execute(
         "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ?",
@@ -8532,6 +8570,18 @@ def _resolved_canonical_audit_outcome(
         role.get("author_profile") != author_assignee["assignee"]
         or role.get("auditor_profile") != audit_assignee["assignee"]
         or author_assignee["assignee"] == audit_assignee["assignee"]
+    ):
+        return None
+    # Exact run/profile provenance: author_run_id / audit_run_id must reference
+    # live task_runs rows bound to the author/auditor task AND its live
+    # assignee. A fabricated or cross-task run id, or a run row whose profile
+    # drifts, fails closed.
+    if not _task_run_matches(
+        conn, author_run_id, author_task_id, author_assignee["assignee"]
+    ):
+        return None
+    if not _task_run_matches(
+        conn, audit_run_id, audit_task_id, audit_assignee["assignee"]
     ):
         return None
     # handoff_event_id must reference the real review_handoff event binding
@@ -8575,11 +8625,13 @@ def _resolved_canonical_audit_outcome(
     # writer recorded.  A lone author envelope — no audit mirror, no
     # changed-fact mirrors — must not grant finalizer authority.
     audit_mirror_row = conn.execute(
-        "SELECT id, payload FROM task_events WHERE task_id = ? AND kind = ? "
+        "SELECT id, run_id, payload FROM task_events WHERE task_id = ? AND kind = ? "
         "ORDER BY id DESC LIMIT 1",
         (audit_task_id, CANONICAL_AUDIT_OUTCOME_EVENT),
     ).fetchone()
     if audit_mirror_row is None:
+        return None
+    if audit_mirror_row["run_id"] != audit_run_id:
         return None
     try:
         audit_mirror = json.loads(audit_mirror_row["payload"] or "{}")
@@ -8588,8 +8640,8 @@ def _resolved_canonical_audit_outcome(
     if audit_mirror != envelope:
         return None
 
-    author_fact = _latest_changed_fact(conn, author_task_id)
-    audit_fact = _latest_changed_fact(conn, audit_task_id)
+    author_fact = _latest_changed_fact(conn, author_task_id, run_id=author_run_id)
+    audit_fact = _latest_changed_fact(conn, audit_task_id, run_id=audit_run_id)
     if author_fact is None or audit_fact is None or author_fact != audit_fact:
         return None
     fact = author_fact
@@ -8625,6 +8677,19 @@ def _resolved_canonical_audit_outcome(
             ).fetchone() is None:
                 return None
     else:
+        return None
+    # Exact live disposition/continuation-set equality: recompute the current
+    # continuation from live task_links/tasks and require the recorded
+    # disposition + ordered continuation to byte-match. A late child (a
+    # FINAL_ACCEPTED that later gained a child), a non-exhaustive subset, or an
+    # extra/foreign target fails closed — the envelope may not grant finalizer
+    # authority over a disposition the live graph no longer reflects.
+    live_disposition, live_targets = _audit_continuation_targets(
+        conn, author_task_id, audit_task_id,
+    )
+    if live_disposition is None or live_disposition != disposition:
+        return None
+    if continuation != live_targets:
         return None
     return envelope
 
