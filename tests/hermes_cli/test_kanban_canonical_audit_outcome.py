@@ -1,0 +1,406 @@
+"""Canonical audit-outcome envelope + atomic continuation invariant.
+
+Reproduces the split-PASS defect (PASS -> stop-guard protocol-violation crash
+-> successor-run completion -> ``_canonical_audit_receipt`` null) as base RED,
+then proves the corrected producer path: a bound PASS completed in the *same*
+run binds exactly one version-3 canonical audit-outcome envelope, one bounded
+``changed_fact``, and exactly one ``FINAL_ACCEPTED`` xor
+``CONTINUATION_COMMITTED`` disposition, atomically inside the terminal writer.
+
+Hostile identity / evidence / role / continuation matrices must fail closed
+with zero mutation, and the resolved envelope must be what the reviewed-author
+finalizer consumes.
+"""
+
+from __future__ import annotations
+
+import copy
+import json
+from pathlib import Path
+
+import pytest
+
+from hermes_cli import kanban_db as kb
+
+
+# Exact closed evidence identity (the same canonical spelling the PASS
+# recovery normalizer already accepts).
+REPOSITORY = "kiddhu/hermes-agent"
+PR = 97
+HEAD = "d0cd38d4f87f2e77dd92fd5faa358d1d67d60286"
+TREE = "f6050f4cad2e89e7fefd5d049c103e848142ec91"
+BASE = "13d9faadb3cf1215888a59d9911c5b8e8a2114df"
+REVIEW_ID = 5154659342
+REVIEW_URL = (
+    f"https://github.com/{REPOSITORY}/pull/{PR}"
+    f"#pullrequestreview-{REVIEW_ID}"
+)
+
+AUTHOR_PROFILE = "agent007"
+AUDITOR_PROFILE = "bafuxunan"
+
+
+def _evidence_metadata():
+    return {
+        "review_outcome": "approved",
+        "repository": REPOSITORY,
+        "pr": PR,
+        "head": HEAD,
+        "tree": TREE,
+        "base": BASE,
+        "github_review_id": REVIEW_ID,
+        "github_review_url": REVIEW_URL,
+        "github_review_state": "APPROVED",
+    }
+
+
+PRECURSOR_REASON = (
+    f"PASS exact head {HEAD}/tree {TREE}/base {BASE}. Independently "
+    "reproduced named base RED tests; changed suites GREEN."
+)
+
+
+@pytest.fixture
+def kanban_home(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    return home
+
+
+def _claim(conn, task_id) -> int:
+    claimed = kb.claim_task(conn, task_id)
+    assert claimed is not None and claimed.current_run_id is not None
+    return int(claimed.current_run_id)
+
+
+def _fixture(conn, *, continuation_child: bool = False):
+    """Author (agent007) -> audit (bafuxunan), PASS bound to the audit run."""
+    author = kb.create_task(
+        conn, title="implementation", factory_build_gate=1, assignee=AUTHOR_PROFILE,
+    )
+    author_run = _claim(conn, author)
+    audit = kb.create_task(
+        conn, title="exact-head audit", assignee=AUDITOR_PROFILE, parents=[author],
+    )
+    if continuation_child:
+        kb.create_task(
+            conn, title="merge", assignee="merger", parents=[author],
+        )
+    assert kb.request_review_handoff(
+        conn, author, expected_run_id=author_run, review_task_id=audit,
+        reason=f"PR #{PR} frozen at exact head {HEAD}",
+    ) is not None
+    audit_run = _claim(conn, audit)
+    assert kb.record_review_verdict(
+        conn, author, review_task_id=audit,
+        expected_review_run_id=audit_run, verdict="pass",
+        reason=PRECURSOR_REASON,
+    )
+    return {
+        "author": author,
+        "author_run": author_run,
+        "audit": audit,
+        "audit_run": audit_run,
+    }
+
+
+def _snapshot(conn):
+    return "\n".join(conn.iterdump())
+
+
+def _events(conn, task_id, kind):
+    return conn.execute(
+        "SELECT id, run_id, payload FROM task_events WHERE task_id=? AND kind=? ORDER BY id",
+        (task_id, kind),
+    ).fetchall()
+
+
+# ---------------------------------------------------------------------------
+# Base RED: split PASS -> protocol-violation crash -> successor completion
+# leaves the canonical receipt null (the defect the producer repair removes).
+# ---------------------------------------------------------------------------
+
+def test_base_red_split_pass_null_receipt(kanban_home):
+    with kb.connect() as conn:
+        fx = _fixture(conn)
+        # Simulate the old stop-guard: PASS then the worker exits -> crashed.
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_runs SET status='crashed', outcome='crashed', "
+                "summary=NULL, metadata=?, ended_at=11111, claim_lock=NULL, "
+                "claim_expires=NULL, worker_pid=NULL WHERE id=?",
+                (json.dumps({"pid": 1, "protocol_violation": True}), fx["audit_run"]),
+            )
+            conn.execute(
+                "UPDATE tasks SET status='ready', current_run_id=NULL, "
+                "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL WHERE id=?",
+                (fx["audit"],),
+            )
+        terminal_run = _claim(conn, fx["audit"])
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_runs SET status='done', outcome='completed', "
+                "summary=?, metadata=?, ended_at=22222, claim_lock=NULL, "
+                "claim_expires=NULL, worker_pid=NULL WHERE id=?",
+                (PRECURSOR_REASON, json.dumps(_evidence_metadata()), terminal_run),
+            )
+            conn.execute(
+                "UPDATE tasks SET status='done', current_run_id=NULL, "
+                "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL WHERE id=?",
+                (fx["audit"],),
+            )
+        # The verdict and the terminal evidence are bound to different runs.
+        assert kb._canonical_audit_receipt(conn, fx["author"]) is None
+        assert kb._resolved_canonical_audit_outcome(conn, fx["author"]) is None
+
+
+# ---------------------------------------------------------------------------
+# GREEN: a bound PASS completed in the same run binds one canonical envelope.
+# ---------------------------------------------------------------------------
+
+def test_green_binds_canonical_envelope(kanban_home):
+    with kb.connect() as conn:
+        fx = _fixture(conn)
+        envelope = kb._bind_canonical_audit_outcome(
+            conn, fx["audit"], fx["audit_run"], _evidence_metadata(),
+        )
+        assert envelope is not None
+        assert envelope["version"] == kb.CANONICAL_AUDIT_OUTCOME_VERSION
+        assert envelope["author_task_id"] == fx["author"]
+        assert envelope["author_run_id"] == fx["author_run"]
+        assert envelope["audit_task_id"] == fx["audit"]
+        assert envelope["audit_run_id"] == fx["audit_run"]
+        assert envelope["verdict"] == "PASS"
+        assert envelope["reason"] == PRECURSOR_REASON
+        assert envelope["evidence"]["repository"] == REPOSITORY
+        assert envelope["role_separation"] == {
+            "author_profile": AUTHOR_PROFILE,
+            "auditor_profile": AUDITOR_PROFILE,
+        }
+        # Envelope is persisted on both the audit and the author.
+        assert len(_events(conn, fx["audit"], kb.CANONICAL_AUDIT_OUTCOME_EVENT)) == 1
+        assert len(_events(conn, fx["author"], kb.CANONICAL_AUDIT_OUTCOME_EVENT)) == 1
+        # Bounded changed_fact carries the disposition + continuation + digest.
+        facts = _events(conn, fx["audit"], kb.CHANGED_FACT_EVENT)
+        assert len(facts) == 1
+        changed = json.loads(facts[0]["payload"])
+        assert changed["task_id"] == fx["audit"]
+        assert changed["run_id"] == fx["audit_run"]
+        assert changed["prior_status"] == "running"
+        assert changed["new_status"] == "done"
+        assert changed["audit_outcome_sha256"] == envelope["evidence_sha256"]
+        assert changed["disposition"] in (
+            kb.AUDIT_DISPOSITION_FINAL_ACCEPTED,
+            kb.AUDIT_DISPOSITION_CONTINUATION_COMMITTED,
+        )
+        # The finalizer consumes the same resolved envelope identity.
+        resolved = kb._resolved_canonical_audit_outcome(conn, fx["author"])
+        assert resolved is not None
+        assert resolved["evidence_sha256"] == envelope["evidence_sha256"]
+        assert kb._reviewed_author_finalizer_run_id(conn, fx["author"]) == fx["author_run"]
+
+
+def test_green_envelope_evidence_digest_is_stable(kanban_home):
+    with kb.connect() as conn:
+        fx = _fixture(conn)
+        env1 = kb._bind_canonical_audit_outcome(
+            conn, fx["audit"], fx["audit_run"], _evidence_metadata(),
+        )
+        expected = kb._canonical_audit_outcome_evidence_sha256(
+            env1["evidence"]
+        )
+        assert env1["evidence_sha256"] == expected
+        # Byte-identical evidence -> byte-identical digest.
+        env2 = kb._bind_canonical_audit_outcome(
+            conn, fx["audit"], fx["audit_run"], _evidence_metadata(),
+        )
+        assert env2["evidence_sha256"] == env1["evidence_sha256"]
+
+
+# ---------------------------------------------------------------------------
+# Disposition: exactly one of FINAL_ACCEPTED / CONTINUATION_COMMITTED.
+# ---------------------------------------------------------------------------
+
+def test_disposition_final_accepted_without_continuation(kanban_home):
+    with kb.connect() as conn:
+        fx = _fixture(conn)
+        envelope = kb._bind_canonical_audit_outcome(
+            conn, fx["audit"], fx["audit_run"], _evidence_metadata(),
+        )
+        fact = json.loads(_events(conn, fx["audit"], kb.CHANGED_FACT_EVENT)[0]["payload"])
+        assert fact["disposition"] == kb.AUDIT_DISPOSITION_FINAL_ACCEPTED
+        assert fact["continuation_task_ids"] == []
+
+
+def test_disposition_continuation_committed_with_target(kanban_home):
+    with kb.connect() as conn:
+        fx = _fixture(conn, continuation_child=True)
+        merge = conn.execute(
+            "SELECT child_id FROM task_links WHERE parent_id=? AND child_id!=?",
+            (fx["author"], fx["audit"]),
+        ).fetchone()["child_id"]
+        envelope = kb._bind_canonical_audit_outcome(
+            conn, fx["audit"], fx["audit_run"], _evidence_metadata(),
+        )
+        fact = json.loads(_events(conn, fx["audit"], kb.CHANGED_FACT_EVENT)[0]["payload"])
+        assert fact["disposition"] == kb.AUDIT_DISPOSITION_CONTINUATION_COMMITTED
+        assert fact["continuation_task_ids"] == [merge]
+
+
+def test_disposition_skips_terminal_children(kanban_home):
+    with kb.connect() as conn:
+        fx = _fixture(conn, continuation_child=True)
+        merge = conn.execute(
+            "SELECT child_id FROM task_links WHERE parent_id=? AND child_id!=?",
+            (fx["author"], fx["audit"]),
+        ).fetchone()["child_id"]
+        conn.execute("UPDATE tasks SET status='done' WHERE id=?", (merge,))
+        conn.commit()
+        envelope = kb._bind_canonical_audit_outcome(
+            conn, fx["audit"], fx["audit_run"], _evidence_metadata(),
+        )
+        fact = json.loads(_events(conn, fx["audit"], kb.CHANGED_FACT_EVENT)[0]["payload"])
+        assert fact["disposition"] == kb.AUDIT_DISPOSITION_FINAL_ACCEPTED
+        assert fact["continuation_task_ids"] == []
+
+
+# ---------------------------------------------------------------------------
+# Hostile identity / evidence / role matrix fails closed with zero mutation.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda m: m.__setitem__("head", "not-a-sha"),
+        lambda m: m.__setitem__("tree", "zzz"),
+        lambda m: m.__setitem__("base", "12345"),
+        lambda m: m.__setitem__("repository", "attacker/repo"),
+        lambda m: m.__setitem__("pr", 1),
+        lambda m: m.__setitem__("github_review_id", 1),
+        lambda m: m.__setitem__("github_review_url", "https://example.com/x"),
+        lambda m: m.__setitem__("github_review_state", "CHANGES_REQUESTED"),
+        lambda m: m.pop("head"),
+        lambda m: m.pop("github_review_id"),
+    ],
+)
+def test_hostile_evidence_skips_envelope(kanban_home, mutate):
+    """Invalid/hostile evidence is not a valid PASS-outcome completion: the
+    envelope is skipped with zero mutation (the proof-kernel receipt is the
+    primary authenticity gate)."""
+    with kb.connect() as conn:
+        fx = _fixture(conn)
+        metadata = _evidence_metadata()
+        mutate(metadata)
+        before = _snapshot(conn)
+        assert kb._bind_canonical_audit_outcome(
+            conn, fx["audit"], fx["audit_run"], metadata,
+        ) is None
+        assert _snapshot(conn) == before
+        assert _events(conn, fx["audit"], kb.CANONICAL_AUDIT_OUTCOME_EVENT) == []
+
+
+def test_missing_evidence_skips_envelope(kanban_home):
+    with kb.connect() as conn:
+        fx = _fixture(conn)
+        before = _snapshot(conn)
+        assert kb._bind_canonical_audit_outcome(
+            conn, fx["audit"], fx["audit_run"], None,
+        ) is None
+        assert _snapshot(conn) == before
+
+
+def test_ambiguous_parent_fails_closed(kanban_home):
+    """With valid evidence, an ambiguous author edge fails closed (zero write)."""
+    with kb.connect() as conn:
+        fx = _fixture(conn)
+        other = kb.create_task(conn, title="other parent", assignee="merger")
+        conn.execute(
+            "INSERT INTO task_links (parent_id, child_id) VALUES (?, ?)",
+            (other, fx["audit"]),
+        )
+        conn.commit()
+        before = _snapshot(conn)
+        with pytest.raises(kb._CanonicalAuditOutcomeError):
+            kb._bind_canonical_audit_outcome(
+                conn, fx["audit"], fx["audit_run"], _evidence_metadata(),
+            )
+        assert _snapshot(conn) == before
+
+
+def test_foreign_continuation_fails_closed(kanban_home):
+    """A continuation target that does not resolve to a live task fails closed."""
+    with kb.connect() as conn:
+        fx = _fixture(conn)
+        conn.execute(
+            "INSERT INTO task_links (parent_id, child_id) VALUES (?, ?)",
+            (fx["author"], "t_ghost_missing"),
+        )
+        conn.commit()
+        before = _snapshot(conn)
+        with pytest.raises(kb._CanonicalAuditOutcomeError):
+            kb._bind_canonical_audit_outcome(
+                conn, fx["audit"], fx["audit_run"], _evidence_metadata(),
+            )
+        assert _snapshot(conn) == before
+
+
+def test_ordinary_completion_produces_no_envelope(kanban_home):
+    with kb.connect() as conn:
+        fx = _fixture(conn)
+        # A non-PASS completion (no bound PASS for the exact run) is not a
+        # trigger: e.g. a request_changes-like terminalization.
+        assert kb._bind_canonical_audit_outcome(
+            conn, fx["audit"], fx["audit_run"] + 999, _evidence_metadata(),
+        ) is None
+        assert _events(conn, fx["audit"], kb.CANONICAL_AUDIT_OUTCOME_EVENT) == []
+
+
+def test_role_separation_violation_fails_closed(kanban_home):
+    with kb.connect() as conn:
+        # A same-profile author/auditor cannot form a handoff, so the envelope
+        # never triggers; this is the upstream guard, exercised end-to-end.
+        author = kb.create_task(
+            conn, title="a", factory_build_gate=1, assignee=AUTHOR_PROFILE,
+        )
+        author_run = _claim(conn, author)
+        audit = kb.create_task(
+            conn, title="audit", assignee=AUTHOR_PROFILE, parents=[author],
+        )
+        assert kb.request_review_handoff(
+            conn, author, expected_run_id=author_run, review_task_id=audit,
+            reason="x",
+        ) is None
+        # No bound PASS -> no envelope (returns None, not a failure).
+        assert kb._bind_canonical_audit_outcome(
+            conn, audit, author_run, _evidence_metadata(),
+        ) is None
+
+
+# ---------------------------------------------------------------------------
+# Resolver: hostile envelope shapes are rejected.
+# ---------------------------------------------------------------------------
+
+def test_resolved_envelope_rejects_tampered_digest(kanban_home):
+    with kb.connect() as conn:
+        fx = _fixture(conn)
+        envelope = kb._bind_canonical_audit_outcome(
+            conn, fx["audit"], fx["audit_run"], _evidence_metadata(),
+        )
+        tampered = dict(envelope)
+        tampered["evidence"] = dict(envelope["evidence"], pr=1)
+        # Persist a tampered envelope directly; the resolver must reject it.
+        with kb.write_txn(conn):
+            conn.execute(
+                "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (fx["author"], fx["author_run"], kb.CANONICAL_AUDIT_OUTCOME_EVENT,
+                 json.dumps(tampered), 999999999),
+            )
+        # Latest envelope is the tampered one and fails digest/evidence check.
+        assert kb._resolved_canonical_audit_outcome(conn, fx["author"]) is None

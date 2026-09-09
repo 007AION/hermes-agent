@@ -137,9 +137,11 @@ def test_terminal_success_requires_exact_worker_task(clear_kanban_env):
 
 
 def test_review_terminal_tools_recognized_as_terminal(clear_kanban_env):
-    """kanban_request_review and kanban_review_verdict are lifecycle-ending
-    tools: a successful call for the exact worker task must stop the loop
-    instead of being treated as a still-running worker that needs a nudge."""
+    """kanban_request_review and kanban_review_verdict(request_changes) are
+    lifecycle-ending tools: a successful call for the exact worker task must
+    stop the loop instead of being treated as a still-running worker that needs
+    a nudge. kanban_review_verdict(pass) is a nonterminal PASS-preparation step
+    (the worker must continue to the proof-kernel kanban_complete path)."""
     clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
 
     assert successful_kanban_terminal_result(
@@ -149,8 +151,40 @@ def test_review_terminal_tools_recognized_as_terminal(clear_kanban_env):
     assert successful_kanban_terminal_result(
         "kanban_review_verdict",
         '{"ok": true, "task_id": "t_abc", "author_task_id": "t_author", '
-        '"verdict": "pass"}',
+        '"verdict": "request_changes"}',
     ) is True
+
+
+def test_review_verdict_pass_is_nonterminal(clear_kanban_env):
+    """A successful PASS verdict must NOT end the worker loop: the audit run is
+    still open and the worker must proceed to kanban_complete in the same run."""
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
+
+    assert successful_kanban_terminal_result(
+        "kanban_review_verdict",
+        '{"ok": true, "task_id": "t_abc", "author_task_id": "t_author", '
+        '"verdict": "pass"}',
+    ) is False
+
+
+def test_review_verdict_pass_suppresses_terminal_but_nudges(clear_kanban_env):
+    """PASS leaves the worker running, so the guard nudges it to complete."""
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
+    messages = [
+        {
+            "role": "assistant",
+            "tool_calls": [{"function": {"name": "kanban_review_verdict"}}],
+        },
+        {
+            "role": "tool",
+            "name": "kanban_review_verdict",
+            "content": '{"ok": true, "task_id": "t_abc", "author_task_id": "t_author", '
+            '"verdict": "pass"}',
+        },
+    ]
+    assert session_called_kanban_terminal(messages) is True
+    assert session_succeeded_kanban_terminal(messages) is False
+    assert build_kanban_stop_nudge(messages=messages) is not None
 
 
 def test_review_terminal_success_suppresses_nudge(clear_kanban_env):

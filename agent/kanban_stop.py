@@ -12,12 +12,16 @@ terminal board tool, return a bounded synthetic nudge so the conversation
 loop continues instead of exiting.
 
 The two review tools are lifecycle-ending in exactly the same sense as
-``kanban_complete`` / ``kanban_block``: a successful ``kanban_request_review``
-atomically ends the author run as ``review_required`` and a successful
-``kanban_review_verdict`` records the bound auditor verdict. Treating them as
-non-terminal leaves the worker nudged to "complete or block" an already-ended
-run — the worker never exits cleanly, its PID/owned descendants stay alive,
-and the Dispatcher cannot reconcile the task's ``predecessor_exited`` fence.
+``kanban_complete`` / ``kanban_block``, with one deliberate exception: a
+successful ``kanban_review_verdict(verdict="pass")`` is a *nonterminal*
+PASS-preparation step for factory-gated audits. The verdict is recorded but
+the audit run/task stay ``running``; the same worker must continue to the
+proof-kernel ``kanban_complete`` path so the terminal write, the canonical
+audit envelope, and the changed-fact/disposition commit atomically in one run.
+Ending the worker on PASS would (again) strand the verdict on a crashed
+predecessor run and split it from the terminal evidence. ``request_changes``
+remains a true terminal writer (it atomically ends the audit run and resumes
+the author), so it still ends the loop.
 """
 
 from __future__ import annotations
@@ -109,6 +113,17 @@ def successful_kanban_terminal_result(
             return False
     if not isinstance(payload, dict):
         return False
+    # ``kanban_review_verdict(pass)`` is a validated NONTERMINAL PASS
+    # preparation step for factory-gated audits: it records the bound verdict
+    # but leaves the audit task/run running, and the same worker must continue
+    # to the proof-kernel completion path (kanban_complete) in the same run so
+    # the terminal write, canonical envelope, and disposition commit together.
+    # Only ``request_changes`` is a true terminal writer (it ends the audit run
+    # and resumes the author), so only that verdict may end the loop.
+    if tool_name == "kanban_review_verdict":
+        verdict = str(payload.get("verdict") or "").strip().lower()
+        if verdict == "pass":
+            return False
     return (
         payload.get("ok") is True
         and str(payload.get("task_id") or "").strip() == expected_task
