@@ -10017,13 +10017,14 @@ def _recover_completed_pass_verdict(
         # to the terminal run or beyond, stays a conflict.
         canonical = _canonical_review_verdict_payload(row)
         is_predecessor_pass = (
-            row["run_id"] == predecessor_run_id
-            and canonical is not None
+            canonical is not None
+            and row["run_id"] == predecessor_run_id
             and prior_payload["verdict"] == "pass"
         )
         is_superseded_request_changes = (
-            row["run_id"] < predecessor_run_id
-            and canonical is not None
+            canonical is not None
+            and row["run_id"] is not None
+            and row["run_id"] < predecessor_run_id
             and prior_payload["verdict"] == "request_changes"
         )
         if not (is_predecessor_pass or is_superseded_request_changes):

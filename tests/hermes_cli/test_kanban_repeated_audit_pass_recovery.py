@@ -318,6 +318,26 @@ def test_repeated_audit_recovery_rejects_non_protocol_violation_predecessor(kanb
         assert _snapshot(conn) == before
 
 
+def test_repeated_audit_recovery_rejects_null_run_prior_verdict(kanban_home):
+    with kb.connect() as conn:
+        fixture = _repeated_audit_fixture(conn)
+        # A malformed same-child prior verdict whose event row carries a NULL
+        # run_id must fail closed (no TypeError) and leave the DB untouched.
+        # The conflict gate must not evaluate the nullable run_id against the
+        # predecessor before canonical validation has already rejected the row.
+        with kb.write_txn(conn):
+            kb._append_event(
+                conn, fixture["author"], "review_verdict",
+                {"version": 1, "review_task_id": fixture["audit"],
+                 "review_run_id": fixture["precursor_run"],
+                 "verdict": "request_changes", "reason": "malformed null-run"},
+                run_id=None,
+            )
+        before = _snapshot(conn)
+        assert not _recover_pass(conn, fixture)
+        assert _snapshot(conn) == before
+
+
 @pytest.mark.parametrize(
     "mutate",
     [
