@@ -257,7 +257,13 @@ def test_pass_preparation_exact_replay_is_read_only_and_drift_fails_closed(
 
 @pytest.mark.parametrize(
     "mutation",
-    ["missing_audit", "duplicate_author", "duplicate_audit", "drifted_author"],
+    [
+        "missing_audit",
+        "duplicate_author",
+        "duplicate_audit",
+        "drifted_author",
+        "coherent_wrong_run_pair",
+    ],
 )
 def test_broken_pass_pair_blocks_replay_and_rolls_back_terminal_writer(
     kanban_home, mutation,
@@ -289,13 +295,25 @@ def test_broken_pass_pair_blocks_replay_and_rolls_back_terminal_writer(
                     "FROM task_events WHERE id=?",
                     (audit_row["id"],),
                 )
-            else:
+            elif mutation == "drifted_author":
                 payload = json.loads(author_row["payload"])
                 payload["reason"] = "drifted author-side PASS reason"
                 conn.execute(
                     "UPDATE task_events SET payload=? WHERE id=?",
                     (json.dumps(payload), author_row["id"]),
                 )
+            else:
+                # A coherent two-sided rebind must not make the current handoff's
+                # prepared family disappear.  Corrupt both the immutable row
+                # binding and the mirrored payload binding to the same real but
+                # foreign run (the author's run).
+                for row in (author_row, audit_row):
+                    payload = json.loads(row["payload"])
+                    payload["review_run_id"] = fx["author_run"]
+                    conn.execute(
+                        "UPDATE task_events SET run_id=?, payload=? WHERE id=?",
+                        (fx["author_run"], json.dumps(payload), row["id"]),
+                    )
         broken = _snapshot(conn)
 
         assert not kb.record_review_verdict(

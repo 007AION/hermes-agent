@@ -7085,11 +7085,20 @@ def _canonical_review_verdict_pair(
     The official writer emits one author row followed immediately by one audit
     row with byte-identical payloads. ``present`` distinguishes an absent
     family (ordinary completion / first write) from a present but malformed,
-    missing, duplicated, drifted, or wrongly-bound family. Rows whose payload
-    claims this audit identity are candidates even when their event ``run_id``
-    was tampered, so replay cannot hide provenance drift by changing the row
-    binding.
+    missing, duplicated, drifted, or wrongly-bound family. Current-lineage rows
+    are discovered from the latest authenticated review-handoff event as well
+    as their claimed/stored run identity. Therefore coherently rebinding both
+    mirrors' event and payload run ids cannot make a prepared family disappear
+    and be mistaken for a first write.
     """
+    handoff_row = _review_handoff_event_for_child(
+        conn, author_task_id, audit_task_id,
+    )
+    handoff_event_id = int(handoff_row["id"]) if handoff_row is not None else None
+    audit_run_exists = conn.execute(
+        "SELECT 1 FROM task_runs WHERE id = ? AND task_id = ?",
+        (audit_run_id, audit_task_id),
+    ).fetchone() is not None
     rows = conn.execute(
         "SELECT id, task_id, run_id, payload FROM task_events "
         "WHERE kind = 'review_verdict' AND task_id IN (?, ?) ORDER BY id",
@@ -7106,7 +7115,16 @@ def _canonical_review_verdict_pair(
             and raw.get("review_task_id") == audit_task_id
             and raw.get("review_run_id") == audit_run_id
         )
-        if row["run_id"] == audit_run_id or claims_identity:
+        belongs_to_current_handoff = (
+            audit_run_exists
+            and handoff_event_id is not None
+            and int(row["id"]) > handoff_event_id
+        )
+        if (
+            row["run_id"] == audit_run_id
+            or claims_identity
+            or belongs_to_current_handoff
+        ):
             candidates.append(row)
     if not candidates:
         return False, None
