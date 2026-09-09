@@ -1125,7 +1125,16 @@ def _reap_worker_descendants(
 # task/run/outcome + stable content digest) instead of being dropped (see
 # build_worker_context and _run_content_digest). Keep this at 1 unless a
 # concrete need for a multi-attempt detail window exists.
+#
+# Prior-review references have their own HARD total bound
+# (_CTX_MAX_PRIOR_REVIEW_REFS) so a review-heavy task cannot emit one inline
+# reference per finding and blow past the prompt budget: each reference is a
+# short fixed-format line (run id + outcome + content digest), so the count cap
+# is also a byte bound. Findings beyond the cap are not deleted — their full
+# text stays in the Native ``task_runs`` record (the existing machine-
+# retrievable surface) and the projection emits a one-line omission marker.
 _CTX_MAX_PRIOR_ATTEMPTS = 1       # most recent N ordinary prior runs shown in full
+_CTX_MAX_PRIOR_REVIEW_REFS = 20   # most recent N prior review findings shown as digest refs
 _CTX_MAX_COMMENTS       = 30      # most recent N comments shown in full
 _CTX_MAX_FIELD_BYTES    = 4 * 1024   # 4 KB per summary/error/metadata/result
 _CTX_MAX_BODY_BYTES     = 8 * 1024   # 8 KB per task.body (opening post)
@@ -1181,15 +1190,24 @@ def _run_content_digest(run: Run) -> str:
     stays in the run record (the existing Native surface); the prompt only
     carries this digest, which bounds injected bytes WITHOUT deleting,
     rewriting, or weakening the finding.
+
+    Serialization is a *canonical, injective* JSON object (``sort_keys=True``,
+    compact separators). JSON string escaping is unambiguous, so two distinct
+    ``(summary, error, metadata)`` triples can never share a digest — unlike a
+    raw delimiter join, which is not injective when the delimiter itself can
+    appear inside a field (e.g. a summary containing an embedded separator
+    sequence). This preserves stable content addressability under hostile
+    cross-field inputs.
     """
-    payload = "\x1f".join(
-        [
-            "summary", run.summary or "",
-            "error", run.error or "",
-            "metadata",
-            json.dumps(run.metadata, ensure_ascii=False, sort_keys=True)
-            if run.metadata else "",
-        ]
+    payload = json.dumps(
+        {
+            "summary": run.summary or "",
+            "error": run.error or "",
+            "metadata": run.metadata or None,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
@@ -21057,7 +21075,10 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
          evidence and is rendered in full, while every EARLIER
          ``request_changes`` verdict is rendered as a machine-addressable
          reference (exact run id + outcome + stable content digest) so no
-         finding is dropped; its full text stays in the run record.
+         finding is dropped; its full text stays in the run record. The
+         inline references are themselves hard-bounded to the most recent
+         ``_CTX_MAX_PRIOR_REVIEW_REFS`` (older findings collapse to a marker,
+         their full text remaining in the Native run record).
          Each attempt's ``summary`` / ``error`` / ``metadata`` capped at
          ``_CTX_MAX_FIELD_BYTES`` each.
       4. Structured handoff results of every done parent task. Prefers
@@ -21211,7 +21232,18 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
                 "this schema does not assert, so any closure is treated as "
                 "ambiguous and the finding stays addressable._"
             )
-            for run in prior_review_refs:
+            # HARD total bound: emit at most _CTX_MAX_PRIOR_REVIEW_REFS inline
+            # references (the most recent earlier findings). Findings beyond
+            # the cap are NOT deleted — their full text stays in the Native
+            # ``task_runs`` record — they are just omitted from the inline
+            # projection and summarised by a one-line marker, so a review-heavy
+            # task cannot blow past the prompt budget.
+            omitted_refs = 0
+            shown_refs = prior_review_refs
+            if len(prior_review_refs) > _CTX_MAX_PRIOR_REVIEW_REFS:
+                omitted_refs = len(prior_review_refs) - _CTX_MAX_PRIOR_REVIEW_REFS
+                shown_refs = prior_review_refs[-_CTX_MAX_PRIOR_REVIEW_REFS:]
+            for run in shown_refs:
                 idx = index_by_id[run.id]
                 ts = time.strftime(
                     "%Y-%m-%d %H:%M", time.localtime(run.started_at)
@@ -21223,6 +21255,14 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
                 lines.append(
                     f"- attempt {idx} (run #{run.id}, {profile}, {ts_disp}) — "
                     f"request_changes — digest sha256:{digest}"
+                )
+            if omitted_refs:
+                lines.append(
+                    f"_({omitted_refs} earlier review finding"
+                    f"{'s' if omitted_refs != 1 else ''} omitted from the "
+                    f"inline reference list to keep this projection bounded; "
+                    f"their full text and run ids remain retrievable from the "
+                    f"Native task_runs records and are not deleted here.)_"
                 )
 
         for run in shown:

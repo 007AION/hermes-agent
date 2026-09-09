@@ -3055,6 +3055,86 @@ def test_build_worker_context_latest_review_finding_survives_finding_storm(kanba
         conn.close()
 
 
+def test_build_worker_context_bounds_prior_review_refs(kanban_home):
+    """Hostile boundedness (auditor's finding-storm probe): a review-heavy task
+    with far more prior findings than the inline-reference budget must NOT emit
+    one reference per finding. The most recent ``_CTX_MAX_PRIOR_REVIEW_REFS``
+    earlier findings stay addressable inline by digest; older findings collapse
+    to a one-line omission marker and remain retrievable (never deleted) from
+    the Native run records. Synthetic public-safe fixture — no provider payload
+    read/emitted."""
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="audit", assignee="auditor")
+        total_findings = 50
+        for i in range(total_findings):
+            kb.claim_task(conn, tid)
+            kb._end_run(conn, tid, outcome="request_changes",
+                        summary=f"STALE-VERDICT-{i}")
+            conn.execute(
+                "UPDATE tasks SET status='ready', claim_lock=NULL, "
+                "claim_expires=NULL WHERE id=?", (tid,),
+            )
+            conn.commit()
+
+        # Latest unresolved finding (rendered in full).
+        kb.claim_task(conn, tid)
+        kb._end_run(conn, tid, outcome="request_changes",
+                    summary="LATEST-OPEN-FINDING")
+        conn.execute(
+            "UPDATE tasks SET status='ready', claim_lock=NULL, "
+            "claim_expires=NULL WHERE id=?", (tid,),
+        )
+        conn.commit()
+
+        # Latest exact run.
+        kb.claim_task(conn, tid)
+        kb._end_run(conn, tid, outcome="blocked",
+                    summary="LATEST-RUN-EVIDENCE")
+        conn.execute(
+            "UPDATE tasks SET status='ready', claim_lock=NULL, "
+            "claim_expires=NULL WHERE id=?", (tid,),
+        )
+        conn.commit()
+
+        runs = kb.list_runs(conn, tid)
+        stale = [r for r in runs
+                 if (r.summary or "").startswith("STALE-VERDICT-")]
+        cap = kb._CTX_MAX_PRIOR_REVIEW_REFS
+        omitted = total_findings - cap
+
+        kb.claim_task(conn, tid)
+        ctx = kb.build_worker_context(conn, tid)
+
+        # Latest finding + latest run still in full.
+        assert "LATEST-OPEN-FINDING" in ctx
+        assert "LATEST-RUN-EVIDENCE" in ctx
+        # The most recent `cap` earlier findings stay addressable inline.
+        newest_stale = stale[-cap:]
+        for r in newest_stale:
+            digest = kb._run_content_digest(r)
+            assert f"digest sha256:{digest}" in ctx, (
+                f"recent earlier verdict run #{r.id} must stay inline"
+            )
+        # The oldest findings are omitted inline and summarised by a marker.
+        oldest_stale = stale[:-cap]
+        for r in oldest_stale:
+            digest = kb._run_content_digest(r)
+            assert f"digest sha256:{digest}" not in ctx, (
+                f"omitted earlier verdict run #{r.id} must not be inline"
+            )
+        assert f"{omitted} earlier review findings omitted" in ctx
+        # None of the stale full text is re-injected.
+        assert "STALE-VERDICT-0" not in ctx
+        # Every finding's full text still lives in the Native run records.
+        stored = {r.summary for r in kb.list_runs(conn, tid) if r.summary}
+        assert {f"STALE-VERDICT-{i}" for i in range(total_findings)} <= stored
+        # Projection is bounded regardless of finding count.
+        assert len(ctx) < 15_000
+    finally:
+        conn.close()
+
+
 def test_run_content_digest_stable_and_content_addressed():
     """The content digest of a run is a stable, content-addressed reference:
     identical evidence -> identical digest; different evidence -> different
@@ -3082,6 +3162,34 @@ def test_run_content_digest_stable_and_content_addressed():
     assert kb._run_content_digest(a1) != kb._run_content_digest(
         make("FINDING-A", error="err")
     )
+
+
+def test_run_content_digest_injective_across_fields():
+    """Cross-field delimiter-ambiguity regression (auditor's hostile probe):
+    two DISTINCT ``(summary, error)`` payloads that would collide under a raw
+    ``\\x1f`` delimiter join must produce DIFFERENT digests under the injective
+    JSON serialization. Stable content addressability means distinct evidence
+    can never share a reference. Synthetic public-safe fixture — no provider
+    payload read/emitted."""
+    def make(summary, metadata=None, error=None):
+        return kb.Run(
+            id=1, task_id="t", profile="auditor", step_key=None,
+            status="request_changes", claim_lock=None, claim_expires=None,
+            worker_pid=None, max_runtime_seconds=None, last_heartbeat_at=None,
+            started_at=0, ended_at=1, outcome="request_changes",
+            summary=summary, metadata=metadata, error=error,
+        )
+
+    # Under a raw \x1f join these two are byte-identical
+    # ("summary" \x1f "A\x1ferror\x1fB" \x1f "error" \x1f "C" \x1f "metadata" \x1f "")
+    # vs ("summary" \x1f "A" \x1f "error" \x1f "B\x1ferror\x1fC" \x1f "metadata" \x1f "").
+    x = make(summary="A\x1ferror\x1fB", error="C")
+    y = make(summary="A", error="B\x1ferror\x1fC")
+    assert kb._run_content_digest(x) != kb._run_content_digest(y)
+
+    # Field boundaries are unambiguous in both directions.
+    assert kb._run_content_digest(x) != kb._run_content_digest(make("A", error="C"))
+    assert kb._run_content_digest(y) != kb._run_content_digest(make("B\x1ferror\x1fC"))
 
 
 def test_build_worker_context_renders_author_with_safe_framing(kanban_home):
