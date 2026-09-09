@@ -8472,20 +8472,28 @@ def _task_run_matches(
     run_id: int,
     task_id: str,
     profile: str,
+    *,
+    status: str,
+    outcome: str,
 ) -> bool:
-    """True when ``run_id`` references a live task_runs row for ``task_id``
-    bound to ``profile`` (exact run/profile provenance).
+    """True when ``run_id`` is the exact terminal projection for ``task_id``.
 
     The terminal writer records the envelope under the author and audit runs
-    it belongs to; a fabricated or cross-task run id — or a run row whose
-    ``profile`` drifts from the task's live assignee — must not be trusted to
-    grant finalizer authority.
+    it belongs to. A fabricated or cross-task run id, profile drift, or a
+    reopened/nonterminal run must not be trusted to grant finalizer authority.
     """
     row = conn.execute(
-        "SELECT profile FROM task_runs WHERE id = ? AND task_id = ?",
+        "SELECT profile, status, outcome, ended_at FROM task_runs "
+        "WHERE id = ? AND task_id = ?",
         (run_id, task_id),
     ).fetchone()
-    return row is not None and row["profile"] == profile
+    return (
+        row is not None
+        and row["profile"] == profile
+        and row["status"] == status
+        and row["outcome"] == outcome
+        and row["ended_at"] is not None
+    )
 
 
 def _resolved_canonical_audit_outcome(
@@ -8558,11 +8566,19 @@ def _resolved_canonical_audit_outcome(
     ).fetchone() is None:
         return None
     # Role profiles must mirror the live task assignees (and differ).
+    identity_fields = (
+        "claim_lock", "claim_expires", "worker_pid", "worker_starttime",
+        "fence_lineage", "fence_disposition",
+    )
     author_assignee = conn.execute(
-        "SELECT assignee FROM tasks WHERE id = ?", (author_task_id,),
+        "SELECT assignee, status, current_run_id, claim_lock, claim_expires, "
+        "worker_pid, worker_starttime, fence_lineage, fence_disposition "
+        "FROM tasks WHERE id = ?", (author_task_id,),
     ).fetchone()
     audit_assignee = conn.execute(
-        "SELECT assignee FROM tasks WHERE id = ?", (audit_task_id,),
+        "SELECT assignee, status, current_run_id, claim_lock, claim_expires, "
+        "worker_pid, worker_starttime, fence_lineage, fence_disposition "
+        "FROM tasks WHERE id = ?", (audit_task_id,),
     ).fetchone()
     if author_assignee is None or audit_assignee is None:
         return None
@@ -8572,16 +8588,30 @@ def _resolved_canonical_audit_outcome(
         or author_assignee["assignee"] == audit_assignee["assignee"]
     ):
         return None
+    # Exact task projections after the same-run terminal writer: the author is
+    # parked in review with no live execution identity, while the audit is done
+    # with no live execution identity. Reopening either side revokes authority.
+    if (
+        author_assignee["status"] != "review"
+        or author_assignee["current_run_id"] is not None
+        or any(author_assignee[field] is not None for field in identity_fields)
+        or audit_assignee["status"] != "done"
+        or audit_assignee["current_run_id"] is not None
+        or any(audit_assignee[field] is not None for field in identity_fields)
+    ):
+        return None
     # Exact run/profile provenance: author_run_id / audit_run_id must reference
     # live task_runs rows bound to the author/auditor task AND its live
     # assignee. A fabricated or cross-task run id, or a run row whose profile
     # drifts, fails closed.
     if not _task_run_matches(
-        conn, author_run_id, author_task_id, author_assignee["assignee"]
+        conn, author_run_id, author_task_id, author_assignee["assignee"],
+        status="review_required", outcome="review_required",
     ):
         return None
     if not _task_run_matches(
-        conn, audit_run_id, audit_task_id, audit_assignee["assignee"]
+        conn, audit_run_id, audit_task_id, audit_assignee["assignee"],
+        status="done", outcome="completed",
     ):
         return None
     # handoff_event_id must reference the real review_handoff event binding
@@ -8600,21 +8630,34 @@ def _resolved_canonical_audit_outcome(
         or handoff.expected_run_id != author_run_id
     ):
         return None
-    # audit_run_id must reference the real bound PASS verdict event, and its
-    # authenticated evidence must byte-match the envelope evidence.
-    verdict_row = conn.execute(
+    # audit_run_id must carry exactly one byte-identical author/audit v2 PASS
+    # verdict pair. The terminal envelope may not outlive a missing or drifted
+    # verdict mirror, and its reason/evidence must match that authenticated pair.
+    audit_verdict_rows = conn.execute(
         "SELECT id, run_id, payload FROM task_events WHERE task_id = ? AND kind = 'review_verdict' "
-        "AND run_id = ? ORDER BY id DESC LIMIT 1",
+        "AND run_id = ? ORDER BY id",
         (audit_task_id, audit_run_id),
-    ).fetchone()
-    if verdict_row is None:
+    ).fetchall()
+    author_verdict_rows = conn.execute(
+        "SELECT id, run_id, payload FROM task_events WHERE task_id = ? AND kind = 'review_verdict' "
+        "AND run_id = ? ORDER BY id",
+        (author_task_id, audit_run_id),
+    ).fetchall()
+    if len(audit_verdict_rows) != 1 or len(author_verdict_rows) != 1:
+        return None
+    verdict_row = audit_verdict_rows[0]
+    author_verdict_row = author_verdict_rows[0]
+    if author_verdict_row["payload"] != verdict_row["payload"]:
         return None
     verdict = _canonical_review_verdict_payload(verdict_row)
+    author_verdict = _canonical_review_verdict_payload(author_verdict_row)
     if (
         verdict is None
+        or author_verdict != verdict
         or verdict["verdict"] != "pass"
         or verdict["review_task_id"] != audit_task_id
         or verdict["review_run_id"] != audit_run_id
+        or verdict["reason"] != envelope["reason"]
     ):
         return None
     if verdict.get("evidence") != envelope["evidence"]:

@@ -182,10 +182,13 @@ def test_base_red_split_pass_null_receipt(kanban_home):
 def test_green_binds_canonical_envelope(kanban_home):
     with kb.connect() as conn:
         fx = _fixture(conn)
-        envelope = kb._bind_canonical_audit_outcome(
-            conn, fx["audit"], fx["audit_run"], _evidence_metadata(),
+        assert kb.complete_task(
+            conn, fx["audit"], expected_run_id=fx["audit_run"],
+            metadata=_evidence_metadata(),
         )
-        assert envelope is not None
+        envelope = json.loads(
+            _events(conn, fx["audit"], kb.CANONICAL_AUDIT_OUTCOME_EVENT)[0]["payload"]
+        )
         assert envelope["version"] == kb.CANONICAL_AUDIT_OUTCOME_VERSION
         assert envelope["author_task_id"] == fx["author"]
         assert envelope["author_run_id"] == fx["author_run"]
@@ -507,13 +510,8 @@ def test_resolved_envelope_rejects_mirrored_identity_drift(kanban_home, mutate):
     handoff event / role profiles) must not resolve: the resolver re-validates
     the envelope against live DB state and fails closed."""
     with kb.connect() as conn:
-        fx = _fixture(conn)
-        envelope = kb._bind_canonical_audit_outcome(
-            conn, fx["audit"], fx["audit_run"], _evidence_metadata(),
-        )
-        assert envelope is not None
-        # Sanity: the untouched envelope resolves.
-        assert kb._resolved_canonical_audit_outcome(conn, fx["author"]) is not None
+        fx = _completed_fixture(conn)
+        envelope = fx["envelope"]
         tampered = copy.deepcopy(envelope)
         mutate(tampered)
         with kb.write_txn(conn):
@@ -571,15 +569,25 @@ def test_complete_task_coherent_wrong_evidence_fails_closed(kanban_home):
 # ---------------------------------------------------------------------------
 
 def _bound_fixture(conn, *, continuation_child: bool = False):
-    """A fixture with a *valid* bound envelope already persisted."""
+    """A valid envelope produced by the real same-run terminal writer."""
     fx = _fixture(conn, continuation_child=continuation_child)
-    envelope = kb._bind_canonical_audit_outcome(
-        conn, fx["audit"], fx["audit_run"], _evidence_metadata(),
+    assert kb.complete_task(
+        conn,
+        fx["audit"],
+        expected_run_id=fx["audit_run"],
+        metadata=_evidence_metadata(),
     )
-    assert envelope is not None
+    envelope = json.loads(
+        _events(conn, fx["audit"], kb.CANONICAL_AUDIT_OUTCOME_EVENT)[0]["payload"]
+    )
     assert kb._resolved_canonical_audit_outcome(conn, fx["author"]) is not None
     fx["envelope"] = envelope
     return fx
+
+
+def _completed_fixture(conn, *, continuation_child: bool = False):
+    """A fixture produced by the real verdict -> complete_task workflow."""
+    return _bound_fixture(conn, continuation_child=continuation_child)
 
 
 def _delete_events(conn, task_id, kind):
@@ -877,3 +885,87 @@ def test_resolver_rejects_non_exhaustive_continuation_subset(kanban_home):
             conn, title="second merge", assignee="merger", parents=[fx["author"]],
         )
         assert kb._resolved_canonical_audit_outcome(conn, fx["author"]) is None
+
+
+# ---------------------------------------------------------------------------
+# Round-5 resolver hardening: authenticate the exact terminal task/run
+# projections, the paired v2 verdict family, and the verdict reason through
+# the real verdict -> complete_task producer path.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("side", ["author", "audit"])
+def test_resolver_rejects_reopened_terminal_run(kanban_home, side):
+    """Reopening either terminal run revokes canonical finalizer authority."""
+    with kb.connect() as conn:
+        fx = _completed_fixture(conn)
+        run_id = fx[f"{side}_run"]
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_runs SET status='running', outcome=NULL, ended_at=NULL "
+                "WHERE id=?",
+                (run_id,),
+            )
+        reopened = conn.execute(
+            "SELECT status, outcome, ended_at FROM task_runs WHERE id=?", (run_id,),
+        ).fetchone()
+        assert tuple(reopened) == ("running", None, None)
+        assert kb._resolved_canonical_audit_outcome(conn, fx["author"]) is None
+        assert kb._reviewed_author_finalizer_run_id(conn, fx["author"]) is None
+
+
+@pytest.mark.parametrize("side", ["author", "audit"])
+def test_resolver_rejects_reopened_terminal_task(kanban_home, side):
+    """Both author review and audit done task projections are authoritative."""
+    with kb.connect() as conn:
+        fx = _completed_fixture(conn)
+        task_id = fx[side]
+        run_id = fx[f"{side}_run"]
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status='running', current_run_id=? WHERE id=?",
+                (run_id, task_id),
+            )
+        reopened = conn.execute(
+            "SELECT status, current_run_id FROM tasks WHERE id=?", (task_id,),
+        ).fetchone()
+        assert tuple(reopened) == ("running", run_id)
+        assert kb._resolved_canonical_audit_outcome(conn, fx["author"]) is None
+        assert kb._reviewed_author_finalizer_run_id(conn, fx["author"]) is None
+
+
+def test_resolver_rejects_missing_author_v2_verdict_mirror(kanban_home):
+    """The audit-side v2 PASS cannot resolve without its author-side pair."""
+    with kb.connect() as conn:
+        fx = _completed_fixture(conn)
+        with kb.write_txn(conn):
+            conn.execute(
+                "DELETE FROM task_events WHERE task_id=? AND kind='review_verdict' "
+                "AND run_id=?",
+                (fx["author"], fx["audit_run"]),
+            )
+        assert _events(conn, fx["author"], "review_verdict") == []
+        assert kb._resolved_canonical_audit_outcome(conn, fx["author"]) is None
+        assert kb._reviewed_author_finalizer_run_id(conn, fx["author"]) is None
+
+
+def test_resolver_rejects_envelope_reason_drift_from_verdict(kanban_home):
+    """Byte-identical envelope mirrors cannot rewrite the bound verdict reason."""
+    with kb.connect() as conn:
+        fx = _completed_fixture(conn)
+        for task_id in (fx["author"], fx["audit"]):
+            row = _events(conn, task_id, kb.CANONICAL_AUDIT_OUTCOME_EVENT)[0]
+            envelope = json.loads(row["payload"])
+            envelope["reason"] = "drifted reason not authenticated by the v2 verdict"
+            with kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE task_events SET payload=? WHERE id=?",
+                    (json.dumps(envelope), row["id"]),
+                )
+        assert all(
+            json.loads(_events(conn, task_id, kb.CANONICAL_AUDIT_OUTCOME_EVENT)[0]["payload"])[
+                "reason"
+            ].startswith("drifted")
+            for task_id in (fx["author"], fx["audit"])
+        )
+        assert kb._resolved_canonical_audit_outcome(conn, fx["author"]) is None
+        assert kb._reviewed_author_finalizer_run_id(conn, fx["author"]) is None
