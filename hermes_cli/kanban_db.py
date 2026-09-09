@@ -8182,7 +8182,9 @@ def _recovered_pass_audit_receipt(
     protocol-violation run, followed by a version-2 recovery PASS bound to the
     latest completed terminal run whose APPROVED receipt matches byte-for-byte
     and whose commit identity is re-stated by the predecessor's reason.  Any
-    other two-verdict shape fails closed.
+    other two-verdict shape fails closed.  Older closed audit rounds may precede
+    the immediate predecessor; only ``auditor_runs[0]``/``auditor_runs[1]`` are
+    consulted, so they never supply authority.
     """
     if len(verdict_rows) != 2:
         return None
@@ -8210,7 +8212,7 @@ def _recovered_pass_audit_receipt(
         "SELECT id, profile, status, outcome, summary, metadata, ended_at "
         "FROM task_runs WHERE task_id = ? ORDER BY id DESC", (auditor_task_id,),
     ).fetchall()
-    if len(auditor_runs) != 2:
+    if len(auditor_runs) < 2:
         return None
     terminal, precursor_run = auditor_runs[0], auditor_runs[1]
     if (
@@ -9805,18 +9807,19 @@ def _authenticated_predecessor_crashed_pass_run_id(
 ) -> Optional[int]:
     """Authenticate the crashed protocol-violation PASS before a terminal PASS.
 
-    Returns the predecessor run id only when the auditor has exactly two closed
-    runs — a latest completed terminal run and a single crashed
-    protocol-violation predecessor — and the predecessor emitted exactly one
-    version-1 PASS verdict, mirrored byte-identically on author and child,
-    whose prose reason re-states the identical head/tree/base commit identity
-    of the terminal receipt.
+    Returns the predecessor run id only when the auditor's latest closed run is
+    a completed terminal run and its *immediate* predecessor is a single crashed
+    protocol-violation run that emitted exactly one version-1 PASS verdict,
+    mirrored byte-identically on author and child, whose prose reason re-states
+    the identical head/tree/base commit identity of the terminal receipt.
+    Older closed audit rounds may precede the immediate predecessor; only
+    ``runs[0]``/``runs[1]`` are consulted, so they never supply authority.
     """
     runs = conn.execute(
         "SELECT id, profile, status, outcome, metadata, ended_at FROM task_runs "
         "WHERE task_id = ? ORDER BY id DESC", (auditor_task_id,),
     ).fetchall()
-    if len(runs) != 2:
+    if len(runs) < 2:
         return None
     terminal, predecessor = runs[0], runs[1]
     if (
@@ -10008,12 +10011,22 @@ def _recover_completed_pass_verdict(
             replay_seen = True
             continue
         # Any other verdict for this auditor child is a conflict unless it is
-        # the authenticated crashed predecessor PASS.
-        if (
-            row["run_id"] != predecessor_run_id
-            or _canonical_review_verdict_payload(row) is None
-            or prior_payload["verdict"] != "pass"
-        ):
+        # the authenticated crashed predecessor PASS, or a superseded
+        # request_changes verdict from an earlier (pre-predecessor) round.  A
+        # stale/non-immediate PASS bound to an older run, or any verdict bound
+        # to the terminal run or beyond, stays a conflict.
+        canonical = _canonical_review_verdict_payload(row)
+        is_predecessor_pass = (
+            row["run_id"] == predecessor_run_id
+            and canonical is not None
+            and prior_payload["verdict"] == "pass"
+        )
+        is_superseded_request_changes = (
+            row["run_id"] < predecessor_run_id
+            and canonical is not None
+            and prior_payload["verdict"] == "request_changes"
+        )
+        if not (is_predecessor_pass or is_superseded_request_changes):
             return False
     if replay_seen:
         return True
