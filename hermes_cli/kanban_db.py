@@ -7086,10 +7086,13 @@ def _canonical_review_verdict_pair(
     row with byte-identical payloads. ``present`` distinguishes an absent
     family (ordinary completion / first write) from a present but malformed,
     missing, duplicated, drifted, or wrongly-bound family. Current-lineage rows
-    are discovered from the latest authenticated review-handoff event as well
-    as their claimed/stored run identity. Therefore coherently rebinding both
-    mirrors' event and payload run ids cannot make a prepared family disappear
-    and be mistaken for a first write.
+    are discovered from both sides of the review boundary: the latest
+    authenticated review-handoff event and the exact audit-run claim event. The
+    claim-side boundary remains available when the handoff projection is
+    deleted, malformed, or rebound to another child. Therefore coherently
+    rebinding both mirrors' event and payload run ids cannot make a prepared
+    family disappear and be mistaken for a first write by also corrupting the
+    handoff projection.
     """
     handoff_row = _review_handoff_event_for_child(
         conn, author_task_id, audit_task_id,
@@ -7099,6 +7102,15 @@ def _canonical_review_verdict_pair(
         "SELECT 1 FROM task_runs WHERE id = ? AND task_id = ?",
         (audit_run_id, audit_task_id),
     ).fetchone() is not None
+    claim_rows = conn.execute(
+        "SELECT id FROM task_events WHERE task_id = ? AND kind = 'claimed' "
+        "AND run_id = ? ORDER BY id",
+        (audit_task_id, audit_run_id),
+    ).fetchall()
+    # The official claim path emits exactly one event before the worker can
+    # prepare a verdict.  More than one exact-run claim is itself ambiguous and
+    # must not be selected as an authority boundary.
+    claim_event_id = int(claim_rows[0]["id"]) if len(claim_rows) == 1 else None
     rows = conn.execute(
         "SELECT id, task_id, run_id, payload FROM task_events "
         "WHERE kind = 'review_verdict' AND task_id IN (?, ?) ORDER BY id",
@@ -7120,10 +7132,16 @@ def _canonical_review_verdict_pair(
             and handoff_event_id is not None
             and int(row["id"]) > handoff_event_id
         )
+        belongs_to_current_audit_run = (
+            audit_run_exists
+            and claim_event_id is not None
+            and int(row["id"]) > claim_event_id
+        )
         if (
             row["run_id"] == audit_run_id
             or claims_identity
             or belongs_to_current_handoff
+            or belongs_to_current_audit_run
         ):
             candidates.append(row)
     if not candidates:

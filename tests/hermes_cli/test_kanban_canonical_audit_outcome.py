@@ -15,6 +15,7 @@ finalizer consumes.
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import sqlite3
 from pathlib import Path
@@ -314,6 +315,97 @@ def test_broken_pass_pair_blocks_replay_and_rolls_back_terminal_writer(
                         "UPDATE task_events SET run_id=?, payload=? WHERE id=?",
                         (fx["author_run"], json.dumps(payload), row["id"]),
                     )
+        broken = _snapshot(conn)
+
+        assert not kb.record_review_verdict(
+            conn, fx["author"], review_task_id=fx["audit"],
+            expected_review_run_id=fx["audit_run"], verdict="pass",
+            reason=PRECURSOR_REASON, evidence=_evidence_block(),
+        )
+        assert _snapshot(conn) == broken
+
+        with pytest.raises(kb._CanonicalAuditOutcomeError, match="verdict family"):
+            kb.complete_task(
+                conn, fx["audit"], expected_run_id=fx["audit_run"],
+                metadata=_evidence_metadata(),
+            )
+        assert _snapshot(conn) == broken
+        task = conn.execute(
+            "SELECT status, current_run_id, completed_at FROM tasks WHERE id=?",
+            (fx["audit"],),
+        ).fetchone()
+        assert tuple(task) == ("running", fx["audit_run"], None)
+        run = conn.execute(
+            "SELECT status, outcome, ended_at FROM task_runs WHERE id=?",
+            (fx["audit_run"],),
+        ).fetchone()
+        assert tuple(run) == ("running", None, None)
+
+
+@pytest.mark.parametrize(
+    "handoff_mutation",
+    ["deleted", "malformed", "wrong_child"],
+)
+def test_wrong_run_pass_pair_with_hostile_handoff_still_fails_closed(
+    kanban_home, handoff_mutation,
+):
+    """The audit-run claim keeps a tampered PASS family detectable.
+
+    Handoff provenance and both redundant verdict run identities are hostile at
+    the same time.  Neither replay nor the real terminal writer may reinterpret
+    that prepared family as ordinary absence.
+    """
+    with kb.connect() as conn:
+        fx = _handoff_fixture(conn)
+        assert kb.record_review_verdict(
+            conn, fx["author"], review_task_id=fx["audit"],
+            expected_review_run_id=fx["audit_run"], verdict="pass",
+            reason=PRECURSOR_REASON, evidence=_evidence_block(),
+        )
+        author_row = _events(conn, fx["author"], "review_verdict")[0]
+        audit_row = _events(conn, fx["audit"], "review_verdict")[0]
+        handoff_row = conn.execute(
+            "SELECT id, payload FROM task_events WHERE task_id=? "
+            "AND kind='review_handoff' ORDER BY id DESC LIMIT 1",
+            (fx["author"],),
+        ).fetchone()
+        assert handoff_row is not None
+        with kb.write_txn(conn):
+            for row in (author_row, audit_row):
+                payload = json.loads(row["payload"])
+                payload["review_run_id"] = fx["author_run"]
+                conn.execute(
+                    "UPDATE task_events SET run_id=?, payload=? WHERE id=?",
+                    (fx["author_run"], json.dumps(payload), row["id"]),
+                )
+            if handoff_mutation == "deleted":
+                conn.execute("DELETE FROM task_events WHERE id=?", (handoff_row["id"],))
+            elif handoff_mutation == "malformed":
+                conn.execute(
+                    "UPDATE task_events SET payload='{' WHERE id=?",
+                    (handoff_row["id"],),
+                )
+            else:
+                payload = json.loads(handoff_row["payload"])
+                payload["review_task_id"] = "t_wrong_child"
+                signed = {
+                    "task_id": fx["author"],
+                    "version": payload["version"],
+                    "expected_run_id": payload["expected_run_id"],
+                    "review_task_id": payload["review_task_id"],
+                    "reason": payload["reason"],
+                    "recovery": payload["recovery"],
+                }
+                payload["receipt_sha256"] = hashlib.sha256(
+                    json.dumps(
+                        signed, sort_keys=True, separators=(",", ":"),
+                        ensure_ascii=False,
+                    ).encode("utf-8")
+                ).hexdigest()
+                conn.execute(
+                    "UPDATE task_events SET payload=? WHERE id=?",
+                    (json.dumps(payload), handoff_row["id"]),
+                )
         broken = _snapshot(conn)
 
         assert not kb.record_review_verdict(
