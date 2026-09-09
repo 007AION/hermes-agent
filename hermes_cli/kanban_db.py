@@ -1126,15 +1126,22 @@ def _reap_worker_descendants(
 # build_worker_context and _run_content_digest). Keep this at 1 unless a
 # concrete need for a multi-attempt detail window exists.
 #
-# Prior-review references have their own HARD total bound
-# (_CTX_MAX_PRIOR_REVIEW_REFS) so a review-heavy task cannot emit one inline
-# reference per finding and blow past the prompt budget: each reference is a
-# short fixed-format line (run id + outcome + content digest), so the count cap
-# is also a byte bound. Findings beyond the cap are not deleted — their full
-# text stays in the Native ``task_runs`` record (the existing machine-
-# retrievable surface) and the projection emits a one-line omission marker.
+# Prior-review references have TWO hard total bounds so a review-heavy task
+# cannot blow past the prompt budget: a count cap
+# (_CTX_MAX_PRIOR_REVIEW_REFS) AND a total byte budget
+# (_CTX_MAX_PRIOR_REVIEW_REF_BYTES). Each reference interpolates run.profile,
+# which is operator-controlled and unbounded, so the count cap alone is NOT a
+# byte bound; the profile field is therefore framed through _sanitize_inline
+# (newlines/control chars collapsed, capped at
+# _CTX_PRIOR_REVIEW_REF_PROFILE_CHARS) and the whole ref block is additionally
+# clamped to a hard byte budget (oldest findings drop first). Findings beyond
+# either bound are not deleted — their full text stays in the Native
+# ``task_runs`` record (the existing machine-retrievable surface) and the
+# projection emits a one-line omission marker.
 _CTX_MAX_PRIOR_ATTEMPTS = 1       # most recent N ordinary prior runs shown in full
 _CTX_MAX_PRIOR_REVIEW_REFS = 20   # most recent N prior review findings shown as digest refs
+_CTX_PRIOR_REVIEW_REF_PROFILE_CHARS = 64      # per-ref profile field cap (bounded framing)
+_CTX_MAX_PRIOR_REVIEW_REF_BYTES = 16 * 1024   # hard total byte budget for the inline ref block
 _CTX_MAX_COMMENTS       = 30      # most recent N comments shown in full
 _CTX_MAX_FIELD_BYTES    = 4 * 1024   # 4 KB per summary/error/metadata/result
 _CTX_MAX_BODY_BYTES     = 8 * 1024   # 8 KB per task.body (opening post)
@@ -1178,6 +1185,27 @@ def _relative_age(ts: Optional[int], now: Optional[int] = None) -> str:
     return f"{d}d ago"
 
 
+def _sanitize_inline(s: Optional[str], limit: int) -> str:
+    """Collapse control/newline characters and truncate ``s`` to ``limit``
+    characters for safe single-line framing.
+
+    ``run.profile`` is operator-controlled and unbounded, so interpolating it
+    verbatim into a prior-review reference line lets a hostile long/newline
+    value inflate the line (breaking the count-is-byte-bound invariant) or
+    inject newlines that escape the single-line framing. Collapse every ASCII
+    control char (newlines, tabs, NUL) to a single space, squeeze whitespace
+    runs, then hard-truncate to ``limit`` chars with a visible ellipsis so the
+    field stays a bounded, single-line token.
+    """
+    if not s:
+        return "(unknown)"
+    collapsed = re.sub(r"[\x00-\x1f\x7f]+", " ", s).strip()
+    collapsed = re.sub(r"\s+", " ", collapsed)
+    if len(collapsed) <= limit:
+        return collapsed
+    return collapsed[:limit] + "…"
+
+
 def _run_content_digest(run: Run) -> str:
     """Stable SHA-256 content digest of a run's immutable evidence payload
     (summary + error + metadata).
@@ -1196,14 +1224,17 @@ def _run_content_digest(run: Run) -> str:
     ``(summary, error, metadata)`` triples can never share a digest — unlike a
     raw delimiter join, which is not injective when the delimiter itself can
     appear inside a field (e.g. a summary containing an embedded separator
-    sequence). This preserves stable content addressability under hostile
-    cross-field inputs.
+    sequence). Values are serialized *presence-preserving*: ``summary`` /
+    ``error`` / ``metadata`` are written as-is (``None`` stays ``null``), never
+    collapsed through ``or ""`` / ``or None``, because the Native path can
+    persist ``summary=NULL`` vs ``summary=''`` and ``metadata=None`` vs
+    ``metadata={}`` as distinct rows that must not share one content address.
     """
     payload = json.dumps(
         {
-            "summary": run.summary or "",
-            "error": run.error or "",
-            "metadata": run.metadata or None,
+            "summary": run.summary,
+            "error": run.error,
+            "metadata": run.metadata,
         },
         ensure_ascii=False,
         sort_keys=True,
@@ -21232,30 +21263,44 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
                 "this schema does not assert, so any closure is treated as "
                 "ambiguous and the finding stays addressable._"
             )
-            # HARD total bound: emit at most _CTX_MAX_PRIOR_REVIEW_REFS inline
-            # references (the most recent earlier findings). Findings beyond
-            # the cap are NOT deleted — their full text stays in the Native
-            # ``task_runs`` record — they are just omitted from the inline
-            # projection and summarised by a one-line marker, so a review-heavy
-            # task cannot blow past the prompt budget.
+            # Hard bounded projection: keep the most-recent earlier findings,
+            # dropping the oldest first, clamped by BOTH a count cap
+            # (_CTX_MAX_PRIOR_REVIEW_REFS) and a total byte budget
+            # (_CTX_MAX_PRIOR_REVIEW_REF_BYTES). Each reference interpolates
+            # run.profile through _sanitize_inline (newline/control collapse +
+            # char cap) so the count cap is an actual byte bound and a hostile
+            # long/newline profile cannot inflate or inject lines. Findings
+            # beyond either bound are NOT deleted — their full text stays in
+            # the Native ``task_runs`` record and is summarised by a one-line
+            # omission marker.
+            kept_refs: list[str] = []  # rendered reference lines, newest first
+            budget_used = 0
             omitted_refs = 0
-            shown_refs = prior_review_refs
-            if len(prior_review_refs) > _CTX_MAX_PRIOR_REVIEW_REFS:
-                omitted_refs = len(prior_review_refs) - _CTX_MAX_PRIOR_REVIEW_REFS
-                shown_refs = prior_review_refs[-_CTX_MAX_PRIOR_REVIEW_REFS:]
-            for run in shown_refs:
+            for run in reversed(prior_review_refs):  # newest first
                 idx = index_by_id[run.id]
                 ts = time.strftime(
                     "%Y-%m-%d %H:%M", time.localtime(run.started_at)
                 )
                 age = _relative_age(run.started_at, _now)
                 ts_disp = f"{ts}, {age}" if age else ts
-                profile = run.profile or "(unknown)"
+                profile = _sanitize_inline(
+                    run.profile, _CTX_PRIOR_REVIEW_REF_PROFILE_CHARS
+                )
                 digest = _run_content_digest(run)
-                lines.append(
+                ref = (
                     f"- attempt {idx} (run #{run.id}, {profile}, {ts_disp}) — "
                     f"request_changes — digest sha256:{digest}"
                 )
+                if len(kept_refs) >= _CTX_MAX_PRIOR_REVIEW_REFS:
+                    omitted_refs += 1
+                    continue
+                if budget_used + len(ref.encode("utf-8")) > _CTX_MAX_PRIOR_REVIEW_REF_BYTES:
+                    omitted_refs += 1
+                    continue
+                kept_refs.append(ref)
+                budget_used += len(ref.encode("utf-8"))
+            # Restore chronological (ascending) order for readability.
+            lines.extend(reversed(kept_refs))
             if omitted_refs:
                 lines.append(
                     f"_({omitted_refs} earlier review finding"
@@ -21270,7 +21315,9 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
             ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(run.started_at))
             age = _relative_age(run.started_at, _now)
             ts_disp = f"{ts}, {age}" if age else ts
-            profile = run.profile or "(unknown)"
+            profile = _sanitize_inline(
+                run.profile, _CTX_PRIOR_REVIEW_REF_PROFILE_CHARS
+            )
             outcome = _outcome(run)
             lines.append(f"### Attempt {idx} — {outcome} ({profile}, {ts_disp})")
             if run.summary and run.summary.strip():
