@@ -247,6 +247,71 @@ def test_normalize_rejects_non_dict():
 
 
 # ---------------------------------------------------------------------------
+# Key-membership / null-shadow alias tests
+#
+# A key that is PRESENT with a null value is a conflict, not an absence.
+# ``dict.get(...) is not None`` presence checks would silently treat a
+# ``head: null`` as "no head" and promote the sibling ``exact_head`` alias,
+# and likewise a ``review_outcome: null`` as "no outcome" and promote the
+# sibling ``verdict`` alias.  The normalizer must decide alias membership by
+# key presence (``key in receipt``) so both null-shadow shapes fail closed.
+# ---------------------------------------------------------------------------
+
+def test_normalize_rejects_null_head_with_exact_head_alias():
+    receipt = copy.deepcopy(RECEIPT_4268)
+    del receipt["head"]
+    receipt["head"] = None
+    receipt["exact_head"] = EXACT_HEAD_4268
+    assert kb._normalize_completed_pass_recovery_receipt(receipt) is None
+
+
+def test_normalize_rejects_null_exact_head_with_head_alias():
+    receipt = copy.deepcopy(RECEIPT_4276)
+    receipt["exact_head"] = None
+    assert kb._normalize_completed_pass_recovery_receipt(receipt) is None
+
+
+def test_normalize_rejects_null_review_outcome_with_verdict_alias():
+    receipt = copy.deepcopy(RECEIPT_4276)
+    del receipt["review_outcome"]
+    receipt["review_outcome"] = None
+    receipt["verdict"] = "PASS_EXACT_HEAD"
+    assert kb._normalize_completed_pass_recovery_receipt(receipt) is None
+
+
+def test_normalize_rejects_null_verdict_with_review_outcome_alias():
+    receipt = copy.deepcopy(RECEIPT_4276)
+    receipt["verdict"] = None
+    assert kb._normalize_completed_pass_recovery_receipt(receipt) is None
+
+
+def test_normalize_rejects_null_head_alone():
+    receipt = copy.deepcopy(RECEIPT_4276)
+    receipt["head"] = None
+    assert kb._normalize_completed_pass_recovery_receipt(receipt) is None
+
+
+def test_normalize_rejects_null_exact_head_alone():
+    receipt = copy.deepcopy(RECEIPT_4268)
+    del receipt["head"]
+    receipt["exact_head"] = None
+    assert kb._normalize_completed_pass_recovery_receipt(receipt) is None
+
+
+def test_normalize_rejects_null_review_outcome_alone():
+    receipt = copy.deepcopy(RECEIPT_4276)
+    receipt["review_outcome"] = None
+    assert kb._normalize_completed_pass_recovery_receipt(receipt) is None
+
+
+def test_normalize_rejects_null_verdict_alone():
+    receipt = copy.deepcopy(RECEIPT_4276)
+    del receipt["review_outcome"]
+    receipt["verdict"] = None
+    assert kb._normalize_completed_pass_recovery_receipt(receipt) is None
+
+
+# ---------------------------------------------------------------------------
 # Full recovery-flow integration tests with copied fixtures
 # ---------------------------------------------------------------------------
 
@@ -443,4 +508,32 @@ def test_recovery_rejects_conflicting_verdict_and_review_outcome_metadata(kanban
         )
         before = _snapshot(conn)
         assert not _recover(conn, fixture, RECEIPT_4268, fixture["terminal_summary"])
+        assert _snapshot(conn) == before
+
+
+def test_recovery_rejects_null_head_with_exact_head_metadata(kanban_home):
+    """A present-but-null ``head`` must not promote the sibling ``exact_head``."""
+    with kb.connect() as conn:
+        metadata = copy.deepcopy(METADATA_4268)
+        metadata["head"] = None  # present-but-null conflicts with exact_head
+        fixture = _alias_fixture(
+            conn, head=EXACT_HEAD_4268, tree=TREE_4268, base=BASE_4268,
+            pr=PR_4268, terminal_metadata=metadata,
+        )
+        before = _snapshot(conn)
+        assert not _recover(conn, fixture, RECEIPT_4268, fixture["terminal_summary"])
+        assert _snapshot(conn) == before
+
+
+def test_recovery_rejects_null_review_outcome_with_verdict_metadata(kanban_home):
+    """A present-but-null ``review_outcome`` must not promote the sibling verdict."""
+    with kb.connect() as conn:
+        metadata = copy.deepcopy(METADATA_4276)
+        metadata["review_outcome"] = None  # present-but-null conflicts with verdict
+        fixture = _alias_fixture(
+            conn, head=HEAD_4276, tree=TREE_4276, base=BASE_4276,
+            pr=PR_4276, terminal_metadata=metadata,
+        )
+        before = _snapshot(conn)
+        assert not _recover(conn, fixture, RECEIPT_4276, fixture["terminal_summary"])
         assert _snapshot(conn) == before
