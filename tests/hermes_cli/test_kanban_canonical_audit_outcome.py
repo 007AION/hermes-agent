@@ -54,6 +54,20 @@ def _evidence_metadata():
     }
 
 
+def _evidence_block():
+    """The closed 8-key evidence block the auditor binds to a PASS verdict."""
+    return {
+        "repository": REPOSITORY,
+        "pr": PR,
+        "head": HEAD,
+        "tree": TREE,
+        "base": BASE,
+        "github_review_id": REVIEW_ID,
+        "github_review_url": REVIEW_URL,
+        "github_review_state": "APPROVED",
+    }
+
+
 PRECURSOR_REASON = (
     f"PASS exact head {HEAD}/tree {TREE}/base {BASE}. Independently "
     "reproduced named base RED tests; changed suites GREEN."
@@ -101,6 +115,7 @@ def _fixture(conn, *, continuation_child: bool = False):
         conn, author, review_task_id=audit,
         expected_review_run_id=audit_run, verdict="pass",
         reason=PRECURSOR_REASON,
+        evidence=_evidence_block(),
     )
     return {
         "author": author,
@@ -289,30 +304,102 @@ def test_disposition_skips_terminal_children(kanban_home):
         lambda m: m.pop("github_review_id"),
     ],
 )
-def test_hostile_evidence_skips_envelope(kanban_home, mutate):
-    """Invalid/hostile evidence is not a valid PASS-outcome completion: the
-    envelope is skipped with zero mutation (the proof-kernel receipt is the
-    primary authenticity gate)."""
+def test_hostile_malformed_evidence_fails_closed(kanban_home, mutate):
+    """Malformed/foreign completion evidence fails closed (raises, zero write):
+    the author's metadata must normalize to the authenticated verdict identity."""
     with kb.connect() as conn:
         fx = _fixture(conn)
         metadata = _evidence_metadata()
         mutate(metadata)
         before = _snapshot(conn)
-        assert kb._bind_canonical_audit_outcome(
-            conn, fx["audit"], fx["audit_run"], metadata,
-        ) is None
+        with pytest.raises(kb._CanonicalAuditOutcomeError):
+            kb._bind_canonical_audit_outcome(
+                conn, fx["audit"], fx["audit_run"], metadata,
+            )
         assert _snapshot(conn) == before
         assert _events(conn, fx["audit"], kb.CANONICAL_AUDIT_OUTCOME_EVENT) == []
 
 
-def test_missing_evidence_skips_envelope(kanban_home):
+def _coherent_wrong_evidence():
+    """A coherent, valid-format but WRONG evidence identity (different valid
+    40-hex SHAs / PR / review id with a matching canonical URL)."""
+    wrong_pr = 999
+    wrong_review_id = 888888
+    return {
+        "review_outcome": "approved",
+        "repository": REPOSITORY,
+        "pr": wrong_pr,
+        "head": "1" * 40,
+        "tree": "2" * 40,
+        "base": "3" * 40,
+        "github_review_id": wrong_review_id,
+        "github_review_url": (
+            f"https://github.com/{REPOSITORY}/pull/{wrong_pr}"
+            f"#pullrequestreview-{wrong_review_id}"
+        ),
+        "github_review_state": "APPROVED",
+    }
+
+
+def test_hostile_coherent_wrong_evidence_fails_closed(kanban_home):
+    """The exact defect the auditor flagged: a coherent valid-format but wrong
+    head/tree/base + PR/URL + review-id/URL must be rejected, not persisted as a
+    resolver-accepted envelope / finalizer authority."""
     with kb.connect() as conn:
         fx = _fixture(conn)
         before = _snapshot(conn)
-        assert kb._bind_canonical_audit_outcome(
+        with pytest.raises(kb._CanonicalAuditOutcomeError):
+            kb._bind_canonical_audit_outcome(
+                conn, fx["audit"], fx["audit_run"], _coherent_wrong_evidence(),
+            )
+        assert _snapshot(conn) == before
+        assert _events(conn, fx["audit"], kb.CANONICAL_AUDIT_OUTCOME_EVENT) == []
+        assert kb._resolved_canonical_audit_outcome(conn, fx["author"]) is None
+
+
+def test_no_metadata_evidence_adopts_verdict_identity(kanban_home):
+    """The author supplies no evidence: the authenticated verdict identity is
+    adopted as the envelope evidence (metadata is not the source of truth)."""
+    with kb.connect() as conn:
+        fx = _fixture(conn)
+        envelope = kb._bind_canonical_audit_outcome(
             conn, fx["audit"], fx["audit_run"], None,
+        )
+        assert envelope is not None
+        assert envelope["evidence"] == _evidence_block()
+        assert envelope["evidence"]["head"] == HEAD
+
+
+def test_v1_pass_verdict_produces_no_envelope(kanban_home):
+    """A version-1 PASS verdict carries no structured evidence, so the new
+    producer cannot authenticate an envelope (returns None, zero write)."""
+    with kb.connect() as conn:
+        author = kb.create_task(
+            conn, title="implementation", factory_build_gate=1,
+            assignee=AUTHOR_PROFILE,
+        )
+        author_run = _claim(conn, author)
+        audit = kb.create_task(
+            conn, title="exact-head audit", assignee=AUDITOR_PROFILE,
+            parents=[author],
+        )
+        assert kb.request_review_handoff(
+            conn, author, expected_run_id=author_run, review_task_id=audit,
+            reason=f"PR #{PR} frozen at exact head {HEAD}",
+        ) is not None
+        audit_run = _claim(conn, audit)
+        # No evidence -> version-1 verdict.
+        assert kb.record_review_verdict(
+            conn, author, review_task_id=audit,
+            expected_review_run_id=audit_run, verdict="pass",
+            reason=PRECURSOR_REASON,
+        )
+        before = _snapshot(conn)
+        assert kb._bind_canonical_audit_outcome(
+            conn, audit, audit_run, _evidence_metadata(),
         ) is None
         assert _snapshot(conn) == before
+        assert _events(conn, audit, kb.CANONICAL_AUDIT_OUTCOME_EVENT) == []
 
 
 def test_ambiguous_parent_fails_closed(kanban_home):

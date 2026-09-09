@@ -912,6 +912,7 @@ def _handle_review_verdict(args: dict, **kw) -> str:
     author_task_id = str(args.get("author_task_id") or "").strip()
     verdict = str(args.get("verdict") or "").strip().lower()
     reason = str(args.get("reason") or "").strip()
+    evidence = args.get("evidence")
 
     if not author_task_id:
         return tool_error("author_task_id is required")
@@ -933,6 +934,7 @@ def _handle_review_verdict(args: dict, **kw) -> str:
                 verdict=verdict,
                 reason=reason,
                 recovery_receipt=recovery_receipt,
+                evidence=evidence,
                 controller_task_id=controller_task_id,
                 controller_run_id=controller_run_id,
                 controller_profile=controller_profile,
@@ -2044,6 +2046,32 @@ KANBAN_REVIEW_VERDICT_SCHEMA = {
                 },
                 "required": [
                     "review_outcome", "repository", "pr", "head", "tree", "base",
+                    "github_review_id", "github_review_url", "github_review_state",
+                ],
+                "additionalProperties": False,
+            },
+            "evidence": {
+                "type": "object",
+                "description": (
+                    "Optional structured evidence identity for a PASS verdict: "
+                    "the exact repository/PR/head/tree/base and commit-bound "
+                    "GitHub APPROVED review id/url/state the auditor "
+                    "authenticated. Digest-bound into the verdict so the "
+                    "terminal writer corroborates the author's completion "
+                    "metadata against it. Only valid for a PASS verdict."
+                ),
+                "properties": {
+                    "repository": {"type": "string"},
+                    "pr": {"type": "integer"},
+                    "head": {"type": "string"},
+                    "tree": {"type": "string"},
+                    "base": {"type": "string"},
+                    "github_review_id": {"type": "integer"},
+                    "github_review_url": {"type": "string"},
+                    "github_review_state": {"type": "string", "enum": ["APPROVED"]},
+                },
+                "required": [
+                    "repository", "pr", "head", "tree", "base",
                     "github_review_id", "github_review_url", "github_review_state",
                 ],
                 "additionalProperties": False,

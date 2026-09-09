@@ -7031,18 +7031,47 @@ def _review_handoff_receipt_from_row(
 def _canonical_review_verdict_payload(row: sqlite3.Row) -> Optional[dict[str, Any]]:
     try:
         payload = json.loads(row["payload"] or "{}")
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    version = payload.get("version")
+    if version == 1:
         schema = {"version": int, "review_task_id": str, "review_run_id": int,
                   "verdict": str, "reason": str}
-        if (not isinstance(payload, dict) or set(payload) != set(schema)
-                or any(type(payload[key]) is not expected for key, expected in schema.items())):
+        if (set(payload) != set(schema)
+                or any(type(payload[key]) is not expected
+                       for key, expected in schema.items())):
             return None
         return payload if (
             payload["version"] == 1 and bool(payload["review_task_id"].strip())
             and payload["verdict"] in {"pass", "request_changes"}
             and bool(payload["reason"].strip()) and payload["review_run_id"] == row["run_id"]
         ) else None
-    except (KeyError, TypeError, ValueError):
-        return None
+    if version == 2:
+        # A version-2 PASS verdict carries the auditor-bound structured
+        # evidence block (digest-bound) that the terminal writer corroborates
+        # completion metadata against.  Only a PASS verdict may carry it; any
+        # malformed/foreign/undigested block fails closed.
+        schema = {"version": int, "review_task_id": str, "review_run_id": int,
+                  "verdict": str, "reason": str, "evidence": dict,
+                  "evidence_sha256": str}
+        if (set(payload) != set(schema)
+                or any(type(payload[key]) is not expected
+                       for key, expected in schema.items())):
+            return None
+        evidence = _canonical_pass_evidence_block(payload["evidence"])
+        if evidence is None:
+            return None
+        if payload["evidence_sha256"] != _canonical_audit_outcome_evidence_sha256(evidence):
+            return None
+        return payload if (
+            payload["verdict"] == "pass"
+            and bool(payload["review_task_id"].strip())
+            and bool(payload["reason"].strip())
+            and payload["review_run_id"] == row["run_id"]
+        ) else None
+    return None
 
 
 _COMPLETED_RECOVERY_RECEIPT_KEYS = {
@@ -8109,6 +8138,63 @@ _CANONICAL_AUDIT_OUTCOME_EVIDENCE_KEYS = (
     "github_review_id", "github_review_url", "github_review_state",
 )
 
+# Keys whose mere presence in completion metadata means the author is
+# asserting an evidence identity (canonical or one of the legacy recovery
+# aliases).  A metadata dict carrying any of these must normalize to a closed
+# canonical PASS identity byte-equal to the authenticated verdict identity,
+# otherwise the terminal write fails closed.  This is what lets the terminal
+# writer distinguish "no evidence supplied" (adopt the verdict identity) from
+# "evidence supplied but malformed / drifted" (reject).
+_CANONICAL_EVIDENCE_BEARING_KEYS = frozenset(
+    {
+        *_CANONICAL_AUDIT_OUTCOME_EVIDENCE_KEYS,
+        "review_outcome", "verdict", "exact_head", "github_review",
+        "recovery_receipt",
+    }
+)
+
+
+def _canonical_pass_evidence_block(evidence: Any) -> Optional[dict[str, Any]]:
+    """Return one closed, typed PASS evidence block (8 identity keys) or None.
+
+    This is the authenticated auditor-bound evidence identity for a PASS
+    verdict: ``repository``/``pr``/``head``/``tree``/``base``/
+    ``github_review_id``/``github_review_url``/``github_review_state``.  Every
+    field must be present, typed, and internally consistent (40-hex SHAs,
+    positive non-bool PR/review id, and the canonical commit-bound APPROVED
+    review URL); anything else fails closed.  It is the single structured
+    source of truth the terminal writer corroborates against, so no caller
+    prose or free-text reason is ever parsed for identity.
+    """
+    if not isinstance(evidence, dict) or set(evidence) != set(
+        _CANONICAL_AUDIT_OUTCOME_EVIDENCE_KEYS
+    ):
+        return None
+    pr = evidence.get("pr")
+    review_id = evidence.get("github_review_id")
+    if (
+        evidence.get("repository") != FACTORY_REVIEW_REPOSITORY
+        or isinstance(pr, bool)
+        or not isinstance(pr, int)
+        or pr <= 0
+        or any(
+            not isinstance(evidence.get(key), str)
+            or re.fullmatch(r"[0-9a-fA-F]{40}", evidence[key]) is None
+            for key in ("head", "tree", "base")
+        )
+        or isinstance(review_id, bool)
+        or not isinstance(review_id, int)
+        or review_id <= 0
+        or evidence.get("github_review_state") != "APPROVED"
+        or evidence.get("github_review_url")
+        != (
+            f"https://github.com/{FACTORY_REVIEW_REPOSITORY}/pull/{pr}"
+            f"#pullrequestreview-{review_id}"
+        )
+    ):
+        return None
+    return {key: evidence[key] for key in _CANONICAL_AUDIT_OUTCOME_EVIDENCE_KEYS}
+
 
 class _CanonicalAuditOutcomeError(Exception):
     """A bound PASS audit completion could not produce a legal envelope."""
@@ -8215,13 +8301,37 @@ def _bind_canonical_audit_outcome(
         # request_changes run is already terminal and never reaches here.
         return None
 
-    # The envelope is only produced for a canonical PASS *outcome* completion,
-    # i.e. when the completion metadata carries closed "approved" evidence. A
-    # bound PASS whose completion metadata is a request-changes correction (or
-    # any other non-PASS-outcome shape) is not an envelope producer — skip.
-    evidence = _canonical_audit_outcome_evidence(metadata)
-    if evidence is None:
+    # The envelope evidence identity is authenticated by the auditor's bound
+    # verdict: a version-2 PASS verdict carries a structured, digest-bound
+    # evidence block.  The author's completion metadata is NOT the source of
+    # truth — if it carries an evidence block it must byte-match the
+    # authenticated verdict identity, and if it is absent the authenticated
+    # identity is adopted.  A version-1 PASS verdict has no structured
+    # evidence, so the new producer cannot authenticate it and no envelope is
+    # produced (legacy split records remain the bounded read-only ingress).
+    authenticated_evidence = verdict.get("evidence")
+    if not isinstance(authenticated_evidence, dict):
         return None
+    metadata_evidence = _canonical_audit_outcome_evidence(metadata)
+    if metadata_evidence is None:
+        if isinstance(metadata, dict) and _CANONICAL_EVIDENCE_BEARING_KEYS.intersection(
+            metadata
+        ):
+            # The author supplied evidence that did not normalize to a closed
+            # canonical PASS identity matching the verdict — drift/malformation
+            # fails closed.
+            raise _CanonicalAuditOutcomeError(
+                "completion evidence is malformed or drifts from the "
+                "authenticated verdict identity"
+            )
+        # No evidence supplied: adopt the authenticated verdict identity.
+        evidence = authenticated_evidence
+    elif metadata_evidence != authenticated_evidence:
+        raise _CanonicalAuditOutcomeError(
+            "completion evidence drifts from the authenticated verdict identity"
+        )
+    else:
+        evidence = authenticated_evidence
 
     # From here on this is a bound PASS audit outcome: any missing identity,
     # role-separation, or disposition fact fails closed (raises, rolling back
@@ -9560,11 +9670,19 @@ def _record_review_verdict(
     verdict: str,
     reason: str,
     recovery_receipt: Optional[dict] = None,
+    evidence: Optional[dict] = None,
     controller_task_id: Optional[str] = None,
     controller_run_id: Optional[int] = None,
     controller_profile: Optional[str] = None,
 ) -> bool:
-    """Record a bound child verdict; only REQUEST_CHANGES resumes the author."""
+    """Record a bound child verdict; only REQUEST_CHANGES resumes the author.
+
+    A PASS verdict may bind a closed, structured ``evidence`` block (the exact
+    repository/PR/head/tree/base/review-id/url/state the auditor authenticated).
+    It is digest-bound into a version-2 verdict payload so the terminal writer
+    can corroborate the author's completion metadata against it; a PASS verdict
+    with malformed/foreign evidence fails closed.
+    """
     verdict = str(verdict or "").strip().lower()
     reason = str(reason or "").strip()
     if verdict not in {"pass", "request_changes"} or not reason:
@@ -9573,6 +9691,13 @@ def _record_review_verdict(
         expected_review_run_id = int(expected_review_run_id)
     except (TypeError, ValueError):
         return False
+    canonical_evidence: Optional[dict[str, Any]] = None
+    if evidence is not None:
+        if verdict != "pass":
+            return False
+        canonical_evidence = _canonical_pass_evidence_block(evidence)
+        if canonical_evidence is None:
+            return False
     with write_txn(conn):
         if recovery_receipt is not None:
             if verdict == "pass":
@@ -9618,6 +9743,7 @@ def _record_review_verdict(
                     row["run_id"] != expected_review_run_id
                     or payload.get("verdict") != verdict
                     or payload.get("reason") != reason
+                    or payload.get("evidence") != canonical_evidence
                 ):
                     return False
                 if verdict == "pass":
@@ -9672,13 +9798,26 @@ def _record_review_verdict(
             or review_run["ended_at"] is not None
         ):
             return False
-        payload = {
-            "version": 1,
-            "review_task_id": review_task_id,
-            "review_run_id": expected_review_run_id,
-            "verdict": verdict,
-            "reason": reason,
-        }
+        if verdict == "pass" and canonical_evidence is not None:
+            payload = {
+                "version": 2,
+                "review_task_id": review_task_id,
+                "review_run_id": expected_review_run_id,
+                "verdict": verdict,
+                "reason": reason,
+                "evidence": canonical_evidence,
+                "evidence_sha256": _canonical_audit_outcome_evidence_sha256(
+                    canonical_evidence
+                ),
+            }
+        else:
+            payload = {
+                "version": 1,
+                "review_task_id": review_task_id,
+                "review_run_id": expected_review_run_id,
+                "verdict": verdict,
+                "reason": reason,
+            }
         if verdict == "request_changes":
             now = int(time.time())
             child_reset = conn.execute(
@@ -10463,6 +10602,7 @@ def record_review_verdict(
     verdict: str,
     reason: str,
     recovery_receipt: Optional[dict] = None,
+    evidence: Optional[dict] = None,
     controller_task_id: Optional[str] = None,
     controller_run_id: Optional[int] = None,
     controller_profile: Optional[str] = None,
@@ -10477,6 +10617,7 @@ def record_review_verdict(
             verdict=verdict,
             reason=reason,
             recovery_receipt=recovery_receipt,
+            evidence=evidence,
             controller_task_id=controller_task_id,
             controller_run_id=controller_run_id,
             controller_profile=controller_profile,
