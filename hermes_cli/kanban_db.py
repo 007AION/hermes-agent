@@ -8456,9 +8456,13 @@ def _task_run_matches(
     The terminal writer records the envelope under the author and audit runs
     it belongs to. A fabricated or cross-task run id, profile drift, or a
     reopened/nonterminal run must not be trusted to grant finalizer authority.
+    The official terminal writer also clears every run-level execution claim;
+    either a reopened claim or any second open run for the task revokes the
+    closed projection.
     """
     row = conn.execute(
-        "SELECT profile, status, outcome, ended_at FROM task_runs "
+        "SELECT profile, status, outcome, ended_at, claim_lock, claim_expires, "
+        "worker_pid FROM task_runs "
         "WHERE id = ? AND task_id = ?",
         (run_id, task_id),
     ).fetchone()
@@ -8468,6 +8472,13 @@ def _task_run_matches(
         and row["status"] == status
         and row["outcome"] == outcome
         and row["ended_at"] is not None
+        and row["claim_lock"] is None
+        and row["claim_expires"] is None
+        and row["worker_pid"] is None
+        and conn.execute(
+            "SELECT 1 FROM task_runs WHERE task_id = ? AND ended_at IS NULL LIMIT 1",
+            (task_id,),
+        ).fetchone() is None
     )
 
 
@@ -8543,11 +8554,17 @@ def _resolved_canonical_audit_outcome(
     # belongs to); a drifted event under a foreign run must not be trusted.
     if row["run_id"] != author_run_id:
         return None
-    # audit_task_id must be a live direct child of the author.
-    if conn.execute(
-        "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ?",
-        (author_task_id, audit_task_id),
-    ).fetchone() is None:
+    # The producer requires one unambiguous author edge. Preserve that exact
+    # live parent-set invariant at consumption time: merely retaining the
+    # recorded edge is insufficient if a second parent is added later.
+    audit_parent_rows = conn.execute(
+        "SELECT parent_id FROM task_links WHERE child_id = ? ORDER BY parent_id",
+        (audit_task_id,),
+    ).fetchall()
+    if (
+        len(audit_parent_rows) != 1
+        or audit_parent_rows[0]["parent_id"] != author_task_id
+    ):
         return None
     # Role profiles must mirror the live task assignees (and differ).
     identity_fields = (
@@ -8555,13 +8572,13 @@ def _resolved_canonical_audit_outcome(
         "fence_lineage", "fence_disposition",
     )
     author_assignee = conn.execute(
-        "SELECT assignee, status, current_run_id, claim_lock, claim_expires, "
-        "worker_pid, worker_starttime, fence_lineage, fence_disposition "
+        "SELECT assignee, status, current_run_id, completed_at, claim_lock, "
+        "claim_expires, worker_pid, worker_starttime, fence_lineage, fence_disposition "
         "FROM tasks WHERE id = ?", (author_task_id,),
     ).fetchone()
     audit_assignee = conn.execute(
-        "SELECT assignee, status, current_run_id, claim_lock, claim_expires, "
-        "worker_pid, worker_starttime, fence_lineage, fence_disposition "
+        "SELECT assignee, status, current_run_id, completed_at, claim_lock, "
+        "claim_expires, worker_pid, worker_starttime, fence_lineage, fence_disposition "
         "FROM tasks WHERE id = ?", (audit_task_id,),
     ).fetchone()
     if author_assignee is None or audit_assignee is None:
@@ -8578,9 +8595,11 @@ def _resolved_canonical_audit_outcome(
     if (
         author_assignee["status"] != "review"
         or author_assignee["current_run_id"] is not None
+        or author_assignee["completed_at"] is not None
         or any(author_assignee[field] is not None for field in identity_fields)
         or audit_assignee["status"] != "done"
         or audit_assignee["current_run_id"] is not None
+        or audit_assignee["completed_at"] is None
         or any(audit_assignee[field] is not None for field in identity_fields)
     ):
         return None

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import copy
 import json
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -125,6 +126,28 @@ def _fixture(conn, *, continuation_child: bool = False):
     }
 
 
+def _handoff_fixture(conn):
+    """Author -> claimed audit before the PASS-preparation write."""
+    author = kb.create_task(
+        conn, title="implementation", factory_build_gate=1, assignee=AUTHOR_PROFILE,
+    )
+    author_run = _claim(conn, author)
+    audit = kb.create_task(
+        conn, title="exact-head audit", assignee=AUDITOR_PROFILE, parents=[author],
+    )
+    assert kb.request_review_handoff(
+        conn, author, expected_run_id=author_run, review_task_id=audit,
+        reason=f"PR #{PR} frozen at exact head {HEAD}",
+    ) is not None
+    audit_run = _claim(conn, audit)
+    return {
+        "author": author,
+        "author_run": author_run,
+        "audit": audit,
+        "audit_run": audit_run,
+    }
+
+
 def _snapshot(conn):
     return "\n".join(conn.iterdump())
 
@@ -173,6 +196,164 @@ def test_base_red_split_pass_null_receipt(kanban_home):
         # The verdict and the terminal evidence are bound to different runs.
         assert kb._canonical_audit_receipt(conn, fx["author"]) is None
         assert kb._resolved_canonical_audit_outcome(conn, fx["author"]) is None
+
+
+@pytest.mark.parametrize("mirror_index", [1, 2])
+def test_pass_preparation_rolls_back_at_each_mirror_boundary(
+    kanban_home, mirror_index,
+):
+    """Either paired-verdict insert failure leaves zero PASS preparation."""
+    with kb.connect() as conn:
+        fx = _handoff_fixture(conn)
+        before = _snapshot(conn)
+        conn.execute(
+            f"""
+            CREATE TEMP TRIGGER injected_pass_failure
+            AFTER INSERT ON task_events
+            WHEN NEW.kind = 'review_verdict'
+             AND (SELECT COUNT(*) FROM task_events
+                   WHERE kind = 'review_verdict') = {mirror_index}
+            BEGIN
+                SELECT RAISE(ABORT, 'injected PASS preparation failure');
+            END
+            """
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="injected PASS"):
+            kb.record_review_verdict(
+                conn, fx["author"], review_task_id=fx["audit"],
+                expected_review_run_id=fx["audit_run"], verdict="pass",
+                reason=PRECURSOR_REASON, evidence=_evidence_block(),
+            )
+        assert _snapshot(conn) == before
+        assert _events(conn, fx["author"], "review_verdict") == []
+        assert _events(conn, fx["audit"], "review_verdict") == []
+
+
+def test_pass_preparation_exact_replay_is_read_only_and_drift_fails_closed(
+    kanban_home,
+):
+    """Only byte-identical same-run PASS preparation may be replayed."""
+    with kb.connect() as conn:
+        fx = _handoff_fixture(conn)
+        assert kb.record_review_verdict(
+            conn, fx["author"], review_task_id=fx["audit"],
+            expected_review_run_id=fx["audit_run"], verdict="pass",
+            reason=PRECURSOR_REASON, evidence=_evidence_block(),
+        )
+        prepared = _snapshot(conn)
+        assert kb.record_review_verdict(
+            conn, fx["author"], review_task_id=fx["audit"],
+            expected_review_run_id=fx["audit_run"], verdict="pass",
+            reason=PRECURSOR_REASON, evidence=_evidence_block(),
+        )
+        assert _snapshot(conn) == prepared
+        assert not kb.record_review_verdict(
+            conn, fx["author"], review_task_id=fx["audit"],
+            expected_review_run_id=fx["audit_run"], verdict="pass",
+            reason="drifted PASS reason", evidence=_evidence_block(),
+        )
+        assert _snapshot(conn) == prepared
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    [
+        "audit_task_done",
+        "audit_run_done",
+        "audit_task_detached",
+        "completed_event",
+        "audit_envelope",
+        "author_envelope",
+        "audit_changed_fact",
+        "author_changed_fact",
+    ],
+)
+def test_terminal_writer_rolls_back_at_each_internal_write_boundary(
+    kanban_home, boundary,
+):
+    """Every injected terminal-write failure restores the exact pre-state."""
+    with kb.connect() as conn:
+        fx = _fixture(conn)
+        before = _snapshot(conn)
+        audit = fx["audit"]
+        audit_run = fx["audit_run"]
+        trigger_sql = {
+            "audit_task_done": f"""
+                CREATE TEMP TRIGGER injected_terminal_failure
+                AFTER UPDATE OF status ON tasks
+                WHEN OLD.id = '{audit}' AND NEW.status = 'done'
+                BEGIN SELECT RAISE(ABORT, 'injected terminal failure'); END
+            """,
+            "audit_run_done": f"""
+                CREATE TEMP TRIGGER injected_terminal_failure
+                AFTER UPDATE OF status ON task_runs
+                WHEN OLD.id = {audit_run} AND NEW.status = 'done'
+                BEGIN SELECT RAISE(ABORT, 'injected terminal failure'); END
+            """,
+            "audit_task_detached": f"""
+                CREATE TEMP TRIGGER injected_terminal_failure
+                AFTER UPDATE OF current_run_id ON tasks
+                WHEN OLD.id = '{audit}' AND OLD.current_run_id IS NOT NULL
+                 AND NEW.current_run_id IS NULL
+                BEGIN SELECT RAISE(ABORT, 'injected terminal failure'); END
+            """,
+            "completed_event": """
+                CREATE TEMP TRIGGER injected_terminal_failure
+                AFTER INSERT ON task_events WHEN NEW.kind = 'completed'
+                BEGIN SELECT RAISE(ABORT, 'injected terminal failure'); END
+            """,
+            "audit_envelope": """
+                CREATE TEMP TRIGGER injected_terminal_failure
+                AFTER INSERT ON task_events
+                WHEN NEW.kind = 'canonical_audit_outcome'
+                 AND (SELECT COUNT(*) FROM task_events
+                      WHERE kind = 'canonical_audit_outcome') = 1
+                BEGIN SELECT RAISE(ABORT, 'injected terminal failure'); END
+            """,
+            "author_envelope": """
+                CREATE TEMP TRIGGER injected_terminal_failure
+                AFTER INSERT ON task_events
+                WHEN NEW.kind = 'canonical_audit_outcome'
+                 AND (SELECT COUNT(*) FROM task_events
+                      WHERE kind = 'canonical_audit_outcome') = 2
+                BEGIN SELECT RAISE(ABORT, 'injected terminal failure'); END
+            """,
+            "audit_changed_fact": """
+                CREATE TEMP TRIGGER injected_terminal_failure
+                AFTER INSERT ON task_events
+                WHEN NEW.kind = 'changed_fact'
+                 AND (SELECT COUNT(*) FROM task_events
+                      WHERE kind = 'changed_fact') = 1
+                BEGIN SELECT RAISE(ABORT, 'injected terminal failure'); END
+            """,
+            "author_changed_fact": """
+                CREATE TEMP TRIGGER injected_terminal_failure
+                AFTER INSERT ON task_events
+                WHEN NEW.kind = 'changed_fact'
+                 AND (SELECT COUNT(*) FROM task_events
+                      WHERE kind = 'changed_fact') = 2
+                BEGIN SELECT RAISE(ABORT, 'injected terminal failure'); END
+            """,
+        }[boundary]
+        conn.execute(trigger_sql)
+        with pytest.raises(sqlite3.IntegrityError, match="injected terminal"):
+            kb.complete_task(
+                conn, audit, expected_run_id=audit_run,
+                metadata=_evidence_metadata(),
+            )
+        assert _snapshot(conn) == before
+        task = conn.execute(
+            "SELECT status, current_run_id, completed_at FROM tasks WHERE id = ?",
+            (audit,),
+        ).fetchone()
+        assert tuple(task) == ("running", audit_run, None)
+        run = conn.execute(
+            "SELECT status, outcome, ended_at FROM task_runs WHERE id = ?",
+            (audit_run,),
+        ).fetchone()
+        assert tuple(run) == ("running", None, None)
+        assert _events(conn, audit, kb.CANONICAL_AUDIT_OUTCOME_EVENT) == []
+        assert _events(conn, audit, kb.CHANGED_FACT_EVENT) == []
 
 
 # ---------------------------------------------------------------------------
@@ -1064,5 +1245,79 @@ def test_resolver_rejects_mirrored_created_at_drift(kanban_home):
                     "UPDATE task_events SET payload=? WHERE id=?",
                     (json.dumps(payload), event["id"]),
                 )
+        assert kb._resolved_canonical_audit_outcome(conn, fx["author"]) is None
+        assert kb._reviewed_author_finalizer_run_id(conn, fx["author"]) is None
+
+
+# ---------------------------------------------------------------------------
+# Round-7 resolver hardening: the canonical family remains authoritative only
+# while its exact parent and terminal execution projections remain closed.
+# ---------------------------------------------------------------------------
+
+def test_resolver_rejects_late_second_audit_parent(kanban_home):
+    """A completed audit whose live parent set becomes ambiguous fails closed."""
+    with kb.connect() as conn:
+        fx = _completed_fixture(conn)
+        second_parent = kb.create_task(conn, title="foreign parent", assignee="merger")
+        with kb.write_txn(conn):
+            conn.execute(
+                "INSERT INTO task_links (parent_id, child_id) VALUES (?, ?)",
+                (second_parent, fx["audit"]),
+            )
+        assert kb._resolved_canonical_audit_outcome(conn, fx["author"]) is None
+        assert kb._reviewed_author_finalizer_run_id(conn, fx["author"]) is None
+
+
+def test_resolver_rejects_missing_audit_completed_at(kanban_home):
+    """The audit task's official done projection includes completed_at."""
+    with kb.connect() as conn:
+        fx = _completed_fixture(conn)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET completed_at = NULL WHERE id = ?",
+                (fx["audit"],),
+            )
+        assert kb._resolved_canonical_audit_outcome(conn, fx["author"]) is None
+        assert kb._reviewed_author_finalizer_run_id(conn, fx["author"]) is None
+
+
+@pytest.mark.parametrize("side", ["author", "audit"])
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("claim_lock", "reopened-lock"),
+        ("claim_expires", 999999999),
+        ("worker_pid", 424242),
+    ],
+)
+def test_resolver_rejects_reopened_run_execution_identity(
+    kanban_home, side, field, value,
+):
+    """Terminal runs cannot retain or regain a live execution identity."""
+    with kb.connect() as conn:
+        fx = _completed_fixture(conn)
+        with kb.write_txn(conn):
+            conn.execute(
+                f"UPDATE task_runs SET {field} = ? WHERE id = ?",
+                (value, fx[f"{side}_run"]),
+            )
+        assert kb._resolved_canonical_audit_outcome(conn, fx["author"]) is None
+        assert kb._reviewed_author_finalizer_run_id(conn, fx["author"]) is None
+
+
+@pytest.mark.parametrize("side", ["author", "audit"])
+def test_resolver_rejects_conflicting_open_run(kanban_home, side):
+    """Any additional open run for either exact task revokes authority."""
+    with kb.connect() as conn:
+        fx = _completed_fixture(conn)
+        task_id = fx[side]
+        profile = AUTHOR_PROFILE if side == "author" else AUDITOR_PROFILE
+        with kb.write_txn(conn):
+            conn.execute(
+                "INSERT INTO task_runs "
+                "(task_id, profile, status, started_at, ended_at, outcome) "
+                "VALUES (?, ?, 'running', 999999999, NULL, NULL)",
+                (task_id, profile),
+            )
         assert kb._resolved_canonical_audit_outcome(conn, fx["author"]) is None
         assert kb._reviewed_author_finalizer_run_id(conn, fx["author"]) is None
