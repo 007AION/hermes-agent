@@ -256,6 +256,74 @@ def test_pass_preparation_exact_replay_is_read_only_and_drift_fails_closed(
 
 
 @pytest.mark.parametrize(
+    "mutation",
+    ["missing_audit", "duplicate_author", "duplicate_audit", "drifted_author"],
+)
+def test_broken_pass_pair_blocks_replay_and_rolls_back_terminal_writer(
+    kanban_home, mutation,
+):
+    """A broken prepared PASS pair cannot become a stranded done audit."""
+    with kb.connect() as conn:
+        fx = _handoff_fixture(conn)
+        assert kb.record_review_verdict(
+            conn, fx["author"], review_task_id=fx["audit"],
+            expected_review_run_id=fx["audit_run"], verdict="pass",
+            reason=PRECURSOR_REASON, evidence=_evidence_block(),
+        )
+        author_row = _events(conn, fx["author"], "review_verdict")[0]
+        audit_row = _events(conn, fx["audit"], "review_verdict")[0]
+        with kb.write_txn(conn):
+            if mutation == "missing_audit":
+                conn.execute("DELETE FROM task_events WHERE id=?", (audit_row["id"],))
+            elif mutation == "duplicate_author":
+                conn.execute(
+                    "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
+                    "SELECT task_id, run_id, kind, payload, created_at "
+                    "FROM task_events WHERE id=?",
+                    (author_row["id"],),
+                )
+            elif mutation == "duplicate_audit":
+                conn.execute(
+                    "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
+                    "SELECT task_id, run_id, kind, payload, created_at "
+                    "FROM task_events WHERE id=?",
+                    (audit_row["id"],),
+                )
+            else:
+                payload = json.loads(author_row["payload"])
+                payload["reason"] = "drifted author-side PASS reason"
+                conn.execute(
+                    "UPDATE task_events SET payload=? WHERE id=?",
+                    (json.dumps(payload), author_row["id"]),
+                )
+        broken = _snapshot(conn)
+
+        assert not kb.record_review_verdict(
+            conn, fx["author"], review_task_id=fx["audit"],
+            expected_review_run_id=fx["audit_run"], verdict="pass",
+            reason=PRECURSOR_REASON, evidence=_evidence_block(),
+        )
+        assert _snapshot(conn) == broken
+
+        with pytest.raises(kb._CanonicalAuditOutcomeError, match="verdict family"):
+            kb.complete_task(
+                conn, fx["audit"], expected_run_id=fx["audit_run"],
+                metadata=_evidence_metadata(),
+            )
+        assert _snapshot(conn) == broken
+        task = conn.execute(
+            "SELECT status, current_run_id, completed_at FROM tasks WHERE id=?",
+            (fx["audit"],),
+        ).fetchone()
+        assert tuple(task) == ("running", fx["audit_run"], None)
+        run = conn.execute(
+            "SELECT status, outcome, ended_at FROM task_runs WHERE id=?",
+            (fx["audit_run"],),
+        ).fetchone()
+        assert tuple(run) == ("running", None, None)
+
+
+@pytest.mark.parametrize(
     "boundary",
     [
         "audit_task_done",
