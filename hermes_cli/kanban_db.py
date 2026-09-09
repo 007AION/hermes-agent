@@ -8137,6 +8137,16 @@ _CANONICAL_AUDIT_OUTCOME_EVIDENCE_KEYS = (
     "repository", "pr", "head", "tree", "base",
     "github_review_id", "github_review_url", "github_review_state",
 )
+_CANONICAL_AUDIT_OUTCOME_KEYS = frozenset({
+    "version", "author_task_id", "author_run_id", "audit_task_id",
+    "audit_run_id", "handoff_event_id", "verdict", "reason", "evidence",
+    "role_separation", "evidence_sha256", "created_at",
+})
+_CANONICAL_AUDIT_ROLE_KEYS = frozenset({"author_profile", "auditor_profile"})
+_CANONICAL_CHANGED_FACT_KEYS = frozenset({
+    "task_id", "run_id", "prior_status", "new_status", "event_id",
+    "audit_outcome_sha256", "disposition", "continuation_task_ids",
+})
 
 # Keys whose mere presence in completion metadata means the author is
 # asserting an evidence identity (canonical or one of the legacy recovery
@@ -8413,41 +8423,6 @@ def _bind_canonical_audit_outcome(
     return envelope
 
 
-def _latest_changed_fact(
-    conn: sqlite3.Connection,
-    task_id: str,
-    *,
-    run_id: Optional[int] = None,
-) -> Optional[dict[str, Any]]:
-    """Return the latest parsed ``changed_fact`` event for a task, or None.
-
-    When ``run_id`` is given, the event must be bound to exactly that run: the
-    terminal writer records the changed-fact under the author/audit run it
-    belongs to, so a drifted event under a foreign run must not be trusted.
-    Only a ``dict`` payload is returned; malformed payloads fail closed to
-    ``None`` so the resolver never trusts unparseable producer state.
-    """
-    if run_id is not None:
-        row = conn.execute(
-            "SELECT payload FROM task_events WHERE task_id = ? AND kind = ? "
-            "AND run_id = ? ORDER BY id DESC LIMIT 1",
-            (task_id, CHANGED_FACT_EVENT, run_id),
-        ).fetchone()
-    else:
-        row = conn.execute(
-            "SELECT payload FROM task_events WHERE task_id = ? AND kind = ? "
-            "ORDER BY id DESC LIMIT 1",
-            (task_id, CHANGED_FACT_EVENT),
-        ).fetchone()
-    if row is None:
-        return None
-    try:
-        payload = json.loads(row["payload"] or "{}")
-    except (TypeError, ValueError):
-        return None
-    return payload if isinstance(payload, dict) else None
-
-
 def _canonical_audit_outcome_event_present(
     conn: sqlite3.Connection,
     author_task_id: str,
@@ -8502,29 +8477,32 @@ def _resolved_canonical_audit_outcome(
 ) -> Optional[dict[str, Any]]:
     """Return the latest persisted canonical audit-outcome envelope for an
     author, if it is a strictly valid version-3 envelope."""
-    row = conn.execute(
-        "SELECT run_id, payload FROM task_events WHERE task_id = ? AND kind = ? "
-        "ORDER BY id DESC LIMIT 1",
+    rows = conn.execute(
+        "SELECT id, run_id, payload, created_at FROM task_events "
+        "WHERE task_id = ? AND kind = ? "
+        "ORDER BY id",
         (author_task_id, CANONICAL_AUDIT_OUTCOME_EVENT),
-    ).fetchone()
-    if row is None:
+    ).fetchall()
+    # Version 3 is a canonical singleton family. Multiple author projections,
+    # even byte-identical ones, are ambiguous and therefore non-authoritative.
+    if len(rows) != 1:
         return None
+    row = rows[0]
     try:
         envelope = json.loads(row["payload"] or "{}")
     except (TypeError, ValueError):
         return None
     if not isinstance(envelope, dict) or envelope.get("version") != CANONICAL_AUDIT_OUTCOME_VERSION:
         return None
-    required = {
-        "author_task_id", "author_run_id", "audit_task_id", "audit_run_id",
-        "handoff_event_id", "verdict", "reason", "evidence",
-        "role_separation", "evidence_sha256", "created_at",
-    }
-    if not required.issubset(envelope.keys()):
+    if set(envelope) != _CANONICAL_AUDIT_OUTCOME_KEYS:
         return None
     if (
         envelope["verdict"] != "PASS"
         or envelope["author_task_id"] != author_task_id
+        or isinstance(envelope["created_at"], bool)
+        or not isinstance(envelope["created_at"], int)
+        or envelope["created_at"] <= 0
+        or row["created_at"] != envelope["created_at"]
         or not isinstance(envelope["evidence"], dict)
         or set(envelope["evidence"]) != set(_CANONICAL_AUDIT_OUTCOME_EVIDENCE_KEYS)
         or envelope["evidence_sha256"]
@@ -8532,7 +8510,13 @@ def _resolved_canonical_audit_outcome(
     ):
         return None
     role = envelope["role_separation"]
-    if not isinstance(role, dict) or role.get("author_profile") == role.get("auditor_profile"):
+    if (
+        not isinstance(role, dict)
+        or set(role) != _CANONICAL_AUDIT_ROLE_KEYS
+        or any(not isinstance(role[key], str) or not role[key].strip()
+               for key in _CANONICAL_AUDIT_ROLE_KEYS)
+        or role["author_profile"] == role["auditor_profile"]
+    ):
         return None
     # Mirrored identity validation: the envelope's author/audit task+run,
     # handoff event, and role profiles must mirror live DB state, and the
@@ -8614,6 +8598,24 @@ def _resolved_canonical_audit_outcome(
         status="done", outcome="completed",
     ):
         return None
+    # The outcome must remain the newest review round on both exact tasks.
+    # A later author run means a newer review obligation exists; the old v3
+    # family is stale even if its own rows are still internally coherent.
+    latest_author_run = conn.execute(
+        "SELECT id FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+        (author_task_id,),
+    ).fetchone()
+    latest_audit_run = conn.execute(
+        "SELECT id FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+        (audit_task_id,),
+    ).fetchone()
+    if (
+        latest_author_run is None
+        or int(latest_author_run["id"]) != author_run_id
+        or latest_audit_run is None
+        or int(latest_audit_run["id"]) != audit_run_id
+    ):
+        return None
     # handoff_event_id must reference the real review_handoff event binding
     # author_run_id and audit_task_id.
     handoff_row = conn.execute(
@@ -8629,6 +8631,15 @@ def _resolved_canonical_audit_outcome(
         or handoff.review_task_id != audit_task_id
         or handoff.expected_run_id != author_run_id
     ):
+        return None
+    # Any later handoff row — valid, malformed, or ambiguous — revokes this
+    # family's authority. Consumers must never reuse an old exact-head PASS
+    # after a newer review round has been opened.
+    if conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id = ? "
+        "AND kind = 'review_handoff' AND id > ? LIMIT 1",
+        (author_task_id, handoff_event_id),
+    ).fetchone() is not None:
         return None
     # audit_run_id must carry exactly one byte-identical author/audit v2 PASS
     # verdict pair. The terminal envelope may not outlive a missing or drifted
@@ -8667,14 +8678,20 @@ def _resolved_canonical_audit_outcome(
     # mirrors that carry the exact disposition / continuation the terminal
     # writer recorded.  A lone author envelope — no audit mirror, no
     # changed-fact mirrors — must not grant finalizer authority.
-    audit_mirror_row = conn.execute(
-        "SELECT id, run_id, payload FROM task_events WHERE task_id = ? AND kind = ? "
-        "ORDER BY id DESC LIMIT 1",
+    audit_mirror_rows = conn.execute(
+        "SELECT id, run_id, payload, created_at FROM task_events "
+        "WHERE task_id = ? AND kind = ? "
+        "ORDER BY id",
         (audit_task_id, CANONICAL_AUDIT_OUTCOME_EVENT),
-    ).fetchone()
-    if audit_mirror_row is None:
+    ).fetchall()
+    if len(audit_mirror_rows) != 1:
         return None
-    if audit_mirror_row["run_id"] != audit_run_id:
+    audit_mirror_row = audit_mirror_rows[0]
+    if (
+        audit_mirror_row["run_id"] != audit_run_id
+        or audit_mirror_row["created_at"] != envelope["created_at"]
+        or audit_mirror_row["payload"] != row["payload"]
+    ):
         return None
     try:
         audit_mirror = json.loads(audit_mirror_row["payload"] or "{}")
@@ -8683,13 +8700,36 @@ def _resolved_canonical_audit_outcome(
     if audit_mirror != envelope:
         return None
 
-    author_fact = _latest_changed_fact(conn, author_task_id, run_id=author_run_id)
-    audit_fact = _latest_changed_fact(conn, audit_task_id, run_id=audit_run_id)
-    if author_fact is None or audit_fact is None or author_fact != audit_fact:
+    author_fact_rows = conn.execute(
+        "SELECT payload, created_at FROM task_events WHERE task_id = ? "
+        "AND kind = ? AND run_id = ? ORDER BY id",
+        (author_task_id, CHANGED_FACT_EVENT, author_run_id),
+    ).fetchall()
+    audit_fact_rows = conn.execute(
+        "SELECT payload, created_at FROM task_events WHERE task_id = ? "
+        "AND kind = ? AND run_id = ? ORDER BY id",
+        (audit_task_id, CHANGED_FACT_EVENT, audit_run_id),
+    ).fetchall()
+    if len(author_fact_rows) != 1 or len(audit_fact_rows) != 1:
+        return None
+    author_fact_row = author_fact_rows[0]
+    audit_fact_row = audit_fact_rows[0]
+    if (
+        author_fact_row["payload"] != audit_fact_row["payload"]
+        or author_fact_row["created_at"] != envelope["created_at"]
+        or audit_fact_row["created_at"] != envelope["created_at"]
+    ):
+        return None
+    try:
+        author_fact = json.loads(author_fact_row["payload"] or "{}")
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(author_fact, dict):
         return None
     fact = author_fact
     if (
-        fact.get("task_id") != audit_task_id
+        set(fact) != _CANONICAL_CHANGED_FACT_KEYS
+        or fact.get("task_id") != audit_task_id
         or fact.get("run_id") != audit_run_id
         or fact.get("event_id") != audit_mirror_row["id"]
         or fact.get("prior_status") != "running"

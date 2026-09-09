@@ -969,3 +969,100 @@ def test_resolver_rejects_envelope_reason_drift_from_verdict(kanban_home):
         )
         assert kb._resolved_canonical_audit_outcome(conn, fx["author"]) is None
         assert kb._reviewed_author_finalizer_run_id(conn, fx["author"]) is None
+
+
+# ---------------------------------------------------------------------------
+# Round-6 resolver hardening: stale review rounds, closed schemas, and exact
+# canonical-family cardinality must revoke old finalizer authority.
+# ---------------------------------------------------------------------------
+
+def test_resolver_rejects_stale_outcome_after_newer_review_round(kanban_home):
+    """A later real handoff/run family revokes the older v3 outcome."""
+    with kb.connect() as conn:
+        fx = _completed_fixture(conn)
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (fx["author"],))
+        newer_author_run = _claim(conn, fx["author"])
+        newer_audit = kb.create_task(
+            conn, title="newer exact-head audit", assignee=AUDITOR_PROFILE,
+            parents=[fx["author"]],
+        )
+        assert kb.request_review_handoff(
+            conn, fx["author"], expected_run_id=newer_author_run,
+            review_task_id=newer_audit, reason="newer exact-head review round",
+        ) is not None
+        newer_audit_run = _claim(conn, newer_audit)
+        assert kb.complete_task(
+            conn, newer_audit, expected_run_id=newer_audit_run,
+            summary="terminal sibling audit without PASS authority",
+        )
+        assert kb._resolved_canonical_audit_outcome(conn, fx["author"]) is None
+        assert kb._reviewed_author_finalizer_run_id(conn, fx["author"]) is None
+
+
+@pytest.mark.parametrize("side", ["author", "audit"])
+@pytest.mark.parametrize("kind", [kb.CANONICAL_AUDIT_OUTCOME_EVENT, kb.CHANGED_FACT_EVENT])
+def test_resolver_rejects_duplicate_canonical_family_row(kanban_home, kind, side):
+    """Even a byte-identical duplicate makes either mirror ambiguous."""
+    with kb.connect() as conn:
+        fx = _completed_fixture(conn)
+        original = _events(conn, fx[side], kind)[0]
+        with kb.write_txn(conn):
+            conn.execute(
+                "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (fx[side], original["run_id"], kind, original["payload"], 999999999),
+            )
+        assert kb._resolved_canonical_audit_outcome(conn, fx["author"]) is None
+        assert kb._reviewed_author_finalizer_run_id(conn, fx["author"]) is None
+
+
+@pytest.mark.parametrize("kind", [kb.CANONICAL_AUDIT_OUTCOME_EVENT, kb.CHANGED_FACT_EVENT])
+def test_resolver_rejects_mirrored_unknown_canonical_field(kanban_home, kind):
+    """Canonical envelope/fact schemas are closed, even when mirrors agree."""
+    with kb.connect() as conn:
+        fx = _completed_fixture(conn)
+        for task_id in (fx["author"], fx["audit"]):
+            event = _events(conn, task_id, kind)[0]
+            payload = json.loads(event["payload"])
+            payload["unknown_extension"] = "must-fail-closed"
+            with kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE task_events SET payload=? WHERE id=?",
+                    (json.dumps(payload), event["id"]),
+                )
+        assert kb._resolved_canonical_audit_outcome(conn, fx["author"]) is None
+        assert kb._reviewed_author_finalizer_run_id(conn, fx["author"]) is None
+
+
+@pytest.mark.parametrize("kind", [kb.CANONICAL_AUDIT_OUTCOME_EVENT, kb.CHANGED_FACT_EVENT])
+def test_resolver_rejects_non_byte_identical_mirror(kanban_home, kind):
+    """Semantically equal but differently serialized mirrors are not identical."""
+    with kb.connect() as conn:
+        fx = _completed_fixture(conn)
+        event = _events(conn, fx["audit"], kind)[0]
+        payload = json.loads(event["payload"])
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_events SET payload=? WHERE id=?",
+                (json.dumps(payload, indent=2), event["id"]),
+            )
+        assert kb._resolved_canonical_audit_outcome(conn, fx["author"]) is None
+        assert kb._reviewed_author_finalizer_run_id(conn, fx["author"]) is None
+
+
+def test_resolver_rejects_mirrored_created_at_drift(kanban_home):
+    """Envelope time is bound to both immutable event projections."""
+    with kb.connect() as conn:
+        fx = _completed_fixture(conn)
+        for task_id in (fx["author"], fx["audit"]):
+            event = _events(conn, task_id, kb.CANONICAL_AUDIT_OUTCOME_EVENT)[0]
+            payload = json.loads(event["payload"])
+            payload["created_at"] += 1
+            with kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE task_events SET payload=? WHERE id=?",
+                    (json.dumps(payload), event["id"]),
+                )
+        assert kb._resolved_canonical_audit_outcome(conn, fx["author"]) is None
+        assert kb._reviewed_author_finalizer_run_id(conn, fx["author"]) is None
