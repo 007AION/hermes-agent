@@ -8413,6 +8413,48 @@ def _bind_canonical_audit_outcome(
     return envelope
 
 
+def _latest_changed_fact(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> Optional[dict[str, Any]]:
+    """Return the latest parsed ``changed_fact`` event for a task, or None.
+
+    Only a ``dict`` payload is returned; malformed payloads fail closed to
+    ``None`` so the resolver never trusts unparseable producer state.
+    """
+    row = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = ? "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id, CHANGED_FACT_EVENT),
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        payload = json.loads(row["payload"] or "{}")
+    except (TypeError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _canonical_audit_outcome_event_present(
+    conn: sqlite3.Connection,
+    author_task_id: str,
+) -> bool:
+    """True when the author carries any canonical audit-outcome event.
+
+    ``canonical_audit_outcome`` is written only by the version-3 producer, so
+    its presence means a producer-side record exists.  When such a record is
+    present but the resolver cannot validate it (malformed / drifted), the
+    consumer must fail closed rather than fall through to the legacy receipt:
+    the legacy path must never grant finalizer authority over a v3 record it
+    did not authenticate.
+    """
+    return conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id = ? AND kind = ? LIMIT 1",
+        (author_task_id, CANONICAL_AUDIT_OUTCOME_EVENT),
+    ).fetchone() is not None
+
+
 def _resolved_canonical_audit_outcome(
     conn: sqlite3.Connection,
     author_task_id: str,
@@ -8450,6 +8492,139 @@ def _resolved_canonical_audit_outcome(
         return None
     role = envelope["role_separation"]
     if not isinstance(role, dict) or role.get("author_profile") == role.get("auditor_profile"):
+        return None
+    # Mirrored identity validation: the envelope's author/audit task+run,
+    # handoff event, and role profiles must mirror live DB state, and the
+    # evidence must byte-match the authenticated bound PASS verdict that
+    # produced it.  Any drift means the envelope cannot be trusted to grant
+    # finalizer authority and is rejected (fail-closed, ``None``).
+    audit_task_id = envelope.get("audit_task_id")
+    author_run_id = envelope.get("author_run_id")
+    audit_run_id = envelope.get("audit_run_id")
+    handoff_event_id = envelope.get("handoff_event_id")
+    if (
+        not isinstance(audit_task_id, str)
+        or not audit_task_id
+        or isinstance(author_run_id, bool)
+        or not isinstance(author_run_id, int)
+        or isinstance(audit_run_id, bool)
+        or not isinstance(audit_run_id, int)
+        or isinstance(handoff_event_id, bool)
+        or not isinstance(handoff_event_id, int)
+    ):
+        return None
+    # audit_task_id must be a live direct child of the author.
+    if conn.execute(
+        "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ?",
+        (author_task_id, audit_task_id),
+    ).fetchone() is None:
+        return None
+    # Role profiles must mirror the live task assignees (and differ).
+    author_assignee = conn.execute(
+        "SELECT assignee FROM tasks WHERE id = ?", (author_task_id,),
+    ).fetchone()
+    audit_assignee = conn.execute(
+        "SELECT assignee FROM tasks WHERE id = ?", (audit_task_id,),
+    ).fetchone()
+    if author_assignee is None or audit_assignee is None:
+        return None
+    if (
+        role.get("author_profile") != author_assignee["assignee"]
+        or role.get("auditor_profile") != audit_assignee["assignee"]
+        or author_assignee["assignee"] == audit_assignee["assignee"]
+    ):
+        return None
+    # handoff_event_id must reference the real review_handoff event binding
+    # author_run_id and audit_task_id.
+    handoff_row = conn.execute(
+        "SELECT id, run_id, payload FROM task_events WHERE id = ? AND task_id = ? "
+        "AND kind = 'review_handoff'",
+        (handoff_event_id, author_task_id),
+    ).fetchone()
+    if handoff_row is None:
+        return None
+    handoff = _review_handoff_receipt_from_row(author_task_id, handoff_row)
+    if (
+        handoff is None
+        or handoff.review_task_id != audit_task_id
+        or handoff.expected_run_id != author_run_id
+    ):
+        return None
+    # audit_run_id must reference the real bound PASS verdict event, and its
+    # authenticated evidence must byte-match the envelope evidence.
+    verdict_row = conn.execute(
+        "SELECT id, run_id, payload FROM task_events WHERE task_id = ? AND kind = 'review_verdict' "
+        "AND run_id = ? ORDER BY id DESC LIMIT 1",
+        (audit_task_id, audit_run_id),
+    ).fetchone()
+    if verdict_row is None:
+        return None
+    verdict = _canonical_review_verdict_payload(verdict_row)
+    if (
+        verdict is None
+        or verdict["verdict"] != "pass"
+        or verdict["review_task_id"] != audit_task_id
+        or verdict["review_run_id"] != audit_run_id
+    ):
+        return None
+    if verdict.get("evidence") != envelope["evidence"]:
+        return None
+    # Mirror corroboration: the envelope is trusted only when mirrored on the
+    # audit task (byte-identical) and paired with author + audit changed-fact
+    # mirrors that carry the exact disposition / continuation the terminal
+    # writer recorded.  A lone author envelope — no audit mirror, no
+    # changed-fact mirrors — must not grant finalizer authority.
+    audit_mirror_row = conn.execute(
+        "SELECT id, payload FROM task_events WHERE task_id = ? AND kind = ? "
+        "ORDER BY id DESC LIMIT 1",
+        (audit_task_id, CANONICAL_AUDIT_OUTCOME_EVENT),
+    ).fetchone()
+    if audit_mirror_row is None:
+        return None
+    try:
+        audit_mirror = json.loads(audit_mirror_row["payload"] or "{}")
+    except (TypeError, ValueError):
+        return None
+    if audit_mirror != envelope:
+        return None
+
+    author_fact = _latest_changed_fact(conn, author_task_id)
+    audit_fact = _latest_changed_fact(conn, audit_task_id)
+    if author_fact is None or audit_fact is None or author_fact != audit_fact:
+        return None
+    fact = author_fact
+    if (
+        fact.get("task_id") != audit_task_id
+        or fact.get("run_id") != audit_run_id
+        or fact.get("event_id") != audit_mirror_row["id"]
+        or fact.get("prior_status") != "running"
+        or fact.get("new_status") != "done"
+        or fact.get("audit_outcome_sha256") != envelope["evidence_sha256"]
+    ):
+        return None
+    disposition = fact.get("disposition")
+    continuation = fact.get("continuation_task_ids")
+    if not isinstance(continuation, list):
+        return None
+    if disposition == AUDIT_DISPOSITION_FINAL_ACCEPTED:
+        if continuation != []:
+            return None
+    elif disposition == AUDIT_DISPOSITION_CONTINUATION_COMMITTED:
+        if not continuation:
+            return None
+        seen: set[str] = set()
+        for cid in continuation:
+            if not isinstance(cid, str) or not cid or cid in seen:
+                return None
+            seen.add(cid)
+            if cid == audit_task_id:
+                return None
+            if conn.execute(
+                "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ?",
+                (author_task_id, cid),
+            ).fetchone() is None:
+                return None
+    else:
         return None
     return envelope
 
@@ -13370,6 +13545,12 @@ def _reviewed_author_finalizer_run_id(
     envelope = _resolved_canonical_audit_outcome(conn, task_id)
     if envelope is not None:
         return int(envelope["author_run_id"])
+    if _canonical_audit_outcome_event_present(conn, task_id):
+        # A canonical audit-outcome event exists but failed validation
+        # (malformed / drifted).  Fail closed: the legacy receipt must not be
+        # permitted to grant finalizer authority over a v3 record it never
+        # authenticated, so there is no fallback.
+        return None
     receipt = _canonical_audit_receipt(conn, task_id)
     if (
         receipt is None
