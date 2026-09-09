@@ -7120,6 +7120,83 @@ def _canonical_completed_pass_recovery_receipt(
     return {key: receipt[key] for key in sorted(_COMPLETED_RECOVERY_RECEIPT_KEYS)}
 
 
+def _normalize_completed_pass_recovery_receipt(receipt: Any) -> Optional[dict[str, Any]]:
+    """Map a completed-audit PASS recovery receipt to the one canonical form.
+
+    Accepts the exact canonical spelling plus the two proven terminal-recovery
+    aliases emitted by the existing audited paths, and maps them to the single
+    canonical internal receipt only when every semantic identity field is
+    present, unique and non-conflicting:
+
+      * ``head`` | ``exact_head`` — when both keys are present their values
+        must be byte-identical; when only one is present its value must be a
+        non-null SHA.  A key that is present but null is a conflict, not an
+        absence, so it fails closed.
+      * ``review_outcome == "approved"`` | ``verdict == "PASS_EXACT_HEAD"`` —
+        when both keys are present they must agree on an approved PASS; when
+        only one is present its value must be the approved-PASS spelling.  A
+        key that is present but null is a conflict, not an absence.
+
+    Alias membership is decided by key presence (``key in receipt``), never by
+    value truthiness, so a ``head: null`` alongside a populated ``exact_head``
+    (and a ``review_outcome: null`` alongside a ``verdict``) fails closed
+    instead of being silently promoted to the sole alias.
+
+    A nested ``recovery_receipt`` wrapper is rejected: the PASS path reads the
+    receipt from the top level of the terminal run metadata.  Every other
+    identity field (repository/PR/tree/base/review id/url/state) is then
+    validated by the strict ``_canonical_completed_pass_recovery_receipt``, so
+    any missing, conflicting, or ambiguous alias — and any non-APPROVED GitHub
+    review state — still fails closed (``None``).
+    """
+    if not isinstance(receipt, dict) or "recovery_receipt" in receipt:
+        return None
+    head = receipt.get("head")
+    exact_head = receipt.get("exact_head")
+    has_head = "head" in receipt
+    has_exact_head = "exact_head" in receipt
+    if has_head and has_exact_head:
+        if head != exact_head:
+            return None
+    elif has_exact_head:
+        if exact_head is None:
+            return None
+        head = exact_head
+    elif has_head:
+        if head is None:
+            return None
+    else:
+        return None
+    review_outcome = receipt.get("review_outcome")
+    verdict = receipt.get("verdict")
+    has_review_outcome = "review_outcome" in receipt
+    has_verdict = "verdict" in receipt
+    if has_review_outcome and has_verdict:
+        if review_outcome != "approved" or verdict != "PASS_EXACT_HEAD":
+            return None
+    elif has_verdict:
+        if verdict != "PASS_EXACT_HEAD":
+            return None
+        review_outcome = "approved"
+    elif has_review_outcome:
+        if review_outcome != "approved":
+            return None
+    else:
+        return None
+    canonical = {
+        "review_outcome": review_outcome,
+        "repository": receipt.get("repository"),
+        "pr": receipt.get("pr"),
+        "head": head,
+        "tree": receipt.get("tree"),
+        "base": receipt.get("base"),
+        "github_review_id": receipt.get("github_review_id"),
+        "github_review_url": receipt.get("github_review_url"),
+        "github_review_state": receipt.get("github_review_state"),
+    }
+    return _canonical_completed_pass_recovery_receipt(canonical)
+
+
 def _reason_bears_commit_identity(reason: Any, receipt: dict[str, Any]) -> bool:
     """True when the prose reason carries the exact head/tree/base SHAs.
 
@@ -8231,12 +8308,9 @@ def _recovered_pass_audit_receipt(
         metadata = json.loads(terminal["metadata"] or "{}")
     except (TypeError, ValueError):
         return None
-    receipt, receipt_family = _closed_completed_audit_recovery_receipt(
-        metadata, _COMPLETED_RECOVERY_RECEIPT_KEYS,
-    )
+    receipt = _normalize_completed_pass_recovery_receipt(metadata)
     if (
-        receipt_family != "top_level"
-        or receipt is None
+        receipt is None
         or receipt != _canonical_completed_pass_recovery_receipt(
             recovery["recovery_receipt"]
         )
@@ -9958,12 +10032,10 @@ def _recover_completed_pass_verdict(
     except (TypeError, ValueError):
         return False
     expected_receipt = _canonical_completed_pass_recovery_receipt(recovery_receipt)
-    receipt, receipt_family = _closed_completed_audit_recovery_receipt(
-        metadata, _COMPLETED_RECOVERY_RECEIPT_KEYS,
-    )
+    receipt = _normalize_completed_pass_recovery_receipt(metadata)
     if (
         expected_receipt is None
-        or receipt_family != "top_level"
+        or receipt is None
         or receipt != expected_receipt
     ):
         return False
