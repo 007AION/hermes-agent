@@ -7120,6 +7120,67 @@ def _canonical_completed_pass_recovery_receipt(
     return {key: receipt[key] for key in sorted(_COMPLETED_RECOVERY_RECEIPT_KEYS)}
 
 
+_COMPLETED_PASS_NESTED_GITHUB_REVIEW_KEYS = frozenset(
+    {"author", "commit_id", "id", "state", "url"},
+)
+
+
+def _completed_pass_nested_github_review_fields(
+    receipt: dict[str, Any],
+    head: Any,
+) -> Optional[dict[str, Any]]:
+    """Lift one complete nested ``github_review`` object to canonical fields.
+
+    A legacy terminal receipt may persist the review identity in a nested
+    ``github_review.{id,url,state,author,commit_id}`` object instead of the
+    canonical top-level ``github_review_id/url/state`` spelling.  This lift is
+    accepted only when the nested object is the *sole* source of review
+    identity (the caller already rejected any top-level review-id/url/state
+    key as a conflict), carries exactly the five typed keys, and is fully
+    corroborated:
+
+      * ``author`` is the factory auditor actor (GemAION);
+      * ``commit_id`` is a 40-hex SHA byte-equal to the resolved ``head``
+        (commit-bound);
+      * ``state`` is ``APPROVED``;
+      * ``id`` is a positive non-bool int and ``url`` matches the canonical
+        commit-bound APPROVED review URL for that id and the terminal ``pr``.
+
+    Any partial, malformed, unknown-key, wrong-actor, wrong-commit, or
+    non-APPROVED shape fails closed (``None``).
+    """
+    nested = receipt.get("github_review")
+    if not isinstance(nested, dict) or set(nested) != _COMPLETED_PASS_NESTED_GITHUB_REVIEW_KEYS:
+        return None
+    review_id = nested.get("id")
+    url = nested.get("url")
+    pr_number = receipt.get("pr")
+    if (
+        nested.get("author") != FACTORY_REVIEW_AUDITOR_ACTOR
+        or nested.get("state") != "APPROVED"
+        or not isinstance(nested.get("commit_id"), str)
+        or re.fullmatch(r"[0-9a-fA-F]{40}", nested["commit_id"]) is None
+        or not isinstance(head, str)
+        or nested["commit_id"] != head
+        or isinstance(review_id, bool)
+        or not isinstance(review_id, int)
+        or review_id <= 0
+        or isinstance(pr_number, bool)
+        or not isinstance(pr_number, int)
+        or pr_number <= 0
+        or url != (
+            f"https://github.com/{FACTORY_REVIEW_REPOSITORY}/pull/{pr_number}"
+            f"#pullrequestreview-{review_id}"
+        )
+    ):
+        return None
+    return {
+        "github_review_id": review_id,
+        "github_review_url": url,
+        "github_review_state": nested["state"],
+    }
+
+
 def _normalize_completed_pass_recovery_receipt(receipt: Any) -> Optional[dict[str, Any]]:
     """Map a completed-audit PASS recovery receipt to the one canonical form.
 
@@ -7143,11 +7204,15 @@ def _normalize_completed_pass_recovery_receipt(receipt: Any) -> Optional[dict[st
     instead of being silently promoted to the sole alias.
 
     A nested ``recovery_receipt`` wrapper is rejected: the PASS path reads the
-    receipt from the top level of the terminal run metadata.  Every other
-    identity field (repository/PR/tree/base/review id/url/state) is then
-    validated by the strict ``_canonical_completed_pass_recovery_receipt``, so
-    any missing, conflicting, or ambiguous alias — and any non-APPROVED GitHub
-    review state — still fails closed (``None``).
+    receipt from the top level of the terminal run metadata.  A legacy nested
+    ``github_review.{id,url,state,author,commit_id}`` object is lifted to the
+    canonical top-level review-id/url/state spelling only when it is the sole
+    source of review identity and fully typed/corroborated (see
+    ``_completed_pass_nested_github_review_fields``).  Every other identity
+    field (repository/PR/tree/base/review id/url/state) is then validated by
+    the strict ``_canonical_completed_pass_recovery_receipt``, so any missing,
+    conflicting, or ambiguous alias — and any non-APPROVED GitHub review
+    state — still fails closed (``None``).
     """
     if not isinstance(receipt, dict) or "recovery_receipt" in receipt:
         return None
@@ -7183,6 +7248,24 @@ def _normalize_completed_pass_recovery_receipt(receipt: Any) -> Optional[dict[st
             return None
     else:
         return None
+    top_level_review_keys = {
+        "github_review_id", "github_review_url", "github_review_state",
+    }
+    if "github_review" in receipt:
+        # A nested ``github_review`` object is accepted only as the sole source
+        # of review identity: any top-level review-id/url/state key is a
+        # conflict, not an absence.
+        if top_level_review_keys.intersection(receipt):
+            return None
+        nested_fields = _completed_pass_nested_github_review_fields(receipt, head)
+        if nested_fields is None:
+            return None
+    else:
+        nested_fields = {
+            "github_review_id": receipt.get("github_review_id"),
+            "github_review_url": receipt.get("github_review_url"),
+            "github_review_state": receipt.get("github_review_state"),
+        }
     canonical = {
         "review_outcome": review_outcome,
         "repository": receipt.get("repository"),
@@ -7190,9 +7273,9 @@ def _normalize_completed_pass_recovery_receipt(receipt: Any) -> Optional[dict[st
         "head": head,
         "tree": receipt.get("tree"),
         "base": receipt.get("base"),
-        "github_review_id": receipt.get("github_review_id"),
-        "github_review_url": receipt.get("github_review_url"),
-        "github_review_state": receipt.get("github_review_state"),
+        "github_review_id": nested_fields["github_review_id"],
+        "github_review_url": nested_fields["github_review_url"],
+        "github_review_state": nested_fields["github_review_state"],
     }
     return _canonical_completed_pass_recovery_receipt(canonical)
 
