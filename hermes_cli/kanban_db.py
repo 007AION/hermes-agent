@@ -1115,15 +1115,16 @@ def _reap_worker_descendants(
 #
 # Prior attempts are age-bounded: only the SINGLE most-recent ordinary prior
 # run is rendered in full (the "latest exact run / evidence" a retry worker
-# must build on). Older runs are superseded history and collapse to a one-line
-# outcome marker, so a retry-heavy task cannot let superseded terminal
-# summaries dominate the assembled prompt. Review findings are treated the
-# same way: only the SINGLE most-recent ``request_changes`` verdict is the
-# unresolved finding and is preserved in full; older ``request_changes``
-# verdicts were already reworked and re-verified by a newer verdict, so they
-# are superseded review history and collapse to the marker too (see
-# build_worker_context). Keep this at 1 unless a concrete need for a
-# multi-attempt detail window exists.
+# must build on). Older ordinary runs are superseded history and collapse to a
+# one-line outcome marker, so a retry-heavy task cannot let superseded
+# terminal summaries dominate the assembled prompt. Review findings are NOT
+# collapsed: only the SINGLE most-recent ``request_changes`` verdict is the
+# unresolved finding and is preserved in full; every EARLIER ``request_changes``
+# verdict is a prior review finding that this schema cannot prove closed or
+# carried forward, so it is rendered as a machine-addressable reference (exact
+# task/run/outcome + stable content digest) instead of being dropped (see
+# build_worker_context and _run_content_digest). Keep this at 1 unless a
+# concrete need for a multi-attempt detail window exists.
 _CTX_MAX_PRIOR_ATTEMPTS = 1       # most recent N ordinary prior runs shown in full
 _CTX_MAX_COMMENTS       = 30      # most recent N comments shown in full
 _CTX_MAX_FIELD_BYTES    = 4 * 1024   # 4 KB per summary/error/metadata/result
@@ -1166,6 +1167,31 @@ def _relative_age(ts: Optional[int], now: Optional[int] = None) -> str:
         return f"{h}h ago"
     d = delta // 86400
     return f"{d}d ago"
+
+
+def _run_content_digest(run: Run) -> str:
+    """Stable SHA-256 content digest of a run's immutable evidence payload
+    (summary + error + metadata).
+
+    Used by :func:`build_worker_context` to render prior ``request_changes``
+    findings as machine-addressable references without re-injecting their full
+    text into the worker prompt. The digest is deterministic for identical run
+    content, so an auditor can recompute it against the Native ``task_runs``
+    row to verify the evidence is intact and unchanged. The full text itself
+    stays in the run record (the existing Native surface); the prompt only
+    carries this digest, which bounds injected bytes WITHOUT deleting,
+    rewriting, or weakening the finding.
+    """
+    payload = "\x1f".join(
+        [
+            "summary", run.summary or "",
+            "error", run.error or "",
+            "metadata",
+            json.dumps(run.metadata, ensure_ascii=False, sort_keys=True)
+            if run.metadata else "",
+        ]
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 # ---------------------------------------------------------------------------
@@ -21025,11 +21051,13 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
       3. Prior attempts on THIS task. Ordinary history is age-bounded to the
          most recent ``_CTX_MAX_PRIOR_ATTEMPTS`` runs shown in full; older
          ordinary runs collapse into a one-line superseded marker (count +
-         outcome distribution) without re-injecting their full text. The
-         single most-recent unresolved review finding (outcome
-         ``request_changes``) is immutable review evidence and is rendered
-         in full; older ``request_changes`` verdicts are superseded review
-         history and collapse into the same marker.
+         outcome distribution) without re-injecting their full text. Review
+         findings are never collapsed: the single most-recent unresolved
+         review finding (outcome ``request_changes``) is immutable review
+         evidence and is rendered in full, while every EARLIER
+         ``request_changes`` verdict is rendered as a machine-addressable
+         reference (exact run id + outcome + stable content digest) so no
+         finding is dropped; its full text stays in the run record.
          Each attempt's ``summary`` / ``error`` / ``metadata`` capped at
          ``_CTX_MAX_FIELD_BYTES`` each.
       4. Structured handoff results of every done parent task. Prefers
@@ -21112,13 +21140,17 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     # history. Skip the currently-active run (that's this worker).
     #
     # Two classes of closed history render differently:
-    #   * The latest unresolved review finding — the SINGLE most-recent run
-    #     whose outcome is ``request_changes`` (a reviewer's still-open
-    #     blocking finding) — is rendered in full. It must stay available to
-    #     the worker until it has been independently re-tested, no matter how
-    #     many newer attempts intervened. Older ``request_changes`` verdicts
-    #     were already reworked and re-verified by a newer verdict, so they
-    #     are SUPERSEDED review history and collapse like ordinary history.
+    #   * Review findings (outcome == ``request_changes``). The SINGLE
+    #     most-recent verdict is the unresolved finding a worker must still
+    #     re-test and is rendered in full. Every EARLIER verdict is a prior
+    #     review finding that this schema cannot prove closed or carried
+    #     forward (the run model has no closure bit / carry-forward relation),
+    #     so instead of dropping it we render a compact machine-addressable
+    #     reference (exact run id + outcome + stable content digest). The full
+    #     finding text stays in the run record (the existing Native surface)
+    #     and is NOT deleted or rewritten — prompt indirection bounds injected
+    #     bytes, it does not weaken evidence. No finding is marked closed or
+    #     superseded.
     #   * Ordinary history (every other closed run) is age-bounded: only the
     #     most-recent _CTX_MAX_PRIOR_ATTEMPTS runs render in full (summary /
     #     error / metadata); older ordinary runs are SUPERSEDED and collapse
@@ -21134,24 +21166,16 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     def _outcome(run: Run) -> str:
         return run.outcome or run.status or "unknown"
 
-    # Only the SINGLE most-recent request_changes verdict is the unresolved
-    # finding a worker must still re-test. Every earlier request_changes
-    # verdict was already reworked and re-verified by a newer verdict, so it
-    # is SUPERSEDED review history and collapses exactly like superseded
-    # ordinary history. (A long-running role-separated audit can accumulate
-    # 6..17 request_changes verdicts; re-injecting all of them in full is the
-    # same "superseded history dominates the prompt" defect the ordinary
-    # window already guards against.)
     review_findings = [r for r in all_prior if _outcome(r) == "request_changes"]
     unresolved_rc = review_findings[-1:] if review_findings else []
-    superseded_rc = review_findings[:-1] if review_findings else []
+    prior_review_refs = review_findings[:-1] if review_findings else []
 
     ordinary = [r for r in all_prior if _outcome(r) != "request_changes"]
     if len(ordinary) > _CTX_MAX_PRIOR_ATTEMPTS:
-        superseded = superseded_rc + ordinary[:-_CTX_MAX_PRIOR_ATTEMPTS]
+        superseded_ordinary = ordinary[:-_CTX_MAX_PRIOR_ATTEMPTS]
         shown_ordinary = ordinary[-_CTX_MAX_PRIOR_ATTEMPTS:]
     else:
-        superseded = superseded_rc
+        superseded_ordinary = []
         shown_ordinary = ordinary
 
     # Full-detail runs: the latest unresolved review finding + the recent
@@ -21159,11 +21183,12 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     shown = unresolved_rc + shown_ordinary
     shown.sort(key=lambda r: index_by_id[r.id])
 
-    if shown:
+    if shown or prior_review_refs or superseded_ordinary:
         lines.append("## Prior attempts on this task")
-        if superseded:
+
+        if superseded_ordinary:
             outcome_counts: dict[str, int] = {}
-            for run in superseded:
+            for run in superseded_ordinary:
                 label = _outcome(run)
                 outcome_counts[label] = outcome_counts.get(label, 0) + 1
             distribution = ", ".join(
@@ -21171,11 +21196,35 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
                 for label, count in sorted(outcome_counts.items())
             )
             lines.append(
-                f"_({len(superseded)} earlier attempt"
-                f"{'s' if len(superseded) != 1 else ''} superseded: "
-                f"{distribution}; latest exact run and latest unresolved "
-                f"request_changes finding shown in full below)_"
+                f"_({len(superseded_ordinary)} earlier attempt"
+                f"{'s' if len(superseded_ordinary) != 1 else ''} superseded: "
+                f"{distribution})_"
             )
+
+        if prior_review_refs:
+            lines.append(
+                "_Earlier `request_changes` findings are preserved as "
+                "machine-addressable references (exact run id + outcome + "
+                "content digest); their full text remains in each run record "
+                "and is not deleted here. No finding is marked closed or "
+                "superseded — closure requires an exact lifecycle relation "
+                "this schema does not assert, so any closure is treated as "
+                "ambiguous and the finding stays addressable._"
+            )
+            for run in prior_review_refs:
+                idx = index_by_id[run.id]
+                ts = time.strftime(
+                    "%Y-%m-%d %H:%M", time.localtime(run.started_at)
+                )
+                age = _relative_age(run.started_at, _now)
+                ts_disp = f"{ts}, {age}" if age else ts
+                profile = run.profile or "(unknown)"
+                digest = _run_content_digest(run)
+                lines.append(
+                    f"- attempt {idx} (run #{run.id}, {profile}, {ts_disp}) — "
+                    f"request_changes — digest sha256:{digest}"
+                )
+
         for run in shown:
             idx = index_by_id[run.id]
             ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(run.started_at))

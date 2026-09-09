@@ -2921,23 +2921,22 @@ def test_build_worker_context_preserves_unresolved_review_finding(kanban_home):
         conn.close()
 
 
-def test_build_worker_context_bounds_superseded_review_findings(kanban_home):
-    """RED/GREEN: a long-running audit whose reviewer returns request_changes
-    many times accumulates superseded review verdicts. Only the LATEST
-    request_changes is the unresolved finding the worker must re-test; every
-    earlier request_changes was already reworked and re-verified by a newer
-    verdict, so it is SUPERSEDED review history and must collapse to the
-    one-line marker — NOT be re-injected in full into the next prompt.
-    Synthetic public-safe fixture — no provider payload read/emitted."""
+def test_build_worker_context_preserves_every_review_finding_addressable(kanban_home):
+    """RED/GREEN (auditor's finding-A/finding-B counterexample): distinct
+    earlier ``request_changes`` findings must NOT be dropped by chronology.
+    The single most-recent verdict is the unresolved finding and is rendered
+    in full; every EARLIER verdict is preserved as a machine-addressable
+    digest reference (exact run id + outcome + content digest) so no finding
+    is deleted. This is the hostile probe where v3 dropped finding A while
+    reporting ``request_changes x1``. Synthetic public-safe fixture — no
+    provider payload read/emitted."""
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="audit", assignee="auditor")
-        # Three successive request_changes verdicts (author reworked between
-        # each; each newer verdict supersedes the prior one).
-        for i in range(3):
+        # Three DISTINCT findings (each a different reviewer obligation).
+        for f in ("FINDING-A", "FINDING-B", "FINDING-C"):
             kb.claim_task(conn, tid)
-            kb._end_run(conn, tid, outcome="request_changes",
-                        summary=f"REVIEW-VERDICT-{i}")
+            kb._end_run(conn, tid, outcome="request_changes", summary=f)
             conn.execute(
                 "UPDATE tasks SET status='ready', claim_lock=NULL, "
                 "claim_expires=NULL WHERE id=?", (tid,),
@@ -2954,31 +2953,46 @@ def test_build_worker_context_bounds_superseded_review_findings(kanban_home):
         )
         conn.commit()
 
+        runs = kb.list_runs(conn, tid)
+        by_summary = {r.summary: r for r in runs if r.summary}
+
         kb.claim_task(conn, tid)
         ctx = kb.build_worker_context(conn, tid)
 
-        # Latest exact run preserved in full.
+        # Latest exact run + latest unresolved finding preserved in full.
         assert "LATEST-EXACT-RUN-EVIDENCE" in ctx
-        assert "### Attempt 4 — blocked" in ctx
-        # The latest (unresolved) request_changes finding is preserved in full.
-        assert "REVIEW-VERDICT-2" in ctx
+        assert "FINDING-C" in ctx
         assert "### Attempt 3 — request_changes" in ctx
-        # Superseded request_changes verdicts are NOT re-injected in full.
-        assert "REVIEW-VERDICT-0" not in ctx
-        assert "REVIEW-VERDICT-1" not in ctx
-        # One-line marker reports the superseded count + outcome distribution.
-        assert "2 earlier attempts superseded" in ctx
-        assert "request_changes x2" in ctx
+        assert "### Attempt 4 — blocked" in ctx
+        # No bare-count collapse of review verdicts (that is what drops
+        # findings); each prior finding keeps its own reference line.
+        assert "request_changes x" not in ctx
+        # Earlier DISTINCT findings are NOT dropped: each stays addressable by
+        # its stable content digest, while its full text is bounded (not
+        # re-injected verbatim into the prompt).
+        for f in ("FINDING-A", "FINDING-B"):
+            assert f not in ctx, (
+                f"{f} full text must be bounded, not re-injected"
+            )
+            digest = kb._run_content_digest(by_summary[f])
+            assert f"digest sha256:{digest}" in ctx, (
+                f"{f} must remain addressable by digest in the projection"
+            )
+        # Full evidence stays retrievable from the Native run records —
+        # prompt indirection bounds injected bytes, it does not delete them.
+        stored = {r.summary for r in kb.list_runs(conn, tid) if r.summary}
+        assert {"FINDING-A", "FINDING-B", "FINDING-C"} <= stored
     finally:
         conn.close()
 
 
-def test_build_worker_context_latest_review_finding_survives_supersession_storm(kanban_home):
+def test_build_worker_context_latest_review_finding_survives_finding_storm(kanban_home):
     """Hostile omission: even when a review-heavy task accumulates a large
-    number of superseded request_changes verdicts, the single most-recent
-    request_changes (the unresolved finding) and the latest exact run are
-    always retained in full; every superseded verdict collapses to a marker.
-    Synthetic public-safe fixture — no provider payload read/emitted."""
+    number of earlier request_changes verdicts, the single most-recent
+    verdict (the unresolved finding) and the latest exact run are always
+    retained in full, and every earlier verdict stays addressable by digest
+    (never dropped to a bare count). Synthetic public-safe fixture — no
+    provider payload read/emitted."""
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="audit", assignee="auditor")
@@ -3012,22 +3026,62 @@ def test_build_worker_context_latest_review_finding_survives_supersession_storm(
         )
         conn.commit()
 
+        runs = kb.list_runs(conn, tid)
+        stale = [r for r in runs
+                 if (r.summary or "").startswith("STALE-VERDICT-")]
+
         kb.claim_task(conn, tid)
         ctx = kb.build_worker_context(conn, tid)
 
-        # Both retained items survive.
+        # Both retained items survive in full.
         assert "LATEST-OPEN-FINDING" in ctx
         assert "LATEST-RUN-EVIDENCE" in ctx
         assert "### Attempt 21 — request_changes" in ctx
         assert "### Attempt 22 — blocked" in ctx
-        # All superseded verdicts collapse; none re-injected in full.
+        # No bare-count collapse of review verdicts.
+        assert "request_changes x" not in ctx
+        # Every earlier verdict stays addressable by digest; none re-injected
+        # in full and none dropped.
         assert "STALE-VERDICT-0" not in ctx
         assert "STALE-VERDICT-19" not in ctx
-        # Marker reports the superseded count + outcome distribution.
-        assert "20 earlier attempts superseded" in ctx
-        assert "request_changes x20" in ctx
+        for r in stale:
+            digest = kb._run_content_digest(r)
+            assert f"digest sha256:{digest}" in ctx, (
+                f"earlier verdict run #{r.id} must stay addressable by digest"
+            )
+        # Context stays bounded despite 20 prior findings.
+        assert len(ctx) < 15_000
     finally:
         conn.close()
+
+
+def test_run_content_digest_stable_and_content_addressed():
+    """The content digest of a run is a stable, content-addressed reference:
+    identical evidence -> identical digest; different evidence -> different
+    digest. An auditor can recompute it against the Native run row to verify
+    the finding is intact and unchanged."""
+    def make(summary, metadata=None, error=None):
+        return kb.Run(
+            id=1, task_id="t", profile="auditor", step_key=None,
+            status="request_changes", claim_lock=None, claim_expires=None,
+            worker_pid=None, max_runtime_seconds=None, last_heartbeat_at=None,
+            started_at=0, ended_at=1, outcome="request_changes",
+            summary=summary, metadata=metadata, error=error,
+        )
+
+    a1 = make("FINDING-A")
+    a2 = make("FINDING-A")
+    b = make("FINDING-B")
+    assert kb._run_content_digest(a1) == kb._run_content_digest(a2)
+    assert kb._run_content_digest(a1) != kb._run_content_digest(b)
+    # metadata participates in the digest.
+    assert kb._run_content_digest(a1) != kb._run_content_digest(
+        make("FINDING-A", metadata={"k": "v"})
+    )
+    # error participates in the digest.
+    assert kb._run_content_digest(a1) != kb._run_content_digest(
+        make("FINDING-A", error="err")
+    )
 
 
 def test_build_worker_context_renders_author_with_safe_framing(kanban_home):
