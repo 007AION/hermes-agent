@@ -9304,10 +9304,7 @@ def request_review_handoff(
         return None
 
 
-_CANONICAL_AUDIT_EVIDENCE_KEYS = {
-    "repository", "pr", "head", "tree", "base", "github_review_id",
-    "github_review_url", "github_review_state",
-}
+_CANONICAL_AUDIT_EVIDENCE_KEYS = {"repository", "pr", "head", "tree", "base", "github_review_id", "github_review_url", "github_review_state"}
 
 
 def _canonical_audit_evidence(value: Any) -> Optional[dict[str, Any]]:
@@ -9315,17 +9312,12 @@ def _canonical_audit_evidence(value: Any) -> Optional[dict[str, Any]]:
     if not isinstance(value, dict) or set(value) != _CANONICAL_AUDIT_EVIDENCE_KEYS:
         return None
     repository, pr, review_id = value["repository"], value["pr"], value["github_review_id"]
-    if (
-        type(repository) is not str
-        or re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository) is None
-        or type(pr) is not int or pr <= 0 or type(review_id) is not int or review_id <= 0
-        or value["github_review_state"] != "APPROVED"
-        or any(type(value[key]) is not str or re.fullmatch(r"[0-9a-fA-F]{40}", value[key]) is None
-               for key in ("head", "tree", "base"))
-        or value["github_review_url"] != (
-            f"https://github.com/{repository}/pull/{pr}#pullrequestreview-{review_id}"
-        )
-    ):
+    if (type(repository) is not str
+            or re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository) is None
+            or type(pr) is not int or pr <= 0 or type(review_id) is not int or review_id <= 0
+            or value["github_review_state"] != "APPROVED"
+            or any(type(value[key]) is not str or re.fullmatch(r"[0-9a-fA-F]{40}", value[key]) is None for key in ("head", "tree", "base"))
+            or value["github_review_url"] != f"https://github.com/{repository}/pull/{pr}#pullrequestreview-{review_id}"):
         return None
     return {key: value[key] for key in sorted(_CANONICAL_AUDIT_EVIDENCE_KEYS)}
 
@@ -9356,6 +9348,8 @@ def _canonical_current_audit_outcome(
         (payload.get("review_handoff_event_id"), author_task_id),
     ).fetchone()
     handoff = _review_handoff_receipt_from_row(author_task_id, handoff_row) if handoff_row else None
+    try: target = json.loads(handoff.reason) if handoff is not None else None
+    except (TypeError, ValueError): target = None
     task = conn.execute(
         "SELECT status, assignee, current_run_id, factory_build_gate, "
         "factory_terminal_receipt_sha256 FROM tasks WHERE id=?", (row["task_id"],),
@@ -9364,20 +9358,16 @@ def _canonical_current_audit_outcome(
         "SELECT profile, status, outcome, ended_at FROM task_runs WHERE id=? AND task_id=?",
         (row["run_id"], row["task_id"]),
     ).fetchone()
-    facts = conn.execute(
-        "SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind='changed_fact'",
-        (row["task_id"], row["run_id"]),
-    ).fetchall()
-    author = conn.execute(
-        "SELECT status, assignee, current_run_id FROM tasks WHERE id=?", (author_task_id,),
-    ).fetchone()
+    facts = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind='changed_fact'",
+                         (row["task_id"], row["run_id"]),).fetchall()
+    author = conn.execute("SELECT status, assignee, current_run_id FROM tasks WHERE id=?",
+                          (author_task_id,),).fetchone()
     author_run = conn.execute(
         "SELECT profile, status, outcome, ended_at FROM task_runs WHERE id=? AND task_id=?",
         (payload.get("author_run_id"), author_task_id),
     ).fetchone()
-    parents = conn.execute(
-        "SELECT parent_id FROM task_links WHERE child_id=?", (row["task_id"],),
-    ).fetchall()
+    parents = conn.execute("SELECT parent_id FROM task_links WHERE child_id=?",
+                           (row["task_id"],),).fetchall()
     required = {
         "version", "author_task_id", "author_run_id", "author_profile", "audit_task_id",
         "audit_run_id", "auditor_profile", "review_handoff_event_id", "verdict", "reason",
@@ -9390,6 +9380,10 @@ def _canonical_current_audit_outcome(
         and payload.get("audit_task_id") == row["task_id"] and payload.get("audit_run_id") == row["run_id"]
         and payload.get("verdict") == "PASS" and payload.get("scope") == "audit_obligation"
         and _canonical_audit_evidence(payload.get("evidence")) == payload.get("evidence")
+        and isinstance(target, dict) and target == {"version": 1, "candidate": {
+            key: payload["evidence"][key] for key in sorted(_CANONICAL_AUDIT_EVIDENCE_KEYS)
+        }, "summary": target.get("summary")}
+        and type(target["summary"]) is str and bool(target["summary"].strip())
         and type(payload.get("reason")) is str and bool(payload["reason"].strip())
         and type(digest) is str and hashlib.sha256(encoded).hexdigest() == digest
         and handoff is not None and handoff.review_task_id == row["task_id"]
@@ -9528,21 +9522,18 @@ def _record_review_verdict(
         expected_review_run_id = int(expected_review_run_id)
     except (TypeError, ValueError):
         return False
-    normalized_evidence: Optional[dict[str, Any]] = None
     if verdict == "pass" and evidence is None:
         return False
+    normalized_evidence: Optional[dict[str, Any]] = None
     with write_txn(conn):
         if verdict == "pass" and evidence is not None:
-            normalized_evidence = _canonical_audit_evidence(evidence)
-            if normalized_evidence is None:
+            if (normalized_evidence := _canonical_audit_evidence(evidence)) is None:
                 return False
             present, receipt = _canonical_current_audit_outcome(conn, task_id)
             if present:
                 row = conn.execute(
-                    "SELECT payload FROM task_events WHERE task_id=? AND run_id=? "
-                    "AND kind='canonical_audit_outcome'",
-                    (review_task_id, expected_review_run_id),
-                ).fetchone()
+                    "SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind='canonical_audit_outcome'",
+                    (review_task_id, expected_review_run_id),).fetchone()
                 if receipt is None or row is None:
                     return False
                 existing = json.loads(row["payload"])
@@ -9657,10 +9648,18 @@ def _record_review_verdict(
             if resumed.rowcount != 1:
                 raise _ReviewHandoffConflict
         elif normalized_evidence is not None:
-            if parent_ids(conn, review_task_id) != [task_id]:
-                return False
             handoff = _review_handoff_event_for_child(conn, task_id, review_task_id)
-            if handoff is None:
+            if parent_ids(conn, review_task_id) != [task_id] or handoff is None:
+                return False
+            receipt = _review_handoff_receipt_from_row(task_id, handoff)
+            try:
+                target = json.loads(receipt.reason) if receipt is not None else None
+            except (TypeError, ValueError):
+                return False
+            expected = normalized_evidence
+            if not isinstance(target, dict) or target != {
+                "version": 1, "candidate": expected, "summary": target.get("summary")
+            } or type(target["summary"]) is not str or not target["summary"].strip():
                 return False
             return _terminalize_review_pass(
                 conn, author_task_id=task_id, audit_task_id=review_task_id,

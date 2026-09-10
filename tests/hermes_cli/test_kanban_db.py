@@ -5824,6 +5824,19 @@ def test_dispatch_max_in_progress_none_is_unlimited(kanban_home, all_assignees_s
 # Role-separated review handoff
 # ---------------------------------------------------------------------------
 
+_APPROVED_EVIDENCE = {
+    "repository": "kiddhu/hermes-agent", "pr": 98,
+    "head": "a" * 40, "tree": "b" * 40, "base": "c" * 40,
+    "github_review_id": 123,
+    "github_review_url": "https://github.com/kiddhu/hermes-agent/pull/98#pullrequestreview-123",
+    "github_review_state": "APPROVED",
+}
+_APPROVED_HANDOFF = json.dumps({
+    "version": 1,
+    "candidate": _APPROVED_EVIDENCE,
+    "summary": "candidate frozen",
+}, sort_keys=True, separators=(",", ":"))
+
 
 def _review_handoff_pair(conn, *, same_assignee=False):
     author = kb.create_task(
@@ -5876,7 +5889,7 @@ def test_request_review_handoff_atomically_binds_run_and_exact_child(kanban_home
             author,
             expected_run_id=run_id,
             review_task_id=review_task,
-            reason="candidate frozen",
+            reason=_APPROVED_HANDOFF,
         )
 
         assert receipt is not None
@@ -5890,7 +5903,7 @@ def test_request_review_handoff_atomically_binds_run_and_exact_child(kanban_home
         run = kb.latest_run(conn, author)
         assert run is not None
         assert run.outcome == "review_required"
-        assert run.summary == "candidate frozen"
+        assert run.summary == _APPROVED_HANDOFF
         immutable_after = conn.execute(
             "SELECT title, body, assignee, tenant, priority, factory_build_gate "
             "FROM tasks WHERE id = ?",
@@ -6019,14 +6032,14 @@ def test_request_review_handoff_replay_returns_same_receipt(kanban_home):
             author,
             expected_run_id=run_id,
             review_task_id=review_task,
-            reason="candidate frozen",
+            reason=_APPROVED_HANDOFF,
         )
         second = kb.request_review_handoff(
             conn,
             author,
             expected_run_id=run_id,
             review_task_id=review_task,
-            reason="candidate frozen",
+            reason=_APPROVED_HANDOFF,
         )
 
         assert first == second
@@ -6146,7 +6159,7 @@ def test_request_review_handoff_matching_replay_correct_state_is_zero_mutation(
             author,
             expected_run_id=run_id,
             review_task_id=review_task,
-            reason="candidate frozen",
+            reason=_APPROVED_HANDOFF,
         )
         before = "\n".join(conn.iterdump())
 
@@ -6155,7 +6168,7 @@ def test_request_review_handoff_matching_replay_correct_state_is_zero_mutation(
             author,
             expected_run_id=run_id,
             review_task_id=review_task,
-            reason="candidate frozen",
+            reason=_APPROVED_HANDOFF,
         )
 
         assert replay == first
@@ -6377,7 +6390,7 @@ def test_request_review_handoff_replay_rejects_conflicting_payload(kanban_home):
             author,
             expected_run_id=run_id,
             review_task_id=review_task,
-            reason="candidate frozen",
+            reason=_APPROVED_HANDOFF,
         ) is not None
 
         assert kb.request_review_handoff(
@@ -6392,7 +6405,7 @@ def test_request_review_handoff_replay_rejects_conflicting_payload(kanban_home):
             author,
             expected_run_id=run_id,
             review_task_id=review_task,
-            reason="candidate frozen",
+            reason=_APPROVED_HANDOFF,
             recovery=True,
         ) is None
         assert len(_review_handoff_events(conn, author)) == 1
@@ -6483,7 +6496,7 @@ def test_request_review_handoff_rolls_back_on_event_write_failure(kanban_home):
                 author,
                 expected_run_id=run_id,
                 review_task_id=review_task,
-                reason="candidate frozen",
+                reason=_APPROVED_HANDOFF,
             )
 
         assert kb.get_task(conn, author).status == "running"
@@ -6509,7 +6522,7 @@ def test_request_review_handoff_rolls_back_when_guarded_write_is_ignored(
             author,
             expected_run_id=run_id,
             review_task_id=review_task,
-            reason="candidate frozen",
+            reason=_APPROVED_HANDOFF,
         ) is None
 
         author_row = kb.get_task(conn, author)
@@ -6607,7 +6620,7 @@ def test_review_handoff_child_claims_without_generic_parent_weakening(
             author,
             expected_run_id=run_id,
             review_task_id=review_task,
-            reason="candidate frozen",
+            reason=_APPROVED_HANDOFF,
         )
         with kb.write_txn(conn):
             conn.execute(
@@ -6628,7 +6641,7 @@ def test_review_verdict_request_changes_resumes_same_author_task(kanban_home):
             author,
             expected_run_id=run_id,
             review_task_id=review_task,
-            reason="candidate frozen",
+            reason=_APPROVED_HANDOFF,
         )
         review_claim = kb.claim_task(conn, review_task)
         assert review_claim is not None
@@ -6678,7 +6691,7 @@ def test_review_verdict_pass_without_evidence_fails_without_mutation(kanban_home
             author,
             expected_run_id=run_id,
             review_task_id=review_task,
-            reason="candidate frozen",
+            reason=_APPROVED_HANDOFF,
         )
         review_claim = kb.claim_task(conn, review_task)
         assert review_claim is not None
@@ -6700,21 +6713,12 @@ def test_review_verdict_pass_without_evidence_fails_without_mutation(kanban_home
         assert audit_task is not None and audit_task.status == "running"
 
 
-_APPROVED_EVIDENCE = {
-    "repository": "kiddhu/hermes-agent", "pr": 98,
-    "head": "a" * 40, "tree": "b" * 40, "base": "c" * 40,
-    "github_review_id": 123,
-    "github_review_url": "https://github.com/kiddhu/hermes-agent/pull/98#pullrequestreview-123",
-    "github_review_state": "APPROVED",
-}
-
-
 def test_review_verdict_pass_atomically_terminalizes_and_replays(kanban_home):
     with kb.connect() as conn:
         author, run_id, review_task = _review_handoff_pair(conn)
         assert kb.request_review_handoff(
             conn, author, expected_run_id=run_id, review_task_id=review_task,
-            reason="candidate frozen",
+            reason=_APPROVED_HANDOFF,
         )
         continuation = kb.create_task(
             conn, title="post-audit continuation", assignee="merger", parents=[review_task],
@@ -6759,12 +6763,41 @@ def test_review_verdict_pass_atomically_terminalizes_and_replays(kanban_home):
         assert "\n".join(conn.iterdump()) == committed
 
 
+@pytest.mark.parametrize("field", [
+    "repository", "pr", "head", "tree", "base", "github_review_id",
+])
+def test_review_verdict_pass_rejects_coherent_wrong_handoff_evidence_without_mutation(
+    kanban_home, field,
+):
+    with kb.connect() as conn:
+        author, run_id, review_task = _review_handoff_pair(conn)
+        assert kb.request_review_handoff(
+            conn, author, expected_run_id=run_id, review_task_id=review_task,
+            reason=_APPROVED_HANDOFF,
+        )
+        audit_run = kb.claim_task(conn, review_task).current_run_id
+        wrong = dict(_APPROVED_EVIDENCE)
+        wrong[field] = ({"repository": "other/repo", "pr": 99,
+                         "github_review_id": 456}.get(field, "d" * 40))
+        wrong["github_review_url"] = (
+            f"https://github.com/{wrong['repository']}/pull/{wrong['pr']}"
+            f"#pullrequestreview-{wrong['github_review_id']}"
+        )
+        before = "\n".join(conn.iterdump())
+        assert not kb.record_review_verdict(
+            conn, author, review_task_id=review_task,
+            expected_review_run_id=audit_run, verdict="pass",
+            reason="coherent but wrong", evidence=wrong,
+        )
+        assert "\n".join(conn.iterdump()) == before
+
+
 def test_review_verdict_pass_rejects_ambiguous_parentage_without_mutation(kanban_home):
     with kb.connect() as conn:
         author, run_id, review_task = _review_handoff_pair(conn)
         assert kb.request_review_handoff(
             conn, author, expected_run_id=run_id, review_task_id=review_task,
-            reason="candidate frozen",
+            reason=_APPROVED_HANDOFF,
         )
         second_parent = kb.create_task(
             conn, title="already completed unrelated parent", assignee="other-author",
@@ -6801,7 +6834,7 @@ def test_review_pass_uses_factory_kernel_terminal_path(kanban_home, monkeypatch)
         conn.commit()
         assert kb.request_review_handoff(
             conn, author, expected_run_id=run_id, review_task_id=review_task,
-            reason="candidate frozen",
+            reason=_APPROVED_HANDOFF,
         )
         claim = kb.claim_task(conn, review_task)
         assert claim is not None and claim.current_run_id is not None
@@ -6837,7 +6870,7 @@ def test_atomic_pass_rolls_back_each_event_boundary(kanban_home, event_kind):
         author, run_id, review_task = _review_handoff_pair(conn)
         assert kb.request_review_handoff(
             conn, author, expected_run_id=run_id, review_task_id=review_task,
-            reason="candidate frozen",
+            reason=_APPROVED_HANDOFF,
         )
         review_claim = kb.claim_task(conn, review_task)
         assert review_claim is not None and review_claim.current_run_id is not None
@@ -6861,7 +6894,7 @@ def test_atomic_pass_rolls_back_recompute_failure(kanban_home, monkeypatch):
         author, run_id, review_task = _review_handoff_pair(conn)
         assert kb.request_review_handoff(
             conn, author, expected_run_id=run_id, review_task_id=review_task,
-            reason="candidate frozen",
+            reason=_APPROVED_HANDOFF,
         )
         claim = kb.claim_task(conn, review_task)
         assert claim is not None and claim.current_run_id is not None
@@ -6886,7 +6919,7 @@ def test_current_outcome_reader_rejects_role_and_run_drift(kanban_home):
         author, run_id, review_task = _review_handoff_pair(conn)
         assert kb.request_review_handoff(
             conn, author, expected_run_id=run_id, review_task_id=review_task,
-            reason="candidate frozen",
+            reason=_APPROVED_HANDOFF,
         )
         claim = kb.claim_task(conn, review_task)
         assert claim is not None and claim.current_run_id is not None
@@ -6911,7 +6944,7 @@ def test_request_changes_replay_rejects_conflicting_reason(kanban_home):
             author,
             expected_run_id=run_id,
             review_task_id=review_task,
-            reason="candidate frozen",
+            reason=_APPROVED_HANDOFF,
         )
         review_claim = kb.claim_task(conn, review_task)
         assert review_claim is not None and review_claim.current_run_id is not None
@@ -6958,7 +6991,7 @@ def test_review_verdict_revalidates_role_separation(kanban_home):
             author,
             expected_run_id=run_id,
             review_task_id=review_task,
-            reason="candidate frozen",
+            reason=_APPROVED_HANDOFF,
         )
         review_claim = kb.claim_task(conn, review_task)
         assert review_claim is not None and review_claim.current_run_id is not None
@@ -6988,7 +7021,7 @@ def test_dispatch_skips_handoff_author_and_dispatches_bound_child(
             author,
             expected_run_id=run_id,
             review_task_id=review_task,
-            reason="candidate frozen",
+            reason=_APPROVED_HANDOFF,
         )
 
         result = kb.dispatch_once(conn, dry_run=True)
