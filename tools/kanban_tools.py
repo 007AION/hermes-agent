@@ -879,36 +879,15 @@ def _handle_review_verdict(args: dict, **kw) -> str:
     delegated_err = _reject_delegated_child_mutation("kanban_review_verdict")
     if delegated_err:
         return delegated_err
-    recovery_receipt = args.get("recovery_receipt")
-    controller_task_id = None
-    controller_run_id = None
-    controller_profile = None
-    if recovery_receipt is not None:
-        controller_task_id = _default_task_id(None)
-        if not controller_task_id:
-            return tool_error("current controller task id is required for recovery")
-        ownership_err = _enforce_worker_task_ownership(controller_task_id)
-        if ownership_err:
-            return ownership_err
-        controller_run_id = _worker_run_id(controller_task_id)
-        controller_profile = os.environ.get("HERMES_PROFILE")
-        review_task_id = str(args.get("review_task_id") or "").strip()
-        raw_review_run_id = args.get("expected_review_run_id")
-        try:
-            review_run_id = int(str(raw_review_run_id))
-        except (TypeError, ValueError):
-            return tool_error("expected_review_run_id is required for recovery")
-    else:
-        review_task_id = _default_task_id(args.get("task_id"))
-        review_run_id = _worker_run_id(review_task_id or "")
+    review_task_id = _default_task_id(args.get("task_id"))
+    review_run_id = _worker_run_id(review_task_id or "")
     if not review_task_id:
         return tool_error(
             "task_id is required (or set HERMES_KANBAN_TASK in the env)"
         )
-    if recovery_receipt is None:
-        ownership_err = _enforce_worker_task_ownership(review_task_id)
-        if ownership_err:
-            return ownership_err
+    ownership_err = _enforce_worker_task_ownership(review_task_id)
+    if ownership_err:
+        return ownership_err
     author_task_id = str(args.get("author_task_id") or "").strip()
     verdict = str(args.get("verdict") or "").strip().lower()
     reason = str(args.get("reason") or "").strip()
@@ -919,7 +898,7 @@ def _handle_review_verdict(args: dict, **kw) -> str:
         return tool_error("verdict must be 'pass' or 'request_changes'")
     if not reason:
         return tool_error("reason is required")
-    if verdict == "pass" and recovery_receipt is None and args.get("evidence") is None:
+    if verdict == "pass" and args.get("evidence") is None:
         return tool_error("evidence is required for PASS")
     if review_run_id is None:
         return tool_error("current dispatcher run id is required")
@@ -935,24 +914,15 @@ def _handle_review_verdict(args: dict, **kw) -> str:
                 verdict=verdict,
                 reason=reason,
                 evidence=args.get("evidence"),
-                recovery_receipt=recovery_receipt,
-                controller_task_id=controller_task_id,
-                controller_run_id=controller_run_id,
-                controller_profile=controller_profile,
             )
             if not ok:
                 return tool_error(
                     "review verdict refused: the author/child/run binding is "
                     "missing, stale, or conflicts with an existing verdict"
                 )
-            # The worker's own task is the review child on the ordinary path
-            # and the live controller on the recovery path; surfacing it as
-            # ``task_id`` keeps the exact-worker ownership gate consistent with
-            # the other terminal handlers.
-            own_task_id = controller_task_id if recovery_receipt is not None else review_task_id
             changed_fact = None
             audit_outcome = None
-            if verdict == "pass" and recovery_receipt is None:
+            if verdict == "pass":
                 row = conn.execute(
                     "SELECT payload FROM task_events WHERE task_id=? AND run_id=? "
                     "AND kind='changed_fact' ORDER BY id DESC LIMIT 1",
@@ -974,7 +944,7 @@ def _handle_review_verdict(args: dict, **kw) -> str:
                         "continuation_ids": envelope["continuation_ids"],
                     }
             return _ok(
-                task_id=own_task_id,
+                task_id=review_task_id,
                 author_task_id=author_task_id,
                 review_task_id=review_task_id,
                 review_run_id=review_run_id,
@@ -2052,41 +2022,6 @@ KANBAN_REVIEW_VERDICT_SCHEMA = {
                     "github_review_state": {"type": "string", "enum": ["APPROVED"]},
                 },
                 "required": ["repository", "pr", "head", "tree", "base", "github_review_id", "github_review_url", "github_review_state"],
-                "additionalProperties": False,
-            },
-            "review_task_id": {
-                "type": "string",
-                "description": "Exact terminal direct audit child (recovery mode only).",
-            },
-            "expected_review_run_id": {
-                "type": "integer",
-                "description": "Exact latest completed audit run (recovery mode only).",
-            },
-            "recovery_receipt": {
-                "type": "object",
-                "description": (
-                    "Closed commit-bound review receipt copied from the "
-                    "terminal auditor run metadata. Presence selects fail-closed "
-                    "completed-audit recovery and requires a live gm/gm2 controller run. "
-                    "REQUEST_CHANGES_EXACT_HEAD/CHANGES_REQUESTED recovers an omitted "
-                    "REQUEST_CHANGES; approved/APPROVED recovers an omitted PASS after a "
-                    "crashed protocol-violation predecessor emitted the identical PASS."
-                ),
-                "properties": {
-                    "review_outcome": {"type": "string", "enum": ["REQUEST_CHANGES_EXACT_HEAD", "approved"]},
-                    "repository": {"type": "string"},
-                    "pr": {"type": "integer"},
-                    "head": {"type": "string"},
-                    "tree": {"type": "string"},
-                    "base": {"type": "string"},
-                    "github_review_id": {"type": "integer"},
-                    "github_review_url": {"type": "string"},
-                    "github_review_state": {"type": "string", "enum": ["CHANGES_REQUESTED", "APPROVED"]},
-                },
-                "required": [
-                    "review_outcome", "repository", "pr", "head", "tree", "base",
-                    "github_review_id", "github_review_url", "github_review_state",
-                ],
                 "additionalProperties": False,
             },
             "board": _board_schema_prop(),

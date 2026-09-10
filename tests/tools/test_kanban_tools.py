@@ -903,6 +903,15 @@ def test_review_verdict_request_changes_resumes_bound_author(
         assert author.assignee == "test-worker"
 
 
+def test_review_verdict_schema_has_no_recovery_authority_fields():
+    from tools import kanban_tools as kt
+
+    properties = kt.KANBAN_REVIEW_VERDICT_SCHEMA["parameters"]["properties"]
+    assert {"review_task_id", "expected_review_run_id", "recovery_receipt"}.isdisjoint(
+        properties
+    )
+
+
 def test_block_rejects_empty_reason(worker_env):
     from tools import kanban_tools as kt
     for bad in ["", "   ", None]:

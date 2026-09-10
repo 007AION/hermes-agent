@@ -9518,10 +9518,6 @@ def _record_review_verdict(
     verdict: str,
     reason: str,
     evidence: Optional[dict] = None,
-    recovery_receipt: Optional[dict] = None,
-    controller_task_id: Optional[str] = None,
-    controller_run_id: Optional[int] = None,
-    controller_profile: Optional[str] = None,
 ) -> bool:
     """Record a bound child verdict; only REQUEST_CHANGES resumes the author."""
     verdict = str(verdict or "").strip().lower()
@@ -9533,33 +9529,9 @@ def _record_review_verdict(
     except (TypeError, ValueError):
         return False
     normalized_evidence: Optional[dict[str, Any]] = None
+    if verdict == "pass" and evidence is None:
+        return False
     with write_txn(conn):
-        if recovery_receipt is not None:
-            if verdict == "pass":
-                return _recover_completed_pass_verdict(
-                    conn,
-                    task_id,
-                    review_task_id=review_task_id,
-                    expected_review_run_id=expected_review_run_id,
-                    verdict=verdict,
-                    reason=reason,
-                    recovery_receipt=recovery_receipt,
-                    controller_task_id=controller_task_id,
-                    controller_run_id=controller_run_id,
-                    controller_profile=controller_profile,
-                )
-            return _recover_completed_review_verdict(
-                conn,
-                task_id,
-                review_task_id=review_task_id,
-                expected_review_run_id=expected_review_run_id,
-                verdict=verdict,
-                reason=reason,
-                recovery_receipt=recovery_receipt,
-                controller_task_id=controller_task_id,
-                controller_run_id=controller_run_id,
-                controller_profile=controller_profile,
-            )
         if verdict == "pass" and evidence is not None:
             normalized_evidence = _canonical_audit_evidence(evidence)
             if normalized_evidence is None:
@@ -9685,6 +9657,8 @@ def _record_review_verdict(
             if resumed.rowcount != 1:
                 raise _ReviewHandoffConflict
         elif normalized_evidence is not None:
+            if parent_ids(conn, review_task_id) != [task_id]:
+                return False
             handoff = _review_handoff_event_for_child(conn, task_id, review_task_id)
             if handoff is None:
                 return False
@@ -10449,10 +10423,6 @@ def record_review_verdict(
     verdict: str,
     reason: str,
     evidence: Optional[dict] = None,
-    recovery_receipt: Optional[dict] = None,
-    controller_task_id: Optional[str] = None,
-    controller_run_id: Optional[int] = None,
-    controller_profile: Optional[str] = None,
 ) -> bool:
     """Public fail-closed wrapper for the bound review-verdict transaction."""
     try:
@@ -10464,10 +10434,6 @@ def record_review_verdict(
             verdict=verdict,
             reason=reason,
             evidence=evidence,
-            recovery_receipt=recovery_receipt,
-            controller_task_id=controller_task_id,
-            controller_run_id=controller_run_id,
-            controller_profile=controller_profile,
         )
     except _ReviewHandoffConflict:
         return False
