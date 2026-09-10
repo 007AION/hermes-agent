@@ -5,7 +5,7 @@ wired into the child-startup path, constructing an agent with tracing enabled
 emits *no* markers, proving the exact observability gap. After the hooks land,
 the same test passes with the required ordered phase markers.
 
-Two audit blockers are covered explicitly:
+Three audit blockers are covered explicitly:
 
 * ``STARTUP_TRACE_EMIT_CAN_PROPAGATE`` — the *entire* emit pipeline (gating,
   timestamp construction, cgroup snapshot, JSON, logging) must be fail-safe so
@@ -17,6 +17,14 @@ Two audit blockers are covered explicitly:
   ``HERMES_*`` env var. Covered by ``test_env_var_no_longer_gates``,
   ``test_config_flag_reads_config_yaml``, and
   ``test_default_config_has_startup_phase_trace``.
+* ``CONFIG_FLAG_NOT_STRICT_BOOL`` — the opt-in gate must accept only the
+  *literal boolean* ``true`` (the YAML string ``"false"`` is truthy, so a
+  ``bool(value)`` check wrongly enables tracing) and the disabled path must
+  not repeatedly read config on the provider-call hot path. Covered by
+  ``test_flag_parser_only_literal_true``,
+  ``test_real_config_malformed_values_fail_closed``,
+  ``test_real_config_literal_true_enables``, and
+  ``test_disabled_path_reads_config_at_most_once``.
 """
 
 from __future__ import annotations
@@ -81,6 +89,15 @@ def capture(monkeypatch):
 def _force_config_flag_off(monkeypatch):
     # Pin the config.yaml path off so only the intended enabler is active.
     monkeypatch.setattr(sp, "_config_flag_enabled", lambda: False)
+
+
+@pytest.fixture(autouse=True)
+def _reset_flag_cache():
+    # The config-flag result is memoized per process; reset it so no test leaks
+    # a prior test's flag decision into the next.
+    sp._reset_config_flag_cache()
+    yield
+    sp._reset_config_flag_cache()
 
 
 @pytest.fixture
@@ -151,6 +168,7 @@ def test_config_flag_reads_config_yaml(monkeypatch):
         "load_config_readonly",
         lambda: {"agent": {"startup_phase_trace": True}},
     )
+    sp._reset_config_flag_cache()
     assert sp._config_flag_enabled() is True
 
     monkeypatch.setattr(
@@ -158,9 +176,11 @@ def test_config_flag_reads_config_yaml(monkeypatch):
         "load_config_readonly",
         lambda: {"agent": {"startup_phase_trace": False}},
     )
+    sp._reset_config_flag_cache()
     assert sp._config_flag_enabled() is False
 
     monkeypatch.setattr(config_mod, "load_config_readonly", lambda: {})
+    sp._reset_config_flag_cache()
     assert sp._config_flag_enabled() is False
 
 
@@ -178,6 +198,96 @@ def test_default_config_has_startup_phase_trace():
     from hermes_cli.config import DEFAULT_CONFIG
 
     assert DEFAULT_CONFIG["agent"]["startup_phase_trace"] is False
+
+
+# ---------------------------------------------------------------------------
+# Strict boolean gate (CONFIG_FLAG_NOT_STRICT_BOOL): only literal True enables
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    [False, "false", "true", "False", "True", 0, 1, None, "", "yes", "no", "1", "0", [], {}],
+)
+def test_flag_parser_only_literal_true(malformed):
+    # bool("false") is True in Python, so a naive bool() check would wrongly
+    # enable tracing on a YAML string. The gate must accept only literal True.
+    assert sp._is_literal_true(malformed) is False
+
+
+def test_flag_parser_literal_true_enables():
+    assert sp._is_literal_true(True) is True
+
+
+def _write_config(tmp_path: Path, agent_yaml: str) -> Path:
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(f"agent:\n  startup_phase_trace: {agent_yaml}\n", encoding="utf-8")
+    return cfg
+
+
+def test_real_config_malformed_values_fail_closed(monkeypatch, tmp_path):
+    # Real temp-config probe: write an actual config.yaml with a malformed /
+    # non-boolean value and drive it through the real load_config_readonly()
+    # path. Only literal true may enable; every string/int/null value fails
+    # closed. (This is the exact probe the audit used to reject bool(value).)
+    from hermes_cli import config as config_mod
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    monkeypatch.delenv("HERMES_SESSION_SOURCE", raising=False)
+
+    malformed_values = ['"false"', '"true"', '"yes"', '"1"', '"0"', "null"]
+    for value in malformed_values:
+        sub = tmp_path / value.strip('"')
+        sub.mkdir()
+        _write_config(sub, value)
+        token = set_hermes_home_override(str(sub))
+        try:
+            sp._reset_config_flag_cache()
+            config_mod._LOAD_CONFIG_CACHE.clear()
+            assert sp._config_flag_enabled() is False
+            assert sp.enabled() is False
+        finally:
+            reset_hermes_home_override(token)
+
+
+def test_real_config_literal_true_enables(monkeypatch, tmp_path):
+    from hermes_cli import config as config_mod
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    monkeypatch.delenv("HERMES_SESSION_SOURCE", raising=False)
+    _write_config(tmp_path, "true")
+    token = set_hermes_home_override(str(tmp_path))
+    try:
+        sp._reset_config_flag_cache()
+        config_mod._LOAD_CONFIG_CACHE.clear()
+        assert sp._config_flag_enabled() is True
+        assert sp.enabled() is True
+    finally:
+        reset_hermes_home_override(token)
+
+
+def test_disabled_path_reads_config_at_most_once(capture, monkeypatch):
+    # Correct/prove the "no repeated config read" claim: on the disabled path,
+    # the config flag is read once and memoized, so emit() on the provider-call
+    # hot path (begin + end, repeated) does not re-read config every turn.
+    from hermes_cli import config as config_mod
+
+    monkeypatch.delenv("HERMES_SESSION_SOURCE", raising=False)
+
+    calls = {"n": 0}
+
+    def _counting_loader():
+        calls["n"] += 1
+        return {}
+
+    monkeypatch.setattr(config_mod, "load_config_readonly", _counting_loader)
+
+    for _ in range(10):
+        sp.emit("provider_call", "begin")
+        sp.emit("provider_call", "end")
+
+    assert calls["n"] == 1  # memoized: one read total, not 20
+    assert capture.records == []  # and still disabled (no marker emitted)
 
 
 # ---------------------------------------------------------------------------
@@ -455,7 +565,7 @@ def test_disabled_constructs_agent_with_real_config(capture, monkeypatch, tmp_pa
     # Normal (disabled) run: no session source, and the *real* config loader
     # must be consulted (agent.startup_phase_trace absent -> default False)
     # without raising, and the agent must construct with zero markers emitted.
-    # This pins the "normal runs are byte-for-byte unaffected" acceptance claim.
+    # This pins the "disabled run emits no marker" acceptance claim.
     monkeypatch.delenv("HERMES_SESSION_SOURCE", raising=False)
     # Deliberately do NOT monkeypatch _config_flag_enabled — exercise the real
     # load_config_readonly() path during construction.

@@ -19,9 +19,12 @@ Safety properties
 -----------------
 * **Opt-in only.** ``enabled()`` is false unless the session is the Elder
   observation path (``HERMES_SESSION_SOURCE == "elder-observation"``) OR the
-  ``agent.startup_phase_trace`` behavioral flag is true in ``config.yaml``
-  (the canonical home for non-secret feature flags per AGENTS.md). Normal runs
-  are byte-for-byte unaffected — no log line, no config read, no file reads.
+  ``agent.startup_phase_trace`` behavioral flag is the *literal boolean*
+  ``true`` in ``config.yaml`` (the canonical home for non-secret feature flags
+  per AGENTS.md). Any other value — including the YAML strings ``"true"`` and
+  ``"false"`` — fails closed. The flag is read once and memoized for the
+  process lifetime, so a disabled run performs no repeated config reads on the
+  provider-call hot path. When disabled, no marker is emitted.
 * **Fully fail-safe.** ``emit`` wraps its *entire* pipeline — gating,
   vocabulary checks, timestamp construction, cgroup reads, JSON serialization,
   and logging — so a failure anywhere in the diagnostic path (including a
@@ -71,31 +74,55 @@ _STATUSES = frozenset({"begin", "end", "ok", "error", "timeout"})
 _logger = logging.getLogger(LOGGER_NAME)
 
 
+_config_flag_cache: Optional[bool] = None
+
+
+def _reset_config_flag_cache() -> None:
+    """Clear the memoized config-flag result (test/refresh hook)."""
+    global _config_flag_cache
+    _config_flag_cache = None
+
+
+def _is_literal_true(value: object) -> bool:
+    """Only the literal boolean ``True`` enables the flag; everything else fails closed.
+
+    This deliberately rejects ``bool(value)`` semantics: the YAML string
+    ``"false"`` (and ``"true"``) is truthy in Python, so ``bool("false")``
+    would wrongly enable tracing. Any non-boolean value — string, int, ``None``
+    — always disables.
+    """
+    return value is True
+
+
 def _config_flag_enabled() -> bool:
     """Read the ``agent.startup_phase_trace`` behavioral flag from config.yaml.
 
     Lazy import keeps this module importable before the full config stack is
     up (e.g. the ``process_spawn`` marker fires at the very top of
-    ``hermes_cli/main.py``). Any failure — missing config, import error,
+    ``hermes_cli/main.py``). Only the literal boolean ``True`` enables the
+    flag; any malformed value fails closed. The result is memoized for the
+    process lifetime so the disabled provider-call hot path does not re-read
+    config on every API turn. Any failure — missing config, import error,
     malformed value — disables the flag and returns ``False``; the Elder
     session-source gate remains the automatic path.
     """
+    global _config_flag_cache
+    cached = _config_flag_cache
+    if cached is not None:
+        return cached
+
+    result = False
     try:
         from hermes_cli.config import load_config_readonly
 
         cfg = load_config_readonly() or {}
-    except Exception:
-        return False
-    try:
         node = cfg.get("agent")
+        if isinstance(node, dict):
+            result = _is_literal_true(node.get(CONFIG_FLAG_KEY, False))
     except Exception:
-        return False
-    if not isinstance(node, dict):
-        return False
-    try:
-        return bool(node.get(CONFIG_FLAG_KEY, False))
-    except Exception:
-        return False
+        result = False
+    _config_flag_cache = result
+    return result
 
 
 def enabled() -> bool:
@@ -103,7 +130,8 @@ def enabled() -> bool:
 
     Activation is automatic on the Elder observation path
     (``HERMES_SESSION_SOURCE == "elder-observation"``) or via the
-    ``agent.startup_phase_trace`` behavioral flag in ``config.yaml``.
+    ``agent.startup_phase_trace`` behavioral flag being the literal boolean
+    ``true`` in ``config.yaml``.
     """
     try:
         if os.environ.get("HERMES_SESSION_SOURCE", "").strip() == ELDER_SESSION_SOURCE:
