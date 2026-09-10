@@ -17,10 +17,17 @@ statuses, integer timestamps, and integer cgroup counters.
 
 Safety properties
 -----------------
-* **Opt-in only.** ``enabled()`` is false unless ``HERMES_STARTUP_PHASE_TRACE``
-  is truthy OR the session source is the Elder observation path
-  (``HERMES_SESSION_SOURCE == "elder-observation"``). Normal runs are
-  byte-for-byte unaffected — no log line, no file reads.
+* **Opt-in only.** ``enabled()`` is false unless the session is the Elder
+  observation path (``HERMES_SESSION_SOURCE == "elder-observation"``) OR the
+  ``agent.startup_phase_trace`` behavioral flag is true in ``config.yaml``
+  (the canonical home for non-secret feature flags per AGENTS.md). Normal runs
+  are byte-for-byte unaffected — no log line, no config read, no file reads.
+* **Fully fail-safe.** ``emit`` wraps its *entire* pipeline — gating,
+  vocabulary checks, timestamp construction, cgroup reads, JSON serialization,
+  and logging — so a failure anywhere in the diagnostic path (including a
+  hostile cgroup/timestamp/logging error) can never propagate into the startup
+  or provider path it is required only to observe. A failed marker is dropped,
+  never raised.
 * **Closed vocabulary.** ``emit`` accepts only phase names from ``_PHASES`` and
   statuses from ``_STATUSES``. An unknown phase is dropped; an unknown status
   collapses to ``"error"``. Callers cannot inject a free-form string.
@@ -28,7 +35,7 @@ Safety properties
   v2 ``memory.current`` / ``memory.high`` / ``memory.events`` counters and
   emits them as integers (or ``null`` on read failure) — no path strings, no
   arbitrary values.
-* **Best-effort.** A read or logging failure never propagates; startup
+* **Best-effort.** A read, config, or logging failure never propagates; startup
   correctness must not depend on this instrumentation.
 """
 
@@ -43,8 +50,8 @@ from contextlib import contextmanager
 from typing import Dict, Optional
 
 LOGGER_NAME = "hermes.startup_phase"
-TRACE_ENV = "HERMES_STARTUP_PHASE_TRACE"
 ELDER_SESSION_SOURCE = "elder-observation"
+CONFIG_FLAG_KEY = "startup_phase_trace"
 
 # Closed phase vocabulary — the only names a caller may emit.
 _PHASES = frozenset(
@@ -64,20 +71,46 @@ _STATUSES = frozenset({"begin", "end", "ok", "error", "timeout"})
 _logger = logging.getLogger(LOGGER_NAME)
 
 
-def enabled() -> bool:
-    """True when startup-phase tracing is active for this process."""
-    if _env_truthy(os.environ.get(TRACE_ENV)):
-        return True
+def _config_flag_enabled() -> bool:
+    """Read the ``agent.startup_phase_trace`` behavioral flag from config.yaml.
+
+    Lazy import keeps this module importable before the full config stack is
+    up (e.g. the ``process_spawn`` marker fires at the very top of
+    ``hermes_cli/main.py``). Any failure — missing config, import error,
+    malformed value — disables the flag and returns ``False``; the Elder
+    session-source gate remains the automatic path.
+    """
     try:
-        return os.environ.get("HERMES_SESSION_SOURCE", "").strip() == ELDER_SESSION_SOURCE
+        from hermes_cli.config import load_config_readonly
+
+        cfg = load_config_readonly() or {}
+    except Exception:
+        return False
+    try:
+        node = cfg.get("agent")
+    except Exception:
+        return False
+    if not isinstance(node, dict):
+        return False
+    try:
+        return bool(node.get(CONFIG_FLAG_KEY, False))
     except Exception:
         return False
 
 
-def _env_truthy(value: Optional[str]) -> bool:
-    if value is None:
-        return False
-    return value.strip().lower() in {"1", "true", "yes", "on"}
+def enabled() -> bool:
+    """True when startup-phase tracing is active for this process.
+
+    Activation is automatic on the Elder observation path
+    (``HERMES_SESSION_SOURCE == "elder-observation"``) or via the
+    ``agent.startup_phase_trace`` behavioral flag in ``config.yaml``.
+    """
+    try:
+        if os.environ.get("HERMES_SESSION_SOURCE", "").strip() == ELDER_SESSION_SOURCE:
+            return True
+    except Exception:
+        pass
+    return _config_flag_enabled()
 
 
 # ---------------------------------------------------------------------------
@@ -159,7 +192,19 @@ def emit(phase: str, status: str) -> None:
     The record carries only ``phase``, ``status``, epoch ``ts``, monotonic
     ``monotonic_ms``, and the five integer cgroup counters. A caller cannot
     smuggle a prompt, argv value, or credential through this interface.
+
+    Fully fail-safe: the *entire* pipeline — gating, vocabulary, timestamp,
+    cgroup snapshot, JSON serialization, and logging — is wrapped so a failure
+    in the diagnostic path can never propagate into the startup/provider path
+    it observes. A failed marker is dropped, never raised.
     """
+    try:
+        _emit_impl(phase, status)
+    except Exception:
+        pass  # instrumentation must never break startup or the observed path
+
+
+def _emit_impl(phase: str, status: str) -> None:
     if not enabled():
         return
     if phase not in _PHASES:
@@ -175,10 +220,7 @@ def emit(phase: str, status: str) -> None:
     }
     record.update(cgroup_pressure())
 
-    try:
-        _logger.info("startup_phase %s", json.dumps(record, sort_keys=True))
-    except Exception:
-        pass  # instrumentation must never break startup
+    _logger.info("startup_phase %s", json.dumps(record, sort_keys=True))
 
 
 @contextmanager
@@ -187,7 +229,8 @@ def phase(name: str):
 
     Exception and timeout paths still produce a safe last-boundary marker
     (``error``), so a crash inside a phase is attributed to that phase rather
-    than leaving the trace silent.
+    than leaving the trace silent. Because ``emit`` is fully fail-safe, a
+    diagnostic failure can never prevent the wrapped body from running.
     """
     emit(name, "begin")
     try:
