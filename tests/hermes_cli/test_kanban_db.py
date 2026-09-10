@@ -6702,6 +6702,175 @@ def test_review_verdict_pass_keeps_author_nonterminal(kanban_home):
         assert json.loads(events[0]["payload"])["verdict"] == "pass"
 
 
+_APPROVED_EVIDENCE = {
+    "repository": "kiddhu/hermes-agent", "pr": 98,
+    "head": "a" * 40, "tree": "b" * 40, "base": "c" * 40,
+    "github_review_id": 123,
+    "github_review_url": "https://github.com/kiddhu/hermes-agent/pull/98#pullrequestreview-123",
+    "github_review_state": "APPROVED",
+}
+
+
+def test_review_verdict_pass_atomically_terminalizes_and_replays(kanban_home):
+    with kb.connect() as conn:
+        author, run_id, review_task = _review_handoff_pair(conn)
+        assert kb.request_review_handoff(
+            conn, author, expected_run_id=run_id, review_task_id=review_task,
+            reason="candidate frozen",
+        )
+        continuation = kb.create_task(
+            conn, title="post-audit continuation", assignee="merger", parents=[review_task],
+        )
+        review_claim = kb.claim_task(conn, review_task)
+        audit_run = review_claim.current_run_id
+        assert kb.record_review_verdict(
+            conn, author, review_task_id=review_task,
+            expected_review_run_id=audit_run, verdict="pass",
+            reason="exact head approved", evidence=_APPROVED_EVIDENCE,
+        )
+        assert kb.get_task(conn, author).status == "review"
+        assert kb.get_task(conn, review_task).status == "done"
+        assert kb.get_task(conn, continuation).status == "ready"
+        run = kb.latest_run(conn, review_task)
+        assert (run.status, run.outcome, run.ended_at is not None) == ("done", "completed", True)
+        outcomes = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='canonical_audit_outcome'",
+            (review_task,),
+        ).fetchall()
+        facts = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='changed_fact'",
+            (review_task,),
+        ).fetchall()
+        assert len(outcomes) == len(facts) == 1
+        outcome = json.loads(outcomes[0]["payload"])
+        assert outcome["disposition"] == "CONTINUATION_COMMITTED"
+        assert outcome["continuation_ids"] == [continuation]
+        assert kb._canonical_audit_receipt(conn, author)["authenticated"] is True
+        committed = "\n".join(conn.iterdump())
+        assert kb.record_review_verdict(
+            conn, author, review_task_id=review_task,
+            expected_review_run_id=audit_run, verdict="pass",
+            reason="exact head approved", evidence=_APPROVED_EVIDENCE,
+        )
+        assert "\n".join(conn.iterdump()) == committed
+        assert not kb.record_review_verdict(
+            conn, author, review_task_id=review_task,
+            expected_review_run_id=audit_run, verdict="pass",
+            reason="drifted replay", evidence=_APPROVED_EVIDENCE,
+        )
+        assert "\n".join(conn.iterdump()) == committed
+
+
+def test_review_pass_uses_factory_kernel_terminal_path(kanban_home, monkeypatch):
+    with kb.connect() as conn:
+        author, run_id, review_task = _review_handoff_pair(conn)
+        conn.execute(
+            "UPDATE tasks SET factory_build_gate=1 WHERE id=?", (review_task,),
+        )
+        conn.commit()
+        assert kb.request_review_handoff(
+            conn, author, expected_run_id=run_id, review_task_id=review_task,
+            reason="candidate frozen",
+        )
+        claim = kb.claim_task(conn, review_task)
+        assert claim is not None and claim.current_run_id is not None
+        audit_run = claim.current_run_id
+        called = []
+
+        def fake_kernel(c, task_id, kernel_run_id, **kwargs):
+            called.append((task_id, kernel_run_id))
+            cur = kb._execute_factory_terminal_write(
+                c, task_id,
+                "UPDATE tasks SET status='done', result=?, completed_at=1, "
+                "factory_terminal_receipt_sha256=? WHERE id=? AND current_run_id=?",
+                (kwargs["result"], "d" * 64, task_id, int(kernel_run_id)),
+            )
+            assert cur.rowcount == 1
+            return {"bound": True}
+
+        monkeypatch.setattr(kb, "_run_kernel_finalizer", fake_kernel)
+        assert kb.record_review_verdict(
+            conn, author, review_task_id=review_task,
+            expected_review_run_id=audit_run, verdict="pass",
+            reason="exact head approved", evidence=_APPROVED_EVIDENCE,
+        )
+        assert called == [(review_task, str(audit_run))]
+        assert kb._canonical_audit_receipt(conn, author)["authenticated"] is True
+
+
+@pytest.mark.parametrize(
+    "event_kind", ["review_verdict", "completed", "canonical_audit_outcome", "changed_fact"],
+)
+def test_atomic_pass_rolls_back_each_event_boundary(kanban_home, event_kind):
+    with kb.connect() as conn:
+        author, run_id, review_task = _review_handoff_pair(conn)
+        assert kb.request_review_handoff(
+            conn, author, expected_run_id=run_id, review_task_id=review_task,
+            reason="candidate frozen",
+        )
+        review_claim = kb.claim_task(conn, review_task)
+        assert review_claim is not None and review_claim.current_run_id is not None
+        audit_run = review_claim.current_run_id
+        before = "\n".join(conn.iterdump())
+        conn.execute(
+            f"CREATE TEMP TRIGGER fail_pass_event AFTER INSERT ON task_events "
+            f"WHEN NEW.kind='{event_kind}' BEGIN SELECT RAISE(ABORT, 'injected'); END"
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="injected"):
+            kb.record_review_verdict(
+                conn, author, review_task_id=review_task,
+                expected_review_run_id=audit_run, verdict="pass",
+                reason="exact head approved", evidence=_APPROVED_EVIDENCE,
+            )
+        assert "\n".join(conn.iterdump()) == before
+
+
+def test_atomic_pass_rolls_back_recompute_failure(kanban_home, monkeypatch):
+    with kb.connect() as conn:
+        author, run_id, review_task = _review_handoff_pair(conn)
+        assert kb.request_review_handoff(
+            conn, author, expected_run_id=run_id, review_task_id=review_task,
+            reason="candidate frozen",
+        )
+        claim = kb.claim_task(conn, review_task)
+        assert claim is not None and claim.current_run_id is not None
+        audit_run = claim.current_run_id
+        before = "\n".join(conn.iterdump())
+
+        def fail_recompute(*args, **kwargs):
+            raise RuntimeError("injected")
+
+        monkeypatch.setattr(kb, "recompute_ready", fail_recompute)
+        with pytest.raises(RuntimeError, match="injected"):
+            kb.record_review_verdict(
+                conn, author, review_task_id=review_task,
+                expected_review_run_id=audit_run, verdict="pass",
+                reason="exact head approved", evidence=_APPROVED_EVIDENCE,
+            )
+        assert "\n".join(conn.iterdump()) == before
+
+
+def test_current_outcome_reader_rejects_role_and_run_drift(kanban_home):
+    with kb.connect() as conn:
+        author, run_id, review_task = _review_handoff_pair(conn)
+        assert kb.request_review_handoff(
+            conn, author, expected_run_id=run_id, review_task_id=review_task,
+            reason="candidate frozen",
+        )
+        claim = kb.claim_task(conn, review_task)
+        assert claim is not None and claim.current_run_id is not None
+        audit_run = claim.current_run_id
+        assert kb.record_review_verdict(
+            conn, author, review_task_id=review_task,
+            expected_review_run_id=audit_run, verdict="pass",
+            reason="exact head approved", evidence=_APPROVED_EVIDENCE,
+        )
+        assert kb._canonical_audit_receipt(conn, author)["authenticated"] is True
+        conn.execute("UPDATE task_runs SET profile='foreign' WHERE id=?", (run_id,))
+        conn.commit()
+        assert kb._canonical_audit_receipt(conn, author) is None
+
+
 @pytest.mark.parametrize("verdict", ["pass", "request_changes"])
 def test_review_verdict_replay_rejects_conflicting_reason(kanban_home, verdict):
     with kb.connect() as conn:

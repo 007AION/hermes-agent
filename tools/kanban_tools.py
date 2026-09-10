@@ -912,7 +912,6 @@ def _handle_review_verdict(args: dict, **kw) -> str:
     author_task_id = str(args.get("author_task_id") or "").strip()
     verdict = str(args.get("verdict") or "").strip().lower()
     reason = str(args.get("reason") or "").strip()
-    evidence = args.get("evidence")
 
     if not author_task_id:
         return tool_error("author_task_id is required")
@@ -920,6 +919,8 @@ def _handle_review_verdict(args: dict, **kw) -> str:
         return tool_error("verdict must be 'pass' or 'request_changes'")
     if not reason:
         return tool_error("reason is required")
+    if verdict == "pass" and recovery_receipt is None and args.get("evidence") is None:
+        return tool_error("evidence is required for PASS")
     if review_run_id is None:
         return tool_error("current dispatcher run id is required")
     reason = redact_sensitive_text(reason, force=True)
@@ -933,8 +934,8 @@ def _handle_review_verdict(args: dict, **kw) -> str:
                 expected_review_run_id=review_run_id,
                 verdict=verdict,
                 reason=reason,
+                evidence=args.get("evidence"),
                 recovery_receipt=recovery_receipt,
-                evidence=evidence,
                 controller_task_id=controller_task_id,
                 controller_run_id=controller_run_id,
                 controller_profile=controller_profile,
@@ -949,12 +950,37 @@ def _handle_review_verdict(args: dict, **kw) -> str:
             # ``task_id`` keeps the exact-worker ownership gate consistent with
             # the other terminal handlers.
             own_task_id = controller_task_id if recovery_receipt is not None else review_task_id
+            changed_fact = None
+            audit_outcome = None
+            if verdict == "pass" and recovery_receipt is None:
+                row = conn.execute(
+                    "SELECT payload FROM task_events WHERE task_id=? AND run_id=? "
+                    "AND kind='changed_fact' ORDER BY id DESC LIMIT 1",
+                    (review_task_id, review_run_id),
+                ).fetchone()
+                changed_fact = json.loads(row["payload"]) if row else None
+                row = conn.execute(
+                    "SELECT id, payload FROM task_events WHERE task_id=? AND run_id=? "
+                    "AND kind='canonical_audit_outcome' ORDER BY id DESC LIMIT 1",
+                    (review_task_id, review_run_id),
+                ).fetchone()
+                if row:
+                    envelope = json.loads(row["payload"])
+                    audit_outcome = {
+                        "event_id": row["id"], "task_id": review_task_id,
+                        "run_id": review_run_id,
+                        "envelope_sha256": envelope["envelope_sha256"],
+                        "disposition": envelope["disposition"],
+                        "continuation_ids": envelope["continuation_ids"],
+                    }
             return _ok(
                 task_id=own_task_id,
                 author_task_id=author_task_id,
                 review_task_id=review_task_id,
                 review_run_id=review_run_id,
                 verdict=verdict,
+                changed_fact=changed_fact,
+                audit_outcome=audit_outcome,
             )
         finally:
             conn.close()
@@ -1999,8 +2025,8 @@ KANBAN_REVIEW_VERDICT_SCHEMA = {
     "name": "kanban_review_verdict",
     "description": (
         "Record this auditor child's bound PASS or REQUEST_CHANGES verdict. "
-        "REQUEST_CHANGES resumes the same author task; PASS leaves it "
-        "nonterminal pending the existing merge/runtime receipt gate."
+        "REQUEST_CHANGES resumes the same author task; PASS atomically "
+        "terminalizes this audit run and returns its bounded changed fact."
     ),
     "parameters": {
         "type": "object",
@@ -2015,6 +2041,19 @@ KANBAN_REVIEW_VERDICT_SCHEMA = {
                 "enum": ["pass", "request_changes"],
             },
             "reason": {"type": "string", "description": "Concrete verdict evidence or findings."},
+            "evidence": {
+                "type": "object",
+                "description": "Commit-bound evidence required for PASS.",
+                "properties": {
+                    "repository": {"type": "string"}, "pr": {"type": "integer"},
+                    "head": {"type": "string"}, "tree": {"type": "string"},
+                    "base": {"type": "string"}, "github_review_id": {"type": "integer"},
+                    "github_review_url": {"type": "string"},
+                    "github_review_state": {"type": "string", "enum": ["APPROVED"]},
+                },
+                "required": ["repository", "pr", "head", "tree", "base", "github_review_id", "github_review_url", "github_review_state"],
+                "additionalProperties": False,
+            },
             "review_task_id": {
                 "type": "string",
                 "description": "Exact terminal direct audit child (recovery mode only).",
@@ -2046,32 +2085,6 @@ KANBAN_REVIEW_VERDICT_SCHEMA = {
                 },
                 "required": [
                     "review_outcome", "repository", "pr", "head", "tree", "base",
-                    "github_review_id", "github_review_url", "github_review_state",
-                ],
-                "additionalProperties": False,
-            },
-            "evidence": {
-                "type": "object",
-                "description": (
-                    "Optional structured evidence identity for a PASS verdict: "
-                    "the exact repository/PR/head/tree/base and commit-bound "
-                    "GitHub APPROVED review id/url/state the auditor "
-                    "authenticated. Digest-bound into the verdict so the "
-                    "terminal writer corroborates the author's completion "
-                    "metadata against it. Only valid for a PASS verdict."
-                ),
-                "properties": {
-                    "repository": {"type": "string"},
-                    "pr": {"type": "integer"},
-                    "head": {"type": "string"},
-                    "tree": {"type": "string"},
-                    "base": {"type": "string"},
-                    "github_review_id": {"type": "integer"},
-                    "github_review_url": {"type": "string"},
-                    "github_review_state": {"type": "string", "enum": ["APPROVED"]},
-                },
-                "required": [
-                    "repository", "pr", "head", "tree", "base",
                     "github_review_id", "github_review_url", "github_review_state",
                 ],
                 "additionalProperties": False,

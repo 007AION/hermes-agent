@@ -6660,11 +6660,13 @@ def _has_protocol_violation_fence(conn: sqlite3.Connection, task_id: str) -> boo
 
 def recompute_ready(
     conn: sqlite3.Connection, failure_limit: int = None,
+    *, promoted_ids: Optional[list[str]] = None,
 ) -> int:
     """Promote tasks whose terminal or typed-review parents are satisfied.
 
-    Returns the number of tasks promoted.  Safe to call inside or outside
-    an existing transaction; it opens its own IMMEDIATE txn.
+    Returns the number of tasks promoted. When ``promoted_ids`` is supplied,
+    the exact ids changed by this call are appended to it. Safe to call inside
+    or outside an existing transaction; it opens its own IMMEDIATE txn.
 
     ``blocked`` tasks are also considered for promotion (so a task
     blocked purely by a parent dependency unblocks itself when the
@@ -6761,18 +6763,22 @@ def recompute_ready(
                     )
                     if failures >= effective_limit:
                         continue
-                    conn.execute(
+                    changed = conn.execute(
                         "UPDATE tasks SET status = 'ready' "
                         "WHERE id = ? AND status = 'blocked'",
                         (task_id,),
                     )
                 else:
-                    conn.execute(
+                    changed = conn.execute(
                         "UPDATE tasks SET status = 'ready' WHERE id = ? AND status = 'todo'",
                         (task_id,),
                     )
+                if changed.rowcount != 1:
+                    continue
                 _append_event(conn, task_id, "promoted", None)
                 promoted += 1
+                if promoted_ids is not None:
+                    promoted_ids.append(task_id)
     return promoted
 
 
@@ -7031,152 +7037,18 @@ def _review_handoff_receipt_from_row(
 def _canonical_review_verdict_payload(row: sqlite3.Row) -> Optional[dict[str, Any]]:
     try:
         payload = json.loads(row["payload"] or "{}")
-    except (TypeError, ValueError):
-        return None
-    if not isinstance(payload, dict):
-        return None
-    version = payload.get("version")
-    if version == 1:
         schema = {"version": int, "review_task_id": str, "review_run_id": int,
                   "verdict": str, "reason": str}
-        if (set(payload) != set(schema)
-                or any(type(payload[key]) is not expected
-                       for key, expected in schema.items())):
+        if (not isinstance(payload, dict) or set(payload) != set(schema)
+                or any(type(payload[key]) is not expected for key, expected in schema.items())):
             return None
         return payload if (
             payload["version"] == 1 and bool(payload["review_task_id"].strip())
             and payload["verdict"] in {"pass", "request_changes"}
             and bool(payload["reason"].strip()) and payload["review_run_id"] == row["run_id"]
         ) else None
-    if version == 2:
-        # A version-2 PASS verdict carries the auditor-bound structured
-        # evidence block (digest-bound) that the terminal writer corroborates
-        # completion metadata against.  Only a PASS verdict may carry it; any
-        # malformed/foreign/undigested block fails closed.
-        schema = {"version": int, "review_task_id": str, "review_run_id": int,
-                  "verdict": str, "reason": str, "evidence": dict,
-                  "evidence_sha256": str}
-        if (set(payload) != set(schema)
-                or any(type(payload[key]) is not expected
-                       for key, expected in schema.items())):
-            return None
-        evidence = _canonical_pass_evidence_block(payload["evidence"])
-        if evidence is None:
-            return None
-        if payload["evidence_sha256"] != _canonical_audit_outcome_evidence_sha256(evidence):
-            return None
-        return payload if (
-            payload["verdict"] == "pass"
-            and bool(payload["review_task_id"].strip())
-            and bool(payload["reason"].strip())
-            and payload["review_run_id"] == row["run_id"]
-        ) else None
-    return None
-
-
-def _canonical_review_verdict_pair(
-    conn: sqlite3.Connection,
-    author_task_id: str,
-    audit_task_id: str,
-    audit_run_id: int,
-) -> tuple[bool, Optional[dict[str, Any]]]:
-    """Authenticate the exact mirrored verdict family for one audit run.
-
-    The official writer emits one author row followed immediately by one audit
-    row with byte-identical payloads. ``present`` distinguishes an absent
-    family (ordinary completion / first write) from a present but malformed,
-    missing, duplicated, drifted, or wrongly-bound family. Current-lineage rows
-    are discovered from both sides of the review boundary: the latest
-    authenticated review-handoff event and the exact audit-run claim event. The
-    claim-side boundary remains available when the handoff projection is
-    deleted, malformed, or rebound to another child. Therefore coherently
-    rebinding both mirrors' event and payload run ids cannot make a prepared
-    family disappear and be mistaken for a first write by also corrupting the
-    handoff projection.
-    """
-    handoff_row = _review_handoff_event_for_child(
-        conn, author_task_id, audit_task_id,
-    )
-    handoff_event_id = int(handoff_row["id"]) if handoff_row is not None else None
-    audit_run_exists = conn.execute(
-        "SELECT 1 FROM task_runs WHERE id = ? AND task_id = ?",
-        (audit_run_id, audit_task_id),
-    ).fetchone() is not None
-    claim_rows = conn.execute(
-        "SELECT id FROM task_events WHERE task_id = ? AND kind = 'claimed' "
-        "AND run_id = ? ORDER BY id",
-        (audit_task_id, audit_run_id),
-    ).fetchall()
-    # The official claim path emits exactly one event before the worker can
-    # prepare a verdict. A live exact audit run with a missing or duplicated
-    # exact-run claim projection is not an ordinary no-verdict state once a
-    # verdict family exists: its authority boundary has drifted. Preserve the
-    # distinction for controller-completed dependency children that have one
-    # parent but no review-verdict history at all.
-    claim_boundary_invalid = audit_run_exists and len(claim_rows) != 1
-    claim_event_id = int(claim_rows[0]["id"]) if len(claim_rows) == 1 else None
-    rows = conn.execute(
-        "SELECT id, task_id, run_id, payload FROM task_events "
-        "WHERE kind = 'review_verdict' AND task_id IN (?, ?) ORDER BY id",
-        (author_task_id, audit_task_id),
-    ).fetchall()
-    if claim_boundary_invalid and rows:
-        # Mark the family present-but-invalid so both PASS replay and the sole
-        # terminal writer fail closed. This remains scoped to a real run owned
-        # by this audit task plus actual review-verdict history.
-        return True, None
-    candidates: list[sqlite3.Row] = []
-    for row in rows:
-        try:
-            raw = json.loads(row["payload"] or "{}")
-        except (TypeError, ValueError):
-            raw = None
-        claims_identity = (
-            isinstance(raw, dict)
-            and raw.get("review_task_id") == audit_task_id
-            and raw.get("review_run_id") == audit_run_id
-        )
-        belongs_to_current_handoff = (
-            audit_run_exists
-            and handoff_event_id is not None
-            and int(row["id"]) > handoff_event_id
-        )
-        belongs_to_current_audit_run = (
-            audit_run_exists
-            and claim_event_id is not None
-            and int(row["id"]) > claim_event_id
-        )
-        if (
-            row["run_id"] == audit_run_id
-            or claims_identity
-            or belongs_to_current_handoff
-            or belongs_to_current_audit_run
-        ):
-            candidates.append(row)
-    if not candidates:
-        return False, None
-    author_rows = [row for row in candidates if row["task_id"] == author_task_id]
-    audit_rows = [row for row in candidates if row["task_id"] == audit_task_id]
-    if len(author_rows) != 1 or len(audit_rows) != 1:
-        return True, None
-    author_row, audit_row = author_rows[0], audit_rows[0]
-    if (
-        author_row["run_id"] != audit_run_id
-        or audit_row["run_id"] != audit_run_id
-        or int(audit_row["id"]) != int(author_row["id"]) + 1
-        or author_row["payload"] != audit_row["payload"]
-    ):
-        return True, None
-    author_payload = _canonical_review_verdict_payload(author_row)
-    audit_payload = _canonical_review_verdict_payload(audit_row)
-    if author_payload is None or audit_payload is None or author_payload != audit_payload:
-        return True, None
-    if (
-        author_payload["review_task_id"] != audit_task_id
-        or author_payload["review_run_id"] != audit_run_id
-    ):
-        return True, None
-    return True, author_payload
+    except (KeyError, TypeError, ValueError):
+        return None
 
 
 _COMPLETED_RECOVERY_RECEIPT_KEYS = {
@@ -8221,696 +8093,6 @@ def _legacy_reused_auditor_final_pass(
     return True
 
 
-# ---------------------------------------------------------------------------
-# Canonical audit-outcome envelope (AION native producer-side conservation)
-# ---------------------------------------------------------------------------
-#
-# One versioned, closed, canonical payload is generated exactly once by the
-# official PASS terminal writer (``complete_task``'s proof-kernel transaction)
-# and referenced by every downstream consumer (finalizer, merger, recovery).
-# This removes the split-PASS defect class: the PASS verdict, the exact audit
-# terminal projection, the canonical evidence identity, a bounded changed-fact,
-# and exactly one FINAL_ACCEPTED / CONTINUATION_COMMITTED disposition all
-# commit (or roll back) in one transaction. No LLM/controller participates.
-
-CANONICAL_AUDIT_OUTCOME_VERSION = 3
-CANONICAL_AUDIT_OUTCOME_EVENT = "canonical_audit_outcome"
-CHANGED_FACT_EVENT = "changed_fact"
-AUDIT_DISPOSITION_FINAL_ACCEPTED = "FINAL_ACCEPTED"
-AUDIT_DISPOSITION_CONTINUATION_COMMITTED = "CONTINUATION_COMMITTED"
-_CANONICAL_AUDIT_OUTCOME_EVIDENCE_KEYS = (
-    "repository", "pr", "head", "tree", "base",
-    "github_review_id", "github_review_url", "github_review_state",
-)
-_CANONICAL_AUDIT_OUTCOME_KEYS = frozenset({
-    "version", "author_task_id", "author_run_id", "audit_task_id",
-    "audit_run_id", "handoff_event_id", "verdict", "reason", "evidence",
-    "role_separation", "evidence_sha256", "created_at",
-})
-_CANONICAL_AUDIT_ROLE_KEYS = frozenset({"author_profile", "auditor_profile"})
-_CANONICAL_CHANGED_FACT_KEYS = frozenset({
-    "task_id", "run_id", "prior_status", "new_status", "event_id",
-    "audit_outcome_sha256", "disposition", "continuation_task_ids",
-})
-
-# Keys whose mere presence in completion metadata means the author is
-# asserting an evidence identity (canonical or one of the legacy recovery
-# aliases).  A metadata dict carrying any of these must normalize to a closed
-# canonical PASS identity byte-equal to the authenticated verdict identity,
-# otherwise the terminal write fails closed.  This is what lets the terminal
-# writer distinguish "no evidence supplied" (adopt the verdict identity) from
-# "evidence supplied but malformed / drifted" (reject).
-_CANONICAL_EVIDENCE_BEARING_KEYS = frozenset(
-    {
-        *_CANONICAL_AUDIT_OUTCOME_EVIDENCE_KEYS,
-        "review_outcome", "verdict", "exact_head", "github_review",
-        "recovery_receipt",
-    }
-)
-
-
-def _canonical_pass_evidence_block(evidence: Any) -> Optional[dict[str, Any]]:
-    """Return one closed, typed PASS evidence block (8 identity keys) or None.
-
-    This is the authenticated auditor-bound evidence identity for a PASS
-    verdict: ``repository``/``pr``/``head``/``tree``/``base``/
-    ``github_review_id``/``github_review_url``/``github_review_state``.  Every
-    field must be present, typed, and internally consistent (40-hex SHAs,
-    positive non-bool PR/review id, and the canonical commit-bound APPROVED
-    review URL); anything else fails closed.  It is the single structured
-    source of truth the terminal writer corroborates against, so no caller
-    prose or free-text reason is ever parsed for identity.
-    """
-    if not isinstance(evidence, dict) or set(evidence) != set(
-        _CANONICAL_AUDIT_OUTCOME_EVIDENCE_KEYS
-    ):
-        return None
-    pr = evidence.get("pr")
-    review_id = evidence.get("github_review_id")
-    if (
-        evidence.get("repository") != FACTORY_REVIEW_REPOSITORY
-        or isinstance(pr, bool)
-        or not isinstance(pr, int)
-        or pr <= 0
-        or any(
-            not isinstance(evidence.get(key), str)
-            or re.fullmatch(r"[0-9a-fA-F]{40}", evidence[key]) is None
-            for key in ("head", "tree", "base")
-        )
-        or isinstance(review_id, bool)
-        or not isinstance(review_id, int)
-        or review_id <= 0
-        or evidence.get("github_review_state") != "APPROVED"
-        or evidence.get("github_review_url")
-        != (
-            f"https://github.com/{FACTORY_REVIEW_REPOSITORY}/pull/{pr}"
-            f"#pullrequestreview-{review_id}"
-        )
-    ):
-        return None
-    return {key: evidence[key] for key in _CANONICAL_AUDIT_OUTCOME_EVIDENCE_KEYS}
-
-
-class _CanonicalAuditOutcomeError(Exception):
-    """A bound PASS audit completion could not produce a legal envelope."""
-
-
-def _canonical_audit_outcome_evidence(
-    metadata: Optional[dict],
-) -> Optional[dict[str, Any]]:
-    """Extract the closed canonical evidence from completion metadata.
-
-    Reuses the single existing PASS-recovery normalizer (the one bounded
-    compatibility ingress) so new writes and legacy recovery share one
-    evidence identity; no new shape-specific parser is introduced.
-    """
-    receipt = _normalize_completed_pass_recovery_receipt(metadata)
-    if receipt is None:
-        return None
-    return {key: receipt[key] for key in _CANONICAL_AUDIT_OUTCOME_EVIDENCE_KEYS}
-
-
-def _canonical_audit_outcome_evidence_sha256(evidence: dict[str, Any]) -> str:
-    """Canonical JSON digest of the closed evidence block."""
-    return hashlib.sha256(
-        json.dumps(
-            evidence, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
-        ).encode("utf-8")
-    ).hexdigest()
-
-
-def _audit_continuation_targets(
-    conn: sqlite3.Connection,
-    author_task_id: str,
-    audit_task_id: str,
-) -> tuple[Optional[str], Optional[list[str]]]:
-    """Resolve the single disposition + bound continuation target ids.
-
-    Continuation targets are the author's existing non-audit, non-terminal
-    children (``task_links`` where ``parent_id`` is the author). Zero targets
-    is ``FINAL_ACCEPTED``; one-or-more is ``CONTINUATION_COMMITTED`` bound to
-    exactly those ids (sorted, deterministic). A child id that does not resolve
-    to a live task row is a *missing* target and fails closed (``(None, None)``).
-    Continuation wakes only through the existing ``recompute_ready`` machinery.
-    """
-    rows = conn.execute(
-        "SELECT child_id FROM task_links WHERE parent_id = ? AND child_id != ?",
-        (author_task_id, audit_task_id),
-    ).fetchall()
-    targets: list[str] = []
-    for row in rows:
-        child_id = str(row["child_id"])
-        live = conn.execute(
-            "SELECT status FROM tasks WHERE id = ?", (child_id,),
-        ).fetchone()
-        if live is None:
-            return None, None
-        if live["status"] in ("done", "archived"):
-            continue
-        targets.append(child_id)
-    targets.sort()
-    if targets:
-        return AUDIT_DISPOSITION_CONTINUATION_COMMITTED, targets
-    return AUDIT_DISPOSITION_FINAL_ACCEPTED, []
-
-
-def _bind_canonical_audit_outcome(
-    conn: sqlite3.Connection,
-    audit_task_id: str,
-    audit_run_id: int,
-    metadata: Optional[dict],
-) -> Optional[dict[str, Any]]:
-    """Generate + persist one canonical audit-outcome envelope (version 3).
-
-    Called by ``complete_task`` inside the same transaction that terminalized
-    the audit run. Returns the envelope, or ``None`` when this completion is
-    *not* a factory-gated PASS audit (the normal completion case). When the
-    completion IS a bound PASS audit, every identity/evidence/disposition fact
-    must be authenticated or the transaction fails closed with zero mutation.
-    """
-    audit = conn.execute(
-        "SELECT assignee FROM tasks WHERE id = ?",
-        (audit_task_id,),
-    ).fetchone()
-    if audit is None or not audit["assignee"]:
-        return None
-    auditor_profile = str(audit["assignee"])
-
-    # A bound PASS verdict family for the exact run is the *only* trigger. A
-    # wholly absent family means ordinary completion. Once either mirror is
-    # present, however, the producer must authenticate the exact singleton,
-    # adjacent, byte-identical author+audit pair before any terminal write may
-    # commit; consumer-only validation after completion is too late.
-    parent_rows = conn.execute(
-        "SELECT l.parent_id, t.assignee, t.status FROM task_links l "
-        "JOIN tasks t ON t.id = l.parent_id WHERE l.child_id = ?",
-        (audit_task_id,),
-    ).fetchall()
-    if len(parent_rows) != 1:
-        audit_verdict_present = conn.execute(
-            "SELECT 1 FROM task_events WHERE task_id = ? "
-            "AND kind = 'review_verdict' AND run_id = ? LIMIT 1",
-            (audit_task_id, audit_run_id),
-        ).fetchone() is not None
-        if audit_verdict_present:
-            raise _CanonicalAuditOutcomeError("audit parent edge is ambiguous or missing")
-        return None
-    author_task_id = str(parent_rows[0]["parent_id"])
-    family_present, verdict = _canonical_review_verdict_pair(
-        conn, author_task_id, audit_task_id, audit_run_id,
-    )
-    if not family_present:
-        return None
-    if verdict is None:
-        raise _CanonicalAuditOutcomeError(
-            "PASS verdict family is missing, duplicated, malformed, or drifted"
-        )
-    if verdict["verdict"] != "pass":
-        # REQUEST_CHANGES is terminalized by the verdict writer and cannot
-        # normally reach completion; preserve ordinary non-PASS semantics.
-        return None
-    if verdict["version"] != 2:
-        # A coherent historical v1 PASS has no structured evidence and remains
-        # eligible only for the bounded read-only legacy ingress.
-        return None
-
-    # The envelope evidence identity is authenticated by the auditor's bound
-    # verdict: a version-2 PASS verdict carries a structured, digest-bound
-    # evidence block.  The author's completion metadata is NOT the source of
-    # truth — if it carries an evidence block it must byte-match the
-    # authenticated verdict identity, and if it is absent the authenticated
-    # identity is adopted.  A version-1 PASS verdict has no structured
-    # evidence, so the new producer cannot authenticate it and no envelope is
-    # produced (legacy split records remain the bounded read-only ingress).
-    authenticated_evidence = verdict.get("evidence")
-    if not isinstance(authenticated_evidence, dict):
-        return None
-    metadata_evidence = _canonical_audit_outcome_evidence(metadata)
-    if metadata_evidence is None:
-        if isinstance(metadata, dict) and _CANONICAL_EVIDENCE_BEARING_KEYS.intersection(
-            metadata
-        ):
-            # The author supplied evidence that did not normalize to a closed
-            # canonical PASS identity matching the verdict — drift/malformation
-            # fails closed.
-            raise _CanonicalAuditOutcomeError(
-                "completion evidence is malformed or drifts from the "
-                "authenticated verdict identity"
-            )
-        # No evidence supplied: adopt the authenticated verdict identity.
-        evidence = authenticated_evidence
-    elif metadata_evidence != authenticated_evidence:
-        raise _CanonicalAuditOutcomeError(
-            "completion evidence drifts from the authenticated verdict identity"
-        )
-    else:
-        evidence = authenticated_evidence
-
-    # From here on this is a bound PASS audit outcome: any missing identity,
-    # role-separation, or disposition fact fails closed (raises, rolling back
-    # the whole terminal transaction).
-    author_profile = str(parent_rows[0]["assignee"])
-    if author_profile == auditor_profile:
-        raise _CanonicalAuditOutcomeError("author/auditor role separation violated")
-
-    handoff_row = _review_handoff_event_for_child(conn, author_task_id, audit_task_id)
-    if handoff_row is None:
-        raise _CanonicalAuditOutcomeError("review handoff is missing or stale")
-    handoff = _review_handoff_receipt_from_row(author_task_id, handoff_row)
-    if handoff is None:
-        raise _CanonicalAuditOutcomeError("review handoff receipt is malformed")
-    author_run_id = handoff.expected_run_id
-
-    evidence_sha256 = _canonical_audit_outcome_evidence_sha256(evidence)
-
-    disposition, continuation_task_ids = _audit_continuation_targets(
-        conn, author_task_id, audit_task_id,
-    )
-    if disposition is None:
-        raise _CanonicalAuditOutcomeError("continuation target missing or foreign")
-
-    now = int(time.time())
-    envelope: dict[str, Any] = {
-        "version": CANONICAL_AUDIT_OUTCOME_VERSION,
-        "author_task_id": author_task_id,
-        "author_run_id": author_run_id,
-        "audit_task_id": audit_task_id,
-        "audit_run_id": audit_run_id,
-        "handoff_event_id": int(handoff.event_id),
-        "verdict": "PASS",
-        "reason": str(verdict["reason"]),
-        "evidence": evidence,
-        "role_separation": {
-            "author_profile": author_profile,
-            "auditor_profile": auditor_profile,
-        },
-        "evidence_sha256": evidence_sha256,
-        "created_at": now,
-    }
-
-    def _insert_event(tid: str, kind: str, payload: dict, run_id: int) -> int:
-        pl = json.dumps(payload, ensure_ascii=False)
-        cur = conn.execute(
-            "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (tid, run_id, kind, pl, now),
-        )
-        return int(cur.lastrowid or 0)
-
-    outcome_event_id = _insert_event(
-        audit_task_id, CANONICAL_AUDIT_OUTCOME_EVENT, envelope, audit_run_id,
-    )
-    _insert_event(
-        author_task_id, CANONICAL_AUDIT_OUTCOME_EVENT, envelope, author_run_id,
-    )
-    changed_fact: dict[str, Any] = {
-        "task_id": audit_task_id,
-        "run_id": audit_run_id,
-        "prior_status": "running",
-        "new_status": "done",
-        "event_id": outcome_event_id,
-        "audit_outcome_sha256": evidence_sha256,
-        "disposition": disposition,
-        "continuation_task_ids": continuation_task_ids,
-    }
-    _insert_event(audit_task_id, CHANGED_FACT_EVENT, changed_fact, audit_run_id)
-    _insert_event(author_task_id, CHANGED_FACT_EVENT, changed_fact, author_run_id)
-    return envelope
-
-
-def _canonical_audit_outcome_event_present(
-    conn: sqlite3.Connection,
-    author_task_id: str,
-) -> bool:
-    """True when the author carries any canonical audit-outcome event.
-
-    ``canonical_audit_outcome`` is written only by the version-3 producer, so
-    its presence means a producer-side record exists.  When such a record is
-    present but the resolver cannot validate it (malformed / drifted), the
-    consumer must fail closed rather than fall through to the legacy receipt:
-    the legacy path must never grant finalizer authority over a v3 record it
-    did not authenticate.
-    """
-    return conn.execute(
-        "SELECT 1 FROM task_events WHERE task_id = ? AND kind = ? LIMIT 1",
-        (author_task_id, CANONICAL_AUDIT_OUTCOME_EVENT),
-    ).fetchone() is not None
-
-
-def _task_run_matches(
-    conn: sqlite3.Connection,
-    run_id: int,
-    task_id: str,
-    profile: str,
-    *,
-    status: str,
-    outcome: str,
-) -> bool:
-    """True when ``run_id`` is the exact terminal projection for ``task_id``.
-
-    The terminal writer records the envelope under the author and audit runs
-    it belongs to. A fabricated or cross-task run id, profile drift, or a
-    reopened/nonterminal run must not be trusted to grant finalizer authority.
-    The official terminal writer also clears every run-level execution claim;
-    either a reopened claim or any second open run for the task revokes the
-    closed projection.
-    """
-    row = conn.execute(
-        "SELECT profile, status, outcome, ended_at, claim_lock, claim_expires, "
-        "worker_pid FROM task_runs "
-        "WHERE id = ? AND task_id = ?",
-        (run_id, task_id),
-    ).fetchone()
-    return (
-        row is not None
-        and row["profile"] == profile
-        and row["status"] == status
-        and row["outcome"] == outcome
-        and row["ended_at"] is not None
-        and row["claim_lock"] is None
-        and row["claim_expires"] is None
-        and row["worker_pid"] is None
-        and conn.execute(
-            "SELECT 1 FROM task_runs WHERE task_id = ? AND ended_at IS NULL LIMIT 1",
-            (task_id,),
-        ).fetchone() is None
-    )
-
-
-def _resolved_canonical_audit_outcome(
-    conn: sqlite3.Connection,
-    author_task_id: str,
-) -> Optional[dict[str, Any]]:
-    """Return the latest persisted canonical audit-outcome envelope for an
-    author, if it is a strictly valid version-3 envelope."""
-    rows = conn.execute(
-        "SELECT id, run_id, payload, created_at FROM task_events "
-        "WHERE task_id = ? AND kind = ? "
-        "ORDER BY id",
-        (author_task_id, CANONICAL_AUDIT_OUTCOME_EVENT),
-    ).fetchall()
-    # Version 3 is a canonical singleton family. Multiple author projections,
-    # even byte-identical ones, are ambiguous and therefore non-authoritative.
-    if len(rows) != 1:
-        return None
-    row = rows[0]
-    try:
-        envelope = json.loads(row["payload"] or "{}")
-    except (TypeError, ValueError):
-        return None
-    if not isinstance(envelope, dict) or envelope.get("version") != CANONICAL_AUDIT_OUTCOME_VERSION:
-        return None
-    if set(envelope) != _CANONICAL_AUDIT_OUTCOME_KEYS:
-        return None
-    if (
-        envelope["verdict"] != "PASS"
-        or envelope["author_task_id"] != author_task_id
-        or isinstance(envelope["created_at"], bool)
-        or not isinstance(envelope["created_at"], int)
-        or envelope["created_at"] <= 0
-        or row["created_at"] != envelope["created_at"]
-        or not isinstance(envelope["evidence"], dict)
-        or set(envelope["evidence"]) != set(_CANONICAL_AUDIT_OUTCOME_EVIDENCE_KEYS)
-        or envelope["evidence_sha256"]
-        != _canonical_audit_outcome_evidence_sha256(envelope["evidence"])
-    ):
-        return None
-    role = envelope["role_separation"]
-    if (
-        not isinstance(role, dict)
-        or set(role) != _CANONICAL_AUDIT_ROLE_KEYS
-        or any(not isinstance(role[key], str) or not role[key].strip()
-               for key in _CANONICAL_AUDIT_ROLE_KEYS)
-        or role["author_profile"] == role["auditor_profile"]
-    ):
-        return None
-    # Mirrored identity validation: the envelope's author/audit task+run,
-    # handoff event, and role profiles must mirror live DB state, and the
-    # evidence must byte-match the authenticated bound PASS verdict that
-    # produced it.  Any drift means the envelope cannot be trusted to grant
-    # finalizer authority and is rejected (fail-closed, ``None``).
-    audit_task_id = envelope.get("audit_task_id")
-    author_run_id = envelope.get("author_run_id")
-    audit_run_id = envelope.get("audit_run_id")
-    handoff_event_id = envelope.get("handoff_event_id")
-    if (
-        not isinstance(audit_task_id, str)
-        or not audit_task_id
-        or isinstance(author_run_id, bool)
-        or not isinstance(author_run_id, int)
-        or isinstance(audit_run_id, bool)
-        or not isinstance(audit_run_id, int)
-        or isinstance(handoff_event_id, bool)
-        or not isinstance(handoff_event_id, int)
-    ):
-        return None
-    # The author envelope event must itself be bound to the exact author run
-    # it records (the terminal writer stamps every event with the run it
-    # belongs to); a drifted event under a foreign run must not be trusted.
-    if row["run_id"] != author_run_id:
-        return None
-    # The producer requires one unambiguous author edge. Preserve that exact
-    # live parent-set invariant at consumption time: merely retaining the
-    # recorded edge is insufficient if a second parent is added later.
-    audit_parent_rows = conn.execute(
-        "SELECT parent_id FROM task_links WHERE child_id = ? ORDER BY parent_id",
-        (audit_task_id,),
-    ).fetchall()
-    if (
-        len(audit_parent_rows) != 1
-        or audit_parent_rows[0]["parent_id"] != author_task_id
-    ):
-        return None
-    # Role profiles must mirror the live task assignees (and differ).
-    identity_fields = (
-        "claim_lock", "claim_expires", "worker_pid", "worker_starttime",
-        "fence_lineage", "fence_disposition",
-    )
-    author_assignee = conn.execute(
-        "SELECT assignee, status, current_run_id, completed_at, claim_lock, "
-        "claim_expires, worker_pid, worker_starttime, fence_lineage, fence_disposition "
-        "FROM tasks WHERE id = ?", (author_task_id,),
-    ).fetchone()
-    audit_assignee = conn.execute(
-        "SELECT assignee, status, current_run_id, completed_at, claim_lock, "
-        "claim_expires, worker_pid, worker_starttime, fence_lineage, fence_disposition "
-        "FROM tasks WHERE id = ?", (audit_task_id,),
-    ).fetchone()
-    if author_assignee is None or audit_assignee is None:
-        return None
-    if (
-        role.get("author_profile") != author_assignee["assignee"]
-        or role.get("auditor_profile") != audit_assignee["assignee"]
-        or author_assignee["assignee"] == audit_assignee["assignee"]
-    ):
-        return None
-    # Exact task projections after the same-run terminal writer: the author is
-    # parked in review with no live execution identity, while the audit is done
-    # with no live execution identity. Reopening either side revokes authority.
-    if (
-        author_assignee["status"] != "review"
-        or author_assignee["current_run_id"] is not None
-        or author_assignee["completed_at"] is not None
-        or any(author_assignee[field] is not None for field in identity_fields)
-        or audit_assignee["status"] != "done"
-        or audit_assignee["current_run_id"] is not None
-        or audit_assignee["completed_at"] is None
-        or any(audit_assignee[field] is not None for field in identity_fields)
-    ):
-        return None
-    # Exact run/profile provenance: author_run_id / audit_run_id must reference
-    # live task_runs rows bound to the author/auditor task AND its live
-    # assignee. A fabricated or cross-task run id, or a run row whose profile
-    # drifts, fails closed.
-    if not _task_run_matches(
-        conn, author_run_id, author_task_id, author_assignee["assignee"],
-        status="review_required", outcome="review_required",
-    ):
-        return None
-    if not _task_run_matches(
-        conn, audit_run_id, audit_task_id, audit_assignee["assignee"],
-        status="done", outcome="completed",
-    ):
-        return None
-    # The outcome must remain the newest review round on both exact tasks.
-    # A later author run means a newer review obligation exists; the old v3
-    # family is stale even if its own rows are still internally coherent.
-    latest_author_run = conn.execute(
-        "SELECT id FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1",
-        (author_task_id,),
-    ).fetchone()
-    latest_audit_run = conn.execute(
-        "SELECT id FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1",
-        (audit_task_id,),
-    ).fetchone()
-    if (
-        latest_author_run is None
-        or int(latest_author_run["id"]) != author_run_id
-        or latest_audit_run is None
-        or int(latest_audit_run["id"]) != audit_run_id
-    ):
-        return None
-    # handoff_event_id must reference the real review_handoff event binding
-    # author_run_id and audit_task_id.
-    handoff_row = conn.execute(
-        "SELECT id, run_id, payload FROM task_events WHERE id = ? AND task_id = ? "
-        "AND kind = 'review_handoff'",
-        (handoff_event_id, author_task_id),
-    ).fetchone()
-    if handoff_row is None:
-        return None
-    handoff = _review_handoff_receipt_from_row(author_task_id, handoff_row)
-    if (
-        handoff is None
-        or handoff.review_task_id != audit_task_id
-        or handoff.expected_run_id != author_run_id
-    ):
-        return None
-    # Any later handoff row — valid, malformed, or ambiguous — revokes this
-    # family's authority. Consumers must never reuse an old exact-head PASS
-    # after a newer review round has been opened.
-    if conn.execute(
-        "SELECT 1 FROM task_events WHERE task_id = ? "
-        "AND kind = 'review_handoff' AND id > ? LIMIT 1",
-        (author_task_id, handoff_event_id),
-    ).fetchone() is not None:
-        return None
-    # audit_run_id must carry exactly one byte-identical author/audit v2 PASS
-    # verdict pair. The terminal envelope may not outlive a missing or drifted
-    # verdict mirror, and its reason/evidence must match that authenticated pair.
-    audit_verdict_rows = conn.execute(
-        "SELECT id, run_id, payload FROM task_events WHERE task_id = ? AND kind = 'review_verdict' "
-        "AND run_id = ? ORDER BY id",
-        (audit_task_id, audit_run_id),
-    ).fetchall()
-    author_verdict_rows = conn.execute(
-        "SELECT id, run_id, payload FROM task_events WHERE task_id = ? AND kind = 'review_verdict' "
-        "AND run_id = ? ORDER BY id",
-        (author_task_id, audit_run_id),
-    ).fetchall()
-    if len(audit_verdict_rows) != 1 or len(author_verdict_rows) != 1:
-        return None
-    verdict_row = audit_verdict_rows[0]
-    author_verdict_row = author_verdict_rows[0]
-    if author_verdict_row["payload"] != verdict_row["payload"]:
-        return None
-    verdict = _canonical_review_verdict_payload(verdict_row)
-    author_verdict = _canonical_review_verdict_payload(author_verdict_row)
-    if (
-        verdict is None
-        or author_verdict != verdict
-        or verdict["verdict"] != "pass"
-        or verdict["review_task_id"] != audit_task_id
-        or verdict["review_run_id"] != audit_run_id
-        or verdict["reason"] != envelope["reason"]
-    ):
-        return None
-    if verdict.get("evidence") != envelope["evidence"]:
-        return None
-    # Mirror corroboration: the envelope is trusted only when mirrored on the
-    # audit task (byte-identical) and paired with author + audit changed-fact
-    # mirrors that carry the exact disposition / continuation the terminal
-    # writer recorded.  A lone author envelope — no audit mirror, no
-    # changed-fact mirrors — must not grant finalizer authority.
-    audit_mirror_rows = conn.execute(
-        "SELECT id, run_id, payload, created_at FROM task_events "
-        "WHERE task_id = ? AND kind = ? "
-        "ORDER BY id",
-        (audit_task_id, CANONICAL_AUDIT_OUTCOME_EVENT),
-    ).fetchall()
-    if len(audit_mirror_rows) != 1:
-        return None
-    audit_mirror_row = audit_mirror_rows[0]
-    if (
-        audit_mirror_row["run_id"] != audit_run_id
-        or audit_mirror_row["created_at"] != envelope["created_at"]
-        or audit_mirror_row["payload"] != row["payload"]
-    ):
-        return None
-    try:
-        audit_mirror = json.loads(audit_mirror_row["payload"] or "{}")
-    except (TypeError, ValueError):
-        return None
-    if audit_mirror != envelope:
-        return None
-
-    author_fact_rows = conn.execute(
-        "SELECT payload, created_at FROM task_events WHERE task_id = ? "
-        "AND kind = ? AND run_id = ? ORDER BY id",
-        (author_task_id, CHANGED_FACT_EVENT, author_run_id),
-    ).fetchall()
-    audit_fact_rows = conn.execute(
-        "SELECT payload, created_at FROM task_events WHERE task_id = ? "
-        "AND kind = ? AND run_id = ? ORDER BY id",
-        (audit_task_id, CHANGED_FACT_EVENT, audit_run_id),
-    ).fetchall()
-    if len(author_fact_rows) != 1 or len(audit_fact_rows) != 1:
-        return None
-    author_fact_row = author_fact_rows[0]
-    audit_fact_row = audit_fact_rows[0]
-    if (
-        author_fact_row["payload"] != audit_fact_row["payload"]
-        or author_fact_row["created_at"] != envelope["created_at"]
-        or audit_fact_row["created_at"] != envelope["created_at"]
-    ):
-        return None
-    try:
-        author_fact = json.loads(author_fact_row["payload"] or "{}")
-    except (TypeError, ValueError):
-        return None
-    if not isinstance(author_fact, dict):
-        return None
-    fact = author_fact
-    if (
-        set(fact) != _CANONICAL_CHANGED_FACT_KEYS
-        or fact.get("task_id") != audit_task_id
-        or fact.get("run_id") != audit_run_id
-        or fact.get("event_id") != audit_mirror_row["id"]
-        or fact.get("prior_status") != "running"
-        or fact.get("new_status") != "done"
-        or fact.get("audit_outcome_sha256") != envelope["evidence_sha256"]
-    ):
-        return None
-    disposition = fact.get("disposition")
-    continuation = fact.get("continuation_task_ids")
-    if not isinstance(continuation, list):
-        return None
-    if disposition == AUDIT_DISPOSITION_FINAL_ACCEPTED:
-        if continuation != []:
-            return None
-    elif disposition == AUDIT_DISPOSITION_CONTINUATION_COMMITTED:
-        if not continuation:
-            return None
-        seen: set[str] = set()
-        for cid in continuation:
-            if not isinstance(cid, str) or not cid or cid in seen:
-                return None
-            seen.add(cid)
-            if cid == audit_task_id:
-                return None
-            if conn.execute(
-                "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ?",
-                (author_task_id, cid),
-            ).fetchone() is None:
-                return None
-    else:
-        return None
-    # Exact live disposition/continuation-set equality: recompute the current
-    # continuation from live task_links/tasks and require the recorded
-    # disposition + ordered continuation to byte-match. A late child (a
-    # FINAL_ACCEPTED that later gained a child), a non-exhaustive subset, or an
-    # extra/foreign target fails closed — the envelope may not grant finalizer
-    # authority over a disposition the live graph no longer reflects.
-    live_disposition, live_targets = _audit_continuation_targets(
-        conn, author_task_id, audit_task_id,
-    )
-    if live_disposition is None or live_disposition != disposition:
-        return None
-    if continuation != live_targets:
-        return None
-    return envelope
-
-
 def _canonical_audit_receipt(
     conn: sqlite3.Connection,
     task_id: str,
@@ -8920,6 +8102,10 @@ def _canonical_audit_receipt(
     Only task, run, edge, handoff, and paired-verdict rows are authoritative.
     Audit metadata, comments, titles, caller data, and external state are cold.
     """
+    current_present, current_receipt = _canonical_current_audit_outcome(conn, task_id)
+    if current_present:
+        return current_receipt
+
     identity_fields = (
         "claim_lock", "claim_expires", "worker_pid", "worker_starttime",
         "fence_lineage", "fence_disposition",
@@ -10118,6 +9304,211 @@ def request_review_handoff(
         return None
 
 
+_CANONICAL_AUDIT_EVIDENCE_KEYS = {
+    "repository", "pr", "head", "tree", "base", "github_review_id",
+    "github_review_url", "github_review_state",
+}
+
+
+def _canonical_audit_evidence(value: Any) -> Optional[dict[str, Any]]:
+    """Validate the one closed exact-head attestation accepted from an auditor."""
+    if not isinstance(value, dict) or set(value) != _CANONICAL_AUDIT_EVIDENCE_KEYS:
+        return None
+    repository, pr, review_id = value["repository"], value["pr"], value["github_review_id"]
+    if (
+        type(repository) is not str
+        or re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository) is None
+        or type(pr) is not int or pr <= 0 or type(review_id) is not int or review_id <= 0
+        or value["github_review_state"] != "APPROVED"
+        or any(type(value[key]) is not str or re.fullmatch(r"[0-9a-fA-F]{40}", value[key]) is None
+               for key in ("head", "tree", "base"))
+        or value["github_review_url"] != (
+            f"https://github.com/{repository}/pull/{pr}#pullrequestreview-{review_id}"
+        )
+    ):
+        return None
+    return {key: value[key] for key in sorted(_CANONICAL_AUDIT_EVIDENCE_KEYS)}
+
+
+def _canonical_current_audit_outcome(
+    conn: sqlite3.Connection, author_task_id: str,
+) -> tuple[bool, Optional[dict[str, Any]]]:
+    """Resolve the strict audit-owned singleton; presence blocks legacy fallback."""
+    rows = conn.execute(
+        "SELECT e.id, e.task_id, e.run_id, e.payload FROM task_events e "
+        "JOIN task_links l ON l.child_id=e.task_id AND l.parent_id=? "
+        "WHERE e.kind='canonical_audit_outcome' ORDER BY e.id", (author_task_id,),
+    ).fetchall()
+    if not rows:
+        return False, None
+    if len(rows) != 1:
+        return True, None
+    row = rows[0]
+    try:
+        envelope = json.loads(row["payload"] or "{}")
+        payload = {key: value for key, value in envelope.items() if key != "envelope_sha256"}
+        digest = envelope["envelope_sha256"]
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return True, None
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    handoff_row = conn.execute(
+        "SELECT id, run_id, payload FROM task_events WHERE id=? AND task_id=? AND kind='review_handoff'",
+        (payload.get("review_handoff_event_id"), author_task_id),
+    ).fetchone()
+    handoff = _review_handoff_receipt_from_row(author_task_id, handoff_row) if handoff_row else None
+    task = conn.execute(
+        "SELECT status, assignee, current_run_id, factory_build_gate, "
+        "factory_terminal_receipt_sha256 FROM tasks WHERE id=?", (row["task_id"],),
+    ).fetchone()
+    run = conn.execute(
+        "SELECT profile, status, outcome, ended_at FROM task_runs WHERE id=? AND task_id=?",
+        (row["run_id"], row["task_id"]),
+    ).fetchone()
+    facts = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind='changed_fact'",
+        (row["task_id"], row["run_id"]),
+    ).fetchall()
+    author = conn.execute(
+        "SELECT status, assignee, current_run_id FROM tasks WHERE id=?", (author_task_id,),
+    ).fetchone()
+    author_run = conn.execute(
+        "SELECT profile, status, outcome, ended_at FROM task_runs WHERE id=? AND task_id=?",
+        (payload.get("author_run_id"), author_task_id),
+    ).fetchone()
+    parents = conn.execute(
+        "SELECT parent_id FROM task_links WHERE child_id=?", (row["task_id"],),
+    ).fetchall()
+    required = {
+        "version", "author_task_id", "author_run_id", "author_profile", "audit_task_id",
+        "audit_run_id", "auditor_profile", "review_handoff_event_id", "verdict", "reason",
+        "evidence", "scope", "disposition", "continuation_ids",
+    }
+    continuation_ids = payload.get("continuation_ids")
+    valid = (
+        set(payload) == required and payload.get("version") == 3
+        and payload.get("author_task_id") == author_task_id
+        and payload.get("audit_task_id") == row["task_id"] and payload.get("audit_run_id") == row["run_id"]
+        and payload.get("verdict") == "PASS" and payload.get("scope") == "audit_obligation"
+        and _canonical_audit_evidence(payload.get("evidence")) == payload.get("evidence")
+        and type(payload.get("reason")) is str and bool(payload["reason"].strip())
+        and type(digest) is str and hashlib.sha256(encoded).hexdigest() == digest
+        and handoff is not None and handoff.review_task_id == row["task_id"]
+        and handoff.expected_run_id == payload.get("author_run_id")
+        and handoff.event_id == payload.get("review_handoff_event_id")
+        and len(parents) == 1 and parents[0]["parent_id"] == author_task_id
+        and author is not None and author["status"] == "review"
+        and author["current_run_id"] is None and author["assignee"] == payload.get("author_profile")
+        and author_run is not None and author_run["profile"] == payload.get("author_profile")
+        and (author_run["status"], author_run["outcome"]) == ("review_required", "review_required")
+        and author_run["ended_at"] is not None
+        and payload.get("author_profile") not in {None, ""}
+        and payload.get("auditor_profile") not in {None, "", payload.get("author_profile")}
+        and task is not None and task["status"] in {"done", "archived"}
+        and (
+            not task["factory_build_gate"]
+            or (type(task["factory_terminal_receipt_sha256"]) is str
+                and re.fullmatch(r"[0-9a-f]{64}", task["factory_terminal_receipt_sha256"]) is not None)
+        )
+        and task["current_run_id"] is None and task["assignee"] == payload.get("auditor_profile")
+        and run is not None and run["profile"] == payload.get("auditor_profile")
+        and (run["status"], run["outcome"]) == ("done", "completed") and run["ended_at"] is not None
+        and type(continuation_ids) is list and all(type(item) is str for item in continuation_ids)
+        and payload.get("disposition") == (
+            "CONTINUATION_COMMITTED" if continuation_ids else "FINAL_ACCEPTED"
+        )
+        and len(facts) == 1
+    )
+    try:
+        fact = json.loads(facts[0]["payload"]) if len(facts) == 1 else None
+    except (TypeError, ValueError):
+        fact = None
+    if fact != {
+        "version": 1, "type": "canonical_audit_outcome_pointer",
+        "outcome_event_id": int(row["id"]), "envelope_sha256": digest,
+        "prior_status": "running", "new_status": "done",
+    }:
+        valid = False
+    if not valid:
+        return True, None
+    receipt = {
+        "task_id": author_task_id, "subject_id": f"{author_task_id}/{payload['author_run_id']}",
+        "subject_version_or_exact_hash": digest, "author_task_id": author_task_id,
+        "author_run_id": payload["author_run_id"], "author_profile": payload["author_profile"],
+        "auditor_task_id": row["task_id"], "auditor_run_id": row["run_id"],
+        "auditor_profile": payload["auditor_profile"], "verdict": "PASS", "issued_at": int(row["id"]),
+    }
+    receipt_hash = hashlib.sha256(
+        json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    return True, {**receipt, "receipt_hash": receipt_hash, "authenticated": True}
+
+
+def _terminalize_review_pass(
+    conn: sqlite3.Connection, *, author_task_id: str, audit_task_id: str,
+    audit_run_id: int, reason: str, evidence: dict[str, Any], handoff: sqlite3.Row,
+) -> bool:
+    """Commit terminal PASS, recompute, one audit outcome, and one fact pointer."""
+    author = conn.execute("SELECT assignee FROM tasks WHERE id=?", (author_task_id,)).fetchone()
+    audit = conn.execute(
+        "SELECT assignee, factory_build_gate FROM tasks WHERE id=?", (audit_task_id,),
+    ).fetchone()
+    receipt = _review_handoff_receipt_from_row(author_task_id, handoff)
+    if author is None or audit is None or receipt is None:
+        return False
+    _append_event(conn, audit_task_id, "review_verdict", {
+        "version": 2, "review_task_id": audit_task_id, "review_run_id": audit_run_id,
+        "verdict": "pass", "reason": reason, "evidence": evidence,
+    }, run_id=audit_run_id)
+    if audit["factory_build_gate"]:
+        _run_kernel_finalizer(
+            conn, audit_task_id, str(audit_run_id), board=get_current_board(), result=reason,
+        )
+    else:
+        changed = _execute_factory_terminal_write(
+            conn, audit_task_id,
+            "UPDATE tasks SET status='done', result=?, completed_at=?, claim_lock=NULL, "
+            "claim_expires=NULL, worker_pid=NULL, block_kind=NULL, block_recurrences=0 "
+            "WHERE id=? AND status='running' AND current_run_id=?",
+            (reason, int(time.time()), audit_task_id, audit_run_id),
+        )
+        if changed.rowcount != 1:
+            raise _ReviewHandoffConflict
+    if _end_run(
+        conn, audit_task_id, outcome="completed", status="done", summary=reason,
+    ) != audit_run_id:
+        raise _ReviewHandoffConflict
+    _append_event(
+        conn, audit_task_id, "completed",
+        {"result_len": len(reason), "summary": reason[:400]}, run_id=audit_run_id,
+    )
+    promoted: list[str] = []
+    recompute_ready(conn, promoted_ids=promoted)
+    promoted.sort()
+    core = {
+        "version": 3, "author_task_id": author_task_id, "author_run_id": receipt.expected_run_id,
+        "author_profile": author["assignee"], "audit_task_id": audit_task_id,
+        "audit_run_id": audit_run_id, "auditor_profile": audit["assignee"],
+        "review_handoff_event_id": receipt.event_id, "verdict": "PASS", "reason": reason,
+        "evidence": evidence, "scope": "audit_obligation",
+        "disposition": "CONTINUATION_COMMITTED" if promoted else "FINAL_ACCEPTED",
+        "continuation_ids": promoted,
+    }
+    digest = hashlib.sha256(
+        json.dumps(core, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    ).hexdigest()
+    _append_event(
+        conn, audit_task_id, "canonical_audit_outcome",
+        {**core, "envelope_sha256": digest}, run_id=audit_run_id,
+    )
+    outcome_event_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+    _append_event(conn, audit_task_id, "changed_fact", {
+        "version": 1, "type": "canonical_audit_outcome_pointer",
+        "outcome_event_id": outcome_event_id, "envelope_sha256": digest,
+        "prior_status": "running", "new_status": "done",
+    }, run_id=audit_run_id)
+    return True
+
+
 def _record_review_verdict(
     conn: sqlite3.Connection,
     task_id: str,
@@ -10126,20 +9517,13 @@ def _record_review_verdict(
     expected_review_run_id: int,
     verdict: str,
     reason: str,
-    recovery_receipt: Optional[dict] = None,
     evidence: Optional[dict] = None,
+    recovery_receipt: Optional[dict] = None,
     controller_task_id: Optional[str] = None,
     controller_run_id: Optional[int] = None,
     controller_profile: Optional[str] = None,
 ) -> bool:
-    """Record a bound child verdict; only REQUEST_CHANGES resumes the author.
-
-    A PASS verdict may bind a closed, structured ``evidence`` block (the exact
-    repository/PR/head/tree/base/review-id/url/state the auditor authenticated).
-    It is digest-bound into a version-2 verdict payload so the terminal writer
-    can corroborate the author's completion metadata against it; a PASS verdict
-    with malformed/foreign evidence fails closed.
-    """
+    """Record a bound child verdict; only REQUEST_CHANGES resumes the author."""
     verdict = str(verdict or "").strip().lower()
     reason = str(reason or "").strip()
     if verdict not in {"pass", "request_changes"} or not reason:
@@ -10148,33 +9532,7 @@ def _record_review_verdict(
         expected_review_run_id = int(expected_review_run_id)
     except (TypeError, ValueError):
         return False
-    canonical_evidence: Optional[dict[str, Any]] = None
-    if evidence is not None:
-        if verdict != "pass":
-            return False
-        canonical_evidence = _canonical_pass_evidence_block(evidence)
-        if canonical_evidence is None:
-            return False
-    if verdict == "pass" and canonical_evidence is not None:
-        expected_payload = {
-            "version": 2,
-            "review_task_id": review_task_id,
-            "review_run_id": expected_review_run_id,
-            "verdict": verdict,
-            "reason": reason,
-            "evidence": canonical_evidence,
-            "evidence_sha256": _canonical_audit_outcome_evidence_sha256(
-                canonical_evidence
-            ),
-        }
-    else:
-        expected_payload = {
-            "version": 1,
-            "review_task_id": review_task_id,
-            "review_run_id": expected_review_run_id,
-            "verdict": verdict,
-            "reason": reason,
-        }
+    normalized_evidence: Optional[dict[str, Any]] = None
     with write_txn(conn):
         if recovery_receipt is not None:
             if verdict == "pass":
@@ -10202,24 +9560,23 @@ def _record_review_verdict(
                 controller_run_id=controller_run_id,
                 controller_profile=controller_profile,
             )
-        if verdict == "pass":
-            family_present, paired_payload = _canonical_review_verdict_pair(
-                conn, task_id, review_task_id, expected_review_run_id,
-            )
-            if family_present:
-                if paired_payload != expected_payload:
-                    return False
-                replay = conn.execute(
-                    "SELECT 1 FROM tasks author JOIN tasks child ON child.id = ? "
-                    "JOIN task_runs run ON run.id = ? AND run.task_id = child.id "
-                    "WHERE author.id = ? AND author.status = 'review' "
-                    "AND child.status = 'running' "
-                    "AND child.current_run_id = run.id "
-                    "AND run.status = 'running' AND run.outcome IS NULL "
-                    "AND run.ended_at IS NULL",
-                    (review_task_id, expected_review_run_id, task_id),
+        if verdict == "pass" and evidence is not None:
+            normalized_evidence = _canonical_audit_evidence(evidence)
+            if normalized_evidence is None:
+                return False
+            present, receipt = _canonical_current_audit_outcome(conn, task_id)
+            if present:
+                row = conn.execute(
+                    "SELECT payload FROM task_events WHERE task_id=? AND run_id=? "
+                    "AND kind='canonical_audit_outcome'",
+                    (review_task_id, expected_review_run_id),
                 ).fetchone()
-                return replay is not None
+                if receipt is None or row is None:
+                    return False
+                existing = json.loads(row["payload"])
+                return existing["reason"] == reason and existing["evidence"] == normalized_evidence
+        elif verdict == "request_changes" and evidence is not None:
+            return False
         prior = conn.execute(
             "SELECT run_id, payload FROM task_events WHERE task_id = ? "
             "AND kind = 'review_verdict' ORDER BY id DESC",
@@ -10238,7 +9595,6 @@ def _record_review_verdict(
                     row["run_id"] != expected_review_run_id
                     or payload.get("verdict") != verdict
                     or payload.get("reason") != reason
-                    or payload.get("evidence") != canonical_evidence
                 ):
                     return False
                 if verdict == "pass":
@@ -10293,7 +9649,13 @@ def _record_review_verdict(
             or review_run["ended_at"] is not None
         ):
             return False
-        payload = expected_payload
+        payload = {
+            "version": 1,
+            "review_task_id": review_task_id,
+            "review_run_id": expected_review_run_id,
+            "verdict": verdict,
+            "reason": reason,
+        }
         if verdict == "request_changes":
             now = int(time.time())
             child_reset = conn.execute(
@@ -10322,6 +9684,15 @@ def _record_review_verdict(
             )
             if resumed.rowcount != 1:
                 raise _ReviewHandoffConflict
+        elif normalized_evidence is not None:
+            handoff = _review_handoff_event_for_child(conn, task_id, review_task_id)
+            if handoff is None:
+                return False
+            return _terminalize_review_pass(
+                conn, author_task_id=task_id, audit_task_id=review_task_id,
+                audit_run_id=expected_review_run_id, reason=reason,
+                evidence=normalized_evidence, handoff=handoff,
+            )
         _append_event(
             conn,
             task_id,
@@ -11077,8 +10448,8 @@ def record_review_verdict(
     expected_review_run_id: int,
     verdict: str,
     reason: str,
-    recovery_receipt: Optional[dict] = None,
     evidence: Optional[dict] = None,
+    recovery_receipt: Optional[dict] = None,
     controller_task_id: Optional[str] = None,
     controller_run_id: Optional[int] = None,
     controller_profile: Optional[str] = None,
@@ -11092,8 +10463,8 @@ def record_review_verdict(
             expected_review_run_id=expected_review_run_id,
             verdict=verdict,
             reason=reason,
-            recovery_receipt=recovery_receipt,
             evidence=evidence,
+            recovery_receipt=recovery_receipt,
             controller_task_id=controller_task_id,
             controller_run_id=controller_run_id,
             controller_profile=controller_profile,
@@ -13838,20 +13209,6 @@ def _reviewed_author_finalizer_run_id(
     packet-family repair interpretation is no longer part of terminal authority.
     """
     del _allow_repair_phase
-    # Prefer the persisted canonical audit-outcome envelope (version 3) bound
-    # by the proof-kernel terminal writer. This is the single producer-side
-    # identity the finalizer/merger consume; legacy split records fall through
-    # to the derived receipt below (the bounded read-only compatibility
-    # ingress), so downstream consumers do not grow independent shape logic.
-    envelope = _resolved_canonical_audit_outcome(conn, task_id)
-    if envelope is not None:
-        return int(envelope["author_run_id"])
-    if _canonical_audit_outcome_event_present(conn, task_id):
-        # A canonical audit-outcome event exists but failed validation
-        # (malformed / drifted).  Fail closed: the legacy receipt must not be
-        # permitted to grant finalizer authority over a v3 record it never
-        # authenticated, so there is no fallback.
-        return None
     receipt = _canonical_audit_receipt(conn, task_id)
     if (
         receipt is None
@@ -15558,15 +14915,6 @@ def complete_task(
             completed_payload,
             run_id=run_id,
         )
-        if run_id is not None:
-            # Bind the canonical audit-outcome envelope (version 3), bounded
-            # changed-fact, and exactly one FINAL_ACCEPTED /
-            # CONTINUATION_COMMITTED disposition inside the SAME terminal
-            # transaction when this completion is a factory-gated PASS audit.
-            # Returns None for ordinary completions; raises (and rolls back the
-            # entire terminal write) when a bound PASS lacks authenticated
-            # identity/evidence or a legal disposition.
-            _bind_canonical_audit_outcome(conn, task_id, int(run_id), metadata)
         if _detached_controller_exact_child_recompute:
             # The exact controller repair requires parent terminality and the
             # ordinary dependency promotion to commit (or roll back) together.
