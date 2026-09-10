@@ -5833,7 +5833,10 @@ _APPROVED_EVIDENCE = {
 }
 _APPROVED_HANDOFF = json.dumps({
     "version": 1,
-    "candidate": _APPROVED_EVIDENCE,
+    "candidate": {
+        key: _APPROVED_EVIDENCE[key]
+        for key in ("repository", "pr", "head", "tree", "base")
+    },
     "summary": "candidate frozen",
 }, sort_keys=True, separators=(",", ":"))
 
@@ -6763,9 +6766,7 @@ def test_review_verdict_pass_atomically_terminalizes_and_replays(kanban_home):
         assert "\n".join(conn.iterdump()) == committed
 
 
-@pytest.mark.parametrize("field", [
-    "repository", "pr", "head", "tree", "base", "github_review_id",
-])
+@pytest.mark.parametrize("field", ["repository", "pr", "head", "tree", "base"])
 def test_review_verdict_pass_rejects_coherent_wrong_handoff_evidence_without_mutation(
     kanban_home, field,
 ):
@@ -6788,6 +6789,62 @@ def test_review_verdict_pass_rejects_coherent_wrong_handoff_evidence_without_mut
             conn, author, review_task_id=review_task,
             expected_review_run_id=audit_run, verdict="pass",
             reason="coherent but wrong", evidence=wrong,
+        )
+        assert "\n".join(conn.iterdump()) == before
+
+
+def test_review_verdict_pass_accepts_post_handoff_auditor_review_attestation(
+    kanban_home,
+):
+    """The pre-review handoff binds the candidate, not a future GitHub review id."""
+    with kb.connect() as conn:
+        author, run_id, review_task = _review_handoff_pair(conn)
+        assert kb.request_review_handoff(
+            conn, author, expected_run_id=run_id, review_task_id=review_task,
+            reason=_APPROVED_HANDOFF,
+        )
+        claim = kb.claim_task(conn, review_task)
+        assert claim is not None and claim.current_run_id is not None
+        audit_run = claim.current_run_id
+        evidence = dict(_APPROVED_EVIDENCE)
+        evidence["github_review_id"] = 456
+        evidence["github_review_url"] = (
+            "https://github.com/kiddhu/hermes-agent/pull/98#pullrequestreview-456"
+        )
+
+        assert kb.record_review_verdict(
+            conn, author, review_task_id=review_task,
+            expected_review_run_id=audit_run, verdict="pass",
+            reason="review created after handoff", evidence=evidence,
+        )
+        present, outcome = kb._canonical_current_audit_outcome(conn, author)
+        assert present is True and outcome is not None
+
+
+@pytest.mark.parametrize("url", [
+    "https://github.com/other/repo/pull/98#pullrequestreview-123",
+    "https://github.com/kiddhu/hermes-agent/pull/99#pullrequestreview-123",
+    "https://github.com/kiddhu/hermes-agent/pull/98#pullrequestreview-456",
+])
+def test_review_verdict_pass_rejects_cross_target_review_url_without_mutation(
+    kanban_home, url,
+):
+    with kb.connect() as conn:
+        author, run_id, review_task = _review_handoff_pair(conn)
+        assert kb.request_review_handoff(
+            conn, author, expected_run_id=run_id, review_task_id=review_task,
+            reason=_APPROVED_HANDOFF,
+        )
+        claim = kb.claim_task(conn, review_task)
+        assert claim is not None and claim.current_run_id is not None
+        audit_run = claim.current_run_id
+        evidence = {**_APPROVED_EVIDENCE, "github_review_url": url}
+        before = "\n".join(conn.iterdump())
+
+        assert not kb.record_review_verdict(
+            conn, author, review_task_id=review_task,
+            expected_review_run_id=audit_run, verdict="pass",
+            reason="bad review url", evidence=evidence,
         )
         assert "\n".join(conn.iterdump()) == before
 

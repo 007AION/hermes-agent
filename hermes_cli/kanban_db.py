@@ -9305,6 +9305,7 @@ def request_review_handoff(
 
 
 _CANONICAL_AUDIT_EVIDENCE_KEYS = {"repository", "pr", "head", "tree", "base", "github_review_id", "github_review_url", "github_review_state"}
+_CANONICAL_AUDIT_TARGET_KEYS = {"repository", "pr", "head", "tree", "base"}
 
 
 def _canonical_audit_evidence(value: Any) -> Optional[dict[str, Any]]:
@@ -9381,7 +9382,7 @@ def _canonical_current_audit_outcome(
         and payload.get("verdict") == "PASS" and payload.get("scope") == "audit_obligation"
         and _canonical_audit_evidence(payload.get("evidence")) == payload.get("evidence")
         and isinstance(target, dict) and target == {"version": 1, "candidate": {
-            key: payload["evidence"][key] for key in sorted(_CANONICAL_AUDIT_EVIDENCE_KEYS)
+            key: payload["evidence"][key] for key in sorted(_CANONICAL_AUDIT_TARGET_KEYS)
         }, "summary": target.get("summary")}
         and type(target["summary"]) is str and bool(target["summary"].strip())
         and type(payload.get("reason")) is str and bool(payload["reason"].strip())
@@ -9656,7 +9657,7 @@ def _record_review_verdict(
                 target = json.loads(receipt.reason) if receipt is not None else None
             except (TypeError, ValueError):
                 return False
-            expected = normalized_evidence
+            expected = {key: normalized_evidence[key] for key in sorted(_CANONICAL_AUDIT_TARGET_KEYS)}
             if not isinstance(target, dict) or target != {
                 "version": 1, "candidate": expected, "summary": target.get("summary")
             } or type(target["summary"]) is not str or not target["summary"].strip():
