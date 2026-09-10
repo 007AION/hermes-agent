@@ -11217,18 +11217,10 @@ def _authenticated_factory_run_metadata(
 def _reviewed_author_finalizer_run_id(
     conn: sqlite3.Connection, task_id: str, *, _allow_repair_phase: bool = True,
 ) -> Optional[int]:
-    """Resolve a reviewed author from the sole canonical Native receipt.
-
-    ``_allow_repair_phase`` remains signature-compatible for installed callers;
-    packet-family repair interpretation is no longer part of terminal authority.
-    """
+    """Resolve the canonical Native receipt; ignore the legacy-compatible flag."""
     del _allow_repair_phase
     receipt = _canonical_audit_receipt(conn, task_id)
-    if (
-        receipt is None
-        or receipt.get("authenticated") is not True
-        or receipt.get("verdict") != "PASS"
-    ):
+    if receipt is None or receipt.get("authenticated") is not True or receipt.get("verdict") != "PASS":
         return None
     return int(receipt["author_run_id"])
 
