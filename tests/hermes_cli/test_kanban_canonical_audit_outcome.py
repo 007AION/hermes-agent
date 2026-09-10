@@ -433,6 +433,92 @@ def test_wrong_run_pass_pair_with_hostile_handoff_still_fails_closed(
         assert tuple(run) == ("running", None, None)
 
 
+@pytest.mark.parametrize("claim_mutation", ["deleted", "duplicate", "wrong_run"])
+def test_wrong_run_pass_pair_with_hostile_handoff_and_claim_fails_closed(
+    kanban_home, claim_mutation,
+):
+    """A malformed exact-run claim boundary cannot hide a prepared PASS.
+
+    This closes the combined case where handoff provenance, both verdict run
+    identities, and the exact audit-run claim projection are all hostile.  The
+    official terminal writer must reject with zero mutation rather than treat
+    the malformed prepared family as absent.
+    """
+    with kb.connect() as conn:
+        fx = _handoff_fixture(conn)
+        assert kb.record_review_verdict(
+            conn, fx["author"], review_task_id=fx["audit"],
+            expected_review_run_id=fx["audit_run"], verdict="pass",
+            reason=PRECURSOR_REASON, evidence=_evidence_block(),
+        )
+        author_row = _events(conn, fx["author"], "review_verdict")[0]
+        audit_row = _events(conn, fx["audit"], "review_verdict")[0]
+        handoff_row = conn.execute(
+            "SELECT id FROM task_events WHERE task_id=? "
+            "AND kind='review_handoff' ORDER BY id DESC LIMIT 1",
+            (fx["author"],),
+        ).fetchone()
+        claim_row = conn.execute(
+            "SELECT id FROM task_events WHERE task_id=? AND kind='claimed' "
+            "AND run_id=? ORDER BY id DESC LIMIT 1",
+            (fx["audit"], fx["audit_run"]),
+        ).fetchone()
+        assert handoff_row is not None and claim_row is not None
+        with kb.write_txn(conn):
+            for row in (author_row, audit_row):
+                payload = json.loads(row["payload"])
+                payload["review_run_id"] = fx["author_run"]
+                conn.execute(
+                    "UPDATE task_events SET run_id=?, payload=? WHERE id=?",
+                    (fx["author_run"], json.dumps(payload), row["id"]),
+                )
+            conn.execute(
+                "DELETE FROM task_events WHERE id=?", (handoff_row["id"],),
+            )
+            if claim_mutation == "deleted":
+                conn.execute(
+                    "DELETE FROM task_events WHERE id=?", (claim_row["id"],),
+                )
+            elif claim_mutation == "duplicate":
+                conn.execute(
+                    "INSERT INTO task_events "
+                    "(task_id, run_id, kind, payload, created_at) "
+                    "SELECT task_id, run_id, kind, payload, created_at "
+                    "FROM task_events WHERE id=?",
+                    (claim_row["id"],),
+                )
+            else:
+                conn.execute(
+                    "UPDATE task_events SET run_id=? WHERE id=?",
+                    (fx["author_run"], claim_row["id"]),
+                )
+        broken = _snapshot(conn)
+
+        assert not kb.record_review_verdict(
+            conn, fx["author"], review_task_id=fx["audit"],
+            expected_review_run_id=fx["audit_run"], verdict="pass",
+            reason=PRECURSOR_REASON, evidence=_evidence_block(),
+        )
+        assert _snapshot(conn) == broken
+
+        with pytest.raises(kb._CanonicalAuditOutcomeError, match="verdict family"):
+            kb.complete_task(
+                conn, fx["audit"], expected_run_id=fx["audit_run"],
+                metadata=_evidence_metadata(),
+            )
+        assert _snapshot(conn) == broken
+        task = conn.execute(
+            "SELECT status, current_run_id, completed_at FROM tasks WHERE id=?",
+            (fx["audit"],),
+        ).fetchone()
+        assert tuple(task) == ("running", fx["audit_run"], None)
+        run = conn.execute(
+            "SELECT status, outcome, ended_at FROM task_runs WHERE id=?",
+            (fx["audit_run"],),
+        ).fetchone()
+        assert tuple(run) == ("running", None, None)
+
+
 @pytest.mark.parametrize(
     "boundary",
     [

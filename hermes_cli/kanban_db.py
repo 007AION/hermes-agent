@@ -7108,14 +7108,23 @@ def _canonical_review_verdict_pair(
         (audit_task_id, audit_run_id),
     ).fetchall()
     # The official claim path emits exactly one event before the worker can
-    # prepare a verdict.  More than one exact-run claim is itself ambiguous and
-    # must not be selected as an authority boundary.
+    # prepare a verdict. A live exact audit run with a missing or duplicated
+    # exact-run claim projection is not an ordinary no-verdict state once a
+    # verdict family exists: its authority boundary has drifted. Preserve the
+    # distinction for controller-completed dependency children that have one
+    # parent but no review-verdict history at all.
+    claim_boundary_invalid = audit_run_exists and len(claim_rows) != 1
     claim_event_id = int(claim_rows[0]["id"]) if len(claim_rows) == 1 else None
     rows = conn.execute(
         "SELECT id, task_id, run_id, payload FROM task_events "
         "WHERE kind = 'review_verdict' AND task_id IN (?, ?) ORDER BY id",
         (author_task_id, audit_task_id),
     ).fetchall()
+    if claim_boundary_invalid and rows:
+        # Mark the family present-but-invalid so both PASS replay and the sole
+        # terminal writer fail closed. This remains scoped to a real run owned
+        # by this audit task plus actual review-verdict history.
+        return True, None
     candidates: list[sqlite3.Row] = []
     for row in rows:
         try:
