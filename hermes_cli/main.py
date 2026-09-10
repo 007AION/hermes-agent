@@ -15641,6 +15641,12 @@ def cmd_claw(args):
 
 def main():
     """Main entry point for hermes CLI."""
+    try:
+        from agent.startup_phase import emit as _emit_startup_phase
+        _emit_startup_phase("process_spawn", "ok")
+    except Exception:
+        pass  # instrumentation is best-effort and never breaks startup
+
     # Cosmetic: make the process show up as 'hermes' instead of 'python3.11'
     # in ps/top/htop.  Non-fatal — just a nicer UX.
     _set_process_title()
