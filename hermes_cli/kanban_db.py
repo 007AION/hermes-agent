@@ -9331,35 +9331,6 @@ _JSON_STRUCTURAL_LEAD = ("{", "[", '"')
 # prefix (``0``, ``truex``, ``0x``, ``NaN``, ``Infinity``, ...) can never fall
 # through to the prose path and authenticate by a coincidental declaration.
 _JSON_VALUE_LEAD_RE = re.compile(r"[-+0-9tfnNI]", re.IGNORECASE)
-# CLOSED candidate-like declaration tokenizers. The gap between a field/PR name
-# and its value token is any run of characters (whitespace, punctuation, a
-# word, an alphanumeric word, or several words), so a conflicting declaration
-# of every separator class — canonical (``head <sha>``), punctuation
-# (``head ` <sha>``, ``head -> <sha>``), word-separated (``head is <sha>``),
-# multi-word (``head value is <sha>``), and alphanumeric-word
-# (``head sha256 is <sha>``) — is matched here and made visible to the
-# singleton count. This is an allow-list grammar, not a deny-list: every
-# candidate-like declaration is tokenized, then the singleton requirement plus
-# the canonical-separator check accept ONLY the exact authentic shape. The
-# former deny-list (a non-word tokenizer plus a word-separated detector) left
-# alphanumeric-word separators invisible, which let a conflicting declaration
-# hide behind the authentic one and authenticate. The value remains 40+ hex for
-# fields so an overlong token is still DETECTED and rejected (``len != 40``).
-# The negative lookbehind excludes ``-`` as well as word characters so a
-# hyphenated compound (``exact-head``, ``Same-PR``) is never read as a
-# standalone declaration, and the ``.*?`` gap never spans a 40-hex run into a
-# later value.
-_PROSE_FIELD_TOKEN_RE = re.compile(
-    r"(?<![A-Za-z0-9_-])(?P<name>head|tree|base)\b"
-    r"(?P<gap>.*?)(?P<value>[0-9a-fA-F]{40,})",
-    re.IGNORECASE,
-)
-_PROSE_PR_TOKEN_RE = re.compile(
-    r"(?<![A-Za-z0-9_-])pr\b(?P<gap>.*?)(?P<value>[0-9]+)",
-    re.IGNORECASE,
-)
-_PROSE_HEAD_SEP_RE = re.compile(r"^\s*[:=]?\s*$")
-_PROSE_PR_SEP_RE = re.compile(r"^\s*#?\s*$")
 
 
 def _looks_json_shaped(text: str) -> bool:
@@ -9378,109 +9349,44 @@ def _looks_json_shaped(text: str) -> bool:
     return _JSON_VALUE_LEAD_RE.match(text) is not None
 
 
-# A PR declaration value must be a short decimal token. Python's ``int(str)``
-# raises ``ValueError`` beyond the integer-string conversion length limit
-# (default 4300 digits), so a hostile multi-thousand-digit PR token would
-# otherwise escape the fail-closed prose resolver as an uncaught exception
-# instead of returning None. GitHub PR ids are small integers; bound the digit
-# length well above any real id before conversion and normalize any conversion
-# failure to ``None`` so the caller fails closed (None) rather than crashing.
-_MAX_PROSE_PR_DIGITS = 10
-
-
-def _bounded_decimal_int(value: str) -> Optional[int]:
-    """Parse a decimal token to ``int``, failing closed on overlong input."""
-    if len(value) > _MAX_PROSE_PR_DIGITS:
-        return None
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None
-
-
 def _resolve_handoff_candidate_target(
     reason: str, expected_candidate: dict[str, Any],
 ) -> Optional[dict[str, Any]]:
     """Resolve the author's declared candidate from a review-handoff ``reason``.
 
-    PR98 requires the author's handoff ``reason`` to be the canonical
-    version-1 candidate envelope ``{"version": 1, "candidate": {...},
-    "summary": ...}``.  Some author lineages (e.g. SEEKAPI-005) persist the
-    same candidate identity as prose instead, so the resolver also accepts a
-    strict prose declaration: exactly one ``head``/``tree``/``base`` 40-hex
-    SHA and exactly one ``PR #<n>`` number that must match the already-validated
-    evidence byte-for-byte (case-insensitive for SHAs).  ``repository`` is bound
-    from the evidence, never from prose.
+    The canonical (and sole supported) handoff format is the version-1 candidate
+    envelope ``{"version": 1, "candidate": {...}, "summary": ...}``.  This
+    decoder is finite, anchored, and exact: it accepts exactly that one envelope
+    shape and nothing else, then normalizes to the single canonical typed
+    receipt.
 
-    A JSON-shaped reason (leading ``{``/``[``/``"`` or a JSON scalar token such
-    as a number, ``true``/``false``/``null``) must decode to the exact canonical
-    envelope; any JSON string/list/number/scalar, malformed JSON, duplicate JSON
-    member, or deeply-nested JSON fails closed (None) rather than being
-    reinterpreted as prose.  A prose reason must declare each of
-    head/tree/base/pr exactly once with the canonical separator (whitespace,
-    ``:`` or ``=`` for fields, whitespace or ``#`` for PR); every candidate-like
-    declaration of any other separator class — punctuation, word-separated,
-    multi-word, or alphanumeric-word — is still tokenized and either violates
-    the singleton requirement or the canonical-separator check, so it fails
-    closed.  SHA declarations must be exactly 40 hex characters, so an overlong
-    hex token can never authenticate by prefix.
+    A non-envelope reason fails closed (None).  In particular a prose reason is
+    a typed capability finding, not a decodable envelope: free-form prose cannot
+    be consumed by a finite closed adapter while rejecting arbitrary additions,
+    so it is never decoded by open-ended token inference.  Likewise any JSON
+    scalar, list, string, malformed JSON, duplicate-member JSON, or
+    deeply-nested JSON fails closed (None) rather than being reinterpreted.
     """
     text = reason.strip()
-    if _looks_json_shaped(text):
-        try:
-            target = _strict_json_loads(text)
-        except (TypeError, ValueError):
-            return None
-        if not isinstance(target, dict):
-            return None
-        if (
-            target == {
-                "version": 1,
-                "candidate": expected_candidate,
-                "summary": target.get("summary"),
-            }
-            and type(target.get("summary")) is str
-            and bool(target["summary"].strip())
-        ):
-            return target
+    if not _looks_json_shaped(text):
         return None
-    expected_head = expected_candidate.get("head")
-    expected_tree = expected_candidate.get("tree")
-    expected_base = expected_candidate.get("base")
-    expected_pr = expected_candidate.get("pr")
-    if (
-        type(expected_head) is not str
-        or type(expected_tree) is not str
-        or type(expected_base) is not str
-        or type(expected_pr) is not int
-    ):
+    try:
+        target = _strict_json_loads(text)
+    except (TypeError, ValueError):
         return None
-    decls: dict[str, list[tuple[str, str]]] = {"head": [], "tree": [], "base": [], "pr": []}
-    for name, gap, value in _PROSE_FIELD_TOKEN_RE.findall(text):
-        decls[name.lower()].append((gap, value))
-    for gap, value in _PROSE_PR_TOKEN_RE.findall(text):
-        decls["pr"].append((gap, value))
-    # Every field must declare exactly one value; a second (or conflicting)
-    # declaration — even one the strict value grammar would skip — is visible
-    # here and fails the singleton requirement.
-    if not all(len(items) == 1 for items in decls.values()):
-        return None
-    for kind in ("head", "tree", "base"):
-        gap, value = decls[kind][0]
-        if not _PROSE_HEAD_SEP_RE.fullmatch(gap) or len(value) != 40:
-            return None
-    pr_gap, pr_value = decls["pr"][0]
-    if not _PROSE_PR_SEP_RE.fullmatch(pr_gap):
+    if not isinstance(target, dict):
         return None
     if (
-        decls["head"][0][1].lower() != expected_head.lower()
-        or decls["tree"][0][1].lower() != expected_tree.lower()
-        or decls["base"][0][1].lower() != expected_base.lower()
-        or _bounded_decimal_int(pr_value) != expected_pr
+        target == {
+            "version": 1,
+            "candidate": expected_candidate,
+            "summary": target.get("summary"),
+        }
+        and type(target.get("summary")) is str
+        and bool(target["summary"].strip())
     ):
-        return None
-    return {"version": 1, "candidate": expected_candidate, "summary": reason}
-
+        return target
+    return None
 
 # Earlier-v3 envelope key set (pre-merge PR98 resident 95392cf8). The final
 # head accepts only the later v3 key set; this names the exact earlier shape so
@@ -9971,22 +9877,28 @@ def _current_v3_bound_verdict(
 
 def _current_v3_continuation_targets(
     conn: sqlite3.Connection, author_task_id: str, audit_task_id: str,
-    outcome_event_id: int,
+    audit_run_id: int, outcome_event_id: int,
 ) -> Optional[tuple[str, list[str]]]:
     """Recompute current-v3 continuation targets from durable promotion events.
 
     The terminal producer emits ``continuation_ids`` as exactly the child ids
     appended by ``recompute_ready`` in its terminal transaction; each such child
-    carries a durable ``promoted`` event appended before the
-    ``canonical_audit_outcome`` event (id = ``outcome_event_id``). This helper
-    recomputes that set from those promotion events — bound by event order and
-    identity — rather than from mutable current task status, so (a) a child
-    linked after the outcome with no producer promotion (zero ``promoted``
-    events) is never a continuation, and (b) a producer-promoted child stays
-    bound after it is later completed (its ``promoted`` event outlives the
-    status flip). A child id that does not resolve to a live task row fails
-    closed (returns ``None``).
+    carries a durable ``promoted`` event appended after the audit run's own
+    ``completed`` marker and before the ``canonical_audit_outcome`` event
+    (id = ``outcome_event_id``). This helper recomputes that set from those
+    promotion events — bound by a lower transaction boundary (the audit run's
+    ``completed`` event id), event order, and identity — rather than from any
+    historical ``promoted`` event before the outcome. A ``promoted`` event from
+    an earlier transaction (a prior parent's completion) is NOT this terminal
+    transaction's output, so it must not count as a continuation. A child id
+    that does not resolve to a live task row fails closed (returns ``None``).
     """
+    completed = conn.execute(
+        "SELECT MAX(id) FROM task_events WHERE task_id = ? AND run_id = ? "
+        "AND kind = 'completed'",
+        (audit_task_id, audit_run_id),
+    ).fetchone()[0]
+    lower = int(completed) if completed is not None else 0
     rows = conn.execute(
         "SELECT child_id FROM task_links WHERE parent_id = ?",
         (audit_task_id,),
@@ -10001,8 +9913,8 @@ def _current_v3_continuation_targets(
             return None
         promoted = conn.execute(
             "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'promoted' "
-            "AND id < ? LIMIT 1",
-            (child_id, outcome_event_id),
+            "AND id > ? AND id < ? LIMIT 1",
+            (child_id, lower, outcome_event_id),
         ).fetchone()
         if promoted is not None:
             targets.append(child_id)
@@ -10014,7 +9926,8 @@ def _current_v3_continuation_targets(
 
 def _current_v3_continuation_ids_valid(
     conn: sqlite3.Connection, author_task_id: str, audit_task_id: str,
-    continuation_ids: Any, disposition: Any, outcome_event_id: int,
+    audit_run_id: int, continuation_ids: Any, disposition: Any,
+    outcome_event_id: int,
 ) -> bool:
     """Validate the current-v3 continuation list against durable promotion events.
 
@@ -10053,7 +9966,7 @@ def _current_v3_continuation_ids_valid(
         if conn.execute("SELECT 1 FROM tasks WHERE id = ?", (cid,)).fetchone() is None:
             return False
     live = _current_v3_continuation_targets(
-        conn, author_task_id, audit_task_id, outcome_event_id,
+        conn, author_task_id, audit_task_id, audit_run_id, outcome_event_id,
     )
     if live is None:
         return False
@@ -10190,8 +10103,8 @@ def _canonical_current_audit_outcome(
         and run is not None and run["profile"] == payload.get("auditor_profile")
         and (run["status"], run["outcome"]) == ("done", "completed") and run["ended_at"] is not None
         and _current_v3_continuation_ids_valid(
-            conn, author_task_id, row["task_id"], continuation_ids, payload.get("disposition"),
-            row["id"],
+            conn, author_task_id, row["task_id"], row["run_id"], continuation_ids,
+            payload.get("disposition"), row["id"],
         )
         and len(facts) == 1
         and len(verdict_rows) == 1
