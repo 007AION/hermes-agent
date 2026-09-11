@@ -9357,23 +9357,30 @@ _PROSE_HEAD_SEP_RE = re.compile(r"^\s*[:=]?\s*$")
 _PROSE_PR_SEP_RE = re.compile(r"^\s*#?\s*$")
 # Word-separated conflicting declaration detectors. The primary field/PR
 # detectors above require the value token to follow a non-word run immediately,
-# so a conflicting declaration whose field name and value are separated by a
-# word (``head is <sha>``, ``PR number 99``, ``PR is #99``) is invisible to the
-# singleton count and leaves the authentic declaration as an apparent singleton.
-# Any such word-separated declaration is a malformed/conflicting form and fails
-# closed. The negative lookbehind excludes a hyphenated compound (``exact-head``)
-# so a normal hyphenated prefix is not read as a declaration. Because the gap
-# must contain at least one letter, a SHA whose leading characters are hex
-# letters is never mistaken for a word separator (the required letter plus the
-# 40-hex value would exceed the token length).
+# so a conflicting declaration whose field name and value are separated by one
+# or more words (``head is <sha>``, ``head value is <sha>``, ``PR number 99``,
+# ``PR number is #99``) is invisible to the singleton count and leaves the
+# authentic declaration as an apparent singleton. Any such word-separated
+# declaration is a malformed/conflicting form and fails closed. The negative
+# lookbehind excludes a hyphenated compound (``exact-head``) so a normal
+# hyphenated prefix is not read as a declaration. Each intervening word is
+# bounded to <40 chars (``{1,39}``) so a 40-hex SHA run is never mistaken for a
+# word separator; without that bound a single greedy word run would swallow a
+# full 40-letter-hex SHA and let the scan span across the legitimate ``head
+# <sha> / tree <sha> ... base <sha>`` declarations. The inner word group
+# repeats (with a required non-word separator between words) so a MULTI-word
+# separator (``head value is <sha>``) is detected, not just a single word, while
+# the required separator keeps the quantifier from degenerating into ``(x+)+``.
 _WORD_SEPARATED_FIELD_RE = re.compile(
     r"(?<![A-Za-z0-9_-])(?:head|tree|base)\b"
-    r"[^A-Za-z0-9]*[A-Za-z]+[^A-Za-z0-9]*[0-9a-fA-F]{40,}",
+    r"[^A-Za-z0-9]*[A-Za-z]{1,39}(?:[^A-Za-z0-9]+[A-Za-z]{1,39})*"
+    r"[^A-Za-z0-9]*[0-9a-fA-F]{40,}",
     re.IGNORECASE,
 )
 _WORD_SEPARATED_PR_RE = re.compile(
     r"(?<![A-Za-z0-9_-])pr\b"
-    r"[^A-Za-z0-9]*[A-Za-z]+[^A-Za-z0-9]*[0-9]+",
+    r"[^A-Za-z0-9]*[A-Za-z]{1,39}(?:[^A-Za-z0-9]+[A-Za-z]{1,39})*"
+    r"[^A-Za-z0-9]*[0-9]+",
     re.IGNORECASE,
 )
 
@@ -9989,6 +9996,41 @@ def _current_v3_bound_verdict(
     return True
 
 
+def _current_v3_continuation_targets(
+    conn: sqlite3.Connection, author_task_id: str, audit_task_id: str,
+) -> Optional[tuple[str, list[str]]]:
+    """Recompute the live current-v3 continuation targets from the task graph.
+
+    The terminal producer emits ``continuation_ids`` as exactly the children
+    promoted to a non-terminal state when the audit terminalized. This helper
+    recomputes that set so the readback can bind the envelope's claim to the
+    live graph: a child of the author or audit task that is still queued
+    (``todo``/``blocked``) was never promoted, so claiming it invents a
+    continuation; a child already in a promoted state (``ready`` and later) that
+    is omitted erases a real continuation. A child id that does not resolve to a
+    live task row fails closed (returns ``None``).
+    """
+    rows = conn.execute(
+        "SELECT child_id FROM task_links WHERE parent_id IN (?, ?)",
+        (author_task_id, audit_task_id),
+    ).fetchall()
+    targets: list[str] = []
+    for row in rows:
+        child_id = str(row["child_id"])
+        live = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (child_id,),
+        ).fetchone()
+        if live is None:
+            return None
+        if live["status"] in ("done", "archived", "todo", "blocked"):
+            continue
+        targets.append(child_id)
+    targets.sort()
+    if targets:
+        return _EARLIER_V3_DISPOSITION_CONTINUATION, targets
+    return _EARLIER_V3_DISPOSITION_FINAL, []
+
+
 def _current_v3_continuation_ids_valid(
     conn: sqlite3.Connection, author_task_id: str, audit_task_id: str,
     continuation_ids: Any, disposition: Any,
@@ -9997,8 +10039,11 @@ def _current_v3_continuation_ids_valid(
 
     Each continuation id must be a unique, nonempty, existing child of the author
     or audit task, and the disposition must match the list's emptiness. A
-    nonexistent, blank, or duplicated continuation id fails closed so a drifted
-    envelope cannot claim an unbound continuation obligation.
+    nonexistent, blank, or duplicated continuation id fails closed. The list must
+    also match the live promoted-continuation set exactly, so a drifted envelope
+    that invents an unpromoted (still ``todo``/``blocked``) child or erases an
+    actually promoted (``ready`` and later) child fails closed even after its
+    digest and fact pointer are recomputed.
     """
     if type(continuation_ids) is not list:
         return False
@@ -10025,6 +10070,12 @@ def _current_v3_continuation_ids_valid(
             return False
         if conn.execute("SELECT 1 FROM tasks WHERE id = ?", (cid,)).fetchone() is None:
             return False
+    live = _current_v3_continuation_targets(conn, author_task_id, audit_task_id)
+    if live is None:
+        return False
+    live_disposition, live_targets = live
+    if live_disposition != disposition or continuation_ids != live_targets:
+        return False
     return True
 
 

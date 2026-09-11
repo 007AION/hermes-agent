@@ -7127,6 +7127,51 @@ def test_review_verdict_pass_rejects_round11_parser_hostile_without_mutation(
         assert kb._canonical_audit_receipt(conn, author) is None
 
 
+# Round-12 hostile parser variants: the word-separated scan must reject a
+# conflicting declaration even when the field name and value are separated by
+# MULTIPLE words (``head value is <sha>``, ``PR number is 99``), not only a
+# single word. A multi-word separator is likewise invisible to the primary
+# non-word separator detector, so the word-separated scan must span it and fail
+# closed rather than leaving the original declaration as an apparent singleton.
+_ROUND12_PARSER_HOSTILE = [
+    _PROSE + " conflicting head value is " + "d" * 40,   # two-word head
+    _PROSE + " conflicting head is now " + "d" * 40,      # two-word head
+    _PROSE + " conflicting tree is equal to " + "d" * 40, # three-word tree
+    _PROSE + " conflicting base is going to be " + "d" * 40,  # four-word base
+    _PROSE + " conflicting PR number is 99",              # two-word PR
+    _PROSE + " conflicting PR is going to be 99",         # four-word PR
+]
+
+
+@pytest.mark.parametrize("reason", _ROUND12_PARSER_HOSTILE)
+def test_resolve_handoff_candidate_target_fails_closed_round12_parser_hostile(reason):
+    expected = _handoff_expected_candidate()
+    assert kb._resolve_handoff_candidate_target(reason, expected) is None
+
+
+@pytest.mark.parametrize("reason", _ROUND12_PARSER_HOSTILE)
+def test_review_verdict_pass_rejects_round12_parser_hostile_without_mutation(
+    kanban_home, reason,
+):
+    """Round-12 multi-word variants never terminalize PASS (fail-closed, no mutation)."""
+    with kb.connect() as conn:
+        author, run_id, review_task = _review_handoff_pair(conn)
+        assert kb.request_review_handoff(
+            conn, author, expected_run_id=run_id, review_task_id=review_task,
+            reason=reason,
+        )
+        audit_run = kb.claim_task(conn, review_task).current_run_id
+        before = "\n".join(conn.iterdump())
+        assert not kb.record_review_verdict(
+            conn, author, review_task_id=review_task,
+            expected_review_run_id=audit_run, verdict="pass",
+            reason="round-12 hostile parser probe", evidence=_APPROVED_EVIDENCE,
+        )
+        assert "\n".join(conn.iterdump()) == before
+        assert kb.get_task(conn, review_task).status == "running"
+        assert kb._canonical_audit_receipt(conn, author) is None
+
+
 def test_bounded_decimal_int_parses_short_and_fails_closed_on_overlong():
     assert kb._bounded_decimal_int("100") == 100
     assert kb._bounded_decimal_int("0") == 0
@@ -7326,6 +7371,56 @@ def test_current_v3_outcome_unbound_continuation_fails_closed(kanban_home, conti
         def mutate(obj):
             obj["disposition"] = "CONTINUATION_COMMITTED"
             obj["continuation_ids"] = continuation_ids
+
+        _rewrite_current_v3_envelope(conn, review_task, audit_run, mutate_envelope=mutate)
+        assert kb._canonical_current_audit_outcome(conn, author) == (True, None)
+        assert kb._reviewed_author_finalizer_run_id(conn, author) is None
+
+
+def test_current_v3_outcome_invents_unpromoted_child_fails_closed(kanban_home):
+    """A continuation id for a still-``todo`` child (never promoted) fails closed.
+
+    The terminal producer only ever emits children that were actually promoted to
+    a non-terminal state, so claiming a queued (``todo``) child invents an
+    obligation the live graph does not support.
+    """
+    with kb.connect() as conn:
+        author, run_id, review_task, audit_run = _current_v3_outcome(conn)
+        # A child with a second, non-done parent stays ``todo`` (not promoted).
+        blocker = kb.create_task(conn, title="blocker", assignee="other")
+        child = kb.create_task(
+            conn, title="unpromoted continuation", assignee="merger",
+            parents=[review_task, blocker],
+        )
+        assert kb.get_task(conn, child).status == "todo"
+
+        def mutate(obj):
+            obj["disposition"] = "CONTINUATION_COMMITTED"
+            obj["continuation_ids"] = [child]
+
+        _rewrite_current_v3_envelope(conn, review_task, audit_run, mutate_envelope=mutate)
+        assert kb._canonical_current_audit_outcome(conn, author) == (True, None)
+        assert kb._reviewed_author_finalizer_run_id(conn, author) is None
+
+
+def test_current_v3_outcome_erases_promoted_child_fails_closed(kanban_home):
+    """An envelope that omits an actually-promoted (``ready``) child fails closed.
+
+    The terminal producer always records every promoted child in the
+    continuation list, so dropping a live ``ready`` continuation erases a real
+    obligation the live graph still supports.
+    """
+    with kb.connect() as conn:
+        author, run_id, review_task, audit_run = _current_v3_outcome(conn)
+        child = kb.create_task(
+            conn, title="promoted continuation", assignee="merger",
+            parents=[review_task],
+        )
+        assert kb.get_task(conn, child).status == "ready"
+
+        def mutate(obj):
+            obj["disposition"] = "FINAL_ACCEPTED"
+            obj["continuation_ids"] = []
 
         _rewrite_current_v3_envelope(conn, review_task, audit_run, mutate_envelope=mutate)
         assert kb._canonical_current_audit_outcome(conn, author) == (True, None)
