@@ -7083,6 +7083,50 @@ def test_review_verdict_pass_rejects_round10_parser_hostile_without_mutation(
         assert kb._canonical_audit_receipt(conn, author) is None
 
 
+# Round-11 hostile parser variants: the prose grammar must reject every extra
+# semantic head/tree/base/PR declaration even when the field name and value are
+# separated by a word (``head is <sha>``, ``PR number 99``, ``PR is #99``). A
+# word-separated conflicting declaration is invisible to the primary non-word
+# separator detector, so a dedicated word-separated scan must catch it and fail
+# closed rather than leaving the original declaration as an apparent singleton.
+_ROUND11_PARSER_HOSTILE = [
+    _PROSE + " conflicting head is " + "d" * 40,      # word-separated head
+    _PROSE + " conflicting tree value " + "d" * 40,   # word-separated tree
+    _PROSE + " conflicting base equals " + "d" * 40,  # word-separated base
+    _PROSE + " conflicting PR number 99",             # word-separated PR
+    _PROSE + " conflicting PR is #99",                # word-separated PR with hash
+]
+
+
+@pytest.mark.parametrize("reason", _ROUND11_PARSER_HOSTILE)
+def test_resolve_handoff_candidate_target_fails_closed_round11_parser_hostile(reason):
+    expected = _handoff_expected_candidate()
+    assert kb._resolve_handoff_candidate_target(reason, expected) is None
+
+
+@pytest.mark.parametrize("reason", _ROUND11_PARSER_HOSTILE)
+def test_review_verdict_pass_rejects_round11_parser_hostile_without_mutation(
+    kanban_home, reason,
+):
+    """Round-11 word-separated variants never terminalize PASS (fail-closed, no mutation)."""
+    with kb.connect() as conn:
+        author, run_id, review_task = _review_handoff_pair(conn)
+        assert kb.request_review_handoff(
+            conn, author, expected_run_id=run_id, review_task_id=review_task,
+            reason=reason,
+        )
+        audit_run = kb.claim_task(conn, review_task).current_run_id
+        before = "\n".join(conn.iterdump())
+        assert not kb.record_review_verdict(
+            conn, author, review_task_id=review_task,
+            expected_review_run_id=audit_run, verdict="pass",
+            reason="round-11 hostile parser probe", evidence=_APPROVED_EVIDENCE,
+        )
+        assert "\n".join(conn.iterdump()) == before
+        assert kb.get_task(conn, review_task).status == "running"
+        assert kb._canonical_audit_receipt(conn, author) is None
+
+
 def test_bounded_decimal_int_parses_short_and_fails_closed_on_overlong():
     assert kb._bounded_decimal_int("100") == 100
     assert kb._bounded_decimal_int("0") == 0
@@ -7208,6 +7252,104 @@ def test_current_v3_outcome_duplicate_fact_member_fails_closed(kanban_home):
         raw = '{"version":999,' + row["payload"][1:]
         with kb.write_txn(conn):
             conn.execute("UPDATE task_events SET payload=? WHERE id=?", (raw, row["id"]))
+        assert kb._canonical_current_audit_outcome(conn, author) == (True, None)
+        assert kb._reviewed_author_finalizer_run_id(conn, author) is None
+
+
+def _rewrite_current_v3_envelope(conn, review_task, audit_run, mutate_envelope=None, mutate_fact=None):
+    """Rewrite the later-v3 canonical_audit_outcome envelope and its changed_fact
+    pointer with a recomputed digest, then apply the supplied mutations. Proves
+    the exact-type / continuation-graph / verdict-binding invariants fail closed
+    even when the self-digest and fact pointer are recomputed to stay coherent."""
+    outcome = conn.execute(
+        "SELECT id, payload FROM task_events WHERE task_id=? AND run_id=? "
+        "AND kind='canonical_audit_outcome'",
+        (review_task, audit_run),
+    ).fetchone()
+    obj = json.loads(outcome["payload"])
+    obj.pop("envelope_sha256")
+    if mutate_envelope:
+        mutate_envelope(obj)
+    digest = hashlib.sha256(
+        json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    ).hexdigest()
+    raw = json.dumps({**obj, "envelope_sha256": digest}, sort_keys=True, separators=(",", ":"))
+    fact = conn.execute(
+        "SELECT id, payload FROM task_events WHERE task_id=? AND run_id=? AND kind='changed_fact'",
+        (review_task, audit_run),
+    ).fetchone()
+    fact_obj = json.loads(fact["payload"])
+    fact_obj["envelope_sha256"] = digest
+    if mutate_fact:
+        mutate_fact(fact_obj)
+    fact_raw = json.dumps(fact_obj, sort_keys=True, separators=(",", ":"))
+    with kb.write_txn(conn):
+        conn.execute("UPDATE task_events SET payload=? WHERE id=?", (raw, outcome["id"]))
+        conn.execute("UPDATE task_events SET payload=? WHERE id=?", (fact_raw, fact["id"]))
+
+
+def test_current_v3_outcome_float_author_run_id_fails_closed(kanban_home):
+    with kb.connect() as conn:
+        author, run_id, review_task, audit_run = _current_v3_outcome(conn)
+        _rewrite_current_v3_envelope(
+            conn, review_task, audit_run,
+            mutate_envelope=lambda obj: obj.__setitem__("author_run_id", float(run_id)),
+        )
+        assert kb._canonical_current_audit_outcome(conn, author) == (True, None)
+        assert kb._reviewed_author_finalizer_run_id(conn, author) is None
+
+
+def test_current_v3_outcome_float_handoff_event_id_fails_closed(kanban_home):
+    with kb.connect() as conn:
+        author, run_id, review_task, audit_run = _current_v3_outcome(conn)
+        handoff_id = conn.execute(
+            "SELECT id FROM task_events WHERE task_id=? AND kind='review_handoff'",
+            (author,),
+        ).fetchone()["id"]
+        _rewrite_current_v3_envelope(
+            conn, review_task, audit_run,
+            mutate_envelope=lambda obj: obj.__setitem__("review_handoff_event_id", float(handoff_id)),
+        )
+        assert kb._canonical_current_audit_outcome(conn, author) == (True, None)
+        assert kb._reviewed_author_finalizer_run_id(conn, author) is None
+
+
+@pytest.mark.parametrize("continuation_ids", [
+    ["t_nonexistent"],          # nonexistent child
+    [""],                        # blank child
+    ["t_fake", "t_fake"],       # duplicated child
+])
+def test_current_v3_outcome_unbound_continuation_fails_closed(kanban_home, continuation_ids):
+    with kb.connect() as conn:
+        author, run_id, review_task, audit_run = _current_v3_outcome(conn)
+
+        def mutate(obj):
+            obj["disposition"] = "CONTINUATION_COMMITTED"
+            obj["continuation_ids"] = continuation_ids
+
+        _rewrite_current_v3_envelope(conn, review_task, audit_run, mutate_envelope=mutate)
+        assert kb._canonical_current_audit_outcome(conn, author) == (True, None)
+        assert kb._reviewed_author_finalizer_run_id(conn, author) is None
+
+
+def test_current_v3_outcome_bool_fact_version_fails_closed(kanban_home):
+    with kb.connect() as conn:
+        author, run_id, review_task, audit_run = _current_v3_outcome(conn)
+        _rewrite_current_v3_envelope(
+            conn, review_task, audit_run,
+            mutate_fact=lambda obj: obj.__setitem__("version", True),
+        )
+        assert kb._canonical_current_audit_outcome(conn, author) == (True, None)
+        assert kb._reviewed_author_finalizer_run_id(conn, author) is None
+
+
+def test_current_v3_outcome_drifted_reason_fails_closed(kanban_home):
+    with kb.connect() as conn:
+        author, run_id, review_task, audit_run = _current_v3_outcome(conn)
+        _rewrite_current_v3_envelope(
+            conn, review_task, audit_run,
+            mutate_envelope=lambda obj: obj.__setitem__("reason", "tampered-but-nonempty"),
+        )
         assert kb._canonical_current_audit_outcome(conn, author) == (True, None)
         assert kb._reviewed_author_finalizer_run_id(conn, author) is None
 

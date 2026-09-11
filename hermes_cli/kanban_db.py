@@ -9355,6 +9355,27 @@ _PROSE_PR_TOKEN_RE = re.compile(
 )
 _PROSE_HEAD_SEP_RE = re.compile(r"^\s*[:=]?\s*$")
 _PROSE_PR_SEP_RE = re.compile(r"^\s*#?\s*$")
+# Word-separated conflicting declaration detectors. The primary field/PR
+# detectors above require the value token to follow a non-word run immediately,
+# so a conflicting declaration whose field name and value are separated by a
+# word (``head is <sha>``, ``PR number 99``, ``PR is #99``) is invisible to the
+# singleton count and leaves the authentic declaration as an apparent singleton.
+# Any such word-separated declaration is a malformed/conflicting form and fails
+# closed. The negative lookbehind excludes a hyphenated compound (``exact-head``)
+# so a normal hyphenated prefix is not read as a declaration. Because the gap
+# must contain at least one letter, a SHA whose leading characters are hex
+# letters is never mistaken for a word separator (the required letter plus the
+# 40-hex value would exceed the token length).
+_WORD_SEPARATED_FIELD_RE = re.compile(
+    r"(?<![A-Za-z0-9_-])(?:head|tree|base)\b"
+    r"[^A-Za-z0-9]*[A-Za-z]+[^A-Za-z0-9]*[0-9a-fA-F]{40,}",
+    re.IGNORECASE,
+)
+_WORD_SEPARATED_PR_RE = re.compile(
+    r"(?<![A-Za-z0-9_-])pr\b"
+    r"[^A-Za-z0-9]*[A-Za-z]+[^A-Za-z0-9]*[0-9]+",
+    re.IGNORECASE,
+)
 
 
 def _looks_json_shaped(text: str) -> bool:
@@ -9437,6 +9458,11 @@ def _resolve_handoff_candidate_target(
             and bool(target["summary"].strip())
         ):
             return target
+        return None
+    # A prose reason with a word-separated declaration (``head is <sha>``,
+    # ``PR number 99``, ``PR is #99``) is malformed or conflicting; reject it
+    # before the primary detector so it cannot hide behind the singleton count.
+    if _WORD_SEPARATED_FIELD_RE.search(text) or _WORD_SEPARATED_PR_RE.search(text):
         return None
     expected_head = expected_candidate.get("head")
     expected_tree = expected_candidate.get("tree")
@@ -9919,6 +9945,89 @@ def _earlier_v3_current_audit_outcome(
     return True, {**receipt, "receipt_hash": receipt_hash, "authenticated": True}
 
 
+# The current-v3 (later-v3) PASS review_verdict contract written by the terminal
+# producer in the same transaction as the canonical_audit_outcome envelope:
+# exactly these six keys, version 2, verdict "pass", and reason/evidence bound
+# byte-for-byte to the envelope. Any unknown/missing key or drift fails closed.
+_CURRENT_V3_VERDICT_KEYS = {
+    "version", "review_task_id", "review_run_id", "verdict", "reason", "evidence",
+}
+
+
+def _current_v3_bound_verdict(
+    payload: Any, audit_task_id: str, audit_run_id: int, envelope: dict[str, Any],
+) -> bool:
+    """Validate the singleton current-v3 PASS review_verdict producer record.
+
+    The terminal producer writes the canonical_audit_outcome envelope and the
+    PASS review_verdict in the same transaction. Binding the envelope's
+    reason/evidence/task/run identity back to that exact verdict record prevents
+    a byte-drifted verdict claim (reason changed and self-digest/fact pointer
+    recomputed) from surviving readback.
+    """
+    try:
+        verdict = _strict_json_loads(payload or "{}")
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(verdict, dict) or set(verdict) != _CURRENT_V3_VERDICT_KEYS:
+        return False
+    if type(verdict.get("version")) is not int or verdict["version"] != 2:
+        return False
+    if type(verdict.get("verdict")) is not str or verdict["verdict"] != "pass":
+        return False
+    if (
+        type(verdict.get("review_task_id")) is not str
+        or verdict["review_task_id"] != audit_task_id
+    ):
+        return False
+    if type(verdict.get("review_run_id")) is not int or verdict["review_run_id"] != audit_run_id:
+        return False
+    if type(verdict.get("reason")) is not str or verdict["reason"] != envelope.get("reason"):
+        return False
+    if verdict.get("evidence") != envelope.get("evidence"):
+        return False
+    return True
+
+
+def _current_v3_continuation_ids_valid(
+    conn: sqlite3.Connection, author_task_id: str, audit_task_id: str,
+    continuation_ids: Any, disposition: Any,
+) -> bool:
+    """Validate the current-v3 continuation identity list against the task graph.
+
+    Each continuation id must be a unique, nonempty, existing child of the author
+    or audit task, and the disposition must match the list's emptiness. A
+    nonexistent, blank, or duplicated continuation id fails closed so a drifted
+    envelope cannot claim an unbound continuation obligation.
+    """
+    if type(continuation_ids) is not list:
+        return False
+    if disposition == "FINAL_ACCEPTED":
+        if continuation_ids != []:
+            return False
+    elif disposition == "CONTINUATION_COMMITTED":
+        if not continuation_ids:
+            return False
+    else:
+        return False
+    seen: set[str] = set()
+    for cid in continuation_ids:
+        if type(cid) is not str or not cid or cid in seen:
+            return False
+        seen.add(cid)
+        if cid in {author_task_id, audit_task_id}:
+            return False
+        linked = conn.execute(
+            "SELECT 1 FROM task_links WHERE child_id = ? AND parent_id IN (?, ?)",
+            (cid, author_task_id, audit_task_id),
+        ).fetchone()
+        if linked is None:
+            return False
+        if conn.execute("SELECT 1 FROM tasks WHERE id = ?", (cid,)).fetchone() is None:
+            return False
+    return True
+
+
 def _canonical_current_audit_outcome(
     conn: sqlite3.Connection, author_task_id: str,
 ) -> tuple[bool, Optional[dict[str, Any]]]:
@@ -10009,8 +10118,15 @@ def _canonical_current_audit_outcome(
         "evidence", "scope", "disposition", "continuation_ids",
     }
     continuation_ids = payload.get("continuation_ids")
+    verdict_rows = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind='review_verdict'",
+        (row["task_id"], row["run_id"]),
+    ).fetchall()
     valid = (
-        set(payload) == required and payload.get("version") == 3
+        set(payload) == required and type(payload.get("version")) is int and payload.get("version") == 3
+        and type(payload.get("author_run_id")) is int
+        and type(payload.get("audit_run_id")) is int
+        and type(payload.get("review_handoff_event_id")) is int
         and payload.get("author_task_id") == author_task_id
         and payload.get("audit_task_id") == row["task_id"] and payload.get("audit_run_id") == row["run_id"]
         and payload.get("verdict") == "PASS" and payload.get("scope") == "audit_obligation"
@@ -10038,11 +10154,14 @@ def _canonical_current_audit_outcome(
         and task["current_run_id"] is None and task["assignee"] == payload.get("auditor_profile")
         and run is not None and run["profile"] == payload.get("auditor_profile")
         and (run["status"], run["outcome"]) == ("done", "completed") and run["ended_at"] is not None
-        and type(continuation_ids) is list and all(type(item) is str for item in continuation_ids)
-        and payload.get("disposition") == (
-            "CONTINUATION_COMMITTED" if continuation_ids else "FINAL_ACCEPTED"
+        and _current_v3_continuation_ids_valid(
+            conn, author_task_id, row["task_id"], continuation_ids, payload.get("disposition"),
         )
         and len(facts) == 1
+        and len(verdict_rows) == 1
+        and _current_v3_bound_verdict(
+            verdict_rows[0]["payload"], row["task_id"], row["run_id"], payload,
+        )
         and latest_author_run == payload.get("author_run_id")
         and latest_audit_run == row["run_id"]
         and latest_handoff_id == payload.get("review_handoff_event_id")
@@ -10051,11 +10170,16 @@ def _canonical_current_audit_outcome(
         fact = _strict_json_loads(facts[0]["payload"] or "{}") if len(facts) == 1 else None
     except (TypeError, ValueError):
         fact = None
-    if fact != {
-        "version": 1, "type": "canonical_audit_outcome_pointer",
-        "outcome_event_id": int(row["id"]), "envelope_sha256": digest,
-        "prior_status": "running", "new_status": "done",
-    }:
+    if (
+        not isinstance(fact, dict)
+        or type(fact.get("version")) is not int or fact.get("version") != 1
+        or fact.get("type") != "canonical_audit_outcome_pointer"
+        or type(fact.get("outcome_event_id")) is not int
+        or fact.get("outcome_event_id") != int(row["id"])
+        or fact.get("envelope_sha256") != digest
+        or fact.get("prior_status") != "running"
+        or fact.get("new_status") != "done"
+    ):
         valid = False
     if not valid:
         return True, None
