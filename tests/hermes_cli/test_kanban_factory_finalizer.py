@@ -7242,3 +7242,84 @@ def test_earlier_v3_audit_outcome_duplicate_changed_fact_member_fails_closed(kan
         assert kb._canonical_audit_receipt(conn, chain["author"]) is None
         assert kb._reviewed_author_finalizer_run_id(conn, chain["author"]) is None
 
+
+# ---------------------------------------------------------------------------
+# Round-5 hostile regressions — deeply nested malformed JSON fails closed.
+#
+# ``json.loads`` uses a recursive C decoder, so an unboundedly nested record
+# (a 1200-level array placed in the envelope, a bound v2 verdict, the handoff,
+# or a changed fact) raises ``RecursionError`` — a ``RuntimeError`` that the
+# call sites' ``except (TypeError, ValueError)`` handlers do not catch. The
+# strict decoder must normalize that to the rejected-record result so a
+# malformed authority record can never crash reviewed-author resolution.
+# ---------------------------------------------------------------------------
+
+def _deeply_nested_json(depth: int = 1200) -> str:
+    """A ``depth``-level nested JSON array, deep enough to exceed the C
+    decoder's recursion limit (RecursionError before the fix, fail-closed
+    ValueError after)."""
+    return "[" * depth + "]" * depth
+
+
+def test_earlier_v3_audit_outcome_deeply_nested_envelope_fails_closed(kanban_home):
+    with kb.connect() as conn:
+        chain = _earlier_v3_audit_outcome_chain(conn)
+        _overwrite_event_payloads(conn, [
+            (chain["reviewer"], chain["reviewer_run"], "canonical_audit_outcome",
+             _deeply_nested_json()),
+        ])
+
+        assert kb._canonical_current_audit_outcome(conn, chain["author"]) == (True, None)
+        assert kb._canonical_audit_receipt(conn, chain["author"]) is None
+        assert kb._reviewed_author_finalizer_run_id(conn, chain["author"]) is None
+
+
+def test_earlier_v3_audit_outcome_deeply_nested_bound_verdict_fails_closed(kanban_home):
+    with kb.connect() as conn:
+        chain = _earlier_v3_audit_outcome_chain(conn)
+        _overwrite_event_payloads(conn, [
+            (chain["reviewer"], chain["reviewer_run"], "review_verdict",
+             _deeply_nested_json()),
+            (chain["author"], chain["reviewer_run"], "review_verdict",
+             _deeply_nested_json()),
+        ])
+
+        assert kb._canonical_current_audit_outcome(conn, chain["author"]) == (True, None)
+        assert kb._canonical_audit_receipt(conn, chain["author"]) is None
+        assert kb._reviewed_author_finalizer_run_id(conn, chain["author"]) is None
+
+
+def test_earlier_v3_audit_outcome_deeply_nested_handoff_fails_closed(kanban_home):
+    with kb.connect() as conn:
+        chain = _earlier_v3_audit_outcome_chain(conn)
+        handoff_row = conn.execute(
+            "SELECT id FROM task_events WHERE task_id = ? AND kind = ?",
+            (chain["author"], "review_handoff"),
+        ).fetchone()
+        assert handoff_row is not None
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_events SET payload = ? WHERE id = ?",
+                (_deeply_nested_json(), handoff_row["id"]),
+            )
+
+        assert kb._canonical_current_audit_outcome(conn, chain["author"]) == (True, None)
+        assert kb._canonical_audit_receipt(conn, chain["author"]) is None
+        assert kb._reviewed_author_finalizer_run_id(conn, chain["author"]) is None
+
+
+def test_earlier_v3_audit_outcome_deeply_nested_changed_fact_fails_closed(kanban_home):
+    with kb.connect() as conn:
+        chain = _earlier_v3_audit_outcome_chain(conn)
+        _overwrite_event_payloads(conn, [
+            (chain["reviewer"], chain["reviewer_run"], "changed_fact",
+             _deeply_nested_json()),
+            (chain["author"], chain["author_run"], "changed_fact",
+             _deeply_nested_json()),
+        ])
+
+        assert kb._canonical_current_audit_outcome(conn, chain["author"]) == (True, None)
+        assert kb._canonical_audit_receipt(conn, chain["author"]) is None
+        assert kb._reviewed_author_finalizer_run_id(conn, chain["author"]) is None
+
+

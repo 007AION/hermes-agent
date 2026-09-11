@@ -9363,8 +9363,18 @@ def _reject_duplicate_json_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]
 
 
 def _strict_json_loads(raw: str) -> Any:
-    """Parse JSON while rejecting duplicate member names at every object level."""
-    return json.loads(raw, object_pairs_hook=_reject_duplicate_json_pairs)
+    """Parse JSON while rejecting duplicate member names at every object level.
+
+    ``json.loads`` uses a recursive C decoder, so a deeply nested (or otherwise
+    adversarial) record raises ``RecursionError`` — a ``RuntimeError`` that the
+    call sites' ``except (TypeError, ValueError)`` fail-closed handlers do not
+    catch. Normalize it to ``ValueError`` here so a malformed authority record
+    can never crash reviewed-author resolution instead of failing closed.
+    """
+    try:
+        return json.loads(raw, object_pairs_hook=_reject_duplicate_json_pairs)
+    except RecursionError as exc:
+        raise ValueError("JSON nesting exceeds the safe decode depth") from exc
 
 
 def _canonical_audit_outcome_evidence_sha256(evidence: dict[str, Any]) -> str:
