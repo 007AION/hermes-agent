@@ -6660,11 +6660,13 @@ def _has_protocol_violation_fence(conn: sqlite3.Connection, task_id: str) -> boo
 
 def recompute_ready(
     conn: sqlite3.Connection, failure_limit: int = None,
+    *, promoted_ids: Optional[list[str]] = None,
 ) -> int:
     """Promote tasks whose terminal or typed-review parents are satisfied.
 
-    Returns the number of tasks promoted.  Safe to call inside or outside
-    an existing transaction; it opens its own IMMEDIATE txn.
+    Returns the number of tasks promoted. When ``promoted_ids`` is supplied,
+    the exact ids changed by this call are appended to it. Safe to call inside
+    or outside an existing transaction; it opens its own IMMEDIATE txn.
 
     ``blocked`` tasks are also considered for promotion (so a task
     blocked purely by a parent dependency unblocks itself when the
@@ -6761,18 +6763,22 @@ def recompute_ready(
                     )
                     if failures >= effective_limit:
                         continue
-                    conn.execute(
+                    changed = conn.execute(
                         "UPDATE tasks SET status = 'ready' "
                         "WHERE id = ? AND status = 'blocked'",
                         (task_id,),
                     )
                 else:
-                    conn.execute(
+                    changed = conn.execute(
                         "UPDATE tasks SET status = 'ready' WHERE id = ? AND status = 'todo'",
                         (task_id,),
                     )
+                if changed.rowcount != 1:
+                    continue
                 _append_event(conn, task_id, "promoted", None)
                 promoted += 1
+                if promoted_ids is not None:
+                    promoted_ids.append(task_id)
     return promoted
 
 
@@ -8096,6 +8102,10 @@ def _canonical_audit_receipt(
     Only task, run, edge, handoff, and paired-verdict rows are authoritative.
     Audit metadata, comments, titles, caller data, and external state are cold.
     """
+    current_present, current_receipt = _canonical_current_audit_outcome(conn, task_id)
+    if current_present:
+        return current_receipt
+
     identity_fields = (
         "claim_lock", "claim_expires", "worker_pid", "worker_starttime",
         "fence_lineage", "fence_disposition",
@@ -8337,10 +8347,10 @@ def _recovered_pass_audit_receipt(
 ) -> Optional[dict[str, Any]]:
     """Resolve one authoritative PASS from a crashed-precursor + recovery pair.
 
-    The exact shape this accepts is the completed-audit PASS recovery emitted by
-    ``_recover_completed_pass_verdict``: a version-1 PASS bound to a crashed
-    protocol-violation run, followed by a version-2 recovery PASS bound to the
-    latest completed terminal run whose APPROVED receipt matches byte-for-byte
+    The exact shape this accepts is one legacy persisted completed-audit PASS
+    recovery: a version-1 PASS bound to a crashed protocol-violation run,
+    followed by a version-2 recovery PASS bound to the latest completed terminal
+    run whose APPROVED receipt matches byte-for-byte
     and whose commit identity is re-stated by the predecessor's reason.  Any
     other two-verdict shape fails closed.  Older closed audit rounds may precede
     the immediate predecessor; only ``auditor_runs[0]``/``auditor_runs[1]`` are
@@ -9294,6 +9304,206 @@ def request_review_handoff(
         return None
 
 
+_CANONICAL_AUDIT_EVIDENCE_KEYS = {"repository", "pr", "head", "tree", "base", "github_review_id", "github_review_url", "github_review_state"}
+_CANONICAL_AUDIT_TARGET_KEYS = {"repository", "pr", "head", "tree", "base"}
+
+
+def _canonical_audit_evidence(value: Any) -> Optional[dict[str, Any]]:
+    """Validate the one closed exact-head attestation accepted from an auditor."""
+    if not isinstance(value, dict) or set(value) != _CANONICAL_AUDIT_EVIDENCE_KEYS:
+        return None
+    repository, pr, review_id = value["repository"], value["pr"], value["github_review_id"]
+    if (type(repository) is not str
+            or re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository) is None
+            or type(pr) is not int or pr <= 0 or type(review_id) is not int or review_id <= 0
+            or value["github_review_state"] != "APPROVED"
+            or any(type(value[key]) is not str or re.fullmatch(r"[0-9a-fA-F]{40}", value[key]) is None for key in ("head", "tree", "base"))
+            or value["github_review_url"] != f"https://github.com/{repository}/pull/{pr}#pullrequestreview-{review_id}"):
+        return None
+    return {key: value[key] for key in sorted(_CANONICAL_AUDIT_EVIDENCE_KEYS)}
+
+
+def _canonical_current_audit_outcome(
+    conn: sqlite3.Connection, author_task_id: str,
+) -> tuple[bool, Optional[dict[str, Any]]]:
+    """Resolve the strict audit-owned singleton; presence blocks legacy fallback."""
+    rows = conn.execute(
+        "SELECT e.id, e.task_id, e.run_id, e.payload FROM task_events e "
+        "JOIN task_links l ON l.child_id=e.task_id AND l.parent_id=? "
+        "WHERE e.kind='canonical_audit_outcome' ORDER BY e.id", (author_task_id,),
+    ).fetchall()
+    if not rows:
+        return False, None
+    if len(rows) != 1:
+        return True, None
+    row = rows[0]
+    try:
+        envelope = json.loads(row["payload"] or "{}")
+        payload = {key: value for key, value in envelope.items() if key != "envelope_sha256"}
+        digest = envelope["envelope_sha256"]
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return True, None
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    handoff_row = conn.execute(
+        "SELECT id, run_id, payload FROM task_events WHERE id=? AND task_id=? AND kind='review_handoff'",
+        (payload.get("review_handoff_event_id"), author_task_id),
+    ).fetchone()
+    handoff = _review_handoff_receipt_from_row(author_task_id, handoff_row) if handoff_row else None
+    try: target = json.loads(handoff.reason) if handoff is not None else None
+    except (TypeError, ValueError): target = None
+    task = conn.execute(
+        "SELECT status, assignee, current_run_id, factory_build_gate, "
+        "factory_terminal_receipt_sha256 FROM tasks WHERE id=?", (row["task_id"],),
+    ).fetchone()
+    run = conn.execute(
+        "SELECT profile, status, outcome, ended_at FROM task_runs WHERE id=? AND task_id=?",
+        (row["run_id"], row["task_id"]),
+    ).fetchone()
+    facts = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind='changed_fact'",
+                         (row["task_id"], row["run_id"]),).fetchall()
+    author = conn.execute("SELECT status, assignee, current_run_id FROM tasks WHERE id=?",
+                          (author_task_id,),).fetchone()
+    author_run = conn.execute(
+        "SELECT profile, status, outcome, ended_at FROM task_runs WHERE id=? AND task_id=?",
+        (payload.get("author_run_id"), author_task_id),
+    ).fetchone()
+    parents = conn.execute("SELECT parent_id FROM task_links WHERE child_id=?",
+                           (row["task_id"],),).fetchall()
+    required = {
+        "version", "author_task_id", "author_run_id", "author_profile", "audit_task_id",
+        "audit_run_id", "auditor_profile", "review_handoff_event_id", "verdict", "reason",
+        "evidence", "scope", "disposition", "continuation_ids",
+    }
+    continuation_ids = payload.get("continuation_ids")
+    valid = (
+        set(payload) == required and payload.get("version") == 3
+        and payload.get("author_task_id") == author_task_id
+        and payload.get("audit_task_id") == row["task_id"] and payload.get("audit_run_id") == row["run_id"]
+        and payload.get("verdict") == "PASS" and payload.get("scope") == "audit_obligation"
+        and _canonical_audit_evidence(payload.get("evidence")) == payload.get("evidence")
+        and isinstance(target, dict) and target == {"version": 1, "candidate": {
+            key: payload["evidence"][key] for key in sorted(_CANONICAL_AUDIT_TARGET_KEYS)
+        }, "summary": target.get("summary")}
+        and type(target["summary"]) is str and bool(target["summary"].strip())
+        and type(payload.get("reason")) is str and bool(payload["reason"].strip())
+        and type(digest) is str and hashlib.sha256(encoded).hexdigest() == digest
+        and handoff is not None and handoff.review_task_id == row["task_id"]
+        and handoff.expected_run_id == payload.get("author_run_id")
+        and handoff.event_id == payload.get("review_handoff_event_id")
+        and len(parents) == 1 and parents[0]["parent_id"] == author_task_id
+        and author is not None and author["status"] == "review"
+        and author["current_run_id"] is None and author["assignee"] == payload.get("author_profile")
+        and author_run is not None and author_run["profile"] == payload.get("author_profile")
+        and (author_run["status"], author_run["outcome"]) == ("review_required", "review_required")
+        and author_run["ended_at"] is not None
+        and payload.get("author_profile") not in {None, ""}
+        and payload.get("auditor_profile") not in {None, "", payload.get("author_profile")}
+        and task is not None and task["status"] in {"done", "archived"}
+        and (
+            not task["factory_build_gate"]
+            or (type(task["factory_terminal_receipt_sha256"]) is str
+                and re.fullmatch(r"[0-9a-f]{64}", task["factory_terminal_receipt_sha256"]) is not None)
+        )
+        and task["current_run_id"] is None and task["assignee"] == payload.get("auditor_profile")
+        and run is not None and run["profile"] == payload.get("auditor_profile")
+        and (run["status"], run["outcome"]) == ("done", "completed") and run["ended_at"] is not None
+        and type(continuation_ids) is list and all(type(item) is str for item in continuation_ids)
+        and payload.get("disposition") == (
+            "CONTINUATION_COMMITTED" if continuation_ids else "FINAL_ACCEPTED"
+        )
+        and len(facts) == 1
+    )
+    try:
+        fact = json.loads(facts[0]["payload"]) if len(facts) == 1 else None
+    except (TypeError, ValueError):
+        fact = None
+    if fact != {
+        "version": 1, "type": "canonical_audit_outcome_pointer",
+        "outcome_event_id": int(row["id"]), "envelope_sha256": digest,
+        "prior_status": "running", "new_status": "done",
+    }:
+        valid = False
+    if not valid:
+        return True, None
+    receipt = {
+        "task_id": author_task_id, "subject_id": f"{author_task_id}/{payload['author_run_id']}",
+        "subject_version_or_exact_hash": digest, "author_task_id": author_task_id,
+        "author_run_id": payload["author_run_id"], "author_profile": payload["author_profile"],
+        "auditor_task_id": row["task_id"], "auditor_run_id": row["run_id"],
+        "auditor_profile": payload["auditor_profile"], "verdict": "PASS", "issued_at": int(row["id"]),
+    }
+    receipt_hash = hashlib.sha256(
+        json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    return True, {**receipt, "receipt_hash": receipt_hash, "authenticated": True}
+
+
+def _terminalize_review_pass(
+    conn: sqlite3.Connection, *, author_task_id: str, audit_task_id: str,
+    audit_run_id: int, reason: str, evidence: dict[str, Any], handoff: sqlite3.Row,
+) -> bool:
+    """Commit terminal PASS, recompute, one audit outcome, and one fact pointer."""
+    author = conn.execute("SELECT assignee FROM tasks WHERE id=?", (author_task_id,)).fetchone()
+    audit = conn.execute(
+        "SELECT assignee, factory_build_gate FROM tasks WHERE id=?", (audit_task_id,),
+    ).fetchone()
+    receipt = _review_handoff_receipt_from_row(author_task_id, handoff)
+    if author is None or audit is None or receipt is None:
+        return False
+    _append_event(conn, audit_task_id, "review_verdict", {
+        "version": 2, "review_task_id": audit_task_id, "review_run_id": audit_run_id,
+        "verdict": "pass", "reason": reason, "evidence": evidence,
+    }, run_id=audit_run_id)
+    if audit["factory_build_gate"]:
+        _run_kernel_finalizer(
+            conn, audit_task_id, str(audit_run_id), board=get_current_board(), result=reason,
+        )
+    else:
+        changed = _execute_factory_terminal_write(
+            conn, audit_task_id,
+            "UPDATE tasks SET status='done', result=?, completed_at=?, claim_lock=NULL, "
+            "claim_expires=NULL, worker_pid=NULL, block_kind=NULL, block_recurrences=0 "
+            "WHERE id=? AND status='running' AND current_run_id=?",
+            (reason, int(time.time()), audit_task_id, audit_run_id),
+        )
+        if changed.rowcount != 1:
+            raise _ReviewHandoffConflict
+    if _end_run(
+        conn, audit_task_id, outcome="completed", status="done", summary=reason,
+    ) != audit_run_id:
+        raise _ReviewHandoffConflict
+    _append_event(
+        conn, audit_task_id, "completed",
+        {"result_len": len(reason), "summary": reason[:400]}, run_id=audit_run_id,
+    )
+    promoted: list[str] = []
+    recompute_ready(conn, promoted_ids=promoted)
+    promoted.sort()
+    core = {
+        "version": 3, "author_task_id": author_task_id, "author_run_id": receipt.expected_run_id,
+        "author_profile": author["assignee"], "audit_task_id": audit_task_id,
+        "audit_run_id": audit_run_id, "auditor_profile": audit["assignee"],
+        "review_handoff_event_id": receipt.event_id, "verdict": "PASS", "reason": reason,
+        "evidence": evidence, "scope": "audit_obligation",
+        "disposition": "CONTINUATION_COMMITTED" if promoted else "FINAL_ACCEPTED",
+        "continuation_ids": promoted,
+    }
+    digest = hashlib.sha256(
+        json.dumps(core, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    ).hexdigest()
+    _append_event(
+        conn, audit_task_id, "canonical_audit_outcome",
+        {**core, "envelope_sha256": digest}, run_id=audit_run_id,
+    )
+    outcome_event_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+    _append_event(conn, audit_task_id, "changed_fact", {
+        "version": 1, "type": "canonical_audit_outcome_pointer",
+        "outcome_event_id": outcome_event_id, "envelope_sha256": digest,
+        "prior_status": "running", "new_status": "done",
+    }, run_id=audit_run_id)
+    return True
+
+
 def _record_review_verdict(
     conn: sqlite3.Connection,
     task_id: str,
@@ -9302,10 +9512,7 @@ def _record_review_verdict(
     expected_review_run_id: int,
     verdict: str,
     reason: str,
-    recovery_receipt: Optional[dict] = None,
-    controller_task_id: Optional[str] = None,
-    controller_run_id: Optional[int] = None,
-    controller_profile: Optional[str] = None,
+    evidence: Optional[dict] = None,
 ) -> bool:
     """Record a bound child verdict; only REQUEST_CHANGES resumes the author."""
     verdict = str(verdict or "").strip().lower()
@@ -9316,33 +9523,24 @@ def _record_review_verdict(
         expected_review_run_id = int(expected_review_run_id)
     except (TypeError, ValueError):
         return False
+    if verdict == "pass" and evidence is None:
+        return False
+    normalized_evidence: Optional[dict[str, Any]] = None
     with write_txn(conn):
-        if recovery_receipt is not None:
-            if verdict == "pass":
-                return _recover_completed_pass_verdict(
-                    conn,
-                    task_id,
-                    review_task_id=review_task_id,
-                    expected_review_run_id=expected_review_run_id,
-                    verdict=verdict,
-                    reason=reason,
-                    recovery_receipt=recovery_receipt,
-                    controller_task_id=controller_task_id,
-                    controller_run_id=controller_run_id,
-                    controller_profile=controller_profile,
-                )
-            return _recover_completed_review_verdict(
-                conn,
-                task_id,
-                review_task_id=review_task_id,
-                expected_review_run_id=expected_review_run_id,
-                verdict=verdict,
-                reason=reason,
-                recovery_receipt=recovery_receipt,
-                controller_task_id=controller_task_id,
-                controller_run_id=controller_run_id,
-                controller_profile=controller_profile,
-            )
+        if verdict == "pass" and evidence is not None:
+            if (normalized_evidence := _canonical_audit_evidence(evidence)) is None:
+                return False
+            present, receipt = _canonical_current_audit_outcome(conn, task_id)
+            if present:
+                row = conn.execute(
+                    "SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind='canonical_audit_outcome'",
+                    (review_task_id, expected_review_run_id),).fetchone()
+                if receipt is None or row is None:
+                    return False
+                existing = json.loads(row["payload"])
+                return existing["reason"] == reason and existing["evidence"] == normalized_evidence
+        elif verdict == "request_changes" and evidence is not None:
+            return False
         prior = conn.execute(
             "SELECT run_id, payload FROM task_events WHERE task_id = ? "
             "AND kind = 'review_verdict' ORDER BY id DESC",
@@ -9450,6 +9648,25 @@ def _record_review_verdict(
             )
             if resumed.rowcount != 1:
                 raise _ReviewHandoffConflict
+        elif normalized_evidence is not None:
+            handoff = _review_handoff_event_for_child(conn, task_id, review_task_id)
+            if parent_ids(conn, review_task_id) != [task_id] or handoff is None:
+                return False
+            receipt = _review_handoff_receipt_from_row(task_id, handoff)
+            try:
+                target = json.loads(receipt.reason) if receipt is not None else None
+            except (TypeError, ValueError):
+                return False
+            expected = {key: normalized_evidence[key] for key in sorted(_CANONICAL_AUDIT_TARGET_KEYS)}
+            if not isinstance(target, dict) or target != {
+                "version": 1, "candidate": expected, "summary": target.get("summary")
+            } or type(target["summary"]) is not str or not target["summary"].strip():
+                return False
+            return _terminalize_review_pass(
+                conn, author_task_id=task_id, audit_task_id=review_task_id,
+                audit_run_id=expected_review_run_id, reason=reason,
+                evidence=normalized_evidence, handoff=handoff,
+            )
         _append_event(
             conn,
             task_id,
@@ -9485,718 +9702,6 @@ def _closed_completed_audit_recovery_receipt(
     return {key: metadata[key] for key in sorted(receipt_keys)}, "top_level"
 
 
-def _legacy_terminal_correction_recovery_receipt(
-    metadata: dict,
-    recovery_receipt: dict,
-) -> Optional[dict[str, Any]]:
-    """Map one persisted legacy terminal correction to the closed receipt schema."""
-    conflicting_keys = {
-        "review_outcome", "github_review_state", "recovery_receipt",
-        "final_verdict", "verdict", "merge_base",
-    }
-    persisted_keys = {
-        "corrected_final_verdict", "repository", "pr", "head", "tree", "base",
-        "github_review_id", "github_review_url", "merge_allowed", "true_done",
-    }
-    if (
-        not isinstance(metadata, dict)
-        or not isinstance(recovery_receipt, dict)
-        or conflicting_keys.intersection(metadata)
-        or not persisted_keys.issubset(metadata)
-        or set(recovery_receipt) != _COMPLETED_RECOVERY_RECEIPT_KEYS
-        or metadata["corrected_final_verdict"] != "REQUEST_CHANGES_EXACT_HEAD"
-        or type(metadata["merge_allowed"]) is not bool
-        or metadata["merge_allowed"] is not False
-        or type(metadata["true_done"]) is not bool
-        or metadata["true_done"] is not False
-    ):
-        return None
-    repository = metadata["repository"]
-    pr_number = metadata["pr"]
-    review_id = metadata["github_review_id"]
-    if (
-        type(repository) is not str
-        or re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository) is None
-        or type(pr_number) is not int
-        or pr_number <= 0
-        or type(review_id) is not int
-        or review_id <= 0
-        or any(
-            type(metadata[key]) is not str
-            or re.fullmatch(r"[0-9a-fA-F]{40}", metadata[key]) is None
-            for key in ("head", "tree", "base")
-        )
-        or metadata["github_review_url"] != (
-            f"https://github.com/{repository}/pull/{pr_number}"
-            f"#pullrequestreview-{review_id}"
-        )
-    ):
-        return None
-    expected = {
-        "review_outcome": metadata["corrected_final_verdict"],
-        "repository": repository,
-        "pr": pr_number,
-        "head": metadata["head"],
-        "tree": metadata["tree"],
-        "base": metadata["base"],
-        "github_review_id": review_id,
-        "github_review_url": metadata["github_review_url"],
-        "github_review_state": "CHANGES_REQUESTED",
-    }
-    return expected if recovery_receipt == expected else None
-
-
-def _authenticated_same_auditor_terminal_correction_source_run_id(
-    conn: sqlite3.Connection,
-    task_id: str,
-    review_task_id: str,
-    expected_review_run_id: int,
-    prior: list[sqlite3.Row],
-    runs: list[sqlite3.Row],
-) -> Optional[int]:
-    """Authenticate two complete REQUEST_CHANGES→transient-PASS rounds."""
-    if len(prior) < 2 or len(runs) != 2:
-        return None
-    handoff_rows = conn.execute(
-        "SELECT id, run_id, payload FROM task_events WHERE task_id = ? "
-        "AND kind = 'review_handoff' ORDER BY id", (task_id,),
-    ).fetchall()
-    if len(handoff_rows) != 2:
-        return None
-    first_handoff = _review_handoff_receipt_from_row(task_id, handoff_rows[0])
-    second_handoff = _review_handoff_receipt_from_row(task_id, handoff_rows[1])
-    if (
-        first_handoff is None
-        or second_handoff is None
-        or first_handoff.review_task_id != review_task_id
-        or second_handoff.review_task_id != review_task_id
-        or first_handoff.recovery is not False
-        or second_handoff.recovery is not False
-    ):
-        return None
-    first_payload = _canonical_review_verdict_payload(prior[0])
-    second_payload = _canonical_review_verdict_payload(prior[1])
-    if (
-        first_payload is None
-        or second_payload is None
-        or first_payload["review_task_id"] != review_task_id
-        or second_payload["review_task_id"] != review_task_id
-        or first_payload["verdict"] != "request_changes"
-        or second_payload["verdict"] != "pass"
-        or second_payload["review_run_id"] != expected_review_run_id
-        or not (
-            first_handoff.event_id < int(prior[0]["id"])
-            < second_handoff.event_id < int(prior[1]["id"])
-        )
-    ):
-        return None
-    review_run_ids = (
-        first_payload["review_run_id"], second_payload["review_run_id"],
-    )
-    if (
-        review_run_ids[0] == review_run_ids[1]
-        or [int(row["id"]) for row in reversed(runs)] != list(review_run_ids)
-        or runs[1]["status"] != "request_changes"
-        or runs[1]["outcome"] != "request_changes"
-        or runs[1]["summary"] != first_payload["reason"]
-    ):
-        return None
-    source_run_ids = (first_handoff.expected_run_id, second_handoff.expected_run_id)
-    source_runs = conn.execute(
-        "SELECT id, profile, status, outcome, summary, ended_at FROM task_runs "
-        "WHERE task_id = ? AND status = 'review_required' ORDER BY id",
-        (task_id,),
-    ).fetchall()
-    if (
-        len(source_runs) != 2
-        or [int(row["id"]) for row in source_runs] != list(source_run_ids)
-        or any(
-            row["profile"] != FACTORY_REVIEW_AUTHOR_PROFILE
-            or row["outcome"] != "review_required"
-            or row["ended_at"] is None
-            for row in source_runs
-        )
-        or source_runs[0]["summary"] != first_handoff.reason
-        or source_runs[1]["summary"] != second_handoff.reason
-    ):
-        return None
-    mirrors = conn.execute(
-        "SELECT id, run_id, payload FROM task_events WHERE task_id = ? "
-        "AND kind = 'review_verdict' ORDER BY id", (review_task_id,),
-    ).fetchall()
-    if len(mirrors) != 2:
-        return None
-    for author_row, mirror_row in zip(prior[:2], mirrors):
-        if (
-            int(mirror_row["id"]) != int(author_row["id"]) + 1
-            or mirror_row["run_id"] != author_row["run_id"]
-            or mirror_row["payload"] != author_row["payload"]
-            or _canonical_review_verdict_payload(mirror_row) is None
-        ):
-            return None
-    return second_handoff.expected_run_id
-
-
-def _authenticated_prior_pass_handoff_run_id(
-    conn: sqlite3.Connection,
-    task_id: str,
-    prior_row: sqlite3.Row,
-    *,
-    later_review_task_id: str,
-    later_review_run_id: int,
-) -> Optional[int]:
-    """Authenticate one distinct original handoff/PASS before a later audit."""
-    try:
-        payload = json.loads(prior_row["payload"] or "{}")
-    except (TypeError, ValueError):
-        return None
-    if set(payload) != {
-        "version", "review_task_id", "review_run_id", "verdict", "reason",
-    }:
-        return None
-    original_task_id = payload.get("review_task_id")
-    original_run_id = payload.get("review_run_id")
-    if (
-        payload.get("version") != 1
-        or payload.get("verdict") != "pass"
-        or not isinstance(payload.get("reason"), str)
-        or not payload["reason"].strip()
-        or not isinstance(original_task_id, str)
-        or original_task_id == later_review_task_id
-        or isinstance(original_run_id, bool)
-        or not isinstance(original_run_id, int)
-        or original_run_id == later_review_run_id
-        or prior_row["run_id"] != original_run_id
-    ):
-        return None
-    handoff_rows = conn.execute(
-        "SELECT id, run_id, payload FROM task_events WHERE task_id = ? "
-        "AND kind = 'review_handoff' ORDER BY id DESC",
-        (task_id,),
-    ).fetchall()
-    if len(handoff_rows) != 1:
-        return None
-    handoff = _review_handoff_receipt_from_row(task_id, handoff_rows[0])
-    if handoff is None or handoff.review_task_id != original_task_id:
-        return None
-    source_runs = conn.execute(
-        "SELECT id, status, outcome, ended_at FROM task_runs "
-        "WHERE task_id = ? ORDER BY id DESC",
-        (task_id,),
-    ).fetchall()
-    if (
-        not source_runs
-        or int(source_runs[0]["id"]) != handoff.expected_run_id
-        or source_runs[0]["status"] != "review_required"
-        or source_runs[0]["outcome"] != "review_required"
-        or source_runs[0]["ended_at"] is None
-    ):
-        return None
-    original = conn.execute(
-        "SELECT status, assignee, current_run_id FROM tasks WHERE id = ?",
-        (original_task_id,),
-    ).fetchone()
-    original_run = conn.execute(
-        "SELECT profile, status, outcome, ended_at FROM task_runs "
-        "WHERE id = ? AND task_id = ?",
-        (original_run_id, original_task_id),
-    ).fetchone()
-    if (
-        original is None
-        or original["assignee"] != FACTORY_REVIEW_AUDITOR_PROFILE
-        or original["status"] not in {"done", "archived"}
-        or original["current_run_id"] is not None
-        or original_run is None
-        or original_run["profile"] != FACTORY_REVIEW_AUDITOR_PROFILE
-        or original_run["status"] != "done"
-        or original_run["outcome"] != "completed"
-        or original_run["ended_at"] is None
-        or conn.execute(
-            "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ?",
-            (task_id, original_task_id),
-        ).fetchone() is None
-    ):
-        return None
-    return handoff.expected_run_id
-
-
-def _recover_completed_review_verdict(
-    conn: sqlite3.Connection,
-    task_id: str,
-    *,
-    review_task_id: str,
-    expected_review_run_id: int,
-    verdict: str,
-    reason: str,
-    recovery_receipt: dict,
-    controller_task_id: Optional[str],
-    controller_run_id: Optional[int],
-    controller_profile: Optional[str],
-) -> bool:
-    """Recover one authenticated REQUEST_CHANGES from a terminal audit run."""
-    if (
-        verdict != "request_changes"
-        or not isinstance(recovery_receipt, dict)
-        or not controller_task_id
-        or controller_run_id is None
-        or controller_profile
-        not in FACTORY_REVIEW_VERDICT_RECOVERY_CONTROLLER_PROFILES
-    ):
-        return False
-    try:
-        controller_run_id = int(controller_run_id)
-    except (TypeError, ValueError):
-        return False
-    if conn.execute(
-        "SELECT 1 FROM tasks task JOIN task_runs run "
-        "ON run.id = ? AND run.task_id = task.id "
-        "WHERE task.id = ? AND task.assignee = ? AND task.status = 'running' "
-        "AND task.current_run_id = run.id AND run.profile = ? "
-        "AND run.status = 'running' AND run.outcome IS NULL "
-        "AND run.ended_at IS NULL",
-        (controller_run_id, controller_task_id, controller_profile, controller_profile),
-    ).fetchone() is None:
-        return False
-
-    author = conn.execute(
-        "SELECT status, assignee, current_run_id FROM tasks WHERE id = ?", (task_id,)
-    ).fetchone()
-    child = conn.execute(
-        "SELECT status, assignee, current_run_id FROM tasks WHERE id = ?",
-        (review_task_id,),
-    ).fetchone()
-    if (
-        author is None
-        or author["assignee"] != FACTORY_REVIEW_AUTHOR_PROFILE
-        or author["current_run_id"] is not None
-        or author["status"] not in {"review", "ready"}
-        or child is None
-        or child["assignee"] != FACTORY_REVIEW_AUDITOR_PROFILE
-        or child["status"] not in {"done", "archived"}
-        or child["current_run_id"] is not None
-        or conn.execute(
-            "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ?",
-            (task_id, review_task_id),
-        ).fetchone() is None
-    ):
-        return False
-    runs = conn.execute(
-        "SELECT id, profile, status, outcome, summary, metadata, ended_at "
-        "FROM task_runs WHERE task_id = ? ORDER BY id DESC", (review_task_id,),
-    ).fetchall()
-    if (
-        not runs
-        or int(runs[0]["id"]) != expected_review_run_id
-        or any(row["ended_at"] is None for row in runs)
-    ):
-        return False
-    review_run = runs[0]
-    if (
-        review_run["profile"] != FACTORY_REVIEW_AUDITOR_PROFILE
-        or review_run["status"] != "done"
-        or review_run["outcome"] != "completed"
-        or review_run["ended_at"] is None
-        or review_run["summary"] != reason
-    ):
-        return False
-    try:
-        metadata = json.loads(review_run["metadata"] or "{}")
-    except (TypeError, ValueError):
-        return False
-    expected_receipt = _canonical_completed_recovery_receipt(recovery_receipt)
-    receipt, receipt_family = _closed_completed_audit_recovery_receipt(
-        metadata, _COMPLETED_RECOVERY_RECEIPT_KEYS,
-    )
-    if expected_receipt is None:
-        expected_receipt = _legacy_terminal_correction_recovery_receipt(
-            metadata, recovery_receipt,
-        )
-        receipt = expected_receipt
-        receipt_family = (
-            "legacy_terminal_correction" if expected_receipt is not None else None
-        )
-    if expected_receipt is None or receipt != expected_receipt:
-        return False
-    payload = {
-        "version": 2,
-        "review_task_id": review_task_id,
-        "review_run_id": expected_review_run_id,
-        "verdict": verdict,
-        "reason": reason,
-        "recovery": True,
-        "recovery_receipt": receipt,
-        "controller": {
-            "task_id": controller_task_id,
-            "run_id": controller_run_id,
-            "profile": controller_profile,
-        },
-    }
-    prior = conn.execute(
-        "SELECT id, run_id, payload FROM task_events WHERE task_id = ? "
-        "AND kind = 'review_verdict' ORDER BY id", (task_id,),
-    ).fetchall()
-    prior_payloads = []
-    for row in prior:
-        try:
-            prior_payload = json.loads(row["payload"] or "{}")
-        except (TypeError, ValueError):
-            return False
-        if not isinstance(prior_payload, dict):
-            return False
-        prior_payloads.append(prior_payload)
-
-    later_source_run_id = None
-    correction_source_run_id = None
-    if receipt_family == "legacy_terminal_correction":
-        correction_source_run_id = (
-            _authenticated_same_auditor_terminal_correction_source_run_id(
-                conn, task_id, review_task_id, expected_review_run_id, prior, runs,
-            )
-        )
-        if correction_source_run_id is None:
-            return False
-        if len(prior) == 3:
-            return (
-                prior[2]["run_id"] == expected_review_run_id
-                and prior_payloads[2] == payload
-                and author["status"] == "ready"
-            )
-        if len(prior) != 2:
-            return False
-    elif prior and prior_payloads[0].get("verdict") == "pass":
-        later_source_run_id = _authenticated_prior_pass_handoff_run_id(
-            conn,
-            task_id,
-            prior[0],
-            later_review_task_id=review_task_id,
-            later_review_run_id=expected_review_run_id,
-        )
-        if later_source_run_id is None or receipt_family != "nested":
-            return False
-        audit_target = metadata.get("audit_target")
-        same_author = metadata.get("same_author_recovery")
-        if (
-            metadata.get("outcome") != "REQUEST_CHANGES_EXACT_HEAD"
-            or not isinstance(audit_target, dict)
-            or set(audit_target) != {
-                "source_author_task", "source_author_run", "source_author_status",
-            }
-            or audit_target != {
-                "source_author_task": task_id,
-                "source_author_run": later_source_run_id,
-                "source_author_status": "review",
-            }
-            or not isinstance(same_author, dict)
-            or set(same_author) != {
-                "resume_existing_task", "resume_existing_run",
-                "replacement_author_allowed", "forced_status_allowed",
-            }
-            or same_author != {
-                "resume_existing_task": task_id,
-                "resume_existing_run": later_source_run_id,
-                "replacement_author_allowed": False,
-                "forced_status_allowed": False,
-            }
-        ):
-            return False
-        if len(prior) == 2:
-            return (
-                prior[1]["run_id"] == expected_review_run_id
-                and prior_payloads[1] == payload
-                and author["status"] == "ready"
-            )
-        if len(prior) != 1:
-            return False
-    else:
-        if receipt_family != "top_level":
-            return False
-        handoff = _review_handoff_event_for_child(conn, task_id, review_task_id)
-        if handoff is None and author["status"] == "ready":
-            handoff_rows = conn.execute(
-                "SELECT id, run_id, payload FROM task_events WHERE task_id = ? "
-                "AND kind = 'review_handoff' ORDER BY id DESC", (task_id,),
-            ).fetchall()
-            if handoff_rows:
-                replay_handoff = _review_handoff_receipt_from_row(task_id, handoff_rows[0])
-                if (
-                    replay_handoff is not None
-                    and replay_handoff.review_task_id == review_task_id
-                ):
-                    handoff = handoff_rows[0]
-        if handoff is None:
-            return False
-        if prior:
-            if len(prior) != 1:
-                return False
-            prior_payload = prior_payloads[0]
-            return (
-                prior[0]["run_id"] == expected_review_run_id
-                and prior_payload == payload
-                and author["status"] == "ready"
-            )
-
-    if prior and later_source_run_id is None and correction_source_run_id is None:
-        return False
-    if author["status"] != "review":
-        return False
-    resumed = conn.execute(
-        "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
-        "claim_expires = NULL, worker_pid = NULL, block_kind = NULL, "
-        "block_recurrences = 0 WHERE id = ? AND status = 'review' "
-        "AND current_run_id IS NULL", (task_id,),
-    )
-    if resumed.rowcount != 1:
-        raise _ReviewHandoffConflict
-    _append_event(
-        conn, task_id, "review_verdict", payload, run_id=expected_review_run_id,
-    )
-    return True
-
-
-def _authenticated_predecessor_crashed_pass_run_id(
-    conn: sqlite3.Connection,
-    *,
-    author_task_id: str,
-    auditor_task_id: str,
-    auditor_profile: str,
-    terminal_run_id: int,
-    terminal_receipt: dict[str, Any],
-) -> Optional[int]:
-    """Authenticate the crashed protocol-violation PASS before a terminal PASS.
-
-    Returns the predecessor run id only when the auditor's latest closed run is
-    a completed terminal run and its *immediate* predecessor is a single crashed
-    protocol-violation run that emitted exactly one version-1 PASS verdict,
-    mirrored byte-identically on author and child, whose prose reason re-states
-    the identical head/tree/base commit identity of the terminal receipt.
-    Older closed audit rounds may precede the immediate predecessor; only
-    ``runs[0]``/``runs[1]`` are consulted, so they never supply authority.
-    """
-    runs = conn.execute(
-        "SELECT id, profile, status, outcome, metadata, ended_at FROM task_runs "
-        "WHERE task_id = ? ORDER BY id DESC", (auditor_task_id,),
-    ).fetchall()
-    if len(runs) < 2:
-        return None
-    terminal, predecessor = runs[0], runs[1]
-    if (
-        int(terminal["id"]) != terminal_run_id
-        or terminal["profile"] != auditor_profile
-        or terminal["status"] != "done"
-        or terminal["outcome"] != "completed"
-        or terminal["ended_at"] is None
-        or predecessor["profile"] != auditor_profile
-        or predecessor["ended_at"] is None
-        or not _run_is_protocol_violation(predecessor)
-    ):
-        return None
-    predecessor_run_id = int(predecessor["id"])
-
-    author_verdicts = conn.execute(
-        "SELECT id, run_id, payload FROM task_events WHERE task_id = ? "
-        "AND kind = 'review_verdict' ORDER BY id", (author_task_id,),
-    ).fetchall()
-    matched = []
-    for row in author_verdicts:
-        payload = _canonical_review_verdict_payload(row)
-        if (
-            payload is not None
-            and payload["review_task_id"] == auditor_task_id
-            and payload["review_run_id"] == predecessor_run_id
-            and payload["verdict"] == "pass"
-            and row["run_id"] == predecessor_run_id
-        ):
-            matched.append(payload)
-    if len(matched) != 1:
-        return None
-    child_verdicts = conn.execute(
-        "SELECT run_id, payload FROM task_events WHERE task_id = ? "
-        "AND kind = 'review_verdict' AND run_id = ? ORDER BY id",
-        (auditor_task_id, predecessor_run_id),
-    ).fetchall()
-    if len(child_verdicts) != 1:
-        return None
-    child_payload = _canonical_review_verdict_payload(child_verdicts[0])
-    if child_payload is None or child_payload != matched[0]:
-        return None
-    if not _reason_bears_commit_identity(matched[0]["reason"], terminal_receipt):
-        return None
-    return predecessor_run_id
-
-
-def _recover_completed_pass_verdict(
-    conn: sqlite3.Connection,
-    task_id: str,
-    *,
-    review_task_id: str,
-    expected_review_run_id: int,
-    verdict: str,
-    reason: str,
-    recovery_receipt: dict,
-    controller_task_id: Optional[str],
-    controller_run_id: Optional[int],
-    controller_profile: Optional[str],
-) -> bool:
-    """Recover one authenticated PASS from a terminal audit run.
-
-    Only a live gm/gm2 controller may bind an omitted PASS to the exact latest
-    terminal direct-auditor run after a predecessor same-child run emitted the
-    identical PASS and then crashed from a proven protocol-violation retry.
-    PASS leaves the author nonterminal (status ``review``), so the author is
-    never resumed here.
-    """
-    if (
-        verdict != "pass"
-        or not isinstance(recovery_receipt, dict)
-        or not controller_task_id
-        or controller_run_id is None
-        or controller_profile
-        not in FACTORY_REVIEW_VERDICT_RECOVERY_CONTROLLER_PROFILES
-    ):
-        return False
-    try:
-        controller_run_id = int(controller_run_id)
-    except (TypeError, ValueError):
-        return False
-    if conn.execute(
-        "SELECT 1 FROM tasks task JOIN task_runs run "
-        "ON run.id = ? AND run.task_id = task.id "
-        "WHERE task.id = ? AND task.assignee = ? AND task.status = 'running' "
-        "AND task.current_run_id = run.id AND run.profile = ? "
-        "AND run.status = 'running' AND run.outcome IS NULL AND run.ended_at IS NULL",
-        (controller_run_id, controller_task_id, controller_profile, controller_profile),
-    ).fetchone() is None:
-        return False
-
-    author = conn.execute(
-        "SELECT status, assignee, current_run_id FROM tasks WHERE id = ?", (task_id,)
-    ).fetchone()
-    child = conn.execute(
-        "SELECT status, assignee, current_run_id FROM tasks WHERE id = ?",
-        (review_task_id,),
-    ).fetchone()
-    if (
-        author is None
-        or author["assignee"] != FACTORY_REVIEW_AUTHOR_PROFILE
-        or author["current_run_id"] is not None
-        or author["status"] != "review"
-        or child is None
-        or child["assignee"] != FACTORY_REVIEW_AUDITOR_PROFILE
-        or child["status"] not in {"done", "archived"}
-        or child["current_run_id"] is not None
-        or conn.execute(
-            "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ?",
-            (task_id, review_task_id),
-        ).fetchone() is None
-    ):
-        return False
-
-    runs = conn.execute(
-        "SELECT id, profile, status, outcome, summary, metadata, ended_at "
-        "FROM task_runs WHERE task_id = ? ORDER BY id DESC", (review_task_id,),
-    ).fetchall()
-    if (
-        not runs
-        or int(runs[0]["id"]) != expected_review_run_id
-        or any(row["ended_at"] is None for row in runs)
-    ):
-        return False
-    review_run = runs[0]
-    if (
-        review_run["profile"] != FACTORY_REVIEW_AUDITOR_PROFILE
-        or review_run["status"] != "done"
-        or review_run["outcome"] != "completed"
-        or review_run["ended_at"] is None
-        or review_run["summary"] != reason
-    ):
-        return False
-    try:
-        metadata = json.loads(review_run["metadata"] or "{}")
-    except (TypeError, ValueError):
-        return False
-    expected_receipt = _canonical_completed_pass_recovery_receipt(recovery_receipt)
-    receipt = _normalize_completed_pass_recovery_receipt(metadata)
-    if (
-        expected_receipt is None
-        or receipt is None
-        or receipt != expected_receipt
-    ):
-        return False
-
-    predecessor_run_id = _authenticated_predecessor_crashed_pass_run_id(
-        conn,
-        author_task_id=task_id,
-        auditor_task_id=review_task_id,
-        auditor_profile=FACTORY_REVIEW_AUDITOR_PROFILE,
-        terminal_run_id=expected_review_run_id,
-        terminal_receipt=receipt,
-    )
-    if predecessor_run_id is None:
-        return False
-
-    payload = {
-        "version": 2,
-        "review_task_id": review_task_id,
-        "review_run_id": expected_review_run_id,
-        "verdict": verdict,
-        "reason": reason,
-        "recovery": True,
-        "recovery_receipt": receipt,
-        "controller": {
-            "task_id": controller_task_id,
-            "run_id": controller_run_id,
-            "profile": controller_profile,
-        },
-    }
-    prior = conn.execute(
-        "SELECT id, run_id, payload FROM task_events WHERE task_id = ? "
-        "AND kind = 'review_verdict' ORDER BY id", (task_id,),
-    ).fetchall()
-    replay_seen = False
-    for row in prior:
-        try:
-            prior_payload = json.loads(row["payload"] or "{}")
-        except (TypeError, ValueError):
-            return False
-        if not isinstance(prior_payload, dict):
-            return False
-        if prior_payload.get("review_task_id") != review_task_id:
-            continue
-        if prior_payload == payload and row["run_id"] == expected_review_run_id:
-            replay_seen = True
-            continue
-        # Any other verdict for this auditor child is a conflict unless it is
-        # the authenticated crashed predecessor PASS, or a superseded
-        # request_changes verdict from an earlier (pre-predecessor) round.  A
-        # stale/non-immediate PASS bound to an older run, or any verdict bound
-        # to the terminal run or beyond, stays a conflict.
-        canonical = _canonical_review_verdict_payload(row)
-        is_predecessor_pass = (
-            canonical is not None
-            and row["run_id"] == predecessor_run_id
-            and prior_payload["verdict"] == "pass"
-        )
-        is_superseded_request_changes = (
-            canonical is not None
-            and row["run_id"] is not None
-            and row["run_id"] < predecessor_run_id
-            and prior_payload["verdict"] == "request_changes"
-        )
-        if not (is_predecessor_pass or is_superseded_request_changes):
-            return False
-    if replay_seen:
-        return True
-
-    _append_event(
-        conn, task_id, "review_verdict", payload, run_id=expected_review_run_id,
-    )
-    _append_event(
-        conn, review_task_id, "review_verdict", payload,
-        run_id=expected_review_run_id,
-    )
-    return True
-
-
 def record_review_verdict(
     conn: sqlite3.Connection,
     task_id: str,
@@ -10205,10 +9710,7 @@ def record_review_verdict(
     expected_review_run_id: int,
     verdict: str,
     reason: str,
-    recovery_receipt: Optional[dict] = None,
-    controller_task_id: Optional[str] = None,
-    controller_run_id: Optional[int] = None,
-    controller_profile: Optional[str] = None,
+    evidence: Optional[dict] = None,
 ) -> bool:
     """Public fail-closed wrapper for the bound review-verdict transaction."""
     try:
@@ -10219,10 +9721,7 @@ def record_review_verdict(
             expected_review_run_id=expected_review_run_id,
             verdict=verdict,
             reason=reason,
-            recovery_receipt=recovery_receipt,
-            controller_task_id=controller_task_id,
-            controller_run_id=controller_run_id,
-            controller_profile=controller_profile,
+            evidence=evidence,
         )
     except _ReviewHandoffConflict:
         return False
@@ -11715,2145 +11214,16 @@ def _authenticated_factory_run_metadata(
     return int(run["id"]), str(task["assignee"]), metadata
 
 
-def _one_direct_child(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
-    rows = conn.execute(
-        "SELECT child_id FROM task_links WHERE parent_id = ? ORDER BY child_id",
-        (task_id,),
-    ).fetchall()
-    return str(rows[0]["child_id"]) if len(rows) == 1 else None
-
-
-def _all_other_parents_terminal(
-    conn: sqlite3.Connection, child_id: str, direct_parent_id: str,
-) -> bool:
-    rows = conn.execute(
-        "SELECT parent.status FROM task_links link "
-        "JOIN tasks parent ON parent.id = link.parent_id "
-        "WHERE link.child_id = ? AND link.parent_id != ?",
-        (child_id, direct_parent_id),
-    ).fetchall()
-    return all(row["status"] in ("done", "archived") for row in rows)
-
-
-def _git_output(repo: Path, *args: str) -> Optional[str]:
-    """Return one authoritative Git answer, or ``None`` on any ambiguity."""
-    try:
-        proc = subprocess.run(
-            ["git", "-C", str(repo), *args],
-            capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=30,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    return proc.stdout.strip() if proc.returncode == 0 else None
-
-
-def _historical_source_preserved_in_installed_git(
-    *, install: dict, source_head: Optional[str], source_tree: Optional[str],
-    source_base: Optional[str], source_merge: Optional[str], source_paths: list[str],
-) -> bool:
-    """Prove a historical reviewed diff survives into the clean executing descendant."""
-    repo = Path(__file__).resolve().parents[1]
-    current_head = _git_output(repo, "rev-parse", "HEAD")
-    installed_head = install.get("head")
-    installed_tree = install.get("tree")
-    object_ids = (
-        current_head, installed_head, installed_tree, source_head, source_tree,
-        source_base, source_merge,
-    )
-    if any(
-        not isinstance(value, str) or re.fullmatch(r"[0-9a-fA-F]{40}", value) is None
-        for value in object_ids
-    ):
-        return False
-    assert isinstance(current_head, str)
-    assert isinstance(installed_head, str)
-    assert isinstance(installed_tree, str)
-    assert isinstance(source_head, str)
-    assert isinstance(source_tree, str)
-    assert isinstance(source_base, str)
-    assert isinstance(source_merge, str)
-    if _git_output(repo, "status", "--porcelain", "--untracked-files=no") != "":
-        return False
-    if any(
-        _git_output(repo, "cat-file", "-e", f"{commit}^{{commit}}") is None
-        for commit in (current_head, installed_head, source_head, source_base, source_merge)
-    ) or any(
-        _git_output(repo, "cat-file", "-e", f"{tree}^{{tree}}") is None
-        for tree in (installed_tree, source_tree)
-    ):
-        return False
-    if (
-        _git_output(repo, "rev-parse", f"{installed_head}^{{tree}}") != installed_tree
-        or _git_output(repo, "rev-parse", f"{source_head}^{{tree}}") != source_tree
-        or _git_output(repo, "rev-parse", f"{source_merge}^{{tree}}") != source_tree
-    ):
-        return False
-    parents = (_git_output(repo, "rev-list", "--parents", "-n", "1", source_merge) or "").split()
-    if parents != [source_merge, source_base, source_head]:
-        return False
-    if (
-        _git_output(repo, "merge-base", "--is-ancestor", source_merge, installed_head) is None
-        or _git_output(repo, "merge-base", "--is-ancestor", installed_head, current_head) is None
-    ):
-        return False
-    actual_paths = (_git_output(
-        repo, "diff", "--name-only", "--no-renames", source_base, source_head,
-    ) or "").splitlines()
-    if sorted(actual_paths) != sorted(source_paths):
-        return False
-    for path in source_paths:
-        source_blob = _git_output(repo, "rev-parse", f"{source_merge}:{path}")
-        installed_blob = _git_output(repo, "rev-parse", f"{installed_head}:{path}")
-        current_blob = _git_output(repo, "rev-parse", f"{current_head}:{path}")
-        if source_blob is None or installed_blob != source_blob or current_blob != source_blob:
-            return False
-    return True
-
-
-def _authenticated_non_pr_review_evidence(
-    review_md: dict,
-    *,
-    task_id: str,
-    author_run_id: int,
-    handoff_reason: str,
-) -> bool:
-    """Historical evidence family retained cold outside terminal authority."""
-    del review_md, task_id, author_run_id, handoff_reason
-    return False
-
-
-def _canonical_factory_review_packet(review_md: dict) -> Optional[dict]:
-    """Historical packet adapter retained cold outside terminal authority."""
-    del review_md
-    return None
-
-
-def _authenticated_canonical_factory_packet_chain(
-    conn: sqlite3.Connection,
-    *,
-    task_id: str,
-    author_run_id: int,
-    reviewer_id: str,
-    reviewer_run_id: int,
-    reviewer_profile: str,
-    review_md: dict,
-    handoff_reason: str,
-    _request_changes_terminal_task_id: Optional[str] = None,
-) -> bool:
-    """Validate the closed audit -> merge -> install -> activation -> audit packets.
-
-    These are the canonical completion packets emitted by the role-separated
-    factory lane.  Every task/run is already receipt-authenticated by the
-    caller; this adapter only accepts their exact structural families and
-    cross-binds immutable identities across direct Native edges.  A repair
-    phase may name its exact authenticated REQUEST_CHANGES terminal so this
-    validator can authenticate the complete original prefix without treating
-    the failed terminal as a PASS packet.
-    """
-    if not task_id or isinstance(author_run_id, bool) or author_run_id <= 0:
-        return False
-    review_keys = {
-        "approval_commit_id", "approved", "base", "github_review_id",
-        "github_review_url", "head", "head_tree", "review_outcome",
-        "tests_failed", "tests_passed", "verification", "worker_session_id",
-    }
-    if set(review_md) != review_keys:
-        return False
-    head, tree, base = review_md.get("head"), review_md.get("head_tree"), review_md.get("base")
-    review_id = review_md.get("github_review_id")
-    review_url = review_md.get("github_review_url")
-    tests_failed = review_md.get("tests_failed")
-    tests_passed = review_md.get("tests_passed")
-    review_match = re.fullmatch(
-        rf"https://github[.]com/{re.escape(FACTORY_REVIEW_REPOSITORY)}/pull/"
-        r"([1-9][0-9]*)#pullrequestreview-([1-9][0-9]*)",
-        review_url if isinstance(review_url, str) else "",
-    )
-    if (
-        reviewer_profile != FACTORY_REVIEW_AUDITOR_PROFILE
-        or review_md.get("approval_commit_id") != head
-        or review_md.get("approved") is not True
-        or review_md.get("review_outcome") != "PASS_EXACT_HEAD"
-        or any(
-            not isinstance(value, str) or re.fullmatch(r"[0-9a-fA-F]{40}", value) is None
-            for value in (head, tree, base)
-        )
-        or isinstance(review_id, bool) or not isinstance(review_id, int) or review_id <= 0
-        or review_match is None or int(review_match.group(2)) != review_id
-        or type(tests_failed) is not int
-        or tests_failed != 0
-        or type(tests_passed) is not int
-        or not isinstance(tests_passed, int)
-        or tests_passed <= 0
-        or not isinstance(review_md.get("verification"), list)
-        or not review_md["verification"]
-        or any(not isinstance(item, str) or not item.strip() for item in review_md["verification"])
-        or len(set(review_md["verification"])) != len(review_md["verification"])
-    ):
-        return False
-    source_pr = int(review_match.group(1))
-    handoff_prs = re.findall(r"\bPR\s+#([1-9][0-9]*)\b", handoff_reason, re.IGNORECASE)
-    if len(handoff_prs) > 1 or (handoff_prs and int(handoff_prs[0]) != source_pr):
-        return False
-
-
-    def exact_children(
-        parent_id: str,
-        keys: set[str] | tuple[set[str], ...],
-        profiles: set[str],
-    ):
-        key_families = (keys,) if isinstance(keys, set) else keys
-        candidates = []
-        for row in conn.execute(
-            "SELECT child_id FROM task_links WHERE parent_id = ? ORDER BY child_id",
-            (parent_id,),
-        ).fetchall():
-            child_id = str(row["child_id"])
-            candidate = _authenticated_factory_run_metadata(conn, child_id)
-            if candidate is None:
-                continue
-            run_id, profile, metadata = candidate
-            if profile in profiles and any(set(metadata) == family for family in key_families):
-                candidates.append((child_id, run_id, profile, metadata))
-        return candidates
-
-    def exact_int(value, expected: int | None = None, *, positive: bool = False) -> bool:
-        return (
-            type(value) is int
-            and (expected is None or value == expected)
-            and (not positive or value > 0)
-        )
-
-    def nonnegative_int(value) -> bool:
-        return type(value) is int and value >= 0
-
-    def exact_hash(value, width: int) -> bool:
-        return (
-            isinstance(value, str)
-            and re.fullmatch(rf"[0-9a-fA-F]{{{width}}}", value) is not None
-        )
-
-    def nonempty_string(value) -> bool:
-        return isinstance(value, str) and bool(value.strip())
-
-    def nonempty_string_list(value) -> bool:
-        return (
-            isinstance(value, list)
-            and bool(value)
-            and all(nonempty_string(item) for item in value)
-            and len(set(value)) == len(value)
-        )
-
-    merger_keys = {
-        "actor", "audited_head", "audited_tree", "audit", "base",
-        "canonical_checkout", "checks", "changed_files", "child_task_id",
-        "forbidden_actions_performed", "formal_receipts", "issues_kept_open",
-        "merge_commit", "merge_parents", "merge_tree", "mutation_ledger",
-        "new_control_plane_count", "pr", "remote_main", "role_separation",
-        "secret_exposure", "worker_session_id",
-    }
-    installed_source_merger_keys = {
-        "actor", "audit", "base", "canonical_checkout", "checks", "child",
-        "evidence_comments", "forbidden_actions_performed", "head", "head_tree",
-        "merge", "merged_blobs", "new_control_plane_count", "not_true_done_for",
-        "pr", "pr_state", "protected_issues", "secret_exposure", "worker_session_id",
-    }
-    actual_role_separated_merger_keys = {
-        "actor", "audit", "base", "canonical_checkout", "changed_paths", "checks",
-        "child", "forbidden_actions_performed", "head", "merge",
-        "new_control_plane_count", "new_runtime_module_count", "outcome",
-        "public_receipts", "secret_exposure", "tree", "worker_session_id",
-    }
-    request_changes_merger_keys = {
-        "artifacts", "audited_head", "audited_tree", "base", "canonical_checkout",
-        "changed_paths", "checks", "created_child", "exact_audit",
-        "forbidden_actions_performed", "github_receipts", "issue_833_state", "merge",
-        "new_control_plane_count", "new_runtime_module_count", "outcome", "pr",
-        "remote_main", "secret_exposure", "worker_session_id",
-    }
-    mergers = exact_children(
-        reviewer_id,
-        (
-            merger_keys, installed_source_merger_keys,
-            actual_role_separated_merger_keys, request_changes_merger_keys,
-        ),
-        {"gm"},
-    )
-    if len(mergers) != 1:
-        return False
-
-    merger_id, merger_run_id, merger_profile, merge_md = mergers[0]
-    if merger_id == task_id or not _all_other_parents_terminal(conn, merger_id, reviewer_id):
-        return False
-    audit = merge_md.get("audit")
-    checkout = merge_md.get("canonical_checkout")
-    has_installed_source_merger = set(merge_md) == installed_source_merger_keys
-    has_actual_role_separated_merger = set(merge_md) == actual_role_separated_merger_keys
-    has_request_changes_merger = set(merge_md) == request_changes_merger_keys
-    if has_actual_role_separated_merger:
-        actor = merge_md.get("actor")
-        child = merge_md.get("child")
-        checks = merge_md.get("checks")
-        merge = merge_md.get("merge")
-        paths = merge_md.get("changed_paths")
-        merge_sha = merge.get("commit") if isinstance(merge, dict) else None
-        if (
-            actor != {
-                "distinct_from": [FACTORY_REVIEW_AUTHOR_ACTOR, FACTORY_REVIEW_AUDITOR_ACTOR],
-                "github": FACTORY_REVIEW_MERGER_ACTOR,
-                "role": "AION-GM",
-            }
-            or audit != {
-                "review_commit_id": head, "review_id": review_id,
-                "review_state": "APPROVED", "review_url": review_url,
-                "run_id": reviewer_run_id, "task_id": reviewer_id,
-            }
-            or checkout != {
-                "branch": "main", "clean": True, "head": base,
-                "installed_in_this_task": False,
-            }
-            or checkout.get("clean") is not True
-            or checkout.get("installed_in_this_task") is not False
-            or not isinstance(paths, list) or not paths
-            or any(not nonempty_string(path) for path in paths)
-            or len(set(paths)) != len(paths)
-            or not isinstance(checks, dict)
-            or set(checks) != {
-                "bad", "ci_run", "ci_status", "neutral", "pending", "skipped",
-                "success",
-            }
-            or not exact_int(checks.get("bad"), 0)
-            or not exact_int(checks.get("pending"), 0)
-            or not exact_int(checks.get("ci_run"), positive=True)
-            or checks.get("ci_status") != "completed/success"
-            or any(
-                not nonnegative_int(checks.get(key))
-                for key in ("neutral", "skipped", "success")
-            )
-            or checks.get("success", 0) <= 0
-            or not isinstance(child, dict)
-            or set(child) != {"assignee", "id", "purpose", "status"}
-            or child.get("assignee") != FACTORY_REVIEW_MERGER_PROFILE
-            or child.get("id") in {None, task_id, merger_id}
-            or not nonempty_string(child.get("purpose"))
-            or child.get("status") != "todo"
-            or merge_md.get("head") != head or merge_md.get("tree") != tree
-            or merge_md.get("base") != base
-            or not isinstance(merge, dict)
-            or set(merge) != {"cas_sha_guard", "commit", "parents", "remote_main", "tree"}
-            or merge.get("cas_sha_guard") != head
-            or merge.get("parents") != [base, head]
-            or merge.get("remote_main") != merge_sha or merge.get("tree") != tree
-            or not exact_hash(merge_sha, 40)
-            or merge_md.get("outcome")
-            != "ROLE_SEPARATED_CAS_MERGE_AND_MAIN_READBACK_COMPLETE"
-            or not nonempty_string_list(merge_md.get("public_receipts"))
-            or merge_md.get("forbidden_actions_performed") != []
-            or not exact_int(merge_md.get("new_control_plane_count"), 0)
-            or not exact_int(merge_md.get("new_runtime_module_count"), 0)
-            or merge_md.get("secret_exposure") != "none"
-            or not nonempty_string(merge_md.get("worker_session_id"))
-        ):
-            return False
-    elif has_request_changes_merger:
-        checks = merge_md.get("checks")
-        child = merge_md.get("created_child")
-        exact_audit = merge_md.get("exact_audit")
-        github_receipts = merge_md.get("github_receipts")
-        merge = merge_md.get("merge")
-        paths = merge_md.get("changed_paths")
-        merge_sha = merge.get("commit") if isinstance(merge, dict) else None
-        if (
-            merge_md.get("audited_head") != head
-            or merge_md.get("audited_tree") != tree
-            or merge_md.get("base") != base
-            or not exact_int(merge_md.get("pr"), source_pr)
-            or checkout != {"clean": True, "head": base, "install_performed": False}
-            or not isinstance(paths, list) or not paths
-            or any(not nonempty_string(path) for path in paths)
-            or len(set(paths)) != len(paths)
-            or not isinstance(checks, dict)
-            or set(checks) != {"all_required_pass", "failing", "pending", "total"}
-            or checks.get("all_required_pass") is not True
-            or not exact_int(checks.get("failing"), 0)
-            or not exact_int(checks.get("pending"), 0)
-            or not exact_int(checks.get("total"), positive=True)
-            or not isinstance(child, dict)
-            or set(child) != {"assignee", "id", "scope"}
-            or child.get("assignee") != FACTORY_REVIEW_MERGER_PROFILE
-            or child.get("id") in {None, task_id, merger_id}
-            or not nonempty_string(child.get("scope"))
-            or exact_audit != {
-                "review_id": review_id, "run": reviewer_run_id,
-                "state": "APPROVED", "task": reviewer_id,
-            }
-            or not exact_int(exact_audit.get("review_id"), review_id)
-            or not exact_int(exact_audit.get("run"), reviewer_run_id)
-            or not isinstance(github_receipts, dict)
-            or set(github_receipts) != {"issue_833", "pr"}
-            or re.fullmatch(
-                r"https://github[.]com/kiddhu/aion-governance/issues/833"
-                r"#issuecomment-[1-9][0-9]*",
-                github_receipts.get("issue_833", ""),
-            ) is None
-            or re.fullmatch(
-                rf"https://github[.]com/{re.escape(FACTORY_REVIEW_REPOSITORY)}"
-                rf"/pull/{source_pr}#issuecomment-[1-9][0-9]*",
-                github_receipts.get("pr", ""),
-            ) is None
-            or merge_md.get("issue_833_state") != "OPEN"
-            or not isinstance(merge, dict)
-            or set(merge) != {
-                "actor", "attempts", "commit", "method", "parents", "sha_guarded",
-                "tree",
-            }
-            or merge.get("actor") != FACTORY_REVIEW_MERGER_ACTOR
-            or not exact_int(merge.get("attempts"), 1)
-            or merge.get("method") != "merge"
-            or merge.get("parents") != [base, head]
-            or merge.get("sha_guarded") is not True
-            or merge.get("tree") != tree
-            or not exact_hash(merge_sha, 40)
-            or merge_md.get("remote_main") != merge_sha
-            or merge_md.get("outcome")
-            != "ROLE_SEPARATED_CAS_MERGE_AND_MAIN_READBACK_COMPLETE"
-            or not nonempty_string_list(merge_md.get("artifacts"))
-            or merge_md.get("forbidden_actions_performed") != []
-            or not exact_int(merge_md.get("new_control_plane_count"), 0)
-            or not exact_int(merge_md.get("new_runtime_module_count"), 0)
-            or merge_md.get("secret_exposure") != "none"
-            or not nonempty_string(merge_md.get("worker_session_id"))
-        ):
-            return False
-    elif has_installed_source_merger:
-        actor = merge_md.get("actor")
-        child = merge_md.get("child")
-        merge = merge_md.get("merge")
-        merged_blobs = merge_md.get("merged_blobs")
-        protected_issues = merge_md.get("protected_issues")
-        paths = list(merged_blobs) if isinstance(merged_blobs, dict) else None
-        merge_sha = merge.get("commit") if isinstance(merge, dict) else None
-        if (
-            actor != {
-                "github": FACTORY_REVIEW_MERGER_ACTOR,
-                "profile": "gm",
-                "role_separated_from": [
-                    f"{FACTORY_REVIEW_AUTHOR_PROFILE}/{FACTORY_REVIEW_AUTHOR_ACTOR}",
-                    f"{FACTORY_REVIEW_AUDITOR_PROFILE}/{FACTORY_REVIEW_AUDITOR_ACTOR}",
-                ],
-            }
-            or audit != {
-                "approval_commit_id": head, "github_review_id": review_id,
-                "native_run_id": reviewer_run_id, "native_task_id": reviewer_id,
-                "review_actor": FACTORY_REVIEW_AUDITOR_ACTOR,
-                "review_state": "APPROVED", "verdict": "PASS_EXACT_HEAD",
-            }
-            or not exact_int(audit.get("github_review_id"), review_id)
-            or not exact_int(audit.get("native_run_id"), reviewer_run_id)
-            or checkout != {"dirty": False, "head": base, "installed_in_task": False}
-            or not isinstance(merge_md.get("checks"), str)
-            or not merge_md["checks"].strip()
-            or not isinstance(child, dict)
-            or set(child) != {"assignee", "id", "purpose", "status_at_creation"}
-            or child.get("assignee") != FACTORY_REVIEW_MERGER_PROFILE
-            or child.get("id") in {None, task_id, merger_id}
-            or child.get("status_at_creation") != "todo"
-            or not isinstance(child.get("purpose"), str) or not child["purpose"].strip()
-            or merge_md.get("head") != head or merge_md.get("head_tree") != tree
-            or merge_md.get("base") != base
-            or not exact_int(merge_md.get("pr"), source_pr)
-            or merge_md.get("pr_state") != "MERGED"
-            or not isinstance(merge, dict)
-            or set(merge) != {"cas_calls", "commit", "method", "parents", "remote_main", "tree"}
-            or not exact_int(merge.get("cas_calls"), 1)
-            or merge.get("method") != "merge"
-            or merge.get("parents") != [base, head]
-            or merge.get("remote_main") != merge_sha or merge.get("tree") != tree
-            or not isinstance(merge_sha, str)
-            or re.fullmatch(r"[0-9a-fA-F]{40}", merge_sha) is None
-            or not isinstance(merged_blobs, dict) or not merged_blobs
-            or any(
-                not isinstance(path, str) or not path
-                or not isinstance(blob, str)
-                or re.fullmatch(r"[0-9a-fA-F]{40}", blob) is None
-                for path, blob in merged_blobs.items()
-            )
-            or not isinstance(protected_issues, dict) or not protected_issues
-            or any(not isinstance(key, str) or not key for key in protected_issues)
-            or any(value != "open" for value in protected_issues.values())
-            or merge_md.get("forbidden_actions_performed") != []
-            or type(merge_md.get("new_control_plane_count")) is not int
-            or merge_md.get("new_control_plane_count") != 0
-            or merge_md.get("secret_exposure") != "none"
-        ):
-            return False
-    else:
-        checks = merge_md.get("checks")
-        roles = merge_md.get("role_separation")
-        ledger = merge_md.get("mutation_ledger")
-        paths = merge_md.get("changed_files")
-        merge_sha = merge_md.get("merge_commit")
-        if (
-            merge_md.get("actor") != FACTORY_REVIEW_MERGER_ACTOR
-            or merge_md.get("audited_head") != head or merge_md.get("audited_tree") != tree
-            or merge_md.get("base") != base or merge_md.get("pr") != source_pr
-            or not isinstance(audit, dict)
-            or audit != {
-                "github_review_id": review_id, "github_review_state": "APPROVED",
-                "native_run_id": reviewer_run_id, "native_task_id": reviewer_id,
-                "verdict": "PASS_EXACT_HEAD",
-            }
-            or not isinstance(checkout, dict) or checkout.get("clean") is not True
-            or checkout.get("installed") is not False or checkout.get("preserved_head") != base
-            or not isinstance(checks, dict)
-            or any(type(checks.get(key)) is not int for key in ("bad_or_pending", "neutral", "skipped", "success", "total"))
-            or not exact_int(checks.get("bad_or_pending"), 0)
-            or not exact_int(checks.get("total"), positive=True)
-            or checks.get("neutral", 0) + checks.get("skipped", 0) + checks.get("success", 0) != checks.get("total")
-            or not isinstance(paths, list) or not paths
-            or any(not isinstance(path, str) or not path for path in paths)
-            or len(set(paths)) != len(paths)
-            or not isinstance(merge_sha, str) or re.fullmatch(r"[0-9a-fA-F]{40}", merge_sha) is None
-            or merge_md.get("merge_parents") != [base, head]
-            or merge_md.get("merge_tree") != tree or merge_md.get("remote_main") != merge_sha
-            or not isinstance(roles, dict)
-            or roles != {
-                "author": f"{FACTORY_REVIEW_AUTHOR_PROFILE}/{FACTORY_REVIEW_AUTHOR_ACTOR}",
-                "auditor": f"{FACTORY_REVIEW_AUDITOR_PROFILE}/{FACTORY_REVIEW_AUDITOR_ACTOR}",
-                "merger": f"gm/{FACTORY_REVIEW_MERGER_ACTOR}",
-            }
-            or len(set(roles.values())) != 3
-            or not isinstance(ledger, dict)
-            or not exact_int(ledger.get("github_cas_merge"), 1)
-            or not exact_int(ledger.get("native_child_creations"), 1)
-            or merge_md.get("forbidden_actions_performed") != []
-            or type(merge_md.get("new_control_plane_count")) is not int
-            or merge_md.get("new_control_plane_count") != 0
-            or merge_md.get("secret_exposure") != "none"
-        ):
-            return False
-
-
-    install_keys = {
-        "artifacts", "author_finalizer_performed", "author_status_before_and_after",
-        "canonical_run_id", "forbidden_actions_performed", "fresh_runtime",
-        "github_review_id", "install", "native_binding", "new_control_plane_count",
-        "not_true_done_for", "public_receipts", "receipt_sha256",
-        "review_obligations", "secret_exposure", "source_changed_paths",
-        "source_head", "source_merge", "source_pr", "source_tree", "tests",
-        "typed_witness", "witness_type", "worker_session_id",
-    }
-    installed_source_install_keys = {
-        "activation_performed", "audited_head", "author_finalizer_performed", "base",
-        "blobs", "canonical_run_id", "forbidden_actions_performed", "fresh_runtime",
-        "install", "merge", "new_control_plane_count", "not_true_done_for", "pr",
-        "public_receipts", "receipt_sha256", "resident_activated", "resident_runtime",
-        "secret_exposure", "source_installed", "tests", "tree", "typed_symbol",
-        "witness_type", "worker_session_id",
-    }
-    actual_installed_source_keys = {
-        "activation_performed", "artifacts", "audited_head",
-        "author_finalizer_performed", "base", "blobs", "canonical_run_id",
-        "changed_files", "forbidden_actions_performed", "fresh_runtime", "install",
-        "install_epoch", "merge", "new_control_plane_count", "new_runtime_module_count",
-        "not_true_done_for", "pr", "public_receipts", "receipt_actor",
-        "receipt_actor_id", "receipt_sha256", "resident_activated", "resident_runtime",
-        "secret_exposure", "source_installed", "tests", "tree", "typed_symbols",
-        "witness_type", "worker_session_id",
-    }
-    installs = exact_children(
-        merger_id, (install_keys, installed_source_install_keys, actual_installed_source_keys),
-        {FACTORY_REVIEW_MERGER_PROFILE},
-    )
-    if len(installs) != 1:
-        return False
-
-    install_id, install_run_id, install_profile, install_md = installs[0]
-    if (
-        install_id in {task_id, merger_id}
-        or (
-            merge_md.get("child_task_id") != install_id
-            if not (
-                has_installed_source_merger or has_actual_role_separated_merger
-                or has_request_changes_merger
-            )
-            else (
-                merge_md.get("created_child", {}).get("id") != install_id
-                if has_request_changes_merger
-                else merge_md.get("child", {}).get("id") != install_id
-            )
-        )
-        or not _all_other_parents_terminal(conn, install_id, merger_id)
-    ):
-        return False
-    install = install_md.get("install")
-    fresh_runtime = install_md.get("fresh_runtime")
-    blobs = install_md.get("blobs")
-    installed_module_blob = blobs.get("hermes_cli/kanban_db.py") if isinstance(blobs, dict) else None
-    has_installed_source_install = set(install_md) == installed_source_install_keys
-    has_actual_installed_source = set(install_md) == actual_installed_source_keys
-    if (
-        has_installed_source_install
-        != (has_installed_source_merger or has_request_changes_merger)
-        or has_actual_installed_source != has_actual_role_separated_merger
-    ):
-        # The schemas are closed end-to-end: never combine an installed-source
-        # authority packet with a legacy install/runtime tail, or vice versa.
-        return False
-    closed_installed_source = has_installed_source_install or has_actual_installed_source
-    if has_actual_installed_source:
-        receipt_sha = install_md.get("receipt_sha256")
-        typed_symbols = install_md.get("typed_symbols")
-        install_paths = install.get("changed_paths") if isinstance(install, dict) else None
-        tests = install_md.get("tests")
-        if (
-            not has_actual_role_separated_merger
-            or not exact_int(install_md.get("canonical_run_id"), install_run_id)
-            or install_md.get("activation_performed") is not False
-            or install_md.get("author_finalizer_performed") is not False
-            or install_md.get("resident_activated") is not False
-            or install_md.get("source_installed") is not True
-            or install_md.get("audited_head") != head
-            or install_md.get("base") != base or install_md.get("tree") != tree
-            or install_md.get("merge") != merge_sha
-            or not exact_int(install_md.get("pr"), source_pr)
-            or install_md.get("changed_files") != paths
-            or not isinstance(blobs, dict) or set(blobs) != set(paths or [])
-            or any(not exact_hash(blob, 40) for blob in blobs.values())
-            or not isinstance(install, dict)
-            or set(install) != {
-                "changed_paths", "head", "method", "parents", "preinstall_commit",
-                "rollback_commit", "rollback_ref", "tree", "worktree_clean",
-            }
-            or install.get("head") != merge_sha or install.get("tree") != tree
-            or install.get("parents") != [base, head] or install_paths != paths
-            or install.get("preinstall_commit") != base
-            or install.get("rollback_commit") != base
-            or not nonempty_string(install.get("rollback_ref"))
-            or install.get("worktree_clean") is not True
-            or install.get("method") != "existing_clean_git_editable_guarded_fast_forward"
-            or not isinstance(fresh_runtime, dict)
-            or set(fresh_runtime) != {
-                "bytes_match", "module_path", "module_sha256", "resolver_loaded",
-                "resolves_to_authoritative_root",
-            }
-            or fresh_runtime.get("bytes_match") is not True
-            or fresh_runtime.get("resolver_loaded") is not True
-            or fresh_runtime.get("resolves_to_authoritative_root") is not True
-            or not exact_hash(fresh_runtime.get("module_sha256"), 64)
-            or not nonempty_string(fresh_runtime.get("module_path"))
-            or not fresh_runtime["module_path"].endswith("/hermes_cli/kanban_db.py")
-            or installed_module_blob is None
-            or typed_symbols != {
-                "_authenticated_canonical_factory_packet_chain_present_callable": True,
-                "_canonical_factory_review_packet_present_callable": True,
-                "_reviewed_author_finalizer_run_id_wraps_canonical_packet": True,
-                "monotonic_fix_active_enter_lt_exec_start": True,
-            }
-            or any(value is not True for value in typed_symbols.values())
-            or install_md.get("witness_type")
-            != f"EXACT_PR{source_pr}_INSTALLED_AND_TYPED_SOURCE_INSTALLED_RESIDENT_NOT_ACTIVATED_WITNESS"
-            or not exact_hash(receipt_sha, 64)
-            or not nonempty_string_list(install_md.get("artifacts"))
-            or not nonempty_string_list(install_md.get("public_receipts"))
-            or install_md.get("receipt_actor") != FACTORY_REVIEW_MERGER_ACTOR
-            or not exact_int(install_md.get("receipt_actor_id"), positive=True)
-            or not exact_int(install_md.get("install_epoch"), positive=True)
-            or not isinstance(install_md.get("resident_runtime"), dict)
-            or set(install_md["resident_runtime"]) != {
-                "all_running_gateways_predate_install", "hermes_gateway_gm2_NRestarts",
-                "hermes_gateway_gm2_active_state", "hermes_gateway_gm2_main_pid",
-                "hermes_gateway_gm2_sub_state", "resident_kanban_db_blob_at_base",
-                "running_gateway_pids",
-            }
-            or install_md["resident_runtime"].get("all_running_gateways_predate_install") is not True
-            or install_md["resident_runtime"].get("hermes_gateway_gm2_NRestarts") != "0"
-            or install_md["resident_runtime"].get("hermes_gateway_gm2_active_state") != "active"
-            or install_md["resident_runtime"].get("hermes_gateway_gm2_sub_state") != "running"
-            or not exact_int(install_md["resident_runtime"].get("hermes_gateway_gm2_main_pid"), positive=True)
-            or not exact_hash(install_md["resident_runtime"].get("resident_kanban_db_blob_at_base"), 40)
-            or not isinstance(install_md["resident_runtime"].get("running_gateway_pids"), list)
-            or not install_md["resident_runtime"]["running_gateway_pids"]
-            or any(
-                not exact_int(pid, positive=True)
-                for pid in install_md["resident_runtime"]["running_gateway_pids"]
-            )
-            or not isinstance(tests, dict)
-            or set(tests) != {
-                "diff_check", "focused_total", "py_compile", "ruff", "test_kanban_db",
-                "test_kanban_factory_finalizer",
-            }
-            or any(tests.get(key) != "pass" for key in ("diff_check", "py_compile", "ruff"))
-            or not all(
-                nonempty_string(tests.get(key))
-                for key in ("focused_total", "test_kanban_db", "test_kanban_factory_finalizer")
-            )
-            or install_md.get("forbidden_actions_performed") != []
-            or not exact_int(install_md.get("new_control_plane_count"), 0)
-            or not exact_int(install_md.get("new_runtime_module_count"), 0)
-            or install_md.get("secret_exposure") != "none"
-            or not nonempty_string(install_md.get("worker_session_id"))
-        ):
-            return False
-    elif has_installed_source_install:
-        typed_symbol = install_md.get("typed_symbol")
-        receipt_sha = install_md.get("receipt_sha256")
-        if (
-            not (has_installed_source_merger or has_request_changes_merger)
-            or not exact_int(install_md.get("canonical_run_id"), install_run_id)
-            or install_md.get("activation_performed") is not False
-            or install_md.get("author_finalizer_performed") is not False
-            or install_md.get("resident_activated") is not False
-            or install_md.get("source_installed") is not True
-            or install_md.get("audited_head") != head
-            or install_md.get("base") != base or install_md.get("tree") != tree
-            or install_md.get("merge") != merge_sha
-            or not exact_int(install_md.get("pr"), source_pr)
-            or (
-                blobs != merge_md.get("merged_blobs")
-                if has_installed_source_merger
-                else (
-                    not isinstance(blobs, dict)
-                    or set(blobs) != set(paths or [])
-                    or any(not exact_hash(blob, 40) for blob in blobs.values())
-                )
-            )
-            or not isinstance(install, dict)
-            or set(install) != {
-                "changed_paths", "head", "method", "parents", "preinstall_commit",
-                "rollback_commit", "rollback_ref", "tree", "worktree_clean",
-            }
-            or install.get("head") != merge_sha or install.get("tree") != tree
-            or install.get("parents") != [base, head]
-            or install.get("changed_paths") != paths
-            or install.get("preinstall_commit") != base
-            or install.get("rollback_commit") != base
-            or not nonempty_string(install.get("rollback_ref"))
-            or install.get("worktree_clean") is not True
-            or install.get("method") != "existing_clean_git_editable_guarded_fast_forward"
-            or not isinstance(fresh_runtime, dict)
-            or set(fresh_runtime) != {
-                "bytes_match", "module_path", "module_sha256", "resolver_loaded",
-                "resolves_to_authoritative_root",
-            }
-            or fresh_runtime.get("bytes_match") is not True
-            or fresh_runtime.get("resolver_loaded") is not True
-            or fresh_runtime.get("resolves_to_authoritative_root") is not True
-            or not exact_hash(fresh_runtime.get("module_sha256"), 64)
-            or not nonempty_string(fresh_runtime.get("module_path"))
-            or not fresh_runtime["module_path"].endswith("/hermes_cli/kanban_db.py")
-            or installed_module_blob is None
-            or typed_symbol != {
-                "approval_commit_id_branch_in_finalizer": True,
-                "present_callable": True,
-                "symbol": "_authenticated_canonical_factory_packet_chain",
-            }
-            or install_md.get("witness_type")
-            != f"EXACT_PR{source_pr}_INSTALLED_AND_TYPED_SOURCE_INSTALLED_RESIDENT_NOT_ACTIVATED_WITNESS"
-            or not isinstance(receipt_sha, str)
-            or re.fullmatch(r"[0-9a-fA-F]{64}", receipt_sha) is None
-            or not isinstance(install_md.get("public_receipts"), list)
-            or not install_md["public_receipts"]
-            or any(
-                not isinstance(receipt, str) or not receipt
-                for receipt in install_md["public_receipts"]
-            )
-            or not isinstance(install_md.get("resident_runtime"), dict)
-            or set(install_md["resident_runtime"]) != {
-                "all_running_gateways_predate_install", "hermes_gateway_gm2_NRestarts",
-                "hermes_gateway_gm2_active_state", "hermes_gateway_gm2_sub_state",
-                "resident_kanban_db_blob_at_base",
-            }
-            or install_md.get("forbidden_actions_performed") != []
-            or type(install_md.get("new_control_plane_count")) is not int
-            or install_md.get("new_control_plane_count") != 0
-            or install_md.get("secret_exposure") != "none"
-        ):
-            return False
-    else:
-        binding = install_md.get("native_binding")
-        typed_witness = install_md.get("typed_witness")
-        if (
-            install_md.get("canonical_run_id") != install_run_id
-            or install_md.get("author_finalizer_performed") is not False
-            or install_md.get("author_status_before_and_after") != "review"
-            or install_md.get("github_review_id") != review_id
-            or install_md.get("source_pr") != source_pr
-            or install_md.get("source_head") != head or install_md.get("source_tree") != tree
-            or install_md.get("source_merge") != merge_sha
-            or install_md.get("source_changed_paths") != paths
-            or install_md.get("witness_type")
-            != f"EXACT_PR{source_pr}_INSTALLED_AND_TYPED_RUNTIME_WITNESS"
-            or not isinstance(install, dict) or install.get("head") != merge_sha
-            or install.get("tree") != tree or install.get("parents") != [base, head]
-            or install.get("changed_paths") != paths or install.get("worktree_clean") is not True
-            or not isinstance(binding, dict)
-            or binding.get("direct_parent_only") != merger_id
-            or binding.get("parent_run") != merger_run_id
-            or binding.get("author_profile") != FACTORY_REVIEW_AUTHOR_PROFILE
-            or binding.get("auditor_profile") != reviewer_profile
-            or binding.get("merge_profile") != merger_profile
-            or binding.get("runtime_profile") != install_profile
-            or binding.get("roles_distinct") is not True
-            or not isinstance(fresh_runtime, dict) or fresh_runtime.get("bytes_match") is not True
-            or fresh_runtime.get("resolver_loaded") is not True
-            or not isinstance(typed_witness, dict)
-            or typed_witness.get("live_board_smoke_zero_mutation") is not True
-            or not all(typed_witness.get("states", {}).get(key) is True for key in ("ACTIVATION_GATED", "INSTALLED_PRESENT", "RESIDENT_ACTIVE", "SOURCE_PRESENT"))
-            or install_md.get("forbidden_actions_performed") != []
-            or type(install_md.get("new_control_plane_count")) is not int
-            or install_md.get("new_control_plane_count") != 0
-            or install_md.get("secret_exposure") != "none"
-        ):
-            return False
-
-
-    activation_keys = {
-        "artifacts", "audit_task", "external_activation_receipt",
-        "focused_barrier_tests", "forbidden_actions_performed", "formal_evidence",
-        "new_control_plane_count", "not_true_done_for", "outcome", "receipt_sha256",
-        "replay_restart_attempts", "resident_runtime", "secret_exposure", "source",
-        "worker_session_id",
-    }
-    activations = exact_children(install_id, activation_keys, {FACTORY_REVIEW_AUTHOR_PROFILE})
-    if len(activations) != 1:
-        return False
-
-    activation_id, activation_run_id, _activation_profile, activation_md = activations[0]
-    if (
-        activation_id in {task_id, reviewer_id, merger_id, install_id}
-        or not _all_other_parents_terminal(conn, activation_id, install_id)
-    ):
-        return False
-    source = activation_md.get("source")
-    external = activation_md.get("external_activation_receipt")
-    resident = activation_md.get("resident_runtime")
-    barrier_tests = activation_md.get("focused_barrier_tests")
-    if (
-        activation_md.get("outcome") != "SAME_TASK_POST_ACTIVATION_READBACK_COMPLETE"
-        or activation_md.get("replay_restart_attempts") != 0
-        or not isinstance(source, dict) or source.get("head") != merge_sha
-        or source.get("tree") != tree or source.get("audited_head") != head
-        or source.get("clean") is not True
-        or not isinstance(external, dict)
-        or not exact_int(external.get("restart_count"), 1)
-        or not exact_int(external.get("second_restart"), 0)
-        or external.get("outside_target_cgroup_proven") is not True
-        or external.get("exact_shell_pid_unique_attribution") is not False
-        or not isinstance(resident, dict)
-        or resident.get("active_state") != "active" or resident.get("sub_state") != "running"
-        or resident.get("result") != "success"
-        or not exact_int(resident.get("nrestarts"), 0)
-        or resident.get("configured_import_exact") is not True
-        or resident.get("barrier_loaded") is not True
-        or not exact_int(resident.get("deep_health_exit_code"), 0)
-        or not isinstance(barrier_tests, dict)
-        or set(barrier_tests) != {"failed", "passed"}
-        or not exact_int(barrier_tests.get("failed"), 0)
-        or not exact_int(barrier_tests.get("passed"), positive=True)
-        or activation_md.get("forbidden_actions_performed") != []
-        or type(activation_md.get("new_control_plane_count")) is not int
-        or activation_md.get("new_control_plane_count") != 0
-        or activation_md.get("secret_exposure") != "none"
-    ):
-        return False
-    if closed_installed_source and (
-        set(source) != {
-            "audited_head", "clean", "head", "kanban_db_blob", "kanban_db_sha256",
-            "merge_commit", "tree",
-        }
-        or set(external) != {
-            "compressed_sha256", "exact_shell_pid_unique_attribution",
-            "outside_target_cgroup_proven", "restart_count", "second_restart",
-            "uncompressed_sha256",
-        }
-        or set(resident) != {
-            "active_enter_timestamp_monotonic", "active_state", "barrier_loaded",
-            "configured_import_exact", "deep_health_exit_code", "exec_start_monotonic",
-            "main_pid", "memory_current", "memory_peak", "nrestarts", "pids_peak",
-            "proc_starttime_ticks", "result", "sub_state", "tasks_max",
-        }
-        or source.get("merge_commit") != merge_sha
-        or source.get("kanban_db_blob") != installed_module_blob
-        or source.get("kanban_db_sha256") != fresh_runtime.get("module_sha256")
-        or not exact_hash(external.get("compressed_sha256"), 64)
-        or not exact_hash(external.get("uncompressed_sha256"), 64)
-        or not exact_int(resident.get("active_enter_timestamp_monotonic"), positive=True)
-        or not exact_int(resident.get("exec_start_monotonic"), positive=True)
-        or resident["active_enter_timestamp_monotonic"] < resident["exec_start_monotonic"]
-        or not exact_int(resident.get("main_pid"), positive=True)
-        or not nonnegative_int(resident.get("memory_current"))
-        or not nonnegative_int(resident.get("memory_peak"))
-        or resident["memory_peak"] < resident["memory_current"]
-        or not exact_int(resident.get("nrestarts"), 0)
-        or not nonnegative_int(resident.get("pids_peak"))
-        or not exact_int(resident.get("proc_starttime_ticks"), positive=True)
-        or not exact_int(resident.get("tasks_max"), positive=True)
-    ):
-        return False
-
-    if _request_changes_terminal_task_id is not None:
-        request_terminal = _authenticated_factory_run_metadata(
-            conn, _request_changes_terminal_task_id,
-        )
-        return (
-            _request_changes_terminal_task_id
-            not in {task_id, reviewer_id, merger_id, install_id, activation_id}
-            and _one_direct_child(conn, activation_id)
-            == _request_changes_terminal_task_id
-            and activation_md.get("audit_task")
-            == _request_changes_terminal_task_id
-            and request_terminal is not None
-            and request_terminal[1] == FACTORY_REVIEW_AUDITOR_PROFILE
-            and _all_other_parents_terminal(
-                conn, _request_changes_terminal_task_id, activation_id,
-            )
-        )
-
-    resident_keys = {
-        "artifact_sha256", "artifacts", "barrier_tests", "deep_health_exit_code",
-        "external_receipt", "forbidden_actions_performed", "formal_evidence",
-        "new_control_plane_count", "next_supported_gate", "not_true_done_for",
-        "outcome", "parent_replay", "resident", "resource_readback",
-        "secret_exposure", "source", "worker_session_id",
-    }
-    installed_source_resident_keys = {
-        "artifact_sha256", "artifacts", "external_receipt", "focused_tests",
-        "forbidden_actions_performed", "formal_evidence", "native_replay",
-        "new_control_plane_count", "next_supported_gate", "not_true_done_for",
-        "outcome", "resident_runtime", "secret_exposure", "source", "worker_session_id",
-    }
-    audits = exact_children(
-        activation_id, (resident_keys, installed_source_resident_keys),
-        {FACTORY_REVIEW_AUDITOR_PROFILE},
-    )
-    if len(audits) != 1:
-        return False
-
-    resident_id, _resident_run_id, _resident_profile, resident_md = audits[0]
-    if (
-        resident_id in {task_id, reviewer_id, merger_id, install_id, activation_id}
-        or activation_md.get("audit_task") != resident_id
-        or not _all_other_parents_terminal(conn, resident_id, activation_id)
-    ):
-        return False
-    audit_source = resident_md.get("source")
-    has_installed_source_resident = set(resident_md) == installed_source_resident_keys
-    if has_installed_source_resident != closed_installed_source:
-        return False
-    if has_installed_source_resident:
-        audit_external = resident_md.get("external_receipt")
-        focused_tests = resident_md.get("focused_tests")
-        native_replay = resident_md.get("native_replay")
-        audited_resident = resident_md.get("resident_runtime")
-        expected_audit_source = {
-            key: source[key]
-            for key in (
-                "audited_head", "clean", "head", "kanban_db_blob",
-                "kanban_db_sha256", "tree",
-            )
-        }
-        if (
-            not closed_installed_source
-            or resident_md.get("outcome") != "PASS_EXACT_RESIDENT_RUNTIME"
-            or not isinstance(focused_tests, dict)
-            or set(focused_tests) != {"failed", "passed"}
-            or not exact_int(focused_tests.get("failed"), 0)
-            or not exact_int(focused_tests.get("passed"), positive=True)
-            or not isinstance(audit_external, dict)
-            or set(audit_external) != {
-                "compressed_sha256", "exact_operator_cgroup_path_attributed",
-                "outside_target_cgroup_proven", "restart_count", "second_restart",
-                "uncompressed_sha256",
-            }
-            or audit_external.get("compressed_sha256") != external.get("compressed_sha256")
-            or audit_external.get("uncompressed_sha256") != external.get("uncompressed_sha256")
-            or audit_external.get("outside_target_cgroup_proven") is not True
-            or audit_external.get("exact_operator_cgroup_path_attributed") is not False
-            or not exact_int(audit_external.get("restart_count"), 1)
-            or not exact_int(audit_external.get("second_restart"), 0)
-            or audit_source != expected_audit_source
-            or not isinstance(native_replay, dict)
-            or set(native_replay) != {
-                "manual_claim_or_dispatch_count", "restart_attempts", "run_id", "task",
-            }
-            or native_replay.get("task") != activation_id
-            or not exact_int(native_replay.get("run_id"), activation_run_id)
-            or not exact_int(native_replay.get("restart_attempts"), 0)
-            or not exact_int(native_replay.get("manual_claim_or_dispatch_count"), 0)
-            or not isinstance(audited_resident, dict)
-            or set(audited_resident) != {
-                "active_state", "exec_start_monotonic", "main_pid", "nrestarts",
-                "pids_events_max", "pids_max", "pids_peak", "proc_starttime_ticks",
-                "result", "sub_state", "tasks_max",
-            }
-            or not exact_int(audited_resident.get("exec_start_monotonic"), positive=True)
-            or not exact_int(audited_resident.get("main_pid"), positive=True)
-            or not exact_int(audited_resident.get("nrestarts"), 0)
-            or not nonnegative_int(audited_resident.get("pids_events_max"))
-            or not exact_int(audited_resident.get("pids_max"), positive=True)
-            or not nonnegative_int(audited_resident.get("pids_peak"))
-            or audited_resident["pids_peak"] > audited_resident["pids_max"]
-            or not exact_int(audited_resident.get("proc_starttime_ticks"), positive=True)
-            or not exact_int(audited_resident.get("tasks_max"), positive=True)
-            or any(
-                audited_resident.get(key) != resident.get(key)
-                for key in (
-                    "active_state", "sub_state", "result", "nrestarts", "main_pid",
-                    "proc_starttime_ticks", "exec_start_monotonic", "tasks_max",
-                )
-            )
-            or resident_md.get("forbidden_actions_performed") != []
-            or type(resident_md.get("new_control_plane_count")) is not int
-            or resident_md.get("new_control_plane_count") != 0
-            or resident_md.get("secret_exposure") != "none"
-        ):
-            return False
-    else:
-        parent_replay = resident_md.get("parent_replay")
-        audited_resident = resident_md.get("resident")
-        if (
-            resident_md.get("outcome") != "PASS_EXACT_RESIDENT_RUNTIME"
-            or not isinstance(resident_md.get("barrier_tests"), dict)
-            or set(resident_md["barrier_tests"]) != {"failed", "passed"}
-            or not exact_int(resident_md["barrier_tests"].get("failed"), 0)
-            or not exact_int(resident_md["barrier_tests"].get("passed"), positive=True)
-            or not exact_int(resident_md.get("deep_health_exit_code"), 0)
-            or resident_md.get("external_receipt") != external
-            or not isinstance(parent_replay, dict)
-            or not exact_int(parent_replay.get("natural_claim_run"), activation_run_id)
-            or not exact_int(parent_replay.get("restart_attempts"), 0)
-            or not exact_int(parent_replay.get("manual_claim_or_dispatch_count"), 0)
-            or not isinstance(audit_source, dict)
-            or audit_source.get("audited_head") != head
-            or audit_source.get("merge_commit") != merge_sha
-            or audit_source.get("tree") != tree
-            or audit_source.get("kanban_db_blob") != source.get("kanban_db_blob")
-            or audit_source.get("kanban_db_sha256") != source.get("kanban_db_sha256")
-            or not isinstance(audited_resident, dict)
-            or any(
-                audited_resident.get(key) != resident.get(key)
-                for key in (
-                    "active_state", "sub_state", "result", "nrestarts", "main_pid",
-                    "proc_starttime_ticks", "exec_start_monotonic", "tasks_max",
-                )
-            )
-            or resident_md.get("forbidden_actions_performed") != []
-            or type(resident_md.get("new_control_plane_count")) is not int
-            or resident_md.get("new_control_plane_count") != 0
-            or resident_md.get("secret_exposure") != "none"
-        ):
-            return False
-
-    return True
-
-
-def _reviewed_author_repair_phase_task_id(
-    conn: sqlite3.Connection,
-    *,
-    task_id: str,
-    author_run_id: int,
-    reviewer_id: str,
-    reviewer_run_id: int,
-    reviewer_profile: str,
-    review_md: dict,
-    handoff_reason: str,
-) -> Optional[str]:
-    """Resolve one exact resident REQUEST_CHANGES -> repair-author phase.
-
-    The phase edge is accepted only when it is the sole structured Native path,
-    its terminal nodes have kernel-authenticated receipts, and the closed audit
-    packet cross-binds the original reviewed head and resident activation.  The
-    packet's prose fields are shape-checked but never used as authority.
-    """
-    path: list[str] = []
-    parent_id = reviewer_id
-    for _ in range(5):
-        child_id = _one_direct_child(conn, parent_id)
-        if child_id is None:
-            return None
-        parents = conn.execute(
-            "SELECT parent_id FROM task_links WHERE child_id = ? ORDER BY parent_id",
-            (child_id,),
-        ).fetchall()
-        if [str(row["parent_id"]) for row in parents] != [parent_id]:
-            return None
-        path.append(child_id)
-        parent_id = child_id
-    merger_id, installer_id, activation_id, failed_audit_id, repair_author_id = path
-
-    authenticated: list[tuple[int, str, dict]] = []
-    for node_id, expected_profile in zip(
-        path[:4],
-        ("gm", FACTORY_REVIEW_MERGER_PROFILE, FACTORY_REVIEW_AUTHOR_PROFILE,
-         FACTORY_REVIEW_AUDITOR_PROFILE),
-    ):
-        terminal = _authenticated_factory_run_metadata(conn, node_id)
-        if terminal is None or terminal[1] != expected_profile:
-            return None
-        authenticated.append(terminal)
-    activation_run_id, _activation_profile, activation_md = authenticated[2]
-    _failed_run_id, _failed_profile, failed_md = authenticated[3]
-
-    request_keys = {
-        "artifact_sha256", "artifacts", "exact_candidate", "focused_tests",
-        "forbidden_actions_performed", "formal_evidence", "github_readback",
-        "new_control_plane_count", "outcome", "packet_blockers", "parent_replay",
-        "post_test_resource_readback", "reviewed_author_probe", "secret_exposure",
-        "source_identity", "static_checks", "worker_session_id",
-    }
-    if set(failed_md) != request_keys:
-        return None
-
-    def exact_hash(value: object, length: int) -> bool:
-        return isinstance(value, str) and re.fullmatch(
-            rf"[0-9a-f]{{{length}}}", value,
-        ) is not None
-
-    def nonempty_string_list(value: object) -> bool:
-        return (
-            isinstance(value, list) and bool(value)
-            and all(isinstance(item, str) and bool(item.strip()) for item in value)
-            and len(set(value)) == len(value)
-        )
-
-    candidate = failed_md.get("exact_candidate")
-    source_pr_match = re.fullmatch(
-        rf"https://github[.]com/{re.escape(FACTORY_REVIEW_REPOSITORY)}"
-        r"/pull/([1-9][0-9]*)",
-        candidate.get("pr") if isinstance(candidate, dict) else "",
-    )
-    review_url = review_md.get("github_review_url")
-    review_pr_match = re.fullmatch(
-        rf"https://github[.]com/{re.escape(FACTORY_REVIEW_REPOSITORY)}"
-        r"/pull/([1-9][0-9]*)#pullrequestreview-[1-9][0-9]*",
-        review_url if isinstance(review_url, str) else "",
-    )
-    activation_source = activation_md.get("source")
-    parent_replay = failed_md.get("parent_replay")
-    probe = failed_md.get("reviewed_author_probe")
-    github_readback = failed_md.get("github_readback")
-    source_identity = failed_md.get("source_identity")
-    focused_tests = failed_md.get("focused_tests")
-    resources = failed_md.get("post_test_resource_readback")
-    static_checks = failed_md.get("static_checks")
-    blockers = failed_md.get("packet_blockers")
-    blocker_ids = (
-        {blocker.get("id") for blocker in blockers}
-        if isinstance(blockers, list)
-        and all(isinstance(blocker, dict) and set(blocker) == {"evidence", "id"}
-                for blocker in blockers)
-        else set()
-    )
-    if (
-        failed_md.get("outcome") != "REQUEST_CHANGES_EXACT_RESIDENT_PACKET"
-        or source_pr_match is None or review_pr_match is None
-        or source_pr_match.group(1) != review_pr_match.group(1)
-        or not isinstance(candidate, dict)
-        or set(candidate) != {"audited_head", "base", "merge_commit", "pr", "tree"}
-        or candidate.get("audited_head") != review_md.get("head")
-        or candidate.get("tree") != review_md.get("head_tree")
-        or candidate.get("base") != review_md.get("base")
-        or not exact_hash(candidate.get("merge_commit"), 40)
-        or not isinstance(activation_source, dict)
-        or activation_source.get("audited_head") != candidate.get("audited_head")
-        or activation_source.get("tree") != candidate.get("tree")
-        or activation_source.get("merge_commit") != candidate.get("merge_commit")
-        or activation_md.get("audit_task") != failed_audit_id
-        or not isinstance(parent_replay, dict)
-        or set(parent_replay) != {
-            "manual_claim_or_dispatch_count", "natural_claim_run", "restart_attempts", "task",
-        }
-        or parent_replay.get("task") != activation_id
-        or type(parent_replay.get("natural_claim_run")) is not int
-        or parent_replay.get("natural_claim_run") != activation_run_id
-        or type(parent_replay.get("manual_claim_or_dispatch_count")) is not int
-        or parent_replay.get("manual_claim_or_dispatch_count") != 0
-        or type(parent_replay.get("restart_attempts")) is not int
-        or parent_replay.get("restart_attempts") != 0
-        or not isinstance(probe, dict)
-        or set(probe) != {
-            "author_task", "connection_total_changes_delta", "data_version_unchanged",
-            "resolver_result", "status_before_after",
-        }
-        or probe.get("author_task") != task_id
-        or type(probe.get("connection_total_changes_delta")) is not int
-        or probe.get("connection_total_changes_delta") != 0
-        or probe.get("data_version_unchanged") is not True
-        or probe.get("resolver_result") is not None
-        or probe.get("status_before_after") != "review/review"
-        or github_readback is None or not isinstance(github_readback, dict)
-        or set(github_readback) != {"actor", "body_sha256", "byte_exact"}
-        or github_readback.get("actor") != FACTORY_REVIEW_AUDITOR_ACTOR
-        or github_readback.get("byte_exact") is not True
-        or not exact_hash(github_readback.get("body_sha256"), 64)
-        or not isinstance(source_identity, dict)
-        or set(source_identity) != {"kanban_db_blob", "kanban_db_sha256", "rollback_commit"}
-        or not exact_hash(source_identity.get("kanban_db_blob"), 40)
-        or not exact_hash(source_identity.get("kanban_db_sha256"), 64)
-        or source_identity.get("rollback_commit") != candidate.get("base")
-        or not isinstance(focused_tests, dict)
-        or set(focused_tests) != {"failed", "passed"}
-        or type(focused_tests.get("failed")) is not int or focused_tests.get("failed") != 0
-        or type(focused_tests.get("passed")) is not int or focused_tests.get("passed", 0) <= 0
-        or not isinstance(resources, dict)
-        or set(resources) != {
-            "memory_events_max", "oom", "oom_kill", "pids_events_max", "pids_max",
-            "pids_peak", "tasks_max",
-        }
-        or any(type(resources.get(key)) is not int for key in resources)
-        or any(resources.get(key) != 0 for key in ("memory_events_max", "oom", "oom_kill"))
-        or resources.get("pids_events_max", -1) < 0
-        or resources.get("pids_max", 0) <= 0 or resources.get("tasks_max", 0) <= 0
-        or resources.get("pids_peak", -1) < 0
-        or static_checks != {
-            "checkout_clean": True, "diff_check": "pass", "py_compile": "pass", "ruff": "pass",
-        }
-        or not isinstance(blockers, list) or len(blockers) != 2
-        or blocker_ids != {
-            "EXACT_REVIEW_PACKET_NOT_ROUTED_TO_INSTALLED_CHAIN",
-            "VALID_SYSTEMD_ORDER_REJECTED",
-        }
-        or any(not isinstance(blocker.get("evidence"), str) or not blocker["evidence"].strip()
-               for blocker in blockers)
-        or not exact_hash(failed_md.get("artifact_sha256"), 64)
-        or not nonempty_string_list(failed_md.get("artifacts"))
-        or not nonempty_string_list(failed_md.get("formal_evidence"))
-        or failed_md.get("forbidden_actions_performed") != []
-        or type(failed_md.get("new_control_plane_count")) is not int
-        or failed_md.get("new_control_plane_count") != 0
-        or failed_md.get("secret_exposure") != "none"
-        or not isinstance(failed_md.get("worker_session_id"), str)
-        or not failed_md["worker_session_id"].strip()
-    ):
-        return None
-
-    if not _authenticated_canonical_factory_packet_chain(
-        conn,
-        task_id=task_id,
-        author_run_id=author_run_id,
-        reviewer_id=reviewer_id,
-        reviewer_run_id=reviewer_run_id,
-        reviewer_profile=reviewer_profile,
-        review_md=review_md,
-        handoff_reason=handoff_reason,
-        _request_changes_terminal_task_id=failed_audit_id,
-    ):
-        return None
-
-    repair_author = conn.execute(
-        "SELECT status, assignee, factory_build_gate FROM tasks WHERE id = ?",
-        (repair_author_id,),
-    ).fetchone()
-    if (
-        repair_author is None or repair_author["status"] != "review"
-        or repair_author["assignee"] != FACTORY_REVIEW_AUTHOR_PROFILE
-        or not repair_author["factory_build_gate"]
-    ):
-        return None
-    return repair_author_id
-
-
 def _reviewed_author_finalizer_run_id(
     conn: sqlite3.Connection, task_id: str, *, _allow_repair_phase: bool = True,
 ) -> Optional[int]:
-    """Resolve a reviewed author from the sole canonical Native receipt.
-
-    ``_allow_repair_phase`` remains signature-compatible for installed callers;
-    packet-family repair interpretation is no longer part of terminal authority.
-    """
+    """Resolve the canonical Native receipt; ignore the legacy-compatible flag."""
     del _allow_repair_phase
     receipt = _canonical_audit_receipt(conn, task_id)
-    if (
-        receipt is None
-        or receipt.get("authenticated") is not True
-        or receipt.get("verdict") != "PASS"
-    ):
+    if receipt is None or receipt.get("authenticated") is not True or receipt.get("verdict") != "PASS":
         return None
     return int(receipt["author_run_id"])
 
-    # Historical packet-family resolver retained cold during the immutable-row
-    # cutover. It is unreachable from the normal reviewed-author hot path.
-    author = conn.execute(
-        "SELECT status, assignee, current_run_id, claim_lock, claim_expires, "
-        "worker_pid, worker_starttime, fence_lineage, fence_disposition "
-        "FROM tasks WHERE id = ?",
-        (task_id,),
-    ).fetchone()
-    if (
-        author is None
-        or author["status"] != "review"
-        or author["assignee"] != FACTORY_REVIEW_AUTHOR_PROFILE
-        or author["current_run_id"] is not None
-        or any(
-            author[field] is not None
-            for field in (
-                "claim_lock", "claim_expires", "worker_pid", "worker_starttime",
-                "fence_lineage", "fence_disposition",
-            )
-        )
-    ):
-        return None
-    runs = conn.execute(
-        "SELECT id, status, outcome, ended_at FROM task_runs "
-        "WHERE task_id = ? ORDER BY id DESC",
-        (task_id,),
-    ).fetchall()
-    if not runs:
-        return None
-    latest = runs[0]
-    if (
-        latest["status"] != "review_required"
-        or latest["outcome"] != "review_required"
-        or latest["ended_at"] is None
-        or any(row["ended_at"] is None for row in runs)
-    ):
-        return None
-    author_run_id = int(latest["id"])
-
-    handoff_rows = conn.execute(
-        "SELECT id, run_id, payload FROM task_events "
-        "WHERE task_id = ? AND kind = 'review_handoff' AND run_id = ?",
-        (task_id, author_run_id),
-    ).fetchall()
-    if len(handoff_rows) != 1:
-        return None
-    handoff = _review_handoff_receipt_from_row(task_id, handoff_rows[0])
-    if handoff is None or handoff.expected_run_id != author_run_id:
-        return None
-    reviewer_id = handoff.review_task_id
-    if conn.execute(
-        "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ?",
-        (task_id, reviewer_id),
-    ).fetchone() is None:
-        return None
-
-    verdicts = []
-    for row in conn.execute(
-        "SELECT id, run_id, payload FROM task_events "
-        "WHERE task_id = ? AND kind = 'review_verdict' ORDER BY id",
-        (task_id,),
-    ).fetchall():
-        try:
-            payload = json.loads(row["payload"] or "{}")
-        except (TypeError, ValueError):
-            return None
-        if payload.get("review_task_id") == reviewer_id:
-            verdicts.append((row, payload))
-    if not verdicts:
-        return None
-    seen_review_runs: set[int] = set()
-    previous_run_id = -1
-    for index, (verdict_row, verdict) in enumerate(verdicts):
-        review_run_id = verdict.get("review_run_id")
-        expected_verdict = "pass" if index == len(verdicts) - 1 else "request_changes"
-        if (
-            not isinstance(review_run_id, int)
-            or review_run_id != verdict_row["run_id"]
-            or review_run_id in seen_review_runs
-            or review_run_id <= previous_run_id
-            or verdict.get("verdict") != expected_verdict
-        ):
-            return None
-        run = conn.execute(
-            "SELECT profile, status, outcome, ended_at FROM task_runs "
-            "WHERE id = ? AND task_id = ?",
-            (review_run_id, reviewer_id),
-        ).fetchone()
-        expected_run_outcome = "completed" if expected_verdict == "pass" else "request_changes"
-        expected_run_status = "done" if expected_verdict == "pass" else "request_changes"
-        if (
-            run is None
-            or run["profile"] != FACTORY_REVIEW_AUDITOR_PROFILE
-            or run["status"] != expected_run_status
-            or run["outcome"] != expected_run_outcome
-            or run["ended_at"] is None
-        ):
-            return None
-        seen_review_runs.add(review_run_id)
-        previous_run_id = review_run_id
-    verdict_row, verdict = verdicts[-1]
-
-    reviewer = _authenticated_factory_run_metadata(conn, reviewer_id)
-    if reviewer is None or reviewer[0] != int(verdict_row["run_id"]):
-        return None
-    _reviewer_run_id, reviewer_profile, review_md = reviewer
-    if reviewer_profile != FACTORY_REVIEW_AUDITOR_PROFILE:
-        return None
-    canonical_review_md = _canonical_factory_review_packet(review_md)
-    if canonical_review_md is not None:
-        if _authenticated_canonical_factory_packet_chain(
-            conn,
-            task_id=task_id,
-            author_run_id=author_run_id,
-            reviewer_id=reviewer_id,
-            reviewer_run_id=_reviewer_run_id,
-            reviewer_profile=reviewer_profile,
-            review_md=canonical_review_md,
-            handoff_reason=handoff.reason,
-        ):
-            return author_run_id
-        if not _allow_repair_phase:
-            return None
-        repair_author_id = _reviewed_author_repair_phase_task_id(
-            conn,
-            task_id=task_id,
-            author_run_id=author_run_id,
-            reviewer_id=reviewer_id,
-            reviewer_run_id=_reviewer_run_id,
-            reviewer_profile=reviewer_profile,
-            review_md=canonical_review_md,
-            handoff_reason=handoff.reason,
-        )
-        if repair_author_id is None:
-            return None
-        return author_run_id if _reviewed_author_finalizer_run_id(
-            conn, repair_author_id, _allow_repair_phase=False,
-        ) is not None else None
-    if "approval_commit_id" in review_md or any(
-        isinstance(key, str) and re.fullmatch(r"lean_pr[1-9][0-9]*_compare", key)
-        for key in review_md
-    ):
-        return None
-    if "evidence_sha256" in review_md:
-        return author_run_id if _authenticated_non_pr_review_evidence(
-            review_md,
-            task_id=task_id,
-            author_run_id=author_run_id,
-            handoff_reason=handoff.reason,
-        ) else None
-    canonical_review_keys = {
-        "review_outcome", "head_sha", "tree_sha", "base_sha",
-        "github_review_id", "changed_files", "source_pr",
-    }
-    immutable_review_keys = {
-        "head", "tree", "base", "review_comment_id", "author_identity",
-        "auditor_identity", "review_outcome", "pr",
-        "forbidden_actions_performed", "secret_exposure",
-    }
-    current_review_keys = {
-        "audit_outcome", "audit_run_id", "author_run_id", "author_task_id",
-        "base", "changed_files", "forbidden_actions_performed", "github_review",
-        "head", "pr", "repository", "secret_exposure", "tree",
-    }
-    terminal_review_keys = {
-        "verdict", "native_review_run", "commit_bound_review", "head", "tree",
-        "base", "changed_files", "merge_allowed", "forbidden_actions_performed",
-        "secret_exposure",
-    }
-    review_key_families = (
-        canonical_review_keys, immutable_review_keys, current_review_keys,
-        terminal_review_keys,
-    )
-    review_discriminators = tuple(
-        keys - set().union(*(other for other in review_key_families if other is not keys))
-        for keys in review_key_families
-    )
-    review_families = tuple(
-        bool(keys.intersection(review_md)) for keys in review_discriminators
-    )
-    if sum(review_families) != 1:
-        return None
-    selected_review_keys = review_key_families[review_families.index(True)]
-    if set().union(*review_key_families).difference(selected_review_keys).intersection(review_md):
-        return None
-    (
-        has_canonical_review, has_immutable_review, has_current_review,
-        has_terminal_review,
-    ) = review_families
-    typed_review_id: Optional[int] = None
-    if has_canonical_review:
-        typed_pr = review_md.get("source_pr")
-        if isinstance(typed_pr, bool) or not isinstance(typed_pr, int) or typed_pr <= 0:
-            return None
-        source_pr_number = typed_pr
-    elif has_immutable_review:
-        typed_pr = review_md.get("pr")
-        typed_pr_match = re.fullmatch(
-            rf"https://github[.]com/{re.escape(FACTORY_REVIEW_REPOSITORY)}/pull/([1-9][0-9]*)",
-            typed_pr if isinstance(typed_pr, str) else "",
-        )
-        if typed_pr_match is None:
-            return None
-        source_pr_number = int(typed_pr_match.group(1))
-    elif has_current_review:
-        typed_pr = review_md.get("pr")
-        if isinstance(typed_pr, bool) or not isinstance(typed_pr, int) or typed_pr <= 0:
-            return None
-        source_pr_number = typed_pr
-    elif has_terminal_review:
-        typed_review_url = review_md.get("commit_bound_review")
-        typed_review_match = re.fullmatch(
-            rf"https://github[.]com/{re.escape(FACTORY_REVIEW_REPOSITORY)}"
-            r"/pull/([1-9][0-9]*)#pullrequestreview-([1-9][0-9]*)",
-            typed_review_url if isinstance(typed_review_url, str) else "",
-        )
-        if typed_review_match is None:
-            return None
-        source_pr_number = int(typed_review_match.group(1))
-        typed_review_id = int(typed_review_match.group(2))
-    else:
-        return None
-
-    handoff_prs = re.findall(
-        r"\bPR\s+#([1-9][0-9]*)\b", handoff.reason, re.IGNORECASE,
-    )
-    if len(handoff_prs) > 1 or (
-        len(handoff_prs) == 1 and int(handoff_prs[0]) != source_pr_number
-    ):
-        return None
-    if has_canonical_review:
-        head = review_md.get("head_sha")
-        tree = review_md.get("tree_sha")
-        base = review_md.get("base_sha")
-        review_id = review_md.get("github_review_id")
-        changed_files = review_md.get("changed_files")
-        if (
-            not canonical_review_keys.issubset(review_md)
-            or ("author_task" in review_md and review_md.get("author_task") != task_id)
-            or review_md.get("review_outcome") != "APPROVE_EXACT_HEAD"
-            or not isinstance(review_id, int)
-            or review_id <= 0
-            or not isinstance(changed_files, list)
-            or not changed_files
-            or any(not isinstance(path, str) or not path for path in changed_files)
-        ):
-            return None
-    elif has_immutable_review:
-        head = review_md.get("head")
-        tree = review_md.get("tree")
-        base = review_md.get("base")
-        review_comment_id = review_md.get("review_comment_id")
-        review_id = None
-        changed_files = None
-        if (
-            not immutable_review_keys.issubset(review_md)
-            or "author_task" in review_md
-            or review_md.get("review_outcome") != "PASS_EXACT_HEAD"
-            or review_md.get("pr")
-            != f"https://github.com/{FACTORY_REVIEW_REPOSITORY}/pull/{source_pr_number}"
-            or review_md.get("author_identity") != FACTORY_REVIEW_AUTHOR_ACTOR
-            or review_md.get("auditor_identity") != FACTORY_REVIEW_AUDITOR_ACTOR
-            or not isinstance(review_comment_id, int)
-            or review_comment_id <= 0
-            or review_md.get("forbidden_actions_performed") != []
-            or review_md.get("secret_exposure") != "none"
-        ):
-            return None
-    elif has_current_review:
-        github_review = review_md.get("github_review")
-        head = review_md.get("head")
-        tree = review_md.get("tree")
-        base = review_md.get("base")
-        review_id = github_review.get("id") if isinstance(github_review, dict) else None
-        changed_files = review_md.get("changed_files")
-        if (
-            not current_review_keys.issubset(review_md)
-            or review_md.get("audit_outcome") != "PASS_EXACT_HEAD"
-            or review_md.get("audit_run_id") != _reviewer_run_id
-            or review_md.get("author_task_id") != task_id
-            or review_md.get("author_run_id") != author_run_id
-            or review_md.get("repository") != FACTORY_REVIEW_REPOSITORY
-            or review_md.get("pr") != source_pr_number
-            or not isinstance(github_review, dict)
-            or github_review.get("state") != "APPROVED"
-            or not isinstance(review_id, int) or review_id <= 0
-            or not isinstance(changed_files, list) or not changed_files
-            or any(not isinstance(path, str) or not path for path in changed_files)
-            or review_md.get("forbidden_actions_performed") != []
-            or review_md.get("secret_exposure") != "none"
-        ):
-            return None
-    else:
-        head = review_md.get("head")
-        tree = review_md.get("tree")
-        base = review_md.get("base")
-        changed_files = review_md.get("changed_files")
-        review_id = typed_review_id
-        if (
-            not has_terminal_review
-            or not terminal_review_keys.issubset(review_md)
-            or review_md.get("verdict") not in FACTORY_TERMINAL_AUDIT_SUCCESS_VERDICTS
-            or review_md.get("native_review_run") != _reviewer_run_id
-            or not isinstance(review_id, int) or review_id <= 0
-            or not isinstance(changed_files, list) or not changed_files
-            or any(not isinstance(path, str) or not path for path in changed_files)
-            or review_md.get("merge_allowed") is not True
-            or review_md.get("forbidden_actions_performed") != []
-            or review_md.get("secret_exposure") != "none"
-        ):
-            return None
-    if any(
-        not isinstance(value, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", value)
-        for value in (head, tree, base)
-    ):
-        return None
-
-    legacy_keys = {
-        "head_sha", "tree_sha", "audited_base_sha", "review_id", "author",
-        "auditor", "role_separation", "forbidden_actions_performed",
-        "secret_exposure",
-    }
-    canonical_keys = {
-        "expected_head", "audited_tree", "audited_base", "github_review_id",
-        "implementation_task_id", "implementation_run_id", "implementation_profile",
-        "implementation_actor", "audit_task_id", "audit_run_id", "audit_profile",
-        "auditor_actor", "native_task_id", "native_run_id", "native_profile",
-        "gate_verdict", "merge_performed", "production_or_runtime_mutation",
-    }
-    immutable_keys = {
-        "verdict", "repo", "pr", "audited_head", "audited_tree", "base_at_audit",
-        "merge_commit", "canonical_main", "canonical_main_tree", "merge_parents",
-        "merger_identity", "auditor_identity", "github_review_id",
-        "native_audit_task", "native_audit_run", "native_audit_verdict",
-        "tools_approval_blob_candidate", "tools_approval_blob_main",
-        "merge_performed", "production_or_runtime_mutation",
-        "forbidden_actions_performed", "secret_exposure",
-    }
-    legacy_family_keys = legacy_keys | {
-        "repository", "pr_number", "merge_commit_sha", "merged_by",
-    }
-    canonical_family_keys = canonical_keys | {
-        "verdict", "repository", "pr_number", "merge_commit_sha", "merged_by",
-        "canonical_main_sha", "canonical_main_parents",
-        "audited_head_is_main_parent", "main_equals_merge_commit",
-    }
-    current_gm_keys = {
-        "outcome", "native_task_id", "native_run_id", "repository", "pr",
-        "merger_profile", "merger_actor", "implementation_actor", "auditor_actor",
-        "audit_task_id", "audit_run_id", "audit_outcome", "github_review_id",
-        "github_review_state", "head", "head_tree", "base_main_before",
-        "merged_files", "merge_method", "cas_merge_attempt_count", "merge_commit",
-        "merge_tree", "merge_parents", "canonical_main_after",
-        "runtime_install_performed", "runtime_witness_performed",
-        "author_finalizer_performed", "forbidden_actions_performed", "secret_exposure",
-    }
-    terminal_gm_keys = {
-        "audit_verdict", "audited_head", "audited_tree", "base_main_before",
-        "canonical_main_after", "cas_merge_count", "changed_files",
-        "commit_bound_review", "exact_audit_run", "exact_audit_task",
-        "implementation_author", "implementation_run", "implementation_task",
-        "independent_auditor", "merge_commit", "merge_parents", "merge_tree",
-        "merger_role", "native_run_id", "pr", "pr_state",
-        "reviewed_author_finalizer_performed", "runtime_install_performed",
-        "typed_runtime_witness_performed", "forbidden_actions_performed",
-        "secret_exposure",
-    }
-    durable_terminal_gm_keys = {
-        "outcome", "canonical_run_id", "project_id", "source_pr", "source_pr_url",
-        "implementation_task", "implementation_run", "implementation_profile",
-        "implementation_github_actor", "exact_audit_task", "exact_audit_run",
-        "audit_profile", "audit_github_actor", "audit_verdict", "github_review_id",
-        "commit_bound_review", "audited_head", "audited_tree", "audited_base",
-        "base_ref", "changed_files", "native_collision_readback", "hosted_checks",
-        "cas_merge", "merge_profile", "merge_github_actor", "roles_distinct",
-        "pr_state", "merge_commit", "merge_tree", "merge_parents", "canonical_main",
-        "audited_head_containment", "public_receipts", "runtime_install_performed",
-        "typed_runtime_witness_performed", "reviewed_author_finalizer_performed",
-        "source_edit_performed", "forbidden_actions_performed", "secret_exposure",
-        "new_control_plane_count", "not_true_done_for", "next_machine_transition",
-        "artifacts", "worker_session_id",
-    }
-    # Detect a family from every key exclusive to its accepted shape, not a
-    # hand-picked subset.  Otherwise an immutable receipt can be enriched with
-    # a non-discriminator alias such as canonical ``audit_run_id`` or legacy
-    # ``author`` and still pass as a pure immutable receipt.
-    merger_family_keys = (
-        legacy_family_keys, canonical_family_keys, immutable_keys, current_gm_keys,
-        terminal_gm_keys, durable_terminal_gm_keys,
-    )
-    merger_discriminators = tuple(
-        keys - set().union(*(other for other in merger_family_keys if other is not keys))
-        for keys in merger_family_keys
-    )
-    (
-        legacy_discriminators, canonical_discriminators, immutable_discriminators,
-        current_gm_discriminators, terminal_gm_discriminators,
-        durable_terminal_gm_discriminators,
-    ) = merger_discriminators
-    # The durable completion packet carries descriptive keys also present as
-    # non-authoritative extras on historical receipts.  Its closed structural
-    # discriminator is the nested CAS result; descriptive extras alone must
-    # not reclassify an older accepted family.
-    durable_terminal_gm_discriminators = {"cas_merge"}
-    merger_discriminators = (
-        legacy_discriminators, canonical_discriminators, immutable_discriminators,
-        current_gm_discriminators, terminal_gm_discriminators,
-        durable_terminal_gm_discriminators,
-    )
-    canonical_mergers = []
-    for child in conn.execute(
-        "SELECT child_id FROM task_links WHERE parent_id = ? ORDER BY child_id",
-        (reviewer_id,),
-    ).fetchall():
-        child_id = str(child["child_id"])
-        candidate = _authenticated_factory_run_metadata(conn, child_id)
-        if candidate is None:
-            continue
-        candidate_run_id, candidate_profile, candidate_md = candidate
-        if candidate_profile in {FACTORY_REVIEW_MERGER_PROFILE, "gm"} and any(
-            discriminators.intersection(candidate_md)
-            for discriminators in merger_discriminators
-        ):
-            canonical_mergers.append(
-                (child_id, candidate_run_id, candidate_profile, candidate_md)
-            )
-
-    if canonical_mergers:
-        if len(canonical_mergers) != 1:
-            return None
-        merger_id, merger_run_id, merger_profile, merge_md = canonical_mergers[0]
-    else:
-        # Legacy receipts carry no authenticated task/run provenance, so retain
-        # the old single-child fence rather than guessing among siblings.
-        merger_id = _one_direct_child(conn, reviewer_id)
-        if merger_id is None:
-            return None
-        merger = _authenticated_factory_run_metadata(conn, merger_id)
-        if merger is None:
-            return None
-        merger_run_id, merger_profile, merge_md = merger
-    if (
-        merger_profile not in {FACTORY_REVIEW_MERGER_PROFILE, "gm"}
-        or not _all_other_parents_terminal(conn, merger_id, reviewer_id)
-    ):
-        return None
-    schema_families = (
-        bool(legacy_discriminators.intersection(merge_md)),
-        bool(canonical_discriminators.intersection(merge_md)),
-        bool(immutable_discriminators.intersection(merge_md)),
-        bool(current_gm_discriminators.intersection(merge_md)),
-        bool(terminal_gm_discriminators.intersection(merge_md)),
-        bool(durable_terminal_gm_discriminators.intersection(merge_md)),
-    )
-    if sum(schema_families) != 1:
-        # Missing, partial-without-a-discriminator, and mixed alias schemas are
-        # ambiguous.  Never let caller-authored aliases complete a receipt.
-        return None
-    (
-        has_legacy_schema, has_canonical_schema, has_immutable_schema,
-        has_current_gm_schema, has_terminal_gm_schema, has_durable_terminal_gm_schema,
-    ) = schema_families
-    family_keys = merger_family_keys
-    selected_family_keys = family_keys[schema_families.index(True)]
-    historical_family_keys = family_keys[:-1]
-    if has_durable_terminal_gm_schema:
-        foreign_aliases = set().union(*historical_family_keys) - selected_family_keys
-    else:
-        foreign_aliases = (
-            set().union(*historical_family_keys) - selected_family_keys
-        ) | durable_terminal_gm_discriminators
-    if foreign_aliases.intersection(merge_md):
-        # Some aliases are shared by two foreign families, so they cannot act
-        # as an exclusive discriminator.  Once the family is selected, still
-        # reject every recognized key that does not belong to that family.
-        return None
-
-    merge_sha = merge_md.get("merge_commit_sha")
-    repository = merge_md.get("repository")
-    pr_number = merge_md.get("pr_number")
-    if has_canonical_schema:
-        canonical_main_parents = merge_md.get("canonical_main_parents")
-        if (
-            not canonical_keys.issubset(merge_md)
-            or merge_md.get("verdict") != "EXACT_HEAD_MERGED_MAIN_READBACK"
-            or merge_md.get("expected_head") != head
-            or merge_md.get("audited_tree") != tree
-            or merge_md.get("audited_base") != base
-            or merge_md.get("github_review_id") != review_id
-            or merge_md.get("implementation_task_id") != task_id
-            or merge_md.get("implementation_run_id") != author_run_id
-            or merge_md.get("implementation_profile") != FACTORY_REVIEW_AUTHOR_PROFILE
-            or merge_md.get("implementation_actor") != FACTORY_REVIEW_AUTHOR_ACTOR
-            or merge_md.get("audit_task_id") != reviewer_id
-            or merge_md.get("audit_run_id") != _reviewer_run_id
-            or merge_md.get("audit_profile") != reviewer_profile
-            or merge_md.get("auditor_actor") != FACTORY_REVIEW_AUDITOR_ACTOR
-            or merge_md.get("native_task_id") != merger_id
-            or merge_md.get("native_run_id") != merger_run_id
-            or merge_md.get("native_profile") != merger_profile
-            or merge_md.get("merged_by") != FACTORY_REVIEW_MERGER_ACTOR
-            or merge_md.get("gate_verdict") != "PASS"
-            or merge_md.get("merge_performed") is not True
-            or merge_md.get("production_or_runtime_mutation") is not False
-            or merge_md.get("canonical_main_sha") != merge_sha
-            or merge_md.get("main_equals_merge_commit") is not True
-            or merge_md.get("audited_head_is_main_parent") is not True
-            or not isinstance(canonical_main_parents, list)
-            or head not in canonical_main_parents
-            or len({
-                merge_md.get("implementation_actor"),
-                merge_md.get("auditor_actor"),
-                merge_md.get("merged_by"),
-            }) != 3
-        ):
-            return None
-    elif has_legacy_schema:
-        role_sep = merge_md.get("role_separation")
-        if (
-            not legacy_keys.issubset(merge_md)
-            or merge_md.get("head_sha") != head
-            or merge_md.get("tree_sha") != tree
-            or merge_md.get("audited_base_sha") != base
-            or merge_md.get("review_id") != review_id
-            or not isinstance(role_sep, dict)
-            or role_sep.get("distinct") is not True
-            or any(
-                not isinstance(role_sep.get(role), str) or not role_sep.get(role)
-                for role in ("author", "auditor", "merger")
-            )
-            or len({
-                role_sep.get("author"), role_sep.get("auditor"), role_sep.get("merger"),
-            }) != 3
-            or merge_md.get("author") != role_sep.get("author")
-            or merge_md.get("auditor") != role_sep.get("auditor")
-            or role_sep.get("author") != FACTORY_REVIEW_AUTHOR_ACTOR
-            or role_sep.get("auditor") != FACTORY_REVIEW_AUDITOR_ACTOR
-            or role_sep.get("merger") != FACTORY_REVIEW_MERGER_ACTOR
-            or merge_md.get("merged_by") != FACTORY_REVIEW_MERGER_ACTOR
-            or merge_md.get("forbidden_actions_performed") != []
-            or merge_md.get("secret_exposure") != "none"
-        ):
-            return None
-    elif has_immutable_schema:
-        merge_sha = merge_md.get("merge_commit")
-        repository = merge_md.get("repo")
-        pr_number = merge_md.get("pr")
-        merge_parents = merge_md.get("merge_parents")
-        immutable_review_id = merge_md.get("github_review_id")
-        candidate_blob = merge_md.get("tools_approval_blob_candidate")
-        main_blob = merge_md.get("tools_approval_blob_main")
-        if (
-            not has_immutable_schema
-            or not immutable_keys.issubset(merge_md)
-            or merge_md.get("verdict") != "EXACT_HEAD_MERGED_MAIN_READBACK"
-            or merge_md.get("audited_head") != head
-            or merge_md.get("audited_tree") != tree
-            or merge_md.get("base_at_audit") != base
-            or merge_md.get("canonical_main") != merge_sha
-            or merge_md.get("canonical_main_tree") != tree
-            or not isinstance(merge_parents, list)
-            or head not in merge_parents
-            or base not in merge_parents
-            or not isinstance(immutable_review_id, int)
-            or immutable_review_id <= 0
-            or merge_md.get("native_audit_task") != reviewer_id
-            or merge_md.get("native_audit_run") != _reviewer_run_id
-            or merge_md.get("native_audit_verdict") != "PASS_EXACT_HEAD"
-            or not isinstance(candidate_blob, str)
-            or not re.fullmatch(r"[0-9a-fA-F]{40}", candidate_blob)
-            or main_blob != candidate_blob
-            or merge_md.get("auditor_identity") != FACTORY_REVIEW_AUDITOR_ACTOR
-            or merge_md.get("merger_identity") != FACTORY_REVIEW_MERGER_ACTOR
-            or len({
-                FACTORY_REVIEW_AUTHOR_ACTOR,
-                merge_md.get("auditor_identity"),
-                merge_md.get("merger_identity"),
-            }) != 3
-            or merge_md.get("merge_performed") is not True
-            or merge_md.get("production_or_runtime_mutation") is not False
-            or merge_md.get("forbidden_actions_performed") != []
-            or merge_md.get("secret_exposure") != "none"
-        ):
-            return None
-        review_id = immutable_review_id
-    elif has_current_gm_schema:
-        merge_sha = merge_md.get("merge_commit")
-        repository = merge_md.get("repository")
-        pr_number = merge_md.get("pr")
-        merge_parents = merge_md.get("merge_parents")
-        if (
-            not current_gm_keys.issubset(merge_md)
-            or merger_profile != "gm"
-            or merge_md.get("outcome") != "ROLE_SEPARATED_CAS_MERGE_AND_MAIN_READBACK_COMPLETE"
-            or merge_md.get("native_task_id") != merger_id
-            or merge_md.get("native_run_id") != merger_run_id
-            or merge_md.get("merger_profile") != merger_profile
-            or merge_md.get("merger_actor") != FACTORY_REVIEW_MERGER_ACTOR
-            or merge_md.get("implementation_actor") != FACTORY_REVIEW_AUTHOR_ACTOR
-            or merge_md.get("auditor_actor") != FACTORY_REVIEW_AUDITOR_ACTOR
-            or len({merge_md.get("merger_actor"), merge_md.get("implementation_actor"), merge_md.get("auditor_actor")}) != 3
-            or merge_md.get("audit_task_id") != reviewer_id
-            or merge_md.get("audit_run_id") != _reviewer_run_id
-            or merge_md.get("audit_outcome") != "PASS_EXACT_HEAD"
-            or merge_md.get("github_review_id") != review_id
-            or merge_md.get("github_review_state") != "APPROVED"
-            or merge_md.get("head") != head
-            or merge_md.get("head_tree") != tree
-            or merge_md.get("base_main_before") != base
-            or merge_md.get("merged_files") != changed_files
-            or merge_md.get("merge_method") != "merge"
-            or merge_md.get("cas_merge_attempt_count") != 1
-            or merge_md.get("merge_tree") != tree
-            or merge_md.get("canonical_main_after") != merge_sha
-            or merge_parents != [base, head]
-            or merge_md.get("runtime_install_performed") is not False
-            or merge_md.get("runtime_witness_performed") is not False
-            or merge_md.get("author_finalizer_performed") is not False
-            or merge_md.get("forbidden_actions_performed") != []
-            or merge_md.get("secret_exposure") != "none"
-        ):
-            return None
-    elif has_terminal_gm_schema:
-        merge_sha = merge_md.get("merge_commit")
-        repository = FACTORY_REVIEW_REPOSITORY
-        pr_number = source_pr_number
-        merge_parents = merge_md.get("merge_parents")
-        if (
-            not has_terminal_gm_schema
-            or not terminal_gm_keys.issubset(merge_md)
-            or merger_profile != "gm"
-            or merge_md.get("native_run_id") != merger_run_id
-            or merge_md.get("audit_verdict") not in FACTORY_TERMINAL_AUDIT_SUCCESS_VERDICTS
-            or (
-                has_terminal_review
-                and merge_md.get("audit_verdict") != review_md.get("verdict")
-            )
-            or merge_md.get("exact_audit_task") != reviewer_id
-            or merge_md.get("exact_audit_run") != _reviewer_run_id
-            or merge_md.get("commit_bound_review")
-            != (
-                f"https://github.com/{FACTORY_REVIEW_REPOSITORY}/pull/"
-                f"{source_pr_number}#pullrequestreview-{review_id}"
-            )
-            or merge_md.get("pr")
-            != f"https://github.com/{FACTORY_REVIEW_REPOSITORY}/pull/{source_pr_number}"
-            or merge_md.get("pr_state") != "MERGED"
-            or merge_md.get("implementation_task") != task_id
-            or merge_md.get("implementation_run") != author_run_id
-            or merge_md.get("implementation_author") != FACTORY_REVIEW_AUTHOR_ACTOR
-            or merge_md.get("independent_auditor") != "GemAION/bafuxunan"
-            or merge_md.get("merger_role") != "AION-GM"
-            or merge_md.get("audited_head") != head
-            or merge_md.get("audited_tree") != tree
-            or merge_md.get("base_main_before") != base
-            or merge_md.get("changed_files") != changed_files
-            or merge_md.get("cas_merge_count") != 1
-            or merge_md.get("merge_tree") != tree
-            or merge_md.get("canonical_main_after") != merge_sha
-            or merge_parents != [base, head]
-            or merge_md.get("runtime_install_performed") is not False
-            or merge_md.get("typed_runtime_witness_performed") is not False
-            or merge_md.get("reviewed_author_finalizer_performed") is not False
-            or merge_md.get("forbidden_actions_performed") != []
-            or merge_md.get("secret_exposure") != "none"
-        ):
-            return None
-    else:
-        merge_sha = merge_md.get("merge_commit")
-        repository = FACTORY_REVIEW_REPOSITORY
-        pr_number = merge_md.get("source_pr")
-        merge_parents = merge_md.get("merge_parents")
-        cas_merge = merge_md.get("cas_merge")
-        hosted_checks = merge_md.get("hosted_checks")
-        collision_readback = merge_md.get("native_collision_readback")
-        head_containment = merge_md.get("audited_head_containment")
-        hosted_total = hosted_checks.get("total") if isinstance(hosted_checks, dict) else None
-        if (
-            not has_durable_terminal_gm_schema
-            or not durable_terminal_gm_keys.issubset(merge_md)
-            or merger_profile != "gm"
-            or merge_md.get("outcome")
-            != "ROLE_SEPARATED_CAS_MERGE_AND_MAIN_READBACK_COMPLETE"
-            or merge_md.get("canonical_run_id") != merger_run_id
-            or merge_md.get("source_pr") != source_pr_number
-            or merge_md.get("source_pr_url")
-            != f"https://github.com/{FACTORY_REVIEW_REPOSITORY}/pull/{source_pr_number}"
-            or merge_md.get("implementation_task") != task_id
-            or merge_md.get("implementation_run") != author_run_id
-            or merge_md.get("implementation_profile") != FACTORY_REVIEW_AUTHOR_PROFILE
-            or merge_md.get("implementation_github_actor") != FACTORY_REVIEW_AUTHOR_ACTOR
-            or merge_md.get("exact_audit_task") != reviewer_id
-            or merge_md.get("exact_audit_run") != _reviewer_run_id
-            or merge_md.get("audit_profile") != reviewer_profile
-            or merge_md.get("audit_github_actor") != FACTORY_REVIEW_AUDITOR_ACTOR
-            or merge_md.get("audit_verdict") not in FACTORY_TERMINAL_AUDIT_SUCCESS_VERDICTS
-            or merge_md.get("audit_verdict") != review_md.get("verdict")
-            or merge_md.get("github_review_id") != review_id
-            or merge_md.get("commit_bound_review")
-            != (
-                f"https://github.com/{FACTORY_REVIEW_REPOSITORY}/pull/"
-                f"{source_pr_number}#pullrequestreview-{review_id}"
-            )
-            or merge_md.get("audited_head") != head
-            or merge_md.get("audited_tree") != tree
-            or merge_md.get("audited_base") != base
-            or merge_md.get("base_ref") != "main"
-            or merge_md.get("changed_files") != changed_files
-            or not isinstance(collision_readback, dict)
-            or type(collision_readback.get("other_nonterminal_exact_merge_owners")) is not int
-            or collision_readback.get("other_nonterminal_exact_merge_owners") != 0
-            or not isinstance(hosted_checks, dict)
-            or type(hosted_total) is not int
-            or hosted_total <= 0
-            or type(hosted_checks.get("terminal")) is not int
-            or hosted_checks.get("terminal") != hosted_total
-            or type(hosted_checks.get("pending")) is not int
-            or hosted_checks.get("pending") != 0
-            or type(hosted_checks.get("failing")) is not int
-            or hosted_checks.get("failing") != 0
-            or hosted_checks.get("required_aggregate") != "All required checks pass"
-            or hosted_checks.get("required_aggregate_conclusion") != "success"
-            or not isinstance(hosted_checks.get("required_aggregate_url"), str)
-            or not hosted_checks.get("required_aggregate_url")
-            or not isinstance(cas_merge, dict)
-            or type(cas_merge.get("attempts")) is not int
-            or cas_merge.get("attempts") != 1
-            or cas_merge.get("method") != "merge"
-            or cas_merge.get("expected_head") != head
-            or cas_merge.get("api_result") != "Pull Request successfully merged"
-            or merge_md.get("merge_profile") != merger_profile
-            or merge_md.get("merge_github_actor") != FACTORY_REVIEW_MERGER_ACTOR
-            or merge_md.get("roles_distinct") is not True
-            or len({
-                merge_md.get("implementation_github_actor"),
-                merge_md.get("audit_github_actor"),
-                merge_md.get("merge_github_actor"),
-            }) != 3
-            or merge_md.get("pr_state") != "MERGED"
-            or merge_md.get("merge_tree") != tree
-            or merge_parents != [base, head]
-            or merge_md.get("canonical_main") != merge_sha
-            or not isinstance(head_containment, dict)
-            or head_containment.get("status") != "ahead"
-            or type(head_containment.get("ahead_by")) is not int
-            or head_containment.get("ahead_by") != 1
-            or type(head_containment.get("behind_by")) is not int
-            or head_containment.get("behind_by") != 0
-            or head_containment.get("exact_second_parent") is not True
-            or merge_md.get("runtime_install_performed") is not False
-            or merge_md.get("typed_runtime_witness_performed") is not False
-            or merge_md.get("reviewed_author_finalizer_performed") is not False
-            or merge_md.get("source_edit_performed") is not False
-            or merge_md.get("forbidden_actions_performed") != []
-            or merge_md.get("secret_exposure") != "none"
-            or type(merge_md.get("new_control_plane_count")) is not int
-            or merge_md.get("new_control_plane_count") != 0
-        ):
-            return None
-
-    if (
-        repository != FACTORY_REVIEW_REPOSITORY
-        or pr_number != source_pr_number
-        or not isinstance(merge_sha, str)
-        or not re.fullmatch(r"[0-9a-fA-F]{40}", merge_sha)
-    ):
-        return None
-
-    runtime_witnesses = []
-    runtime_discriminators = {
-        "canonical_run_id", "install", "witness_type", "source_pr",
-        "source_head", "source_tree", "source_merge", "source_changed_paths",
-        "candidate_packet",
-    }
-    for child in conn.execute(
-        "SELECT child_id FROM task_links WHERE parent_id = ? ORDER BY child_id",
-        (merger_id,),
-    ).fetchall():
-        child_id = str(child["child_id"])
-        candidate = _authenticated_factory_run_metadata(conn, child_id)
-        if candidate is None:
-            continue
-        candidate_run_id, candidate_profile, candidate_md = candidate
-        if runtime_discriminators.intersection(candidate_md):
-            runtime_witnesses.append(
-                (child_id, candidate_run_id, candidate_profile, candidate_md)
-            )
-    if len(runtime_witnesses) != 1:
-        return None
-    runtime_id, runtime_run_id, runtime_profile, wrapper_md = runtime_witnesses[0]
-    if not _all_other_parents_terminal(conn, runtime_id, merger_id):
-        return None
-    candidate_packet = wrapper_md.get("candidate_packet")
-    has_descendant_wrapper = isinstance(candidate_packet, dict)
-    runtime_md = candidate_packet if has_descendant_wrapper else wrapper_md
-    install = runtime_md.get("install")
-    if has_descendant_wrapper:
-        flat_runtime_aliases = runtime_discriminators - {
-            "candidate_packet", "canonical_run_id",
-        }
-        installed_runtime = wrapper_md.get("installed_runtime")
-        source_lineage = wrapper_md.get("source_lineage")
-        role_binding = wrapper_md.get("role_binding")
-        review_obligations = wrapper_md.get("review_obligations")
-        direct_parents = [str(row["parent_id"]) for row in conn.execute(
-            "SELECT parent_id FROM task_links WHERE child_id = ? ORDER BY parent_id",
-            (runtime_id,),
-        ).fetchall()]
-        source_paths = runtime_md.get("source_changed_paths")
-        if (
-            not has_immutable_review
-            or flat_runtime_aliases.intersection(wrapper_md)
-            or wrapper_md.get("canonical_run_id") != runtime_run_id
-            or runtime_md.get("canonical_run_id") != runtime_run_id
-            or wrapper_md.get("forbidden_actions_performed") != []
-            or wrapper_md.get("secret_exposure") != "none"
-            or not isinstance(install, dict)
-            or not isinstance(installed_runtime, dict)
-            or not isinstance(source_lineage, dict)
-            or not isinstance(role_binding, dict)
-            or not isinstance(review_obligations, dict)
-            or installed_runtime.get("head") != install.get("head")
-            or installed_runtime.get("tree") != install.get("tree")
-            or installed_runtime.get("changed_paths") != install.get("changed_paths")
-            or source_lineage.get("source_pr") != runtime_md.get("source_pr")
-            or source_lineage.get("source_head") != runtime_md.get("source_head")
-            or source_lineage.get("source_tree") != runtime_md.get("source_tree")
-            or source_lineage.get("source_merge") != runtime_md.get("source_merge")
-            or source_lineage.get("github_review_id") != runtime_md.get("github_review_id")
-            or source_lineage.get("source_changed_paths") != source_paths
-            or sorted(role_binding.get("direct_parents", [])) != sorted(direct_parents)
-            or merger_id not in direct_parents
-            or role_binding.get("parents_terminal") is not True
-            or role_binding.get("runtime_profile") != runtime_profile
-            or role_binding.get("author_profile") != author["assignee"]
-            or role_binding.get("auditor_profile") != reviewer_profile
-            or role_binding.get("selected_merger_profile") != merger_profile
-            or role_binding.get("roles_distinct") is not True
-            or len({runtime_profile, author["assignee"], reviewer_profile, merger_profile}) != 4
-            or review_obligations.get("unchanged") is not True
-            or review_obligations.get("author_finalizer_performed") is not False
-            or not isinstance(source_paths, list) or not source_paths
-            or not _historical_source_preserved_in_installed_git(
-                install=install, source_head=head, source_tree=tree, source_base=base,
-                source_merge=merge_sha, source_paths=source_paths,
-            )
-        ):
-            return None
-    runtime_changed_paths = install.get("changed_paths") if isinstance(install, dict) else None
-    if (
-        runtime_profile in {author["assignee"], reviewer_profile, merger_profile}
-        or runtime_md.get("canonical_run_id") != runtime_run_id
-        or not isinstance(install, dict)
-        or (not has_descendant_wrapper and install.get("head") != merge_sha)
-        or (not has_descendant_wrapper and install.get("tree") != tree)
-        or not isinstance(runtime_changed_paths, list)
-        or not runtime_changed_paths
-        or any(not isinstance(path, str) or not path for path in runtime_changed_paths)
-        or (
-            not has_descendant_wrapper
-            and changed_files is not None
-            and runtime_changed_paths != changed_files
-        )
-        or runtime_md.get("forbidden_actions_performed") != []
-        or runtime_md.get("secret_exposure") != "none"
-    ):
-        return None
-    if (has_immutable_review or has_terminal_review) and (
-        runtime_md.get("witness_type") != "RUNTIME_INSTALL_READBACK"
-        or runtime_md.get("source_pr") != source_pr_number
-        or runtime_md.get("source_head") != head
-        or runtime_md.get("source_tree") != tree
-        or runtime_md.get("source_merge") != merge_sha
-        or runtime_md.get("github_review_id") != review_id
-        or (
-            not has_descendant_wrapper
-            and runtime_md.get("source_changed_paths") != runtime_changed_paths
-        )
-    ):
-        return None
-    return author_run_id
 
 
 def _read_aion889_atomic_finalizer_runtime(service: str) -> dict[str, str]:
