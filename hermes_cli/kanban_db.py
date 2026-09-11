@@ -9335,6 +9335,13 @@ _EARLIER_V3_AUDIT_OUTCOME_KEYS = {
 _EARLIER_V3_AUDIT_ROLE_KEYS = {"author_profile", "auditor_profile"}
 _EARLIER_V3_DISPOSITION_FINAL = "FINAL_ACCEPTED"
 _EARLIER_V3_DISPOSITION_CONTINUATION = "CONTINUATION_COMMITTED"
+# The pre-merge v2 PASS review_verdict contract: exactly these seven keys,
+# version 2, verdict "pass", and evidence_sha256 recomputed over the closed
+# evidence block. Any unknown or missing key fails closed.
+_EARLIER_V3_VERDICT_KEYS = {
+    "version", "review_task_id", "review_run_id", "verdict", "reason",
+    "evidence", "evidence_sha256",
+}
 
 
 def _canonical_audit_outcome_evidence_sha256(evidence: dict[str, Any]) -> str:
@@ -9403,6 +9410,54 @@ def _earlier_v3_continuation_targets(
     if targets:
         return _EARLIER_V3_DISPOSITION_CONTINUATION, targets
     return _EARLIER_V3_DISPOSITION_FINAL, []
+
+
+def _earlier_v3_bound_verdict(
+    payload: Any, audit_task_id: str, audit_run_id: int, envelope: dict[str, Any],
+) -> bool:
+    """Validate one bound pre-merge version-2 PASS review_verdict mirror.
+
+    The authentic producer wrote the exact seven-key v2 schema and recomputed
+    ``evidence_sha256`` over the closed evidence block. Any unknown/missing
+    key, wrong type, drift from the envelope, or a digest that does not
+    recompute over the closed evidence block fails closed so this ingress can
+    never trust a malformed or tampered authority record.
+    """
+    try:
+        verdict = json.loads(payload or "{}")
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(verdict, dict) or set(verdict) != _EARLIER_V3_VERDICT_KEYS:
+        return False
+    if type(verdict.get("version")) is not int or verdict["version"] != 2:
+        return False
+    if type(verdict.get("verdict")) is not str or verdict["verdict"] != "pass":
+        return False
+    if (
+        type(verdict.get("review_task_id")) is not str
+        or verdict["review_task_id"] != audit_task_id
+    ):
+        return False
+    review_run_id = verdict.get("review_run_id")
+    if type(review_run_id) is not int or review_run_id != audit_run_id:
+        return False
+    reason = verdict.get("reason")
+    if type(reason) is not str or reason != envelope.get("reason"):
+        return False
+    evidence = verdict.get("evidence")
+    if not isinstance(evidence, dict) or set(evidence) != _CANONICAL_AUDIT_EVIDENCE_KEYS:
+        return False
+    if _canonical_audit_evidence(evidence) != evidence:
+        return False
+    if evidence != envelope.get("evidence"):
+        return False
+    evidence_sha256 = verdict.get("evidence_sha256")
+    if (
+        type(evidence_sha256) is not str
+        or evidence_sha256 != _canonical_audit_outcome_evidence_sha256(evidence)
+    ):
+        return False
+    return True
 
 
 def _earlier_v3_current_audit_outcome(
@@ -9521,11 +9576,11 @@ def _earlier_v3_current_audit_outcome(
     ).fetchall()
     if len(author_mirrors) != 1:
         return True, None
-    try:
-        author_envelope = json.loads(author_mirrors[0]["payload"] or "{}")
-    except (TypeError, ValueError):
-        return True, None
-    if author_envelope != envelope:
+    # The round-1 singleton requirement is byte-identity, not parsed-object
+    # equality: the authentic producer wrote the exact same serialized bytes to
+    # both task histories. Re-serializing the author mirror with a different
+    # key order (semantically equal but byte-different) must fail closed.
+    if author_mirrors[0]["payload"] != row["payload"]:
         return True, None
     # Bind the envelope back to the mirrored PASS review_verdict rows that
     # actually granted the PASS, so this ingress corroborates the existing
@@ -9544,20 +9599,18 @@ def _earlier_v3_current_audit_outcome(
     ).fetchall()
     if len(audit_verdicts) != 1 or len(author_verdicts) != 1:
         return True, None
-    try:
-        audit_verdict = json.loads(audit_verdicts[0]["payload"] or "{}")
-        author_verdict = json.loads(author_verdicts[0]["payload"] or "{}")
-    except (TypeError, ValueError):
-        return True, None
+    # Validate each singleton bound PASS review_verdict against the exact
+    # pre-merge version-2 schema/types and the recomputed closed-evidence
+    # digest, and bind it back to the envelope reason/evidence. A tampered
+    # digest or an unknown/missing key fails closed (never an alternate
+    # authority over a present v3 record).
     if (
-        not isinstance(audit_verdict, dict)
-        or not isinstance(author_verdict, dict)
-        or audit_verdict != author_verdict
-        or audit_verdict.get("verdict") != "pass"
-        or audit_verdict.get("review_task_id") != audit_task_id
-        or audit_verdict.get("review_run_id") != audit_run_id
-        or audit_verdict.get("reason") != envelope.get("reason")
-        or audit_verdict.get("evidence") != envelope.get("evidence")
+        not _earlier_v3_bound_verdict(
+            audit_verdicts[0]["payload"], audit_task_id, audit_run_id, envelope,
+        )
+        or not _earlier_v3_bound_verdict(
+            author_verdicts[0]["payload"], audit_task_id, audit_run_id, envelope,
+        )
     ):
         return True, None
     handoff_row = conn.execute(

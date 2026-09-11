@@ -6658,6 +6658,38 @@ def _bind_earlier_v3_pass_verdict(conn, chain):
         )
 
 
+def _rebind_earlier_v3_verdict(conn, chain, *, verdict_payload=None):
+    """Replace both bound v2 PASS verdict rows with ``verdict_payload``.
+
+    Used to seed a tampered digest or an unknown/mixed key set so the ingress
+    is proven to reject a malformed authority record rather than trust it.
+    """
+    if verdict_payload is None:
+        verdict_payload = {
+            "version": 2,
+            "review_task_id": chain["reviewer"],
+            "review_run_id": chain["reviewer_run"],
+            "verdict": "pass",
+            "reason": _EARLIER_V3_REASON,
+            "evidence": chain["evidence"],
+            "evidence_sha256": chain["evidence_sha256"],
+        }
+    with kb.write_txn(conn):
+        conn.execute(
+            "DELETE FROM task_events WHERE kind='review_verdict' "
+            "AND task_id IN (?, ?) AND run_id = ?",
+            (chain["author"], chain["reviewer"], chain["reviewer_run"]),
+        )
+        kb._append_event(
+            conn, chain["reviewer"], "review_verdict", verdict_payload,
+            run_id=chain["reviewer_run"],
+        )
+        kb._append_event(
+            conn, chain["author"], "review_verdict", verdict_payload,
+            run_id=chain["reviewer_run"],
+        )
+
+
 def _earlier_v3_envelope_for(chain):
     return {
         "version": 3,
@@ -6985,3 +7017,67 @@ def test_earlier_v3_audit_outcome_ambiguous_second_parent_fails_closed(kanban_ho
         assert kb._canonical_current_audit_outcome(conn, chain["author"]) == (True, None)
         assert kb._canonical_audit_receipt(conn, chain["author"]) is None
         assert kb._reviewed_author_finalizer_run_id(conn, chain["author"]) is None
+
+
+def test_earlier_v3_audit_outcome_tampered_bound_verdict_digest_fails_closed(kanban_home):
+    with kb.connect() as conn:
+        chain = _earlier_v3_audit_outcome_chain(conn)
+        # A bound PASS verdict whose evidence_sha256 was replaced with 64
+        # zeroes must not authenticate: the digest no longer recomputes over
+        # the closed evidence block.
+        tampered = {
+            "version": 2,
+            "review_task_id": chain["reviewer"],
+            "review_run_id": chain["reviewer_run"],
+            "verdict": "pass",
+            "reason": _EARLIER_V3_REASON,
+            "evidence": chain["evidence"],
+            "evidence_sha256": "0" * 64,
+        }
+        _rebind_earlier_v3_verdict(conn, chain, verdict_payload=tampered)
+
+        assert kb._canonical_current_audit_outcome(conn, chain["author"]) == (True, None)
+        assert kb._canonical_audit_receipt(conn, chain["author"]) is None
+        assert kb._reviewed_author_finalizer_run_id(conn, chain["author"]) is None
+
+
+def test_earlier_v3_audit_outcome_unknown_bound_verdict_key_fails_closed(kanban_home):
+    with kb.connect() as conn:
+        chain = _earlier_v3_audit_outcome_chain(conn)
+        # An unknown foreign key makes the verdict neither the exact seven-key
+        # v2 schema nor any supported shape; it must fail closed, never act as
+        # an alternate authority over the present v3 record.
+        tampered = {
+            "version": 2,
+            "review_task_id": chain["reviewer"],
+            "review_run_id": chain["reviewer_run"],
+            "verdict": "pass",
+            "reason": _EARLIER_V3_REASON,
+            "evidence": chain["evidence"],
+            "evidence_sha256": chain["evidence_sha256"],
+            "foreign_authority": "evil",
+        }
+        _rebind_earlier_v3_verdict(conn, chain, verdict_payload=tampered)
+
+        assert kb._canonical_current_audit_outcome(conn, chain["author"]) == (True, None)
+        assert kb._canonical_audit_receipt(conn, chain["author"]) is None
+        assert kb._reviewed_author_finalizer_run_id(conn, chain["author"]) is None
+
+
+def test_earlier_v3_audit_outcome_byte_different_author_mirror_fails_closed(kanban_home):
+    with kb.connect() as conn:
+        chain = _earlier_v3_audit_outcome_chain(conn)
+        _clear_earlier_v3_outcome(conn, chain)
+        envelope = _earlier_v3_envelope_for(chain)
+        # Semantically equal object, byte-different serialization: reordering
+        # the top-level keys changes the json.dumps bytes without changing the
+        # parsed value. The ingress requires byte-identity with the audit event.
+        reordered = {key: envelope[key] for key in reversed(list(envelope.keys()))}
+        assert json.loads(json.dumps(reordered)) == json.loads(json.dumps(envelope))
+        assert json.dumps(reordered) != json.dumps(envelope)
+        _seed_earlier_v3_outcome(conn, chain, envelope=envelope, author_envelope=reordered)
+
+        assert kb._canonical_current_audit_outcome(conn, chain["author"]) == (True, None)
+        assert kb._canonical_audit_receipt(conn, chain["author"]) is None
+        assert kb._reviewed_author_finalizer_run_id(conn, chain["author"]) is None
+
