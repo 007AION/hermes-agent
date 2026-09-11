@@ -9345,13 +9345,17 @@ _JSON_VALUE_LEAD_RE = re.compile(r"[-+0-9tfnNI]", re.IGNORECASE)
 # alphanumeric-word separators invisible, which let a conflicting declaration
 # hide behind the authentic one and authenticate. The value remains 40+ hex for
 # fields so an overlong token is still DETECTED and rejected (``len != 40``).
+# The negative lookbehind excludes ``-`` as well as word characters so a
+# hyphenated compound (``exact-head``, ``Same-PR``) is never read as a
+# standalone declaration, and the ``.*?`` gap never spans a 40-hex run into a
+# later value.
 _PROSE_FIELD_TOKEN_RE = re.compile(
-    r"(?<![A-Za-z0-9_])(?P<name>head|tree|base)\b"
+    r"(?<![A-Za-z0-9_-])(?P<name>head|tree|base)\b"
     r"(?P<gap>.*?)(?P<value>[0-9a-fA-F]{40,})",
     re.IGNORECASE,
 )
 _PROSE_PR_TOKEN_RE = re.compile(
-    r"(?<![A-Za-z0-9_])pr\b(?P<gap>.*?)(?P<value>[0-9]+)",
+    r"(?<![A-Za-z0-9_-])pr\b(?P<gap>.*?)(?P<value>[0-9]+)",
     re.IGNORECASE,
 )
 _PROSE_HEAD_SEP_RE = re.compile(r"^\s*[:=]?\s*$")
