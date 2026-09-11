@@ -9349,16 +9349,20 @@ def _canonical_audit_outcome_evidence_sha256(evidence: dict[str, Any]) -> str:
 def _earlier_v3_changed_fact(
     conn: sqlite3.Connection, task_id: str, run_id: int,
 ) -> Optional[dict[str, Any]]:
-    """Read one earlier-v3 changed-fact mirror for a task+run, if well-formed."""
-    row = conn.execute(
+    """Read the one earlier-v3 changed-fact mirror for a task+run, if well-formed.
+
+    Requires a singleton: a second changed_fact on the exact task+run fails
+    closed so a hidden conflicting fact cannot be masked by a matching latest row.
+    """
+    rows = conn.execute(
         "SELECT payload FROM task_events WHERE task_id = ? AND run_id = ? "
-        "AND kind = 'changed_fact' ORDER BY id DESC LIMIT 1",
+        "AND kind = 'changed_fact'",
         (task_id, run_id),
-    ).fetchone()
-    if row is None:
+    ).fetchall()
+    if len(rows) != 1:
         return None
     try:
-        payload = json.loads(row["payload"] or "{}")
+        payload = json.loads(rows[0]["payload"] or "{}")
     except (TypeError, ValueError):
         return None
     if not isinstance(payload, dict):
@@ -9458,10 +9462,11 @@ def _earlier_v3_current_audit_outcome(
         return True, None
     if audit_task_id != row["task_id"] or audit_run_id != row["run_id"]:
         return True, None
-    if conn.execute(
-        "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ?",
-        (author_task_id, audit_task_id),
-    ).fetchone() is None:
+    audit_parents = conn.execute(
+        "SELECT parent_id FROM task_links WHERE child_id = ?",
+        (audit_task_id,),
+    ).fetchall()
+    if len(audit_parents) != 1 or audit_parents[0]["parent_id"] != author_task_id:
         return True, None
     author_row = conn.execute(
         "SELECT status, assignee, current_run_id FROM tasks WHERE id = ?",
@@ -9509,18 +9514,51 @@ def _earlier_v3_current_audit_outcome(
         or audit_run["ended_at"] is None
     ):
         return True, None
-    author_mirror = conn.execute(
+    author_mirrors = conn.execute(
         "SELECT payload FROM task_events WHERE task_id = ? AND run_id = ? "
         "AND kind = 'canonical_audit_outcome'",
         (author_task_id, author_run_id),
-    ).fetchone()
-    if author_mirror is None:
+    ).fetchall()
+    if len(author_mirrors) != 1:
         return True, None
     try:
-        author_envelope = json.loads(author_mirror["payload"] or "{}")
+        author_envelope = json.loads(author_mirrors[0]["payload"] or "{}")
     except (TypeError, ValueError):
         return True, None
     if author_envelope != envelope:
+        return True, None
+    # Bind the envelope back to the mirrored PASS review_verdict rows that
+    # actually granted the PASS, so this ingress corroborates the existing
+    # authority instead of acting as an alternate one. Removing either bound
+    # verdict row, or drifting the envelope's reason/evidence away from the
+    # verdict, fails closed.
+    audit_verdicts = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND run_id = ? "
+        "AND kind = 'review_verdict'",
+        (audit_task_id, audit_run_id),
+    ).fetchall()
+    author_verdicts = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND run_id = ? "
+        "AND kind = 'review_verdict'",
+        (author_task_id, audit_run_id),
+    ).fetchall()
+    if len(audit_verdicts) != 1 or len(author_verdicts) != 1:
+        return True, None
+    try:
+        audit_verdict = json.loads(audit_verdicts[0]["payload"] or "{}")
+        author_verdict = json.loads(author_verdicts[0]["payload"] or "{}")
+    except (TypeError, ValueError):
+        return True, None
+    if (
+        not isinstance(audit_verdict, dict)
+        or not isinstance(author_verdict, dict)
+        or audit_verdict != author_verdict
+        or audit_verdict.get("verdict") != "pass"
+        or audit_verdict.get("review_task_id") != audit_task_id
+        or audit_verdict.get("review_run_id") != audit_run_id
+        or audit_verdict.get("reason") != envelope.get("reason")
+        or audit_verdict.get("evidence") != envelope.get("evidence")
+    ):
         return True, None
     handoff_row = conn.execute(
         "SELECT id, run_id, payload FROM task_events WHERE id = ? AND task_id = ? "
