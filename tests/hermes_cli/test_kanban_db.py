@@ -6885,6 +6885,71 @@ def test_review_verdict_pass_rejects_prose_handoff_candidate_mismatch(kanban_hom
         assert kb._canonical_audit_receipt(conn, author) is None
 
 
+def _handoff_expected_candidate():
+    return {
+        key: _APPROVED_EVIDENCE[key]
+        for key in sorted(kb._CANONICAL_AUDIT_TARGET_KEYS)
+    }
+
+
+_PROSE = _prose_handoff_reason()
+
+
+@pytest.mark.parametrize("reason", [
+    json.dumps(_PROSE),                                    # JSON string encoding a prose declaration
+    json.dumps([_PROSE]),                                  # JSON list wrapping the declaration
+    '{"version": 1, "candidate": ',                        # truncated/malformed JSON envelope
+    '{"version": 1, "summary": ' + json.dumps(_PROSE),     # malformed JSON embedding prose declaration
+    '"unterminated json string',                           # malformed JSON string literal
+    _PROSE + " head " + "d" * 40,                          # conflicting duplicate head
+    _PROSE + " tree " + "d" * 40,                          # conflicting duplicate tree
+    _PROSE + " base " + "d" * 40,                          # conflicting duplicate base
+    _PROSE + " PR #99",                                    # conflicting duplicate PR
+    _PROSE + " head " + _APPROVED_EVIDENCE["head"],        # duplicated (identical) head
+])
+def test_resolve_handoff_candidate_target_fails_closed_hostile(reason):
+    """JSON string/list, malformed JSON, and duplicate declarations fail closed."""
+    expected = _handoff_expected_candidate()
+    assert kb._resolve_handoff_candidate_target(reason, expected) is None
+
+
+def test_resolve_handoff_candidate_target_fails_closed_deep_nesting():
+    """A deeply nested JSON-shaped reason fails closed instead of raising RecursionError."""
+    expected = _handoff_expected_candidate()
+    deep = "[" * 2000 + "]" * 2000
+    assert kb._resolve_handoff_candidate_target(deep, expected) is None
+
+
+@pytest.mark.parametrize("reason", [
+    json.dumps(_PROSE),
+    json.dumps([_PROSE]),
+    '{"version": 1, "candidate": ',
+    '{"version": 1, "summary": ' + json.dumps(_PROSE),
+    _PROSE + " head " + "d" * 40,
+    _PROSE + " PR #99",
+])
+def test_review_verdict_pass_rejects_hostile_handoff_candidate_without_mutation(
+    kanban_home, reason,
+):
+    """A hostile handoff candidate never terminalizes PASS (fail-closed, no mutation)."""
+    with kb.connect() as conn:
+        author, run_id, review_task = _review_handoff_pair(conn)
+        assert kb.request_review_handoff(
+            conn, author, expected_run_id=run_id, review_task_id=review_task,
+            reason=reason,
+        )
+        audit_run = kb.claim_task(conn, review_task).current_run_id
+        before = "\n".join(conn.iterdump())
+        assert not kb.record_review_verdict(
+            conn, author, review_task_id=review_task,
+            expected_review_run_id=audit_run, verdict="pass",
+            reason="coherent but hostile handoff candidate", evidence=_APPROVED_EVIDENCE,
+        )
+        assert "\n".join(conn.iterdump()) == before
+        assert kb.get_task(conn, review_task).status == "running"
+        assert kb._canonical_audit_receipt(conn, author) is None
+
+
 @pytest.mark.parametrize("url", [
     "https://github.com/other/repo/pull/98#pullrequestreview-123",
     "https://github.com/kiddhu/hermes-agent/pull/99#pullrequestreview-123",

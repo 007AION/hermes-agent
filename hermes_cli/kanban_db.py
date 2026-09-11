@@ -9332,17 +9332,26 @@ def _resolve_handoff_candidate_target(
     version-1 candidate envelope ``{"version": 1, "candidate": {...},
     "summary": ...}``.  Some author lineages (e.g. SEEKAPI-005) persist the
     same candidate identity as prose instead, so the resolver also accepts a
-    strict prose declaration: an exact ``head``/``tree``/``base`` 40-hex SHA
-    and a ``PR #<n>`` number that must match the already-validated evidence
-    byte-for-byte (case-insensitive for SHAs).  ``repository`` is bound from
-    the evidence, never from prose.  Any malformed JSON, non-dict JSON, or a
-    prose reason missing any of head/tree/base/pr fails closed (None).
+    strict prose declaration: exactly one ``head``/``tree``/``base`` 40-hex
+    SHA and exactly one ``PR #<n>`` number that must match the already-validated
+    evidence byte-for-byte (case-insensitive for SHAs).  ``repository`` is bound
+    from the evidence, never from prose.
+
+    A JSON-shaped reason (leading ``{``/``[``/``"``) must decode to the exact
+    canonical envelope; any JSON string/list/number, malformed JSON, duplicate
+    JSON member, or deeply-nested JSON fails closed (None) rather than being
+    reinterpreted as prose.  A prose reason must declare each of
+    head/tree/base/pr exactly once; a conflicting or duplicated declaration
+    fails closed.
     """
-    try:
-        target = json.loads(reason)
-    except (TypeError, ValueError):
-        target = None
-    if isinstance(target, dict):
+    text = reason.strip()
+    if text[:1] in ("{", "[", '"'):
+        try:
+            target = _strict_json_loads(text)
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(target, dict):
+            return None
         if (
             target == {
                 "version": 1,
@@ -9354,17 +9363,28 @@ def _resolve_handoff_candidate_target(
         ):
             return target
         return None
-    head = re.search(r"\bhead\s+([0-9a-fA-F]{40})", reason)
-    tree = re.search(r"\btree\s+([0-9a-fA-F]{40})", reason)
-    base = re.search(r"\bbase\s+([0-9a-fA-F]{40})", reason)
-    pr = re.search(r"\bPR\s*#?\s*(\d+)\b", reason, re.IGNORECASE)
-    if head is None or tree is None or base is None or pr is None:
+    heads = re.findall(r"\bhead\s+([0-9a-fA-F]{40})", text)
+    trees = re.findall(r"\btree\s+([0-9a-fA-F]{40})", text)
+    bases = re.findall(r"\bbase\s+([0-9a-fA-F]{40})", text)
+    prs = re.findall(r"\bPR\s*#?\s*(\d+)\b", text, re.IGNORECASE)
+    if not (len(heads) == len(trees) == len(bases) == len(prs) == 1):
+        return None
+    expected_head = expected_candidate.get("head")
+    expected_tree = expected_candidate.get("tree")
+    expected_base = expected_candidate.get("base")
+    expected_pr = expected_candidate.get("pr")
+    if (
+        type(expected_head) is not str
+        or type(expected_tree) is not str
+        or type(expected_base) is not str
+        or type(expected_pr) is not int
+    ):
         return None
     if (
-        head.group(1).lower() != str(expected_candidate["head"]).lower()
-        or tree.group(1).lower() != str(expected_candidate["tree"]).lower()
-        or base.group(1).lower() != str(expected_candidate["base"]).lower()
-        or int(pr.group(1)) != expected_candidate["pr"]
+        heads[0].lower() != expected_head.lower()
+        or trees[0].lower() != expected_tree.lower()
+        or bases[0].lower() != expected_base.lower()
+        or int(prs[0]) != expected_pr
     ):
         return None
     return {"version": 1, "candidate": expected_candidate, "summary": reason}
