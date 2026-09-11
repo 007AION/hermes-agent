@@ -7378,11 +7378,12 @@ def test_current_v3_outcome_unbound_continuation_fails_closed(kanban_home, conti
 
 
 def test_current_v3_outcome_invents_unpromoted_child_fails_closed(kanban_home):
-    """A continuation id for a still-``todo`` child (never promoted) fails closed.
+    """A continuation id for a child with no producer promotion fails closed.
 
-    The terminal producer only ever emits children that were actually promoted to
-    a non-terminal state, so claiming a queued (``todo``) child invents an
-    obligation the live graph does not support.
+    The terminal producer only ever emits children it actually promoted in its
+    terminal transaction (a durable ``promoted`` event), so claiming a child
+    linked after the outcome with zero ``promoted`` events invents an obligation
+    the immutable promotion history does not support.
     """
     with kb.connect() as conn:
         author, run_id, review_task, audit_run = _current_v3_outcome(conn)
@@ -7404,17 +7405,29 @@ def test_current_v3_outcome_invents_unpromoted_child_fails_closed(kanban_home):
 
 
 def test_current_v3_outcome_erases_promoted_child_fails_closed(kanban_home):
-    """An envelope that omits an actually-promoted (``ready``) child fails closed.
+    """An envelope that omits a producer-promoted child fails closed.
 
-    The terminal producer always records every promoted child in the
-    continuation list, so dropping a live ``ready`` continuation erases a real
-    obligation the live graph still supports.
+    The terminal producer records every child it promotes in its terminal
+    transaction (``recompute_ready`` emits a durable ``promoted`` event) in the
+    ``continuation_ids`` list, so dropping that child from the envelope erases a
+    real obligation that the immutable promotion event still supports.
     """
     with kb.connect() as conn:
-        author, run_id, review_task, audit_run = _current_v3_outcome(conn)
+        author, run_id, review_task = _review_handoff_pair(conn)
+        assert kb.request_review_handoff(
+            conn, author, expected_run_id=run_id, review_task_id=review_task,
+            reason=_APPROVED_HANDOFF,
+        )
         child = kb.create_task(
             conn, title="promoted continuation", assignee="merger",
             parents=[review_task],
+        )
+        assert kb.get_task(conn, child).status == "todo"
+        audit_run = kb.claim_task(conn, review_task).current_run_id
+        assert kb.record_review_verdict(
+            conn, author, review_task_id=review_task,
+            expected_review_run_id=audit_run, verdict="pass",
+            reason="PASS_CURRENT_V3_FIXTURE", evidence=_APPROVED_EVIDENCE,
         )
         assert kb.get_task(conn, child).status == "ready"
 

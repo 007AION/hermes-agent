@@ -9331,58 +9331,31 @@ _JSON_STRUCTURAL_LEAD = ("{", "[", '"')
 # prefix (``0``, ``truex``, ``0x``, ``NaN``, ``Infinity``, ...) can never fall
 # through to the prose path and authenticate by a coincidental declaration.
 _JSON_VALUE_LEAD_RE = re.compile(r"[-+0-9tfnNI]", re.IGNORECASE)
-# A candidate-like head/tree/base declaration: the field name followed by any
-# non-alphanumeric separator and a SHA-length hex token (40+ hex). The separator
-# class is deliberately broad (any non-word run) so a conflicting second
-# declaration that uses an unrecognized separator (backtick, arrow, ``::``,
-# etc.) is still DETECTED here and visible to the singleton check, instead of
-# being hidden and leaving the original declaration as an apparent singleton.
-# Overlong (41+) hex tokens are still DETECTED so they can be rejected rather
-# than being invisible to the singleton check.
+# CLOSED candidate-like declaration tokenizers. The gap between a field/PR name
+# and its value token is any run of characters (whitespace, punctuation, a
+# word, an alphanumeric word, or several words), so a conflicting declaration
+# of every separator class — canonical (``head <sha>``), punctuation
+# (``head ` <sha>``, ``head -> <sha>``), word-separated (``head is <sha>``),
+# multi-word (``head value is <sha>``), and alphanumeric-word
+# (``head sha256 is <sha>``) — is matched here and made visible to the
+# singleton count. This is an allow-list grammar, not a deny-list: every
+# candidate-like declaration is tokenized, then the singleton requirement plus
+# the canonical-separator check accept ONLY the exact authentic shape. The
+# former deny-list (a non-word tokenizer plus a word-separated detector) left
+# alphanumeric-word separators invisible, which let a conflicting declaration
+# hide behind the authentic one and authenticate. The value remains 40+ hex for
+# fields so an overlong token is still DETECTED and rejected (``len != 40``).
 _PROSE_FIELD_TOKEN_RE = re.compile(
     r"(?<![A-Za-z0-9_])(?P<name>head|tree|base)\b"
-    r"(?P<gap>[^A-Za-z0-9]*?)(?P<value>[0-9a-fA-F]{40,})",
+    r"(?P<gap>.*?)(?P<value>[0-9a-fA-F]{40,})",
     re.IGNORECASE,
 )
-# A candidate-like PR declaration: the field name followed by any non-word
-# separator and a digit token. As above, the broad separator keeps a conflicting
-# ``PR/99`` or ``PR (#99)`` visible to the singleton check instead of hidden.
-# A colon/equals separator (``PR:`` / ``PR=``) is likewise still DETECTED so it
-# can be rejected as malformed rather than hidden from the singleton check.
 _PROSE_PR_TOKEN_RE = re.compile(
-    r"(?<![A-Za-z0-9_])pr\b(?P<gap>[^A-Za-z0-9]*?)(?P<value>[0-9]+)",
+    r"(?<![A-Za-z0-9_])pr\b(?P<gap>.*?)(?P<value>[0-9]+)",
     re.IGNORECASE,
 )
 _PROSE_HEAD_SEP_RE = re.compile(r"^\s*[:=]?\s*$")
 _PROSE_PR_SEP_RE = re.compile(r"^\s*#?\s*$")
-# Word-separated conflicting declaration detectors. The primary field/PR
-# detectors above require the value token to follow a non-word run immediately,
-# so a conflicting declaration whose field name and value are separated by one
-# or more words (``head is <sha>``, ``head value is <sha>``, ``PR number 99``,
-# ``PR number is #99``) is invisible to the singleton count and leaves the
-# authentic declaration as an apparent singleton. Any such word-separated
-# declaration is a malformed/conflicting form and fails closed. The negative
-# lookbehind excludes a hyphenated compound (``exact-head``) so a normal
-# hyphenated prefix is not read as a declaration. Each intervening word is
-# bounded to <40 chars (``{1,39}``) so a 40-hex SHA run is never mistaken for a
-# word separator; without that bound a single greedy word run would swallow a
-# full 40-letter-hex SHA and let the scan span across the legitimate ``head
-# <sha> / tree <sha> ... base <sha>`` declarations. The inner word group
-# repeats (with a required non-word separator between words) so a MULTI-word
-# separator (``head value is <sha>``) is detected, not just a single word, while
-# the required separator keeps the quantifier from degenerating into ``(x+)+``.
-_WORD_SEPARATED_FIELD_RE = re.compile(
-    r"(?<![A-Za-z0-9_-])(?:head|tree|base)\b"
-    r"[^A-Za-z0-9]*[A-Za-z]{1,39}(?:[^A-Za-z0-9]+[A-Za-z]{1,39})*"
-    r"[^A-Za-z0-9]*[0-9a-fA-F]{40,}",
-    re.IGNORECASE,
-)
-_WORD_SEPARATED_PR_RE = re.compile(
-    r"(?<![A-Za-z0-9_-])pr\b"
-    r"[^A-Za-z0-9]*[A-Za-z]{1,39}(?:[^A-Za-z0-9]+[A-Za-z]{1,39})*"
-    r"[^A-Za-z0-9]*[0-9]+",
-    re.IGNORECASE,
-)
 
 
 def _looks_json_shaped(text: str) -> bool:
@@ -9440,12 +9413,13 @@ def _resolve_handoff_candidate_target(
     envelope; any JSON string/list/number/scalar, malformed JSON, duplicate JSON
     member, or deeply-nested JSON fails closed (None) rather than being
     reinterpreted as prose.  A prose reason must declare each of
-    head/tree/base/pr exactly once; field names are matched case-insensitively
-    and may be followed by whitespace, ``:`` or ``=``, so a conflicting
-    alternate declaration (e.g. ``HEAD <sha>`` or ``head: <sha>``) is visible to
-    the singleton check.  SHA declarations must be exactly 40 hex characters
-    with a non-hex boundary on both sides, so an overlong hex token can never
-    authenticate by prefix.
+    head/tree/base/pr exactly once with the canonical separator (whitespace,
+    ``:`` or ``=`` for fields, whitespace or ``#`` for PR); every candidate-like
+    declaration of any other separator class — punctuation, word-separated,
+    multi-word, or alphanumeric-word — is still tokenized and either violates
+    the singleton requirement or the canonical-separator check, so it fails
+    closed.  SHA declarations must be exactly 40 hex characters, so an overlong
+    hex token can never authenticate by prefix.
     """
     text = reason.strip()
     if _looks_json_shaped(text):
@@ -9465,11 +9439,6 @@ def _resolve_handoff_candidate_target(
             and bool(target["summary"].strip())
         ):
             return target
-        return None
-    # A prose reason with a word-separated declaration (``head is <sha>``,
-    # ``PR number 99``, ``PR is #99``) is malformed or conflicting; reject it
-    # before the primary detector so it cannot hide behind the singleton count.
-    if _WORD_SEPARATED_FIELD_RE.search(text) or _WORD_SEPARATED_PR_RE.search(text):
         return None
     expected_head = expected_candidate.get("head")
     expected_tree = expected_candidate.get("tree")
@@ -9998,33 +9967,41 @@ def _current_v3_bound_verdict(
 
 def _current_v3_continuation_targets(
     conn: sqlite3.Connection, author_task_id: str, audit_task_id: str,
+    outcome_event_id: int,
 ) -> Optional[tuple[str, list[str]]]:
-    """Recompute the live current-v3 continuation targets from the task graph.
+    """Recompute current-v3 continuation targets from durable promotion events.
 
-    The terminal producer emits ``continuation_ids`` as exactly the children
-    promoted to a non-terminal state when the audit terminalized. This helper
-    recomputes that set so the readback can bind the envelope's claim to the
-    live graph: a child of the author or audit task that is still queued
-    (``todo``/``blocked``) was never promoted, so claiming it invents a
-    continuation; a child already in a promoted state (``ready`` and later) that
-    is omitted erases a real continuation. A child id that does not resolve to a
-    live task row fails closed (returns ``None``).
+    The terminal producer emits ``continuation_ids`` as exactly the child ids
+    appended by ``recompute_ready`` in its terminal transaction; each such child
+    carries a durable ``promoted`` event appended before the
+    ``canonical_audit_outcome`` event (id = ``outcome_event_id``). This helper
+    recomputes that set from those promotion events — bound by event order and
+    identity — rather than from mutable current task status, so (a) a child
+    linked after the outcome with no producer promotion (zero ``promoted``
+    events) is never a continuation, and (b) a producer-promoted child stays
+    bound after it is later completed (its ``promoted`` event outlives the
+    status flip). A child id that does not resolve to a live task row fails
+    closed (returns ``None``).
     """
     rows = conn.execute(
-        "SELECT child_id FROM task_links WHERE parent_id IN (?, ?)",
-        (author_task_id, audit_task_id),
+        "SELECT child_id FROM task_links WHERE parent_id = ?",
+        (audit_task_id,),
     ).fetchall()
     targets: list[str] = []
     for row in rows:
         child_id = str(row["child_id"])
         live = conn.execute(
-            "SELECT status FROM tasks WHERE id = ?", (child_id,),
+            "SELECT 1 FROM tasks WHERE id = ?", (child_id,),
         ).fetchone()
         if live is None:
             return None
-        if live["status"] in ("done", "archived", "todo", "blocked"):
-            continue
-        targets.append(child_id)
+        promoted = conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'promoted' "
+            "AND id < ? LIMIT 1",
+            (child_id, outcome_event_id),
+        ).fetchone()
+        if promoted is not None:
+            targets.append(child_id)
     targets.sort()
     if targets:
         return _EARLIER_V3_DISPOSITION_CONTINUATION, targets
@@ -10033,17 +10010,18 @@ def _current_v3_continuation_targets(
 
 def _current_v3_continuation_ids_valid(
     conn: sqlite3.Connection, author_task_id: str, audit_task_id: str,
-    continuation_ids: Any, disposition: Any,
+    continuation_ids: Any, disposition: Any, outcome_event_id: int,
 ) -> bool:
-    """Validate the current-v3 continuation identity list against the task graph.
+    """Validate the current-v3 continuation list against durable promotion events.
 
     Each continuation id must be a unique, nonempty, existing child of the author
     or audit task, and the disposition must match the list's emptiness. A
     nonexistent, blank, or duplicated continuation id fails closed. The list must
-    also match the live promoted-continuation set exactly, so a drifted envelope
-    that invents an unpromoted (still ``todo``/``blocked``) child or erases an
-    actually promoted (``ready`` and later) child fails closed even after its
-    digest and fact pointer are recomputed.
+    also match the durable promoted-continuation set exactly, so a drifted
+    envelope that invents a child with no producer promotion (linked after the
+    outcome, zero ``promoted`` events) or erases a producer-promoted child after
+    it was later completed fails closed even after its digest and fact pointer
+    are recomputed.
     """
     if type(continuation_ids) is not list:
         return False
@@ -10070,7 +10048,9 @@ def _current_v3_continuation_ids_valid(
             return False
         if conn.execute("SELECT 1 FROM tasks WHERE id = ?", (cid,)).fetchone() is None:
             return False
-    live = _current_v3_continuation_targets(conn, author_task_id, audit_task_id)
+    live = _current_v3_continuation_targets(
+        conn, author_task_id, audit_task_id, outcome_event_id,
+    )
     if live is None:
         return False
     live_disposition, live_targets = live
@@ -10207,6 +10187,7 @@ def _canonical_current_audit_outcome(
         and (run["status"], run["outcome"]) == ("done", "completed") and run["ended_at"] is not None
         and _current_v3_continuation_ids_valid(
             conn, author_task_id, row["task_id"], continuation_ids, payload.get("disposition"),
+            row["id"],
         )
         and len(facts) == 1
         and len(verdict_rows) == 1
