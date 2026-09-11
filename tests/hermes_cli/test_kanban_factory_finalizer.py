@@ -7323,3 +7323,156 @@ def test_earlier_v3_audit_outcome_deeply_nested_changed_fact_fails_closed(kanban
         assert kb._reviewed_author_finalizer_run_id(conn, chain["author"]) is None
 
 
+# ---------------------------------------------------------------------------
+# Round-9 regressions — lifecycle freshness and producer-shape gates.
+#
+# The earlier-v3 ingress must bind the envelope to the LATEST author/audit runs
+# and the LATEST review handoff (freshness), and require byte-identical paired
+# verdict/fact mirrors with exact integer id types and a created_at bound to the
+# event timestamp (producer shape). A stale or drifted receipt must fail closed
+# instead of authenticating a superseded or non-authentic authority record.
+# ---------------------------------------------------------------------------
+
+
+def test_earlier_v3_audit_outcome_later_duplicate_handoff_fails_closed(kanban_home):
+    with kb.connect() as conn:
+        chain = _earlier_v3_audit_outcome_chain(conn)
+        row = conn.execute(
+            "SELECT payload FROM task_events WHERE id = ?",
+            (chain["handoff"].event_id,),
+        ).fetchone()
+        # A second, later review_handoff (re-issued review) supersedes the bound
+        # one and must fail closed.
+        with kb.write_txn(conn):
+            kb._append_event(
+                conn, chain["author"], "review_handoff", json.loads(row["payload"]),
+                run_id=chain["author_run"], created_at=2,
+            )
+
+        assert kb._canonical_current_audit_outcome(conn, chain["author"]) == (True, None)
+        assert kb._canonical_audit_receipt(conn, chain["author"]) is None
+        assert kb._reviewed_author_finalizer_run_id(conn, chain["author"]) is None
+
+
+def test_earlier_v3_audit_outcome_newer_author_run_fails_closed(kanban_home):
+    with kb.connect() as conn:
+        chain = _earlier_v3_audit_outcome_chain(conn)
+        # A newer terminal review_required author run supersedes the envelope's
+        # author run and must fail closed.
+        with kb.write_txn(conn):
+            conn.execute(
+                "INSERT INTO task_runs(task_id,profile,status,started_at,ended_at,"
+                "outcome,summary) VALUES (?,?, 'review_required', 2, 2, "
+                "'review_required', 'newer author review')",
+                (chain["author"], "agent007"),
+            )
+
+        assert kb._canonical_current_audit_outcome(conn, chain["author"]) == (True, None)
+        assert kb._canonical_audit_receipt(conn, chain["author"]) is None
+        assert kb._reviewed_author_finalizer_run_id(conn, chain["author"]) is None
+
+
+def test_earlier_v3_audit_outcome_newer_audit_run_fails_closed(kanban_home):
+    with kb.connect() as conn:
+        chain = _earlier_v3_audit_outcome_chain(conn)
+        # A newer completed audit run supersedes the envelope's audit run and
+        # must fail closed.
+        with kb.write_txn(conn):
+            conn.execute(
+                "INSERT INTO task_runs(task_id,profile,status,started_at,ended_at,"
+                "outcome,summary) VALUES (?,?, 'done', 2, 2, 'completed', "
+                "'newer audit pass')",
+                (chain["reviewer"], "bafuxunan"),
+            )
+
+        assert kb._canonical_current_audit_outcome(conn, chain["author"]) == (True, None)
+        assert kb._canonical_audit_receipt(conn, chain["author"]) is None
+        assert kb._reviewed_author_finalizer_run_id(conn, chain["author"]) is None
+
+
+def test_earlier_v3_audit_outcome_created_at_drift_fails_closed(kanban_home):
+    with kb.connect() as conn:
+        chain = _earlier_v3_audit_outcome_chain(conn)
+        _clear_earlier_v3_outcome(conn, chain)
+        envelope = _earlier_v3_envelope_for(chain)
+        # The envelope's created_at no longer matches the seeded event timestamp.
+        envelope["created_at"] = 999
+        _seed_earlier_v3_outcome(conn, chain, envelope=envelope)
+
+        assert kb._canonical_current_audit_outcome(conn, chain["author"]) == (True, None)
+        assert kb._canonical_audit_receipt(conn, chain["author"]) is None
+        assert kb._reviewed_author_finalizer_run_id(conn, chain["author"]) is None
+
+
+def test_earlier_v3_audit_outcome_float_fact_ids_fail_closed(kanban_home):
+    with kb.connect() as conn:
+        chain = _earlier_v3_audit_outcome_chain(conn)
+        _clear_earlier_v3_outcome(conn, chain)
+        envelope = _earlier_v3_envelope_for(chain)
+        # Float run_id/event_id in the changed_fact are not exact integers and
+        # must fail closed.
+        with kb.write_txn(conn):
+            kb._append_event(
+                conn, chain["reviewer"], "canonical_audit_outcome", envelope,
+                run_id=chain["reviewer_run"], created_at=1,
+            )
+            event_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+            kb._append_event(
+                conn, chain["author"], "canonical_audit_outcome", envelope,
+                run_id=chain["author_run"], created_at=1,
+            )
+            fact = _earlier_v3_fact_for(chain, event_id)
+            fact["run_id"] = float(fact["run_id"])
+            fact["event_id"] = float(fact["event_id"])
+            kb._append_event(
+                conn, chain["reviewer"], "changed_fact", fact,
+                run_id=chain["reviewer_run"], created_at=1,
+            )
+            kb._append_event(
+                conn, chain["author"], "changed_fact", fact,
+                run_id=chain["author_run"], created_at=1,
+            )
+
+        assert kb._canonical_current_audit_outcome(conn, chain["author"]) == (True, None)
+        assert kb._canonical_audit_receipt(conn, chain["author"]) is None
+        assert kb._reviewed_author_finalizer_run_id(conn, chain["author"]) is None
+
+
+def test_earlier_v3_audit_outcome_byte_different_fact_mirror_fails_closed(kanban_home):
+    with kb.connect() as conn:
+        chain = _earlier_v3_audit_outcome_chain(conn)
+        row = conn.execute(
+            "SELECT id, payload FROM task_events WHERE task_id = ? AND run_id = ? "
+            "AND kind = 'changed_fact'",
+            (chain["author"], chain["author_run"]),
+        ).fetchone()
+        obj = json.loads(row["payload"])
+        raw = json.dumps({key: obj[key] for key in reversed(list(obj))})
+        assert raw != row["payload"] and json.loads(raw) == obj
+        # A key-reordered (semantically equal) author fact mirror must fail closed.
+        with kb.write_txn(conn):
+            conn.execute("UPDATE task_events SET payload = ? WHERE id = ?", (raw, row["id"]))
+
+        assert kb._canonical_current_audit_outcome(conn, chain["author"]) == (True, None)
+        assert kb._canonical_audit_receipt(conn, chain["author"]) is None
+        assert kb._reviewed_author_finalizer_run_id(conn, chain["author"]) is None
+
+
+def test_earlier_v3_audit_outcome_byte_different_verdict_mirror_fails_closed(kanban_home):
+    with kb.connect() as conn:
+        chain = _earlier_v3_audit_outcome_chain(conn)
+        row = conn.execute(
+            "SELECT id, payload FROM task_events WHERE task_id = ? AND run_id = ? "
+            "AND kind = 'review_verdict'",
+            (chain["author"], chain["reviewer_run"]),
+        ).fetchone()
+        obj = json.loads(row["payload"])
+        raw = json.dumps({key: obj[key] for key in reversed(list(obj))})
+        assert raw != row["payload"] and json.loads(raw) == obj
+        # A key-reordered (semantically equal) author verdict mirror must fail closed.
+        with kb.write_txn(conn):
+            conn.execute("UPDATE task_events SET payload = ? WHERE id = ?", (raw, row["id"]))
+
+        assert kb._canonical_current_audit_outcome(conn, chain["author"]) == (True, None)
+        assert kb._canonical_audit_receipt(conn, chain["author"]) is None
+        assert kb._reviewed_author_finalizer_run_id(conn, chain["author"]) is None

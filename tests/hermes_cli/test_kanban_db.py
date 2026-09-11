@@ -6994,6 +6994,51 @@ def test_review_verdict_pass_rejects_round8_hostile_candidates_without_mutation(
         assert kb._canonical_audit_receipt(conn, author) is None
 
 
+# Round-9 hostile parser variants: the JSON discriminator must route NaN/Infinity/
+# 0x/truex prefixes to the strict decoder (fail-closed), and the prose grammar must
+# reject overlong (41-hex) heads, double-colon separators, and colon/equals PR
+# separators instead of leaving them invisible to the singleton check.
+_ROUND9_PARSER_HOSTILE = [
+    "NaN " + _PROSE,
+    "Infinity " + _PROSE,
+    "0x " + _PROSE,
+    "truex " + _PROSE,
+    _PROSE + " conflicting head " + "d" * 41,     # overlong 41-hex second head
+    _PROSE + " conflicting head:: " + "d" * 40,   # double-colon separator
+    _PROSE + " conflicting PR: #99",              # colon PR separator
+    _PROSE + " conflicting PR=99",                # equals PR separator
+]
+
+
+@pytest.mark.parametrize("reason", _ROUND9_PARSER_HOSTILE)
+def test_resolve_handoff_candidate_target_fails_closed_round9_parser_hostile(reason):
+    expected = _handoff_expected_candidate()
+    assert kb._resolve_handoff_candidate_target(reason, expected) is None
+
+
+@pytest.mark.parametrize("reason", _ROUND9_PARSER_HOSTILE)
+def test_review_verdict_pass_rejects_round9_parser_hostile_without_mutation(
+    kanban_home, reason,
+):
+    """Round-9 parser variants never terminalize PASS (fail-closed, no mutation)."""
+    with kb.connect() as conn:
+        author, run_id, review_task = _review_handoff_pair(conn)
+        assert kb.request_review_handoff(
+            conn, author, expected_run_id=run_id, review_task_id=review_task,
+            reason=reason,
+        )
+        audit_run = kb.claim_task(conn, review_task).current_run_id
+        before = "\n".join(conn.iterdump())
+        assert not kb.record_review_verdict(
+            conn, author, review_task_id=review_task,
+            expected_review_run_id=audit_run, verdict="pass",
+            reason="round-9 hostile parser probe", evidence=_APPROVED_EVIDENCE,
+        )
+        assert "\n".join(conn.iterdump()) == before
+        assert kb.get_task(conn, review_task).status == "running"
+        assert kb._canonical_audit_receipt(conn, author) is None
+
+
 @pytest.mark.parametrize("url", [
     "https://github.com/other/repo/pull/98#pullrequestreview-123",
     "https://github.com/kiddhu/hermes-agent/pull/99#pullrequestreview-123",

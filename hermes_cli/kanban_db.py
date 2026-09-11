@@ -9324,26 +9324,47 @@ def _canonical_audit_evidence(value: Any) -> Optional[dict[str, Any]]:
 
 
 _JSON_STRUCTURAL_LEAD = ("{", "[", '"')
-_JSON_SCALAR_TOKEN_RE = re.compile(
-    r"(?:[-+]?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][-+]?[0-9]+)?|true|false|null)"
-    r"(?![A-Za-z0-9_])"
-)
-_PROSE_FIELD_DECL_RE = re.compile(
-    r"(?<![A-Za-z0-9_])(head|tree|base)\s*(?:[:=]\s*|\s+)"
-    r"([0-9a-fA-F]{40})(?![0-9a-fA-F])",
+# A closed JSON-value lead: a sign, a digit, or the initial of a JSON keyword
+# (true/false/null) or a Python float keyword (NaN/Infinity), case-insensitively.
+# Any leading such character routes the reason to the strict decoder, which
+# accepts ONLY the exact canonical envelope — so a scalar or malformed JSON-like
+# prefix (``0``, ``truex``, ``0x``, ``NaN``, ``Infinity``, ...) can never fall
+# through to the prose path and authenticate by a coincidental declaration.
+_JSON_VALUE_LEAD_RE = re.compile(r"[-+0-9tfnNI]", re.IGNORECASE)
+# A candidate-like head/tree/base declaration: the field name followed by a
+# separator and a SHA-length hex token (40+ hex). Overlong (41+) tokens and
+# malformed separators (``::``) are still DETECTED here so they can be rejected
+# instead of being invisible to the singleton check.
+_PROSE_FIELD_TOKEN_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(?P<name>head|tree|base)\b"
+    r"(?P<gap>[:=\s]*?)(?P<value>[0-9a-fA-F]{40,})",
     re.IGNORECASE,
 )
-_PROSE_PR_DECL_RE = re.compile(
-    r"(?<![A-Za-z0-9_])PR\s*#?\s*(\d+)\b",
+# A candidate-like PR declaration: the field name followed by a separator and a
+# digit token. A colon/equals separator (``PR:`` / ``PR=``) is still DETECTED so
+# it can be rejected as malformed rather than hidden from the singleton check.
+_PROSE_PR_TOKEN_RE = re.compile(
+    r"(?<![A-Za-z0-9_])pr\b(?P<gap>[#:=\s]*?)(?P<value>[0-9]+)",
     re.IGNORECASE,
 )
+_PROSE_HEAD_SEP_RE = re.compile(r"^\s*[:=]?\s*$")
+_PROSE_PR_SEP_RE = re.compile(r"^\s*#?\s*$")
 
 
 def _looks_json_shaped(text: str) -> bool:
-    """Return True when ``text`` leads with a JSON structural or scalar token."""
-    if text[:1] in _JSON_STRUCTURAL_LEAD:
+    """Return True when ``text`` leads with any JSON value or JSON-like token.
+
+    The discriminator is deliberately closed and over-permissive: a leading
+    structural character, number sign, digit, or JSON keyword initial routes to
+    the strict decoder. That decoder accepts ONLY the exact canonical envelope,
+    so any scalar or malformed JSON-like prefix (``NaN``, ``Infinity``, ``0x``,
+    ``truex``, ...) fails closed rather than being reinterpreted as prose.
+    """
+    if not text:
+        return False
+    if text[0] in _JSON_STRUCTURAL_LEAD:
         return True
-    return _JSON_SCALAR_TOKEN_RE.match(text) is not None
+    return _JSON_VALUE_LEAD_RE.match(text) is not None
 
 
 def _resolve_handoff_candidate_target(
@@ -9391,13 +9412,6 @@ def _resolve_handoff_candidate_target(
         ):
             return target
         return None
-    field_decls = _PROSE_FIELD_DECL_RE.findall(text)
-    heads = [sha for name, sha in field_decls if name.lower() == "head"]
-    trees = [sha for name, sha in field_decls if name.lower() == "tree"]
-    bases = [sha for name, sha in field_decls if name.lower() == "base"]
-    prs = [int(n) for n in _PROSE_PR_DECL_RE.findall(text)]
-    if not (len(heads) == len(trees) == len(bases) == len(prs) == 1):
-        return None
     expected_head = expected_candidate.get("head")
     expected_tree = expected_candidate.get("tree")
     expected_base = expected_candidate.get("base")
@@ -9409,11 +9423,28 @@ def _resolve_handoff_candidate_target(
         or type(expected_pr) is not int
     ):
         return None
+    decls: dict[str, list[tuple[str, str]]] = {"head": [], "tree": [], "base": [], "pr": []}
+    for name, gap, value in _PROSE_FIELD_TOKEN_RE.findall(text):
+        decls[name.lower()].append((gap, value))
+    for gap, value in _PROSE_PR_TOKEN_RE.findall(text):
+        decls["pr"].append((gap, value))
+    # Every field must declare exactly one value; a second (or conflicting)
+    # declaration — even one the strict value grammar would skip — is visible
+    # here and fails the singleton requirement.
+    if not all(len(items) == 1 for items in decls.values()):
+        return None
+    for kind in ("head", "tree", "base"):
+        gap, value = decls[kind][0]
+        if not _PROSE_HEAD_SEP_RE.fullmatch(gap) or len(value) != 40:
+            return None
+    pr_gap, pr_value = decls["pr"][0]
+    if not _PROSE_PR_SEP_RE.fullmatch(pr_gap):
+        return None
     if (
-        heads[0].lower() != expected_head.lower()
-        or trees[0].lower() != expected_tree.lower()
-        or bases[0].lower() != expected_base.lower()
-        or prs[0] != expected_pr
+        decls["head"][0][1].lower() != expected_head.lower()
+        or decls["tree"][0][1].lower() != expected_tree.lower()
+        or decls["base"][0][1].lower() != expected_base.lower()
+        or int(pr_value) != expected_pr
     ):
         return None
     return {"version": 1, "candidate": expected_candidate, "summary": reason}
@@ -9484,11 +9515,13 @@ def _canonical_audit_outcome_evidence_sha256(evidence: dict[str, Any]) -> str:
 
 def _earlier_v3_changed_fact(
     conn: sqlite3.Connection, task_id: str, run_id: int,
-) -> Optional[dict[str, Any]]:
+) -> Optional[tuple[dict[str, Any], str]]:
     """Read the one earlier-v3 changed-fact mirror for a task+run, if well-formed.
 
     Requires a singleton: a second changed_fact on the exact task+run fails
     closed so a hidden conflicting fact cannot be masked by a matching latest row.
+    Returns both the parsed record and its exact raw payload bytes so the caller
+    can enforce byte-identity between the author and audit mirrors.
     """
     rows = conn.execute(
         "SELECT payload FROM task_events WHERE task_id = ? AND run_id = ? "
@@ -9497,8 +9530,9 @@ def _earlier_v3_changed_fact(
     ).fetchall()
     if len(rows) != 1:
         return None
+    raw = rows[0]["payload"] or "{}"
     try:
-        payload = _strict_json_loads(rows[0]["payload"] or "{}")
+        payload = _strict_json_loads(raw)
     except (TypeError, ValueError):
         return None
     if not isinstance(payload, dict):
@@ -9508,7 +9542,7 @@ def _earlier_v3_changed_fact(
         "audit_outcome_sha256", "disposition", "continuation_task_ids",
     }:
         return None
-    return payload
+    return payload, raw
 
 
 def _earlier_v3_continuation_targets(
@@ -9620,7 +9654,12 @@ def _earlier_v3_current_audit_outcome(
         return True, None
     if not isinstance(envelope.get("reason"), str) or not envelope["reason"].strip():
         return True, None
-    if isinstance(envelope.get("created_at"), bool) or not isinstance(envelope.get("created_at"), int):
+    envelope_created_at = envelope.get("created_at")
+    if (
+        isinstance(envelope_created_at, bool)
+        or not isinstance(envelope_created_at, int)
+        or envelope_created_at != row["created_at"]
+    ):
         return True, None
     role = envelope.get("role_separation")
     if not isinstance(role, dict) or set(role) != _EARLIER_V3_AUDIT_ROLE_KEYS:
@@ -9698,6 +9737,18 @@ def _earlier_v3_current_audit_outcome(
         or audit_run["ended_at"] is None
     ):
         return True, None
+    # Freshness gate: the envelope must bind the LATEST author and audit runs.
+    # A newer terminal author run or a newer completed audit run makes this
+    # receipt stale, so the ingress fails closed rather than authenticating a
+    # superseded run identity.
+    latest_author_run = conn.execute(
+        "SELECT MAX(id) FROM task_runs WHERE task_id = ?", (author_task_id,),
+    ).fetchone()[0]
+    latest_audit_run = conn.execute(
+        "SELECT MAX(id) FROM task_runs WHERE task_id = ?", (audit_task_id,),
+    ).fetchone()[0]
+    if latest_author_run != author_run_id or latest_audit_run != audit_run_id:
+        return True, None
     author_mirrors = conn.execute(
         "SELECT payload FROM task_events WHERE task_id = ? AND run_id = ? "
         "AND kind = 'canonical_audit_outcome'",
@@ -9727,6 +9778,11 @@ def _earlier_v3_current_audit_outcome(
         (author_task_id, audit_run_id),
     ).fetchall()
     if len(audit_verdicts) != 1 or len(author_verdicts) != 1:
+        return True, None
+    # The paired PASS review_verdict mirrors must be byte-identical: the
+    # authentic producer wrote the exact same serialized bytes to both
+    # histories, so a key-reordered (semantically equal) mirror fails closed.
+    if audit_verdicts[0]["payload"] != author_verdicts[0]["payload"]:
         return True, None
     # Validate each singleton bound PASS review_verdict against the exact
     # pre-merge version-2 schema/types and the recomputed closed-evidence
@@ -9763,15 +9819,31 @@ def _earlier_v3_current_audit_outcome(
         or handoff.expected_run_id != author_run_id
     ):
         return True, None
-    author_fact = _earlier_v3_changed_fact(conn, author_task_id, author_run_id)
-    audit_fact = _earlier_v3_changed_fact(conn, audit_task_id, audit_run_id)
-    if author_fact is None or audit_fact is None or author_fact != audit_fact:
+    # Freshness gate: the bound handoff must be the LATEST review_handoff for
+    # the author. A later handoff (a re-issued review request) supersedes the
+    # bound one and makes this receipt stale.
+    latest_handoff_id = conn.execute(
+        "SELECT MAX(id) FROM task_events WHERE task_id = ? AND kind = 'review_handoff'",
+        (author_task_id,),
+    ).fetchone()[0]
+    if latest_handoff_id != handoff_event_id:
+        return True, None
+    author_fact_raw = _earlier_v3_changed_fact(conn, author_task_id, author_run_id)
+    audit_fact_raw = _earlier_v3_changed_fact(conn, audit_task_id, audit_run_id)
+    if author_fact_raw is None or audit_fact_raw is None:
+        return True, None
+    author_fact, author_raw = author_fact_raw
+    audit_fact, audit_raw = audit_fact_raw
+    # The paired changed-fact mirrors must be byte-identical, not merely
+    # parse-equal: the authentic producer serialized the exact same bytes to
+    # both histories, so a key-reordered (semantically equal) mirror fails closed.
+    if author_raw != audit_raw or author_fact != audit_fact:
         return True, None
     fact = author_fact
     if (
-        fact.get("task_id") != audit_task_id
-        or fact.get("run_id") != audit_run_id
-        or fact.get("event_id") != row["id"]
+        type(fact.get("task_id")) is not str or fact["task_id"] != audit_task_id
+        or type(fact.get("run_id")) is not int or fact["run_id"] != audit_run_id
+        or type(fact.get("event_id")) is not int or fact["event_id"] != row["id"]
         or fact.get("prior_status") != "running"
         or fact.get("new_status") != "done"
         or fact.get("audit_outcome_sha256") != evidence_sha256
@@ -9826,7 +9898,7 @@ def _canonical_current_audit_outcome(
 ) -> tuple[bool, Optional[dict[str, Any]]]:
     """Resolve the strict audit-owned singleton; presence blocks legacy fallback."""
     rows = conn.execute(
-        "SELECT e.id, e.task_id, e.run_id, e.payload FROM task_events e "
+        "SELECT e.id, e.task_id, e.run_id, e.payload, e.created_at FROM task_events e "
         "JOIN task_links l ON l.child_id=e.task_id AND l.parent_id=? "
         "WHERE e.kind='canonical_audit_outcome' ORDER BY e.id", (author_task_id,),
     ).fetchall()
