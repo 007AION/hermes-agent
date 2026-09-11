@@ -6821,6 +6821,70 @@ def test_review_verdict_pass_accepts_post_handoff_auditor_review_attestation(
         assert present is True and outcome is not None
 
 
+def _prose_handoff_reason(*, head=None, tree=None, base=None, pr=None, declared=True):
+    """Build a prose (non-JSON) review-handoff reason for the SEEKAPI-005 lineage."""
+    if not declared:
+        return "SEEKAPI-005 implementation review, no candidate identity declared."
+    head = head if head is not None else _APPROVED_EVIDENCE["head"]
+    tree = tree if tree is not None else _APPROVED_EVIDENCE["tree"]
+    base = base if base is not None else _APPROVED_EVIDENCE["base"]
+    pr = pr if pr is not None else _APPROVED_EVIDENCE["pr"]
+    return (
+        f"SEEKAPI-005 PR #{pr} head {head} / tree {tree} on frozen base {base}. "
+        "Focused tests pass, acceptance PASS."
+    )
+
+
+def test_review_verdict_pass_accepts_prose_handoff_candidate(kanban_home):
+    """A prose handoff that declares the exact candidate must still terminalize PASS."""
+    with kb.connect() as conn:
+        author, run_id, review_task = _review_handoff_pair(conn)
+        assert kb.request_review_handoff(
+            conn, author, expected_run_id=run_id, review_task_id=review_task,
+            reason=_prose_handoff_reason(),
+        )
+        continuation = kb.create_task(
+            conn, title="post-audit continuation", assignee="merger", parents=[review_task],
+        )
+        audit_run = kb.claim_task(conn, review_task).current_run_id
+        assert kb.record_review_verdict(
+            conn, author, review_task_id=review_task,
+            expected_review_run_id=audit_run, verdict="pass",
+            reason="exact head approved", evidence=_APPROVED_EVIDENCE,
+        )
+        assert kb.get_task(conn, review_task).status == "done"
+        assert kb.get_task(conn, continuation).status == "ready"
+        present, outcome = kb._canonical_current_audit_outcome(conn, author)
+        assert present is True and outcome is not None
+
+
+@pytest.mark.parametrize("reason", [
+    _prose_handoff_reason(head="d" * 40),
+    _prose_handoff_reason(tree="d" * 40),
+    _prose_handoff_reason(base="d" * 40),
+    _prose_handoff_reason(pr=99),
+    _prose_handoff_reason(declared=False),
+])
+def test_review_verdict_pass_rejects_prose_handoff_candidate_mismatch(kanban_home, reason):
+    """A prose handoff whose declared candidate conflicts with evidence fails closed."""
+    with kb.connect() as conn:
+        author, run_id, review_task = _review_handoff_pair(conn)
+        assert kb.request_review_handoff(
+            conn, author, expected_run_id=run_id, review_task_id=review_task,
+            reason=reason,
+        )
+        audit_run = kb.claim_task(conn, review_task).current_run_id
+        before = "\n".join(conn.iterdump())
+        assert not kb.record_review_verdict(
+            conn, author, review_task_id=review_task,
+            expected_review_run_id=audit_run, verdict="pass",
+            reason="coherent but conflicting prose candidate", evidence=_APPROVED_EVIDENCE,
+        )
+        assert "\n".join(conn.iterdump()) == before
+        assert kb.get_task(conn, review_task).status == "running"
+        assert kb._canonical_audit_receipt(conn, author) is None
+
+
 @pytest.mark.parametrize("url", [
     "https://github.com/other/repo/pull/98#pullrequestreview-123",
     "https://github.com/kiddhu/hermes-agent/pull/99#pullrequestreview-123",

@@ -9323,6 +9323,53 @@ def _canonical_audit_evidence(value: Any) -> Optional[dict[str, Any]]:
     return {key: value[key] for key in sorted(_CANONICAL_AUDIT_EVIDENCE_KEYS)}
 
 
+def _resolve_handoff_candidate_target(
+    reason: str, expected_candidate: dict[str, Any],
+) -> Optional[dict[str, Any]]:
+    """Resolve the author's declared candidate from a review-handoff ``reason``.
+
+    PR98 requires the author's handoff ``reason`` to be the canonical
+    version-1 candidate envelope ``{"version": 1, "candidate": {...},
+    "summary": ...}``.  Some author lineages (e.g. SEEKAPI-005) persist the
+    same candidate identity as prose instead, so the resolver also accepts a
+    strict prose declaration: an exact ``head``/``tree``/``base`` 40-hex SHA
+    and a ``PR #<n>`` number that must match the already-validated evidence
+    byte-for-byte (case-insensitive for SHAs).  ``repository`` is bound from
+    the evidence, never from prose.  Any malformed JSON, non-dict JSON, or a
+    prose reason missing any of head/tree/base/pr fails closed (None).
+    """
+    try:
+        target = json.loads(reason)
+    except (TypeError, ValueError):
+        target = None
+    if isinstance(target, dict):
+        if (
+            target == {
+                "version": 1,
+                "candidate": expected_candidate,
+                "summary": target.get("summary"),
+            }
+            and type(target.get("summary")) is str
+            and bool(target["summary"].strip())
+        ):
+            return target
+        return None
+    head = re.search(r"\bhead\s+([0-9a-fA-F]{40})", reason)
+    tree = re.search(r"\btree\s+([0-9a-fA-F]{40})", reason)
+    base = re.search(r"\bbase\s+([0-9a-fA-F]{40})", reason)
+    pr = re.search(r"\bPR\s*#?\s*(\d+)\b", reason, re.IGNORECASE)
+    if head is None or tree is None or base is None or pr is None:
+        return None
+    if (
+        head.group(1).lower() != str(expected_candidate["head"]).lower()
+        or tree.group(1).lower() != str(expected_candidate["tree"]).lower()
+        or base.group(1).lower() != str(expected_candidate["base"]).lower()
+        or int(pr.group(1)) != expected_candidate["pr"]
+    ):
+        return None
+    return {"version": 1, "candidate": expected_candidate, "summary": reason}
+
+
 # Earlier-v3 envelope key set (pre-merge PR98 resident 95392cf8). The final
 # head accepts only the later v3 key set; this names the exact earlier shape so
 # a persisted authentic earlier-v3 receipt can be recognized without weakening
@@ -9758,8 +9805,15 @@ def _canonical_current_audit_outcome(
         (payload.get("review_handoff_event_id"), author_task_id),
     ).fetchone()
     handoff = _review_handoff_receipt_from_row(author_task_id, handoff_row) if handoff_row else None
-    try: target = json.loads(handoff.reason) if handoff is not None else None
-    except (TypeError, ValueError): target = None
+    evidence = payload.get("evidence")
+    expected_candidate = (
+        {key: evidence[key] for key in sorted(_CANONICAL_AUDIT_TARGET_KEYS)}
+        if isinstance(evidence, dict) else {}
+    )
+    candidate_bound = (
+        handoff is not None
+        and _resolve_handoff_candidate_target(handoff.reason, expected_candidate) is not None
+    )
     task = conn.execute(
         "SELECT status, assignee, current_run_id, factory_build_gate, "
         "factory_terminal_receipt_sha256 FROM tasks WHERE id=?", (row["task_id"],),
@@ -9790,10 +9844,7 @@ def _canonical_current_audit_outcome(
         and payload.get("audit_task_id") == row["task_id"] and payload.get("audit_run_id") == row["run_id"]
         and payload.get("verdict") == "PASS" and payload.get("scope") == "audit_obligation"
         and _canonical_audit_evidence(payload.get("evidence")) == payload.get("evidence")
-        and isinstance(target, dict) and target == {"version": 1, "candidate": {
-            key: payload["evidence"][key] for key in sorted(_CANONICAL_AUDIT_TARGET_KEYS)
-        }, "summary": target.get("summary")}
-        and type(target["summary"]) is str and bool(target["summary"].strip())
+        and candidate_bound
         and type(payload.get("reason")) is str and bool(payload["reason"].strip())
         and type(digest) is str and hashlib.sha256(encoded).hexdigest() == digest
         and handoff is not None and handoff.review_task_id == row["task_id"]
@@ -10062,14 +10113,11 @@ def _record_review_verdict(
             if parent_ids(conn, review_task_id) != [task_id] or handoff is None:
                 return False
             receipt = _review_handoff_receipt_from_row(task_id, handoff)
-            try:
-                target = json.loads(receipt.reason) if receipt is not None else None
-            except (TypeError, ValueError):
-                return False
             expected = {key: normalized_evidence[key] for key in sorted(_CANONICAL_AUDIT_TARGET_KEYS)}
-            if not isinstance(target, dict) or target != {
-                "version": 1, "candidate": expected, "summary": target.get("summary")
-            } or type(target["summary"]) is not str or not target["summary"].strip():
+            if (
+                receipt is None
+                or _resolve_handoff_candidate_target(receipt.reason, expected) is None
+            ):
                 return False
             return _terminalize_review_pass(
                 conn, author_task_id=task_id, audit_task_id=review_task_id,
