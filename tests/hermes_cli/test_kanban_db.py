@@ -6920,14 +6920,14 @@ _PROSE = _prose_handoff_reason()
 def test_resolve_handoff_candidate_target_fails_closed_hostile(reason):
     """JSON string/list, malformed JSON, and duplicate declarations fail closed."""
     expected = _handoff_expected_candidate()
-    assert kb._resolve_handoff_candidate_target(reason, expected) is None
+    assert not isinstance(kb._resolve_handoff_candidate_target(reason, expected), dict)
 
 
 def test_resolve_handoff_candidate_target_fails_closed_deep_nesting():
     """A deeply nested JSON-shaped reason fails closed instead of raising RecursionError."""
     expected = _handoff_expected_candidate()
     deep = "[" * 2000 + "]" * 2000
-    assert kb._resolve_handoff_candidate_target(deep, expected) is None
+    assert not isinstance(kb._resolve_handoff_candidate_target(deep, expected), dict)
 
 
 @pytest.mark.parametrize("reason", [
@@ -7016,7 +7016,7 @@ _ROUND9_PARSER_HOSTILE = [
 @pytest.mark.parametrize("reason", _ROUND9_PARSER_HOSTILE)
 def test_resolve_handoff_candidate_target_fails_closed_round9_parser_hostile(reason):
     expected = _handoff_expected_candidate()
-    assert kb._resolve_handoff_candidate_target(reason, expected) is None
+    assert not isinstance(kb._resolve_handoff_candidate_target(reason, expected), dict)
 
 
 @pytest.mark.parametrize("reason", _ROUND9_PARSER_HOSTILE)
@@ -7060,7 +7060,7 @@ _ROUND10_PARSER_HOSTILE = [
 @pytest.mark.parametrize("reason", _ROUND10_PARSER_HOSTILE)
 def test_resolve_handoff_candidate_target_fails_closed_round10_parser_hostile(reason):
     expected = _handoff_expected_candidate()
-    assert kb._resolve_handoff_candidate_target(reason, expected) is None
+    assert not isinstance(kb._resolve_handoff_candidate_target(reason, expected), dict)
 
 
 @pytest.mark.parametrize("reason", _ROUND10_PARSER_HOSTILE)
@@ -7104,7 +7104,7 @@ _ROUND11_PARSER_HOSTILE = [
 @pytest.mark.parametrize("reason", _ROUND11_PARSER_HOSTILE)
 def test_resolve_handoff_candidate_target_fails_closed_round11_parser_hostile(reason):
     expected = _handoff_expected_candidate()
-    assert kb._resolve_handoff_candidate_target(reason, expected) is None
+    assert not isinstance(kb._resolve_handoff_candidate_target(reason, expected), dict)
 
 
 @pytest.mark.parametrize("reason", _ROUND11_PARSER_HOSTILE)
@@ -7149,7 +7149,7 @@ _ROUND12_PARSER_HOSTILE = [
 @pytest.mark.parametrize("reason", _ROUND12_PARSER_HOSTILE)
 def test_resolve_handoff_candidate_target_fails_closed_round12_parser_hostile(reason):
     expected = _handoff_expected_candidate()
-    assert kb._resolve_handoff_candidate_target(reason, expected) is None
+    assert not isinstance(kb._resolve_handoff_candidate_target(reason, expected), dict)
 
 
 @pytest.mark.parametrize("reason", _ROUND12_PARSER_HOSTILE)
@@ -7214,7 +7214,7 @@ _ROUND14_PARSER_HOSTILE = [
 @pytest.mark.parametrize("reason", _ROUND14_PARSER_HOSTILE)
 def test_resolve_handoff_candidate_target_fails_closed_round14_parser_hostile(reason):
     expected = _handoff_expected_candidate()
-    assert kb._resolve_handoff_candidate_target(reason, expected) is None
+    assert not isinstance(kb._resolve_handoff_candidate_target(reason, expected), dict)
 
 
 @pytest.mark.parametrize("reason", _ROUND14_PARSER_HOSTILE)
@@ -7238,6 +7238,127 @@ def test_review_verdict_pass_rejects_round14_parser_hostile_without_mutation(
         assert "\n".join(conn.iterdump()) == before
         assert kb.get_task(conn, review_task).status == "running"
         assert kb._canonical_audit_receipt(conn, author) is None
+
+
+# Round-15 hostile variants (round-14 REQUEST_CHANGES): the version-1 candidate
+# decoder must be strictly typed, not loose ``==``, so a JSON bool/float alias
+# (``version`` true, ``pr`` 98.0) can never alias the integer fields. A prose
+# reason is a typed capability finding, not a generic None.
+_ROUND15_BOOL_FLOAT_ALIASES = [
+    json.dumps({
+        "version": True,
+        "candidate": {k: _APPROVED_EVIDENCE[k] for k in ("repository", "pr", "head", "tree", "base")},
+        "summary": "bool version alias",
+    }),
+    json.dumps({
+        "version": 1,
+        "candidate": {
+            "repository": _APPROVED_EVIDENCE["repository"],
+            "pr": float(_APPROVED_EVIDENCE["pr"]),
+            "head": _APPROVED_EVIDENCE["head"],
+            "tree": _APPROVED_EVIDENCE["tree"],
+            "base": _APPROVED_EVIDENCE["base"],
+        },
+        "summary": "float pr alias",
+    }),
+    json.dumps({
+        "version": 1,
+        "candidate": {
+            "repository": _APPROVED_EVIDENCE["repository"],
+            "pr": True,
+            "head": _APPROVED_EVIDENCE["head"],
+            "tree": _APPROVED_EVIDENCE["tree"],
+            "base": _APPROVED_EVIDENCE["base"],
+        },
+        "summary": "bool pr alias",
+    }),
+]
+
+
+@pytest.mark.parametrize("reason", _ROUND15_BOOL_FLOAT_ALIASES)
+def test_resolve_handoff_candidate_target_rejects_bool_float_aliases(reason):
+    """A JSON bool/float alias never equals the integer version/pr fields."""
+    expected = _handoff_expected_candidate()
+    assert not isinstance(kb._resolve_handoff_candidate_target(reason, expected), dict)
+
+
+@pytest.mark.parametrize("reason", _ROUND15_BOOL_FLOAT_ALIASES)
+def test_review_verdict_pass_rejects_bool_float_alias_envelope_without_mutation(
+    kanban_home, reason,
+):
+    """A bool/float alias envelope never terminalizes PASS (fail-closed, no mutation)."""
+    with kb.connect() as conn:
+        author, run_id, review_task = _review_handoff_pair(conn)
+        assert kb.request_review_handoff(
+            conn, author, expected_run_id=run_id, review_task_id=review_task,
+            reason=reason,
+        )
+        audit_run = kb.claim_task(conn, review_task).current_run_id
+        before = "\n".join(conn.iterdump())
+        assert not kb.record_review_verdict(
+            conn, author, review_task_id=review_task,
+            expected_review_run_id=audit_run, verdict="pass",
+            reason="round-15 bool/float alias probe", evidence=_APPROVED_EVIDENCE,
+        )
+        assert "\n".join(conn.iterdump()) == before
+        assert kb.get_task(conn, review_task).status == "running"
+        assert kb._canonical_audit_receipt(conn, author) is None
+
+
+def test_resolve_handoff_candidate_target_prose_returns_typed_capability_finding():
+    """A prose reason returns the typed capability finding, not a generic None."""
+    expected = _handoff_expected_candidate()
+    result = kb._resolve_handoff_candidate_target(_PROSE, expected)
+    assert isinstance(result, kb._ProseHandoffCapabilityFinding)
+    assert result is kb._PROSE_HANDOFF_CAPABILITY_FINDING
+
+
+def test_current_v3_outcome_later_completed_event_fails_closed(kanban_home):
+    """A post-outcome same-run completed marker must fail closed, not move the
+    continuation boundary.
+
+    The lower transaction boundary is the audit run's *singleton* ``completed``
+    marker whose id precedes the outcome. Appending a later same-run
+    ``completed`` event after the outcome is a post-outcome completion marker,
+    which is rejected: the continuation readback returns ``None`` and the
+    canonical receipt no longer authenticates, so a recomputed
+    ``FINAL_ACCEPTED``/``[]`` envelope cannot erase a real producer-promoted
+    continuation.
+    """
+    with kb.connect() as conn:
+        author, run_id, review_task = _review_handoff_pair(conn)
+        assert kb.request_review_handoff(
+            conn, author, expected_run_id=run_id, review_task_id=review_task,
+            reason=_APPROVED_HANDOFF,
+        )
+        child = kb.create_task(
+            conn, title="post-audit continuation", assignee="merger",
+            parents=[review_task],
+        )
+        assert kb.get_task(conn, child).status == "todo"
+        audit_run = kb.claim_task(conn, review_task).current_run_id
+        assert kb.record_review_verdict(
+            conn, author, review_task_id=review_task,
+            expected_review_run_id=audit_run, verdict="pass",
+            reason="PASS_CURRENT_V3_FIXTURE", evidence=_APPROVED_EVIDENCE,
+        )
+        present, receipt = kb._canonical_current_audit_outcome(conn, author)
+        assert present is True and receipt is not None
+        assert receipt["authenticated"] is True
+        outcome_event_id = conn.execute(
+            "SELECT MAX(id) FROM task_events WHERE task_id=? AND kind='canonical_audit_outcome'",
+            (review_task,),
+        ).fetchone()[0]
+        with kb.write_txn(conn):
+            kb._append_event(
+                conn, review_task, "completed",
+                {"result_len": 0, "summary": "post-outcome duplicate"}, run_id=audit_run,
+            )
+        assert kb._current_v3_continuation_targets(
+            conn, author, review_task, audit_run, outcome_event_id,
+        ) is None
+        present, receipt = kb._canonical_current_audit_outcome(conn, author)
+        assert present is True and receipt is None
 
 
 def test_current_v3_outcome_historical_promotion_not_continuation(kanban_home):

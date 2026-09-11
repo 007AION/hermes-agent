@@ -9349,44 +9349,65 @@ def _looks_json_shaped(text: str) -> bool:
     return _JSON_VALUE_LEAD_RE.match(text) is not None
 
 
+@dataclass(frozen=True)
+class _ProseHandoffCapabilityFinding:
+    """A prose review-handoff reason is a typed capability finding, not a
+    decodable envelope.
+
+    Free-form prose cannot be consumed by the finite closed JSON-envelope
+    adapter while rejecting arbitrary additions, so it is never decoded by
+    open-ended token inference. This frozen singleton is returned (distinct from
+    the generic ``None`` used for absent, malformed, or mismatched JSON input) so
+    a prose handoff — a recognized capability boundary — is observable as such
+    while still failing closed.
+    """
+
+
+_PROSE_HANDOFF_CAPABILITY_FINDING = _ProseHandoffCapabilityFinding()
+
+
 def _resolve_handoff_candidate_target(
     reason: str, expected_candidate: dict[str, Any],
-) -> Optional[dict[str, Any]]:
+) -> Any:
     """Resolve the author's declared candidate from a review-handoff ``reason``.
 
     The canonical (and sole supported) handoff format is the version-1 candidate
     envelope ``{"version": 1, "candidate": {...}, "summary": ...}``.  This
-    decoder is finite, anchored, and exact: it accepts exactly that one envelope
-    shape and nothing else, then normalizes to the single canonical typed
-    receipt.
+    decoder is finite, anchored, exact, and strictly typed: it accepts exactly
+    that one envelope shape — ``version`` the integer ``1``, ``candidate`` a
+    dict whose every value carries the exact same Python type and value as the
+    already-validated evidence, and ``summary`` a non-empty ``str`` — and
+    nothing else. Because the comparison is type-strict (not ``==``), a JSON
+    ``true``/``false`` or a float such as ``100.0`` can never alias the integer
+    fields and authenticate.
 
-    A non-envelope reason fails closed (None).  In particular a prose reason is
-    a typed capability finding, not a decodable envelope: free-form prose cannot
-    be consumed by a finite closed adapter while rejecting arbitrary additions,
-    so it is never decoded by open-ended token inference.  Likewise any JSON
-    scalar, list, string, malformed JSON, duplicate-member JSON, or
-    deeply-nested JSON fails closed (None) rather than being reinterpreted.
+    The return value is three-valued and typed:
+      * ``dict`` — the exact canonical envelope (the sole decodable input).
+      * ``_ProseHandoffCapabilityFinding`` — the reason is prose: a recognized
+        capability boundary that fails closed as a typed finding, never decoded.
+      * ``None`` — absent, malformed, duplicate-member, deeply-nested, or
+        otherwise non-canonical JSON input.
     """
     text = reason.strip()
     if not _looks_json_shaped(text):
-        return None
+        return _PROSE_HANDOFF_CAPABILITY_FINDING
     try:
         target = _strict_json_loads(text)
     except (TypeError, ValueError):
         return None
-    if not isinstance(target, dict):
+    if not isinstance(target, dict) or set(target) != {"version", "candidate", "summary"}:
         return None
-    if (
-        target == {
-            "version": 1,
-            "candidate": expected_candidate,
-            "summary": target.get("summary"),
-        }
-        and type(target.get("summary")) is str
-        and bool(target["summary"].strip())
-    ):
-        return target
-    return None
+    if type(target.get("version")) is not int or target["version"] != 1:
+        return None
+    candidate = target.get("candidate")
+    if type(candidate) is not dict or set(candidate) != set(expected_candidate):
+        return None
+    for key, expected_value in expected_candidate.items():
+        if type(candidate.get(key)) is not type(expected_value) or candidate[key] != expected_value:
+            return None
+    if type(target.get("summary")) is not str or not target["summary"].strip():
+        return None
+    return target
 
 # Earlier-v3 envelope key set (pre-merge PR98 resident 95392cf8). The final
 # head accepts only the later v3 key set; this names the exact earlier shape so
@@ -9888,17 +9909,29 @@ def _current_v3_continuation_targets(
     (id = ``outcome_event_id``). This helper recomputes that set from those
     promotion events — bound by a lower transaction boundary (the audit run's
     ``completed`` event id), event order, and identity — rather than from any
-    historical ``promoted`` event before the outcome. A ``promoted`` event from
-    an earlier transaction (a prior parent's completion) is NOT this terminal
-    transaction's output, so it must not count as a continuation. A child id
-    that does not resolve to a live task row fails closed (returns ``None``).
+    historical ``promoted`` event before the outcome.
+
+    The lower boundary is the audit run's *singleton* ``completed`` marker: the
+    terminal transaction emits exactly one such marker, and its id must precede
+    the outcome. A missing, duplicate, or post-outcome same-run ``completed``
+    marker fails closed (returns ``None``), because the boundary must be a stable
+    producer marker — a later duplicate ``completed`` event appended before the
+    outcome would otherwise move the boundary past the promoted set and erase a
+    producer-promoted continuation. A ``promoted`` event from an earlier
+    transaction (a prior parent's completion) is NOT this terminal transaction's
+    output, so it must not count as a continuation. A child id that does not
+    resolve to a live task row fails closed (returns ``None``).
     """
-    completed = conn.execute(
-        "SELECT MAX(id) FROM task_events WHERE task_id = ? AND run_id = ? "
+    completed_rows = conn.execute(
+        "SELECT id FROM task_events WHERE task_id = ? AND run_id = ? "
         "AND kind = 'completed'",
         (audit_task_id, audit_run_id),
-    ).fetchone()[0]
-    lower = int(completed) if completed is not None else 0
+    ).fetchall()
+    if len(completed_rows) != 1:
+        return None
+    lower = int(completed_rows[0]["id"])
+    if lower >= outcome_event_id:
+        return None
     rows = conn.execute(
         "SELECT child_id FROM task_links WHERE parent_id = ?",
         (audit_task_id,),
@@ -10025,7 +10058,10 @@ def _canonical_current_audit_outcome(
     )
     candidate_bound = (
         handoff is not None
-        and _resolve_handoff_candidate_target(handoff.reason, expected_candidate) is not None
+        and isinstance(
+            _resolve_handoff_candidate_target(handoff.reason, expected_candidate),
+            dict,
+        )
     )
     task = conn.execute(
         "SELECT status, assignee, current_run_id, factory_build_gate, "
@@ -10363,7 +10399,9 @@ def _record_review_verdict(
             expected = {key: normalized_evidence[key] for key in sorted(_CANONICAL_AUDIT_TARGET_KEYS)}
             if (
                 receipt is None
-                or _resolve_handoff_candidate_target(receipt.reason, expected) is None
+                or not isinstance(
+                    _resolve_handoff_candidate_target(receipt.reason, expected), dict,
+                )
             ):
                 return False
             return _terminalize_review_pass(
