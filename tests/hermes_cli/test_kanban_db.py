@@ -7039,6 +7039,179 @@ def test_review_verdict_pass_rejects_round9_parser_hostile_without_mutation(
         assert kb._canonical_audit_receipt(conn, author) is None
 
 
+# Round-10 hostile parser variants: the prose grammar must reject every extra
+# head/tree/base/PR field occurrence independent of punctuation. A conflicting
+# backtick/arrow/slash/parenthesized declaration must stay visible to the
+# singleton check instead of leaving the original declaration as an apparent
+# singleton. The bounded PR digit parse must also fail closed (not raise).
+_ROUND10_PARSER_HOSTILE = [
+    _PROSE + " conflicting head `" + "d" * 40,   # backtick separator
+    _PROSE + " conflicting head -> " + "d" * 40, # arrow separator
+    _PROSE + " conflicting tree `" + "d" * 40,   # backtick tree
+    _PROSE + " conflicting base -> " + "d" * 40, # arrow base
+    _PROSE + " conflicting PR/99",               # slash PR separator
+    _PROSE + " conflicting PR (#99)",            # parenthesized PR separator
+]
+
+
+@pytest.mark.parametrize("reason", _ROUND10_PARSER_HOSTILE)
+def test_resolve_handoff_candidate_target_fails_closed_round10_parser_hostile(reason):
+    expected = _handoff_expected_candidate()
+    assert kb._resolve_handoff_candidate_target(reason, expected) is None
+
+
+@pytest.mark.parametrize("reason", _ROUND10_PARSER_HOSTILE)
+def test_review_verdict_pass_rejects_round10_parser_hostile_without_mutation(
+    kanban_home, reason,
+):
+    """Round-10 punctuation variants never terminalize PASS (fail-closed, no mutation)."""
+    with kb.connect() as conn:
+        author, run_id, review_task = _review_handoff_pair(conn)
+        assert kb.request_review_handoff(
+            conn, author, expected_run_id=run_id, review_task_id=review_task,
+            reason=reason,
+        )
+        audit_run = kb.claim_task(conn, review_task).current_run_id
+        before = "\n".join(conn.iterdump())
+        assert not kb.record_review_verdict(
+            conn, author, review_task_id=review_task,
+            expected_review_run_id=audit_run, verdict="pass",
+            reason="round-10 hostile parser probe", evidence=_APPROVED_EVIDENCE,
+        )
+        assert "\n".join(conn.iterdump()) == before
+        assert kb.get_task(conn, review_task).status == "running"
+        assert kb._canonical_audit_receipt(conn, author) is None
+
+
+def test_bounded_decimal_int_parses_short_and_fails_closed_on_overlong():
+    assert kb._bounded_decimal_int("100") == 100
+    assert kb._bounded_decimal_int("0") == 0
+    assert kb._bounded_decimal_int("9" * 10) == 9999999999
+    assert kb._bounded_decimal_int("1" * 11) is None
+    assert kb._bounded_decimal_int("0" * 5000 + "100") is None
+
+
+def test_review_verdict_pass_rejects_huge_prose_pr_without_mutation(kanban_home):
+    """A multi-thousand-digit PR token fails closed instead of raising ValueError."""
+    with kb.connect() as conn:
+        author, run_id, review_task = _review_handoff_pair(conn)
+        reason = _prose_handoff_reason().replace(
+            "PR #98", "PR #" + "0" * 5000 + "98",
+        )
+        assert kb.request_review_handoff(
+            conn, author, expected_run_id=run_id, review_task_id=review_task,
+            reason=reason,
+        )
+        audit_run = kb.claim_task(conn, review_task).current_run_id
+        before = "\n".join(conn.iterdump())
+        assert not kb.record_review_verdict(
+            conn, author, review_task_id=review_task,
+            expected_review_run_id=audit_run, verdict="pass",
+            reason="round-10 huge PR probe", evidence=_APPROVED_EVIDENCE,
+        )
+        assert "\n".join(conn.iterdump()) == before
+        assert kb.get_task(conn, review_task).status == "running"
+        assert kb._canonical_audit_receipt(conn, author) is None
+
+
+def _current_v3_outcome(conn):
+    """Produce an authentic later-v3 canonical_audit_outcome via the real
+    producer path (record_review_verdict PASS) and return its identity."""
+    author, run_id, review_task = _review_handoff_pair(conn)
+    assert kb.request_review_handoff(
+        conn, author, expected_run_id=run_id, review_task_id=review_task,
+        reason=_APPROVED_HANDOFF,
+    )
+    audit_run = kb.claim_task(conn, review_task).current_run_id
+    assert kb.record_review_verdict(
+        conn, author, review_task_id=review_task,
+        expected_review_run_id=audit_run, verdict="pass",
+        reason="PASS_CURRENT_V3_FIXTURE", evidence=_APPROVED_EVIDENCE,
+    )
+    return author, run_id, review_task, audit_run
+
+
+def test_current_v3_outcome_authentic_resolves(kanban_home):
+    with kb.connect() as conn:
+        author, run_id, review_task, audit_run = _current_v3_outcome(conn)
+        present, receipt = kb._canonical_current_audit_outcome(conn, author)
+        assert present is True and receipt is not None
+        assert receipt["author_run_id"] == run_id
+        assert receipt["authenticated"] is True
+        assert kb._reviewed_author_finalizer_run_id(conn, author) == run_id
+
+
+def test_current_v3_outcome_newer_author_run_fails_closed(kanban_home):
+    with kb.connect() as conn:
+        author, run_id, review_task, audit_run = _current_v3_outcome(conn)
+        with kb.write_txn(conn):
+            conn.execute(
+                "INSERT INTO task_runs(task_id,profile,status,started_at,ended_at,"
+                "outcome,summary) VALUES (?,?, 'review_required', 3, 3, "
+                "'review_required', 'newer author review')",
+                (author, "author"),
+            )
+        assert kb._canonical_current_audit_outcome(conn, author) == (True, None)
+        assert kb._reviewed_author_finalizer_run_id(conn, author) is None
+
+
+def test_current_v3_outcome_newer_audit_run_fails_closed(kanban_home):
+    with kb.connect() as conn:
+        author, run_id, review_task, audit_run = _current_v3_outcome(conn)
+        with kb.write_txn(conn):
+            conn.execute(
+                "INSERT INTO task_runs(task_id,profile,status,started_at,ended_at,"
+                "outcome,summary) VALUES (?,?, 'done', 3, 3, 'completed', 'newer audit pass')",
+                (review_task, "auditor"),
+            )
+        assert kb._canonical_current_audit_outcome(conn, author) == (True, None)
+        assert kb._reviewed_author_finalizer_run_id(conn, author) is None
+
+
+def test_current_v3_outcome_later_handoff_fails_closed(kanban_home):
+    with kb.connect() as conn:
+        author, run_id, review_task, audit_run = _current_v3_outcome(conn)
+        row = conn.execute(
+            "SELECT id, payload FROM task_events WHERE task_id=? AND kind='review_handoff'",
+            (author,),
+        ).fetchone()
+        with kb.write_txn(conn):
+            kb._append_event(
+                conn, author, "review_handoff", json.loads(row["payload"]),
+                run_id=run_id, created_at=3,
+            )
+        assert kb._canonical_current_audit_outcome(conn, author) == (True, None)
+        assert kb._reviewed_author_finalizer_run_id(conn, author) is None
+
+
+def test_current_v3_outcome_duplicate_handoff_member_fails_closed(kanban_home):
+    with kb.connect() as conn:
+        author, run_id, review_task, audit_run = _current_v3_outcome(conn)
+        row = conn.execute(
+            "SELECT id, payload FROM task_events WHERE task_id=? AND kind='review_handoff'",
+            (author,),
+        ).fetchone()
+        raw = '{"version":999,' + row["payload"][1:]
+        with kb.write_txn(conn):
+            conn.execute("UPDATE task_events SET payload=? WHERE id=?", (raw, row["id"]))
+        assert kb._canonical_current_audit_outcome(conn, author) == (True, None)
+        assert kb._reviewed_author_finalizer_run_id(conn, author) is None
+
+
+def test_current_v3_outcome_duplicate_fact_member_fails_closed(kanban_home):
+    with kb.connect() as conn:
+        author, run_id, review_task, audit_run = _current_v3_outcome(conn)
+        row = conn.execute(
+            "SELECT id, payload FROM task_events WHERE task_id=? AND run_id=? AND kind='changed_fact'",
+            (review_task, audit_run),
+        ).fetchone()
+        raw = '{"version":999,' + row["payload"][1:]
+        with kb.write_txn(conn):
+            conn.execute("UPDATE task_events SET payload=? WHERE id=?", (raw, row["id"]))
+        assert kb._canonical_current_audit_outcome(conn, author) == (True, None)
+        assert kb._reviewed_author_finalizer_run_id(conn, author) is None
+
+
 @pytest.mark.parametrize("url", [
     "https://github.com/other/repo/pull/98#pullrequestreview-123",
     "https://github.com/kiddhu/hermes-agent/pull/99#pullrequestreview-123",

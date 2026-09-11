@@ -9331,20 +9331,26 @@ _JSON_STRUCTURAL_LEAD = ("{", "[", '"')
 # prefix (``0``, ``truex``, ``0x``, ``NaN``, ``Infinity``, ...) can never fall
 # through to the prose path and authenticate by a coincidental declaration.
 _JSON_VALUE_LEAD_RE = re.compile(r"[-+0-9tfnNI]", re.IGNORECASE)
-# A candidate-like head/tree/base declaration: the field name followed by a
-# separator and a SHA-length hex token (40+ hex). Overlong (41+) tokens and
-# malformed separators (``::``) are still DETECTED here so they can be rejected
-# instead of being invisible to the singleton check.
+# A candidate-like head/tree/base declaration: the field name followed by any
+# non-alphanumeric separator and a SHA-length hex token (40+ hex). The separator
+# class is deliberately broad (any non-word run) so a conflicting second
+# declaration that uses an unrecognized separator (backtick, arrow, ``::``,
+# etc.) is still DETECTED here and visible to the singleton check, instead of
+# being hidden and leaving the original declaration as an apparent singleton.
+# Overlong (41+) hex tokens are still DETECTED so they can be rejected rather
+# than being invisible to the singleton check.
 _PROSE_FIELD_TOKEN_RE = re.compile(
     r"(?<![A-Za-z0-9_])(?P<name>head|tree|base)\b"
-    r"(?P<gap>[:=\s]*?)(?P<value>[0-9a-fA-F]{40,})",
+    r"(?P<gap>[^A-Za-z0-9]*?)(?P<value>[0-9a-fA-F]{40,})",
     re.IGNORECASE,
 )
-# A candidate-like PR declaration: the field name followed by a separator and a
-# digit token. A colon/equals separator (``PR:`` / ``PR=``) is still DETECTED so
-# it can be rejected as malformed rather than hidden from the singleton check.
+# A candidate-like PR declaration: the field name followed by any non-word
+# separator and a digit token. As above, the broad separator keeps a conflicting
+# ``PR/99`` or ``PR (#99)`` visible to the singleton check instead of hidden.
+# A colon/equals separator (``PR:`` / ``PR=``) is likewise still DETECTED so it
+# can be rejected as malformed rather than hidden from the singleton check.
 _PROSE_PR_TOKEN_RE = re.compile(
-    r"(?<![A-Za-z0-9_])pr\b(?P<gap>[#:=\s]*?)(?P<value>[0-9]+)",
+    r"(?<![A-Za-z0-9_])pr\b(?P<gap>[^A-Za-z0-9]*?)(?P<value>[0-9]+)",
     re.IGNORECASE,
 )
 _PROSE_HEAD_SEP_RE = re.compile(r"^\s*[:=]?\s*$")
@@ -9365,6 +9371,26 @@ def _looks_json_shaped(text: str) -> bool:
     if text[0] in _JSON_STRUCTURAL_LEAD:
         return True
     return _JSON_VALUE_LEAD_RE.match(text) is not None
+
+
+# A PR declaration value must be a short decimal token. Python's ``int(str)``
+# raises ``ValueError`` beyond the integer-string conversion length limit
+# (default 4300 digits), so a hostile multi-thousand-digit PR token would
+# otherwise escape the fail-closed prose resolver as an uncaught exception
+# instead of returning None. GitHub PR ids are small integers; bound the digit
+# length well above any real id before conversion and normalize any conversion
+# failure to ``None`` so the caller fails closed (None) rather than crashing.
+_MAX_PROSE_PR_DIGITS = 10
+
+
+def _bounded_decimal_int(value: str) -> Optional[int]:
+    """Parse a decimal token to ``int``, failing closed on overlong input."""
+    if len(value) > _MAX_PROSE_PR_DIGITS:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _resolve_handoff_candidate_target(
@@ -9444,7 +9470,7 @@ def _resolve_handoff_candidate_target(
         decls["head"][0][1].lower() != expected_head.lower()
         or decls["tree"][0][1].lower() != expected_tree.lower()
         or decls["base"][0][1].lower() != expected_base.lower()
-        or int(pr_value) != expected_pr
+        or _bounded_decimal_int(pr_value) != expected_pr
     ):
         return None
     return {"version": 1, "candidate": expected_candidate, "summary": reason}
@@ -9925,6 +9951,15 @@ def _canonical_current_audit_outcome(
         "SELECT id, run_id, payload FROM task_events WHERE id=? AND task_id=? AND kind='review_handoff'",
         (payload.get("review_handoff_event_id"), author_task_id),
     ).fetchone()
+    # The bound review handoff participates in the current-v3 authentication
+    # chain; decode its raw bytes with duplicate-member rejection so a handoff
+    # whose raw JSON repeats a member name (e.g. ``version``) can never collapse
+    # into the expected shape and authenticate (mirrors the earlier-v3 ingress).
+    if handoff_row is not None:
+        try:
+            _strict_json_loads(handoff_row["payload"] or "{}")
+        except (TypeError, ValueError):
+            return True, None
     handoff = _review_handoff_receipt_from_row(author_task_id, handoff_row) if handoff_row else None
     evidence = payload.get("evidence")
     expected_candidate = (
@@ -9953,6 +9988,21 @@ def _canonical_current_audit_outcome(
     ).fetchone()
     parents = conn.execute("SELECT parent_id FROM task_links WHERE child_id=?",
                            (row["task_id"],),).fetchall()
+    # Freshness gates: the authoritative later-v3 receipt must bind the LATEST
+    # author run, audit run, and review handoff. A newer terminal author run, a
+    # newer completed audit run, or a later re-issued handoff makes this receipt
+    # stale, so the readback fails closed rather than authenticating a
+    # superseded run/handoff identity (mirrors the earlier-v3 ingress).
+    latest_author_run = conn.execute(
+        "SELECT MAX(id) FROM task_runs WHERE task_id = ?", (author_task_id,),
+    ).fetchone()[0]
+    latest_audit_run = conn.execute(
+        "SELECT MAX(id) FROM task_runs WHERE task_id = ?", (row["task_id"],),
+    ).fetchone()[0]
+    latest_handoff_id = conn.execute(
+        "SELECT MAX(id) FROM task_events WHERE task_id = ? AND kind = 'review_handoff'",
+        (author_task_id,),
+    ).fetchone()[0]
     required = {
         "version", "author_task_id", "author_run_id", "author_profile", "audit_task_id",
         "audit_run_id", "auditor_profile", "review_handoff_event_id", "verdict", "reason",
@@ -9993,9 +10043,12 @@ def _canonical_current_audit_outcome(
             "CONTINUATION_COMMITTED" if continuation_ids else "FINAL_ACCEPTED"
         )
         and len(facts) == 1
+        and latest_author_run == payload.get("author_run_id")
+        and latest_audit_run == row["run_id"]
+        and latest_handoff_id == payload.get("review_handoff_event_id")
     )
     try:
-        fact = json.loads(facts[0]["payload"]) if len(facts) == 1 else None
+        fact = _strict_json_loads(facts[0]["payload"] or "{}") if len(facts) == 1 else None
     except (TypeError, ValueError):
         fact = None
     if fact != {
