@@ -502,6 +502,11 @@ class AIAgent:
         requested_provider: str = None,
     ):
         """Forwarder — see ``agent.agent_init.init_agent``."""
+        try:
+            from agent.startup_phase import emit as _emit_startup_phase
+            _emit_startup_phase("run_agent_import", "ok")
+        except Exception:
+            pass  # instrumentation is best-effort and never breaks startup
         from agent.agent_init import init_agent
         init_agent(
             self,
@@ -619,17 +624,23 @@ class AIAgent:
                     _profile_for_session = None
             except Exception:
                 _profile_for_session = None
-            self._session_db.create_session(
-                session_id=self.session_id,
-                source=source,
-                model=self.model,
-                model_config=self._session_init_model_config,
-                system_prompt=self._cached_system_prompt,
-                user_id=None,
-                parent_session_id=self._parent_session_id,
-                cwd=_launch_cwd_for_session(source),
-                profile_name=_profile_for_session,
-            )
+            try:
+                from agent.startup_phase import phase as _startup_phase
+            except Exception:
+                from contextlib import nullcontext as _startup_phase
+
+            with _startup_phase("durable_session_create"):
+                self._session_db.create_session(
+                    session_id=self.session_id,
+                    source=source,
+                    model=self.model,
+                    model_config=self._session_init_model_config,
+                    system_prompt=self._cached_system_prompt,
+                    user_id=None,
+                    parent_session_id=self._parent_session_id,
+                    cwd=_launch_cwd_for_session(source),
+                    profile_name=_profile_for_session,
+                )
             self._session_db_created = True
         except Exception as e:
             # Transient failure (e.g. SQLite lock). Keep _session_db alive —

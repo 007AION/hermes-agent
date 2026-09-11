@@ -1070,6 +1070,17 @@ DEFAULT_CONFIG = {
         # a human as chat noise. Doc/markdown/skill-only edits never fire it.
         # Set true to force on everywhere, or false to disable.
         "verify_on_stop": "auto",
+        # Safe startup-phase tracing for child-startup stall attribution
+        # (AION governance issue #863). When true, the child-startup path
+        # emits one bounded, structured, redacted log record per phase boundary
+        # (process spawn, run_agent import, AIAgent construction, durable
+        # session creation, provider-client creation, provider call) plus the
+        # owning-cgroup memory counters. The record is names/status/timestamps/
+        # integer-counts only — it never captures prompts, argv, provider
+        # payloads, credentials, or customer data. The Elder observation path
+        # also activates automatically via HERMES_SESSION_SOURCE. Default false
+        # (off): normal runs are unaffected.
+        "startup_phase_trace": False,
         # Staged inactivity warning: send a warning to the user at this
         # threshold before escalating to a full timeout.  The warning fires
         # once per run and does not interrupt the agent.  0 = disable warning.

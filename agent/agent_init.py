@@ -569,6 +569,11 @@ def init_agent(
             identity even when skip_context_files=True. Project context files from the cwd
             remain skipped.
     """
+    try:
+        from agent.startup_phase import emit as _emit_startup_phase
+        _emit_startup_phase("aiagent_constructor", "begin")
+    except Exception:
+        pass  # instrumentation is best-effort and never breaks startup
     _install_safe_stdio()
 
     agent.model = model
@@ -1327,7 +1332,13 @@ def init_agent(
             from agent.ssl_guard import verify_ca_bundle_with_fallback
 
             verify_ca_bundle_with_fallback()
-            agent.client = agent._create_openai_client(client_kwargs, reason="agent_init", shared=True)
+            try:
+                from agent.startup_phase import phase as _startup_phase
+            except Exception:
+                from contextlib import nullcontext as _startup_phase
+
+            with _startup_phase("provider_client_create"):
+                agent.client = agent._create_openai_client(client_kwargs, reason="agent_init", shared=True)
             if not agent.quiet_mode:
                 print(f"🤖 AI Agent initialized with model: {agent.model}")
                 if base_url:
@@ -2687,6 +2698,11 @@ def init_agent(
             "is_anthropic_oauth": agent._is_anthropic_oauth,
         })
 
+    try:
+        from agent.startup_phase import emit as _emit_startup_phase
+        _emit_startup_phase("aiagent_constructor", "end")
+    except Exception:
+        pass  # instrumentation is best-effort and never breaks startup
 
 
 __all__ = ["init_agent"]
