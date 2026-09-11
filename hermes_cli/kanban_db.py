@@ -9323,6 +9323,29 @@ def _canonical_audit_evidence(value: Any) -> Optional[dict[str, Any]]:
     return {key: value[key] for key in sorted(_CANONICAL_AUDIT_EVIDENCE_KEYS)}
 
 
+_JSON_STRUCTURAL_LEAD = ("{", "[", '"')
+_JSON_SCALAR_TOKEN_RE = re.compile(
+    r"(?:[-+]?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][-+]?[0-9]+)?|true|false|null)"
+    r"(?![A-Za-z0-9_])"
+)
+_PROSE_FIELD_DECL_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(head|tree|base)\s*(?:[:=]\s*|\s+)"
+    r"([0-9a-fA-F]{40})(?![0-9a-fA-F])",
+    re.IGNORECASE,
+)
+_PROSE_PR_DECL_RE = re.compile(
+    r"(?<![A-Za-z0-9_])PR\s*#?\s*(\d+)\b",
+    re.IGNORECASE,
+)
+
+
+def _looks_json_shaped(text: str) -> bool:
+    """Return True when ``text`` leads with a JSON structural or scalar token."""
+    if text[:1] in _JSON_STRUCTURAL_LEAD:
+        return True
+    return _JSON_SCALAR_TOKEN_RE.match(text) is not None
+
+
 def _resolve_handoff_candidate_target(
     reason: str, expected_candidate: dict[str, Any],
 ) -> Optional[dict[str, Any]]:
@@ -9337,15 +9360,20 @@ def _resolve_handoff_candidate_target(
     evidence byte-for-byte (case-insensitive for SHAs).  ``repository`` is bound
     from the evidence, never from prose.
 
-    A JSON-shaped reason (leading ``{``/``[``/``"``) must decode to the exact
-    canonical envelope; any JSON string/list/number, malformed JSON, duplicate
-    JSON member, or deeply-nested JSON fails closed (None) rather than being
+    A JSON-shaped reason (leading ``{``/``[``/``"`` or a JSON scalar token such
+    as a number, ``true``/``false``/``null``) must decode to the exact canonical
+    envelope; any JSON string/list/number/scalar, malformed JSON, duplicate JSON
+    member, or deeply-nested JSON fails closed (None) rather than being
     reinterpreted as prose.  A prose reason must declare each of
-    head/tree/base/pr exactly once; a conflicting or duplicated declaration
-    fails closed.
+    head/tree/base/pr exactly once; field names are matched case-insensitively
+    and may be followed by whitespace, ``:`` or ``=``, so a conflicting
+    alternate declaration (e.g. ``HEAD <sha>`` or ``head: <sha>``) is visible to
+    the singleton check.  SHA declarations must be exactly 40 hex characters
+    with a non-hex boundary on both sides, so an overlong hex token can never
+    authenticate by prefix.
     """
     text = reason.strip()
-    if text[:1] in ("{", "[", '"'):
+    if _looks_json_shaped(text):
         try:
             target = _strict_json_loads(text)
         except (TypeError, ValueError):
@@ -9363,10 +9391,11 @@ def _resolve_handoff_candidate_target(
         ):
             return target
         return None
-    heads = re.findall(r"\bhead\s+([0-9a-fA-F]{40})", text)
-    trees = re.findall(r"\btree\s+([0-9a-fA-F]{40})", text)
-    bases = re.findall(r"\bbase\s+([0-9a-fA-F]{40})", text)
-    prs = re.findall(r"\bPR\s*#?\s*(\d+)\b", text, re.IGNORECASE)
+    field_decls = _PROSE_FIELD_DECL_RE.findall(text)
+    heads = [sha for name, sha in field_decls if name.lower() == "head"]
+    trees = [sha for name, sha in field_decls if name.lower() == "tree"]
+    bases = [sha for name, sha in field_decls if name.lower() == "base"]
+    prs = [int(n) for n in _PROSE_PR_DECL_RE.findall(text)]
     if not (len(heads) == len(trees) == len(bases) == len(prs) == 1):
         return None
     expected_head = expected_candidate.get("head")
@@ -9384,7 +9413,7 @@ def _resolve_handoff_candidate_target(
         heads[0].lower() != expected_head.lower()
         or trees[0].lower() != expected_tree.lower()
         or bases[0].lower() != expected_base.lower()
-        or int(prs[0]) != expected_pr
+        or prs[0] != expected_pr
     ):
         return None
     return {"version": 1, "candidate": expected_candidate, "summary": reason}

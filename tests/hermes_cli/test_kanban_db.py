@@ -6906,6 +6906,13 @@ _PROSE = _prose_handoff_reason()
     _PROSE + " base " + "d" * 40,                          # conflicting duplicate base
     _PROSE + " PR #99",                                    # conflicting duplicate PR
     _PROSE + " head " + _APPROVED_EVIDENCE["head"],        # duplicated (identical) head
+    "0 " + _PROSE,                                         # JSON number scalar prefix
+    "true " + _PROSE,                                      # JSON true scalar prefix
+    "false " + _PROSE,                                     # JSON false scalar prefix
+    "null " + _PROSE,                                      # JSON null scalar prefix
+    _prose_handoff_reason(head=_APPROVED_EVIDENCE["head"] + "d"),   # 41-hex overlong head
+    _PROSE + " HEAD " + "d" * 40,                          # conflicting uppercase head
+    _PROSE + " head: " + "d" * 40,                         # conflicting colon-delimited head
 ])
 def test_resolve_handoff_candidate_target_fails_closed_hostile(reason):
     """JSON string/list, malformed JSON, and duplicate declarations fail closed."""
@@ -6944,6 +6951,43 @@ def test_review_verdict_pass_rejects_hostile_handoff_candidate_without_mutation(
             conn, author, review_task_id=review_task,
             expected_review_run_id=audit_run, verdict="pass",
             reason="coherent but hostile handoff candidate", evidence=_APPROVED_EVIDENCE,
+        )
+        assert "\n".join(conn.iterdump()) == before
+        assert kb.get_task(conn, review_task).status == "running"
+        assert kb._canonical_audit_receipt(conn, author) is None
+
+
+@pytest.mark.parametrize("reason", [
+    "0 " + _PROSE,                                         # JSON number scalar prefix
+    "true " + _PROSE,                                      # JSON true scalar prefix
+    "false " + _PROSE,                                     # JSON false scalar prefix
+    "null " + _PROSE,                                      # JSON null scalar prefix
+    _prose_handoff_reason(head=_APPROVED_EVIDENCE["head"] + "d"),   # 41-hex overlong head
+    _PROSE + " HEAD " + "d" * 40,                          # conflicting uppercase head
+    _PROSE + " head: " + "d" * 40,                         # conflicting colon-delimited head
+])
+def test_review_verdict_pass_rejects_round8_hostile_candidates_without_mutation(
+    kanban_home, reason,
+):
+    """Round-8 fail-open classes fail closed with no DB mutation.
+
+    JSON scalar prefixes, an overlong 41-hex SHA, and alternate
+    (uppercase / colon-delimited) conflicting declarations must never
+    terminalize PASS: the verdict returns False, the DB bytes are unchanged,
+    the audit task stays running, and no canonical receipt is written.
+    """
+    with kb.connect() as conn:
+        author, run_id, review_task = _review_handoff_pair(conn)
+        assert kb.request_review_handoff(
+            conn, author, expected_run_id=run_id, review_task_id=review_task,
+            reason=reason,
+        )
+        audit_run = kb.claim_task(conn, review_task).current_run_id
+        before = "\n".join(conn.iterdump())
+        assert not kb.record_review_verdict(
+            conn, author, review_task_id=review_task,
+            expected_review_run_id=audit_run, verdict="pass",
+            reason="round-8 hostile candidate probe", evidence=_APPROVED_EVIDENCE,
         )
         assert "\n".join(conn.iterdump()) == before
         assert kb.get_task(conn, review_task).status == "running"
