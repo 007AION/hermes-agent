@@ -9344,6 +9344,29 @@ _EARLIER_V3_VERDICT_KEYS = {
 }
 
 
+def _reject_duplicate_json_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """``object_pairs_hook`` that fails closed on any repeated JSON member name.
+
+    ``json.loads`` keeps only the last duplicate member, so a raw authority
+    record that is not the authentic producer shape could collapse into the
+    expected key set and authenticate. ``json.loads`` applies this hook
+    recursively at every object level, so the first repeated member name raises
+    ``ValueError`` and the caller fails closed instead of trusting the collapsed
+    result.
+    """
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key: {key}")
+        result[key] = value
+    return result
+
+
+def _strict_json_loads(raw: str) -> Any:
+    """Parse JSON while rejecting duplicate member names at every object level."""
+    return json.loads(raw, object_pairs_hook=_reject_duplicate_json_pairs)
+
+
 def _canonical_audit_outcome_evidence_sha256(evidence: dict[str, Any]) -> str:
     """Canonical JSON digest of the closed evidence block (earlier-v3 identity)."""
     return hashlib.sha256(
@@ -9369,7 +9392,7 @@ def _earlier_v3_changed_fact(
     if len(rows) != 1:
         return None
     try:
-        payload = json.loads(rows[0]["payload"] or "{}")
+        payload = _strict_json_loads(rows[0]["payload"] or "{}")
     except (TypeError, ValueError):
         return None
     if not isinstance(payload, dict):
@@ -9424,7 +9447,7 @@ def _earlier_v3_bound_verdict(
     never trust a malformed or tampered authority record.
     """
     try:
-        verdict = json.loads(payload or "{}")
+        verdict = _strict_json_loads(payload or "{}")
     except (TypeError, ValueError):
         return False
     if not isinstance(verdict, dict) or set(verdict) != _EARLIER_V3_VERDICT_KEYS:
@@ -9618,6 +9641,15 @@ def _earlier_v3_current_audit_outcome(
         "AND kind = 'review_handoff'",
         (handoff_event_id, author_task_id),
     ).fetchone()
+    # The bound review handoff participates in the earlier-v3 authentication
+    # chain; decode its raw bytes with duplicate-member rejection so a handoff
+    # whose raw JSON repeats a member name (e.g. ``version``) can never collapse
+    # into the expected shape and authenticate.
+    if handoff_row is not None:
+        try:
+            _strict_json_loads(handoff_row["payload"] or "{}")
+        except (TypeError, ValueError):
+            return True, None
     handoff = _review_handoff_receipt_from_row(author_task_id, handoff_row) if handoff_row else None
     if (
         handoff is None
@@ -9698,7 +9730,7 @@ def _canonical_current_audit_outcome(
         return True, None
     row = rows[0]
     try:
-        envelope = json.loads(row["payload"] or "{}")
+        envelope = _strict_json_loads(row["payload"] or "{}")
     except (TypeError, ValueError):
         return True, None
     if not isinstance(envelope, dict):

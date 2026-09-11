@@ -7081,3 +7081,164 @@ def test_earlier_v3_audit_outcome_byte_different_author_mirror_fails_closed(kanb
         assert kb._canonical_audit_receipt(conn, chain["author"]) is None
         assert kb._reviewed_author_finalizer_run_id(conn, chain["author"]) is None
 
+
+# ---------------------------------------------------------------------------
+# Round-4 hostile regressions — duplicate JSON member names fail closed.
+#
+# Python ``json.loads`` keeps only the last duplicate member, so a raw authority
+# record that repeats a member name (a wrong value first, the authentic value
+# last) collapses into the expected key set and authenticates. The ingress must
+# decode every raw record in the earlier-v3 chain with recursive
+# duplicate-member rejection so such tampering fails closed before any exact-key
+# or digest check can trust the collapsed result.
+# ---------------------------------------------------------------------------
+
+def _raw_duplicate_member_json(obj, member_key, wrong_value) -> str:
+    """Serialize ``obj`` with a duplicate ``member_key`` (wrong first, real last).
+
+    The wrong value is injected immediately before the authentic member, so
+    ``json.loads`` (last-wins) collapses to the authentic value while strict
+    duplicate-member rejection raises on the repeated name.
+    """
+    text = json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+    needle = f'"{member_key}":'
+    idx = text.index(needle)
+    return text[:idx] + f'"{member_key}":{json.dumps(wrong_value)},' + text[idx:]
+
+
+def _overwrite_event_payloads(conn, specs) -> None:
+    """Overwrite the payload of each singleton event row with raw JSON text."""
+    with kb.write_txn(conn):
+        for task_id, run_id, kind, raw_text in specs:
+            rows = conn.execute(
+                "SELECT id FROM task_events WHERE task_id = ? AND run_id = ? "
+                "AND kind = ?",
+                (task_id, run_id, kind),
+            ).fetchall()
+            assert len(rows) == 1, (task_id, run_id, kind, len(rows))
+            conn.execute(
+                "UPDATE task_events SET payload = ? WHERE id = ?",
+                (raw_text, rows[0]["id"]),
+            )
+
+
+def test_earlier_v3_audit_outcome_duplicate_envelope_member_fails_closed(kanban_home):
+    with kb.connect() as conn:
+        chain = _earlier_v3_audit_outcome_chain(conn)
+        raw = _raw_duplicate_member_json(_earlier_v3_envelope_for(chain), "version", 999)
+        # Both mirrors carry the byte-identical duplicate so only the strict
+        # decode can reject them (the byte-identity and collapsed key-set checks
+        # would otherwise pass).
+        _overwrite_event_payloads(conn, [
+            (chain["reviewer"], chain["reviewer_run"], "canonical_audit_outcome", raw),
+            (chain["author"], chain["author_run"], "canonical_audit_outcome", raw),
+        ])
+
+        assert kb._canonical_current_audit_outcome(conn, chain["author"]) == (True, None)
+        assert kb._canonical_audit_receipt(conn, chain["author"]) is None
+        assert kb._reviewed_author_finalizer_run_id(conn, chain["author"]) is None
+
+
+def test_earlier_v3_audit_outcome_duplicate_evidence_member_fails_closed(kanban_home):
+    with kb.connect() as conn:
+        chain = _earlier_v3_audit_outcome_chain(conn)
+        # A wrong first ``head`` followed by the authentic ``head`` inside the
+        # nested evidence block collapses to the authentic value under plain
+        # json.loads but must fail closed under recursive duplicate rejection.
+        raw = _raw_duplicate_member_json(
+            _earlier_v3_envelope_for(chain), "head", "0" * 40,
+        )
+        _overwrite_event_payloads(conn, [
+            (chain["reviewer"], chain["reviewer_run"], "canonical_audit_outcome", raw),
+            (chain["author"], chain["author_run"], "canonical_audit_outcome", raw),
+        ])
+
+        assert kb._canonical_current_audit_outcome(conn, chain["author"]) == (True, None)
+        assert kb._canonical_audit_receipt(conn, chain["author"]) is None
+        assert kb._reviewed_author_finalizer_run_id(conn, chain["author"]) is None
+
+
+def test_earlier_v3_audit_outcome_duplicate_bound_verdict_member_fails_closed(kanban_home):
+    with kb.connect() as conn:
+        chain = _earlier_v3_audit_outcome_chain(conn)
+        verdict = {
+            "version": 2,
+            "review_task_id": chain["reviewer"],
+            "review_run_id": chain["reviewer_run"],
+            "verdict": "pass",
+            "reason": _EARLIER_V3_REASON,
+            "evidence": chain["evidence"],
+            "evidence_sha256": chain["evidence_sha256"],
+        }
+        raw = _raw_duplicate_member_json(verdict, "version", 999)
+        _overwrite_event_payloads(conn, [
+            (chain["reviewer"], chain["reviewer_run"], "review_verdict", raw),
+            (chain["author"], chain["reviewer_run"], "review_verdict", raw),
+        ])
+
+        assert kb._canonical_current_audit_outcome(conn, chain["author"]) == (True, None)
+        assert kb._canonical_audit_receipt(conn, chain["author"]) is None
+        assert kb._reviewed_author_finalizer_run_id(conn, chain["author"]) is None
+
+
+def test_earlier_v3_audit_outcome_duplicate_bound_verdict_evidence_member_fails_closed(
+    kanban_home,
+):
+    with kb.connect() as conn:
+        chain = _earlier_v3_audit_outcome_chain(conn)
+        verdict = {
+            "version": 2,
+            "review_task_id": chain["reviewer"],
+            "review_run_id": chain["reviewer_run"],
+            "verdict": "pass",
+            "reason": _EARLIER_V3_REASON,
+            "evidence": chain["evidence"],
+            "evidence_sha256": chain["evidence_sha256"],
+        }
+        raw = _raw_duplicate_member_json(verdict, "head", "0" * 40)
+        _overwrite_event_payloads(conn, [
+            (chain["reviewer"], chain["reviewer_run"], "review_verdict", raw),
+            (chain["author"], chain["reviewer_run"], "review_verdict", raw),
+        ])
+
+        assert kb._canonical_current_audit_outcome(conn, chain["author"]) == (True, None)
+        assert kb._canonical_audit_receipt(conn, chain["author"]) is None
+        assert kb._reviewed_author_finalizer_run_id(conn, chain["author"]) is None
+
+
+def test_earlier_v3_audit_outcome_duplicate_handoff_member_fails_closed(kanban_home):
+    with kb.connect() as conn:
+        chain = _earlier_v3_audit_outcome_chain(conn)
+        handoff_row = conn.execute(
+            "SELECT id, payload FROM task_events WHERE task_id = ? AND kind = ?",
+            (chain["author"], "review_handoff"),
+        ).fetchone()
+        assert handoff_row is not None
+        raw = _raw_duplicate_member_json(
+            json.loads(handoff_row["payload"]), "version", 999,
+        )
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_events SET payload = ? WHERE id = ?",
+                (raw, handoff_row["id"]),
+            )
+
+        assert kb._canonical_current_audit_outcome(conn, chain["author"]) == (True, None)
+        assert kb._canonical_audit_receipt(conn, chain["author"]) is None
+        assert kb._reviewed_author_finalizer_run_id(conn, chain["author"]) is None
+
+
+def test_earlier_v3_audit_outcome_duplicate_changed_fact_member_fails_closed(kanban_home):
+    with kb.connect() as conn:
+        chain = _earlier_v3_audit_outcome_chain(conn)
+        fact = _earlier_v3_fact_for(chain, chain["outcome_event_id"])
+        raw = _raw_duplicate_member_json(fact, "new_status", "blocked")
+        _overwrite_event_payloads(conn, [
+            (chain["reviewer"], chain["reviewer_run"], "changed_fact", raw),
+            (chain["author"], chain["author_run"], "changed_fact", raw),
+        ])
+
+        assert kb._canonical_current_audit_outcome(conn, chain["author"]) == (True, None)
+        assert kb._canonical_audit_receipt(conn, chain["author"]) is None
+        assert kb._reviewed_author_finalizer_run_id(conn, chain["author"]) is None
+
