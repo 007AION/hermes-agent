@@ -7640,6 +7640,94 @@ def test_current_v3_outcome_erases_promoted_child_fails_closed(kanban_home):
         assert kb._reviewed_author_finalizer_run_id(conn, author) is None
 
 
+def test_current_v3_outcome_unrelated_global_promotion_authenticates(kanban_home):
+    """Writer and readback must consume one identical immutable promotion fact.
+
+    The terminal PASS transaction promotes every globally eligible ``todo`` via
+    ``recompute_ready`` (not only the audit task's children) and records that
+    exact set as ``continuation_ids``. The readback must reconstruct the same
+    immutable set from the durable terminal-transaction ``promoted`` events, so
+    an unrelated task promoted by that same sweep cannot make the freshly
+    produced receipt self-invalidate (writer/reader disagreement).
+    """
+    with kb.connect() as conn:
+        author, run_id, review_task = _review_handoff_pair(conn)
+        assert kb.request_review_handoff(
+            conn, author, expected_run_id=run_id, review_task_id=review_task,
+            reason=_APPROVED_HANDOFF,
+        )
+        # An unrelated globally eligible todo: parent already done but no
+        # recompute has fired yet, so it sits in ``todo`` at terminal time.
+        done_parent = kb.create_task(conn, title="unrelated done parent", assignee="other")
+        unrelated = kb.create_task(
+            conn, title="unrelated globally eligible todo", assignee="other",
+            parents=[done_parent],
+        )
+        assert kb.get_task(conn, unrelated).status == "todo"
+        conn.execute("UPDATE tasks SET status='done' WHERE id=?", (done_parent,))
+        conn.commit()
+        audit_run = kb.claim_task(conn, review_task).current_run_id
+        assert kb.record_review_verdict(
+            conn, author, review_task_id=review_task,
+            expected_review_run_id=audit_run, verdict="pass",
+            reason="PASS_CURRENT_V3_FIXTURE", evidence=_APPROVED_EVIDENCE,
+        )
+        assert kb.get_task(conn, unrelated).status == "ready"
+        present, receipt = kb._canonical_current_audit_outcome(conn, author)
+        assert present is True and receipt is not None
+        assert receipt["authenticated"] is True
+        assert kb._reviewed_author_finalizer_run_id(conn, author) == run_id
+
+
+def test_current_v3_outcome_link_evolution_cannot_erase_promotion(kanban_home):
+    """Post-outcome link/unlink evolution must not erase an immutable promotion.
+
+    The terminal producer promotes an audit child and records
+    CONTINUATION_COMMITTED. Supported ``link_tasks``/``unlink_tasks`` may later
+    add an unmet parent and remove the audit edge while the producer ``promoted``
+    event stays intact. Rewriting disposition/continuation plus the envelope
+    digest/pointer to FINAL_ACCEPTED/[] must still fail closed because the
+    immutable promotion event, not present-day links, decides whether the
+    continuation existed.
+    """
+    with kb.connect() as conn:
+        author, run_id, review_task = _review_handoff_pair(conn)
+        assert kb.request_review_handoff(
+            conn, author, expected_run_id=run_id, review_task_id=review_task,
+            reason=_APPROVED_HANDOFF,
+        )
+        child = kb.create_task(
+            conn, title="post-audit continuation", assignee="merger",
+            parents=[review_task],
+        )
+        assert kb.get_task(conn, child).status == "todo"
+        audit_run = kb.claim_task(conn, review_task).current_run_id
+        assert kb.record_review_verdict(
+            conn, author, review_task_id=review_task,
+            expected_review_run_id=audit_run, verdict="pass",
+            reason="PASS_CURRENT_V3_FIXTURE", evidence=_APPROVED_EVIDENCE,
+        )
+        assert kb.get_task(conn, child).status == "ready"
+        present, receipt = kb._canonical_current_audit_outcome(conn, author)
+        assert present is True and receipt is not None
+        assert receipt["authenticated"] is True
+
+        # Supported link evolution: add an unmet parent (demotes child to todo),
+        # then remove the audit edge while the producer promoted event survives.
+        unmet = kb.create_task(conn, title="unmet independent parent", assignee="other")
+        kb.link_tasks(conn, unmet, child)
+        assert kb.get_task(conn, child).status == "todo"
+        assert kb.unlink_tasks(conn, review_task, child)
+
+        def mutate(obj):
+            obj["disposition"] = "FINAL_ACCEPTED"
+            obj["continuation_ids"] = []
+
+        _rewrite_current_v3_envelope(conn, review_task, audit_run, mutate_envelope=mutate)
+        assert kb._canonical_current_audit_outcome(conn, author) == (True, None)
+        assert kb._reviewed_author_finalizer_run_id(conn, author) is None
+
+
 def test_current_v3_outcome_bool_fact_version_fails_closed(kanban_home):
     with kb.connect() as conn:
         author, run_id, review_task, audit_run = _current_v3_outcome(conn)

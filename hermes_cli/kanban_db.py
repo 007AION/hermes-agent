@@ -9900,16 +9900,18 @@ def _current_v3_continuation_targets(
     conn: sqlite3.Connection, author_task_id: str, audit_task_id: str,
     audit_run_id: int, outcome_event_id: int,
 ) -> Optional[tuple[str, list[str]]]:
-    """Recompute current-v3 continuation targets from durable promotion events.
+    """Reconstruct the immutable terminal-transaction promotion fact.
 
-    The terminal producer emits ``continuation_ids`` as exactly the child ids
-    appended by ``recompute_ready`` in its terminal transaction; each such child
+    The terminal producer emits ``continuation_ids`` as exactly the task ids
+    promoted by ``recompute_ready`` in its terminal transaction; each such task
     carries a durable ``promoted`` event appended after the audit run's own
     ``completed`` marker and before the ``canonical_audit_outcome`` event
-    (id = ``outcome_event_id``). This helper recomputes that set from those
-    promotion events — bound by a lower transaction boundary (the audit run's
-    ``completed`` event id), event order, and identity — rather than from any
-    historical ``promoted`` event before the outcome.
+    (id = ``outcome_event_id``). This helper reconstructs that exact set from
+    those promotion events alone — the immutable, causally-scoped
+    terminal-transaction promotion fact — rather than from present-day
+    ``task_links``/``tasks`` relationship or status state, so the producer and
+    the validator consume one identical fact and supported post-outcome
+    link/unlink evolution cannot erase a producer-promoted continuation.
 
     The lower boundary is the audit run's *singleton* ``completed`` marker: the
     terminal transaction emits exactly one such marker, and its id must precede
@@ -9919,8 +9921,7 @@ def _current_v3_continuation_targets(
     outcome would otherwise move the boundary past the promoted set and erase a
     producer-promoted continuation. A ``promoted`` event from an earlier
     transaction (a prior parent's completion) is NOT this terminal transaction's
-    output, so it must not count as a continuation. A child id that does not
-    resolve to a live task row fails closed (returns ``None``).
+    output, so it must not count as a continuation.
     """
     completed_rows = conn.execute(
         "SELECT id FROM task_events WHERE task_id = ? AND run_id = ? "
@@ -9933,25 +9934,11 @@ def _current_v3_continuation_targets(
     if lower >= outcome_event_id:
         return None
     rows = conn.execute(
-        "SELECT child_id FROM task_links WHERE parent_id = ?",
-        (audit_task_id,),
+        "SELECT DISTINCT task_id FROM task_events "
+        "WHERE kind = 'promoted' AND id > ? AND id < ?",
+        (lower, outcome_event_id),
     ).fetchall()
-    targets: list[str] = []
-    for row in rows:
-        child_id = str(row["child_id"])
-        live = conn.execute(
-            "SELECT 1 FROM tasks WHERE id = ?", (child_id,),
-        ).fetchone()
-        if live is None:
-            return None
-        promoted = conn.execute(
-            "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'promoted' "
-            "AND id > ? AND id < ? LIMIT 1",
-            (child_id, lower, outcome_event_id),
-        ).fetchone()
-        if promoted is not None:
-            targets.append(child_id)
-    targets.sort()
+    targets: list[str] = sorted(str(row["task_id"]) for row in rows)
     if targets:
         return _EARLIER_V3_DISPOSITION_CONTINUATION, targets
     return _EARLIER_V3_DISPOSITION_FINAL, []
@@ -9962,16 +9949,18 @@ def _current_v3_continuation_ids_valid(
     audit_run_id: int, continuation_ids: Any, disposition: Any,
     outcome_event_id: int,
 ) -> bool:
-    """Validate the current-v3 continuation list against durable promotion events.
+    """Validate the current-v3 continuation list against the immutable
+    terminal-transaction promotion fact.
 
-    Each continuation id must be a unique, nonempty, existing child of the author
-    or audit task, and the disposition must match the list's emptiness. A
-    nonexistent, blank, or duplicated continuation id fails closed. The list must
-    also match the durable promoted-continuation set exactly, so a drifted
-    envelope that invents a child with no producer promotion (linked after the
-    outcome, zero ``promoted`` events) or erases a producer-promoted child after
-    it was later completed fails closed even after its digest and fact pointer
-    are recomputed.
+    Each continuation id must be a unique, nonempty string that is neither the
+    author nor the audit task, and the disposition must match the list's
+    emptiness. The list must match the durable terminal-transaction promoted set
+    exactly, so a drifted envelope that invents a task with no producer
+    promotion, or erases a producer-promoted task, fails closed even after its
+    digest and fact pointer are recomputed. Present-day ``task_links`` or
+    ``tasks`` relationship/status state is never consulted: the immutable
+    promotion events are the sole authority, so supported post-outcome
+    link/unlink evolution cannot erase an intact producer promotion.
     """
     if type(continuation_ids) is not list:
         return False
@@ -9989,14 +9978,6 @@ def _current_v3_continuation_ids_valid(
             return False
         seen.add(cid)
         if cid in {author_task_id, audit_task_id}:
-            return False
-        linked = conn.execute(
-            "SELECT 1 FROM task_links WHERE child_id = ? AND parent_id IN (?, ?)",
-            (cid, author_task_id, audit_task_id),
-        ).fetchone()
-        if linked is None:
-            return False
-        if conn.execute("SELECT 1 FROM tasks WHERE id = ?", (cid,)).fetchone() is None:
             return False
     live = _current_v3_continuation_targets(
         conn, author_task_id, audit_task_id, audit_run_id, outcome_event_id,
