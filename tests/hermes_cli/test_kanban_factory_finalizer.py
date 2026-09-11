@@ -6561,3 +6561,293 @@ def test_canonical_audit_receipt_authenticates_legacy_blocked_provider_failure(
         )
         author_task = kb.get_task(conn, chain["author"])
         assert author_task is not None and author_task.status == "done"
+
+
+# ---------------------------------------------------------------------------
+# PR #98 earlier-v3 envelope compatibility ingress (pre-merge resident 95392cf8)
+# ---------------------------------------------------------------------------
+# The pre-merge resident persisted the canonical audit-outcome envelope in an
+# earlier v3 key set; the final head accepts only the later v3 key set. These
+# tests prove the read-only in-memory ingress resolves the authentic earlier-v3
+# shape and fails closed on every hostile variant, without mutating history.
+
+
+def _earlier_v3_audit_outcome_chain(conn, *, author_assignee="agent007"):
+    """Seed a role-separated chain whose audit-outcome envelope is the earlier-v3
+    key set (the live compatibility incident, minus any sensitive value)."""
+    author = kb.create_task(
+        conn, title="earlier-v3 reviewed author", factory_build_gate=1,
+        assignee=author_assignee,
+    )
+    reviewer = kb.create_task(
+        conn, title="role-separated audit", factory_build_gate=1,
+        assignee="bafuxunan", parents=[author],
+    )
+    child = kb.create_task(
+        conn, title="downstream product transition", factory_build_gate=1,
+        assignee="gm2", parents=[author],
+    )
+    author_run = _claim_and_run_id(conn, author)
+    handoff = kb.request_review_handoff(
+        conn, author, expected_run_id=author_run, review_task_id=reviewer,
+        reason="earlier-v3 exact receipt audit",
+    )
+    assert handoff is not None
+    reviewer_run = _claim_and_run_id(conn, reviewer)
+    # Directly terminalize the audit (no kernel finalizer): the role separation
+    # is already bound and the factory terminal receipt is pre-seeded so the
+    # compatibility ingress can validate the audit's terminal-receipt gate.
+    with kb.write_txn(conn):
+        kb._execute_factory_terminal_write(
+            conn, reviewer,
+            "UPDATE tasks SET status='done', current_run_id=NULL, claim_lock=NULL, "
+            "claim_expires=NULL, worker_pid=NULL, factory_terminal_receipt_sha256=? "
+            "WHERE id=?",
+            ("f" * 64, reviewer),
+        )
+        conn.execute(
+            "UPDATE task_runs SET status='done', outcome='completed', ended_at=1, "
+            "summary='independent audit passed' WHERE id=?",
+            (reviewer_run,),
+        )
+    assert _record_legacy_review_verdict_fixture(
+        conn, author, review_task_id=reviewer,
+        expected_review_run_id=reviewer_run, verdict="pass",
+        reason="PASS_EARLIER_V3_NATIVE_RECEIPT",
+    )
+    evidence = {
+        "repository": "kiddhu/hermes-agent",
+        "pr": 98,
+        "head": "3e70a4a91562f60532c742404b126f4cb369d062",
+        "tree": "e112b9b72910a39972b37229de7eeef7cc0a4d92",
+        "base": "25fcb86314ea81b152406c42e5389f3f9d9849f3",
+        "github_review_id": 5164970120,
+        "github_review_url": "https://github.com/kiddhu/hermes-agent/pull/98#pullrequestreview-5164970120",
+        "github_review_state": "APPROVED",
+    }
+    evidence_sha256 = kb._canonical_audit_outcome_evidence_sha256(evidence)
+    chain = {
+        "author": author, "author_run": author_run, "reviewer": reviewer,
+        "reviewer_run": reviewer_run, "child": child, "handoff": handoff,
+        "evidence": evidence, "evidence_sha256": evidence_sha256,
+        "author_assignee": author_assignee,
+    }
+    chain["outcome_event_id"] = _seed_earlier_v3_outcome(conn, chain)
+    return chain
+
+
+def _earlier_v3_envelope_for(chain):
+    return {
+        "version": 3,
+        "author_task_id": chain["author"],
+        "author_run_id": chain["author_run"],
+        "audit_task_id": chain["reviewer"],
+        "audit_run_id": chain["reviewer_run"],
+        "handoff_event_id": chain["handoff"].event_id,
+        "verdict": "PASS",
+        "reason": "APPROVED_EXACT_HEAD: earlier-v3 authentic envelope",
+        "evidence": chain["evidence"],
+        "role_separation": {
+            "author_profile": chain["author_assignee"],
+            "auditor_profile": "bafuxunan",
+        },
+        "evidence_sha256": chain["evidence_sha256"],
+        "created_at": 1,
+    }
+
+
+def _earlier_v3_fact_for(chain, outcome_event_id, evidence_sha256=None):
+    return {
+        "task_id": chain["reviewer"],
+        "run_id": chain["reviewer_run"],
+        "prior_status": "running",
+        "new_status": "done",
+        "event_id": outcome_event_id,
+        "audit_outcome_sha256": evidence_sha256 or chain["evidence_sha256"],
+        "disposition": "CONTINUATION_COMMITTED",
+        "continuation_task_ids": [chain["child"]],
+    }
+
+
+def _seed_earlier_v3_outcome(
+    conn, chain, *, envelope=None, fact=None, author_mirror=True,
+    author_envelope=None, dual=False,
+):
+    """Seed the earlier-v3 canonical_audit_outcome + changed_fact events.
+
+    Returns the audit outcome event id. ``author_envelope`` (when set) writes a
+    different author mirror payload than the audit event; ``dual`` writes a
+    second audit canonical_audit_outcome event (conflicting dual receipt).
+    """
+    if envelope is None:
+        envelope = _earlier_v3_envelope_for(chain)
+    with kb.write_txn(conn):
+        kb._append_event(
+            conn, chain["reviewer"], "canonical_audit_outcome", envelope,
+            run_id=chain["reviewer_run"], created_at=1,
+        )
+        outcome_event_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+        if dual:
+            kb._append_event(
+                conn, chain["reviewer"], "canonical_audit_outcome", envelope,
+                run_id=chain["reviewer_run"], created_at=2,
+            )
+        if author_mirror:
+            kb._append_event(
+                conn, chain["author"], "canonical_audit_outcome",
+                envelope if author_envelope is None else author_envelope,
+                run_id=chain["author_run"], created_at=1,
+            )
+        if fact is None:
+            fact = _earlier_v3_fact_for(chain, outcome_event_id)
+        kb._append_event(
+            conn, chain["reviewer"], "changed_fact", fact,
+            run_id=chain["reviewer_run"], created_at=1,
+        )
+        kb._append_event(
+            conn, chain["author"], "changed_fact", fact,
+            run_id=chain["author_run"], created_at=1,
+        )
+    return outcome_event_id
+
+
+def _clear_earlier_v3_outcome(conn, chain):
+    with kb.write_txn(conn):
+        conn.execute(
+            "DELETE FROM task_events WHERE task_id IN (?, ?) AND kind IN "
+            "('canonical_audit_outcome', 'changed_fact')",
+            (chain["reviewer"], chain["author"]),
+        )
+
+
+def test_earlier_v3_audit_outcome_authentic_envelope_resolves_same_author(kanban_home):
+    with kb.connect() as conn:
+        chain = _earlier_v3_audit_outcome_chain(conn)
+        before = _native_state_snapshot(conn)
+
+        present, receipt = kb._canonical_current_audit_outcome(conn, chain["author"])
+        assert present is True
+        assert receipt is not None
+        assert receipt["author_task_id"] == chain["author"]
+        assert receipt["author_run_id"] == chain["author_run"]
+        assert receipt["author_profile"] == "agent007"
+        assert receipt["auditor_task_id"] == chain["reviewer"]
+        assert receipt["auditor_run_id"] == chain["reviewer_run"]
+        assert receipt["auditor_profile"] == "bafuxunan"
+        assert receipt["verdict"] == "PASS"
+        assert receipt["subject_version_or_exact_hash"] == chain["evidence_sha256"]
+        assert receipt["issued_at"] == chain["outcome_event_id"]
+        assert re.fullmatch(r"[0-9a-f]{64}", receipt["receipt_hash"])
+        assert receipt["authenticated"] is True
+
+        # The full receipt resolver and finalizer return the exact same author
+        # continuation identity, with zero mutation.
+        resolved = kb._canonical_audit_receipt(conn, chain["author"])
+        assert resolved == receipt
+        assert kb._reviewed_author_finalizer_run_id(
+            conn, chain["author"],
+        ) == chain["author_run"]
+        assert _native_state_snapshot(conn) == before
+
+
+@pytest.mark.parametrize(
+    "label, envelope_overrides",
+    [
+        ("tampered_evidence_digest", {"evidence_sha256": "0" * 64}),
+        ("wrong_verdict", {"verdict": "REQUEST_CHANGES"}),
+        ("wrong_author_task", {"author_task_id": "t_foreign_author"}),
+        ("wrong_audit_task", {"audit_task_id": "t_foreign_audit"}),
+        ("wrong_audit_run", {"audit_run_id": 999999}),
+        ("wrong_author_run", {"author_run_id": 999998}),
+        ("wrong_handoff_event", {"handoff_event_id": 987654}),
+        ("collapsed_role_separation", {
+            "role_separation": {
+                "author_profile": "agent007", "auditor_profile": "agent007",
+            },
+        }),
+        ("missing_role_profile", {
+            "role_separation": {"author_profile": "agent007"},
+        }),
+        ("malformed_evidence", {
+            "evidence": {
+                "repository": "kiddhu/hermes-agent",
+                "pr": 98,
+                "head": "3e70a4a91562f60532c742404b126f4cb369d062",
+                "tree": "e112b9b72910a39972b37229de7eeef7cc0a4d92",
+                "base": "25fcb86314ea81b152406c42e5389f3f9d9849f3",
+                "github_review_id": 5164970120,
+                "github_review_url": "https://github.com/kiddhu/hermes-agent/pull/98#pullrequestreview-5164970120",
+                "github_review_state": "CHANGES_REQUESTED",
+            },
+        }),
+    ],
+)
+def test_earlier_v3_audit_outcome_hostile_envelope_fails_closed(
+    kanban_home, label, envelope_overrides,
+):
+    with kb.connect() as conn:
+        chain = _earlier_v3_audit_outcome_chain(conn)
+        _clear_earlier_v3_outcome(conn, chain)
+        envelope = _earlier_v3_envelope_for(chain)
+        envelope.update(envelope_overrides)
+        # A tampered evidence block must still carry a self-consistent digest
+        # so the failure is attributable to the evidence identity, not the
+        # digest recompute alone.
+        if "evidence" in envelope_overrides:
+            envelope["evidence_sha256"] = kb._canonical_audit_outcome_evidence_sha256(
+                envelope["evidence"]
+            )
+        _seed_earlier_v3_outcome(conn, chain, envelope=envelope)
+
+        assert kb._canonical_current_audit_outcome(conn, chain["author"]) == (True, None)
+        assert kb._canonical_audit_receipt(conn, chain["author"]) is None
+        assert kb._reviewed_author_finalizer_run_id(conn, chain["author"]) is None
+
+
+def test_earlier_v3_audit_outcome_mixed_key_set_fails_closed(kanban_home):
+    with kb.connect() as conn:
+        chain = _earlier_v3_audit_outcome_chain(conn)
+        _clear_earlier_v3_outcome(conn, chain)
+        envelope = _earlier_v3_envelope_for(chain)
+        # Swap the earlier handoff key for the later review_handoff key: a
+        # mixed-key envelope is neither earlier-v3 nor later-v3 and must fail
+        # closed (no legacy fallback over a present canonical record).
+        envelope["review_handoff_event_id"] = envelope.pop("handoff_event_id")
+        _seed_earlier_v3_outcome(conn, chain, envelope=envelope)
+
+        assert kb._canonical_current_audit_outcome(conn, chain["author"]) == (True, None)
+        assert kb._canonical_audit_receipt(conn, chain["author"]) is None
+        assert kb._reviewed_author_finalizer_run_id(conn, chain["author"]) is None
+
+
+def test_earlier_v3_audit_outcome_missing_author_mirror_fails_closed(kanban_home):
+    with kb.connect() as conn:
+        chain = _earlier_v3_audit_outcome_chain(conn)
+        _clear_earlier_v3_outcome(conn, chain)
+        _seed_earlier_v3_outcome(conn, chain, author_mirror=False)
+
+        assert kb._canonical_current_audit_outcome(conn, chain["author"]) == (True, None)
+        assert kb._canonical_audit_receipt(conn, chain["author"]) is None
+
+
+def test_earlier_v3_audit_outcome_tampered_author_mirror_fails_closed(kanban_home):
+    with kb.connect() as conn:
+        chain = _earlier_v3_audit_outcome_chain(conn)
+        _clear_earlier_v3_outcome(conn, chain)
+        envelope = _earlier_v3_envelope_for(chain)
+        tampered = dict(envelope)
+        tampered["reason"] = "TAMPERED_MIRROR"
+        _seed_earlier_v3_outcome(conn, chain, envelope=envelope, author_envelope=tampered)
+
+        assert kb._canonical_current_audit_outcome(conn, chain["author"]) == (True, None)
+        assert kb._canonical_audit_receipt(conn, chain["author"]) is None
+
+
+def test_earlier_v3_audit_outcome_dual_receipt_fails_closed(kanban_home):
+    with kb.connect() as conn:
+        chain = _earlier_v3_audit_outcome_chain(conn)
+        _clear_earlier_v3_outcome(conn, chain)
+        _seed_earlier_v3_outcome(conn, chain, dual=True)
+
+        assert kb._canonical_current_audit_outcome(conn, chain["author"]) == (True, None)
+        assert kb._canonical_audit_receipt(conn, chain["author"]) is None

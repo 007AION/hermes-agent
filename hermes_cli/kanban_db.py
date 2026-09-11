@@ -9323,6 +9323,275 @@ def _canonical_audit_evidence(value: Any) -> Optional[dict[str, Any]]:
     return {key: value[key] for key in sorted(_CANONICAL_AUDIT_EVIDENCE_KEYS)}
 
 
+# Earlier-v3 envelope key set (pre-merge PR98 resident 95392cf8). The final
+# head accepts only the later v3 key set; this names the exact earlier shape so
+# a persisted authentic earlier-v3 receipt can be recognized without weakening
+# the later-v3 authority or mutating any historical byte.
+_EARLIER_V3_AUDIT_OUTCOME_KEYS = {
+    "version", "author_task_id", "author_run_id", "audit_task_id", "audit_run_id",
+    "handoff_event_id", "verdict", "reason", "evidence", "role_separation",
+    "evidence_sha256", "created_at",
+}
+_EARLIER_V3_AUDIT_ROLE_KEYS = {"author_profile", "auditor_profile"}
+_EARLIER_V3_DISPOSITION_FINAL = "FINAL_ACCEPTED"
+_EARLIER_V3_DISPOSITION_CONTINUATION = "CONTINUATION_COMMITTED"
+
+
+def _canonical_audit_outcome_evidence_sha256(evidence: dict[str, Any]) -> str:
+    """Canonical JSON digest of the closed evidence block (earlier-v3 identity)."""
+    return hashlib.sha256(
+        json.dumps(
+            evidence, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _earlier_v3_changed_fact(
+    conn: sqlite3.Connection, task_id: str, run_id: int,
+) -> Optional[dict[str, Any]]:
+    """Read one earlier-v3 changed-fact mirror for a task+run, if well-formed."""
+    row = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND run_id = ? "
+        "AND kind = 'changed_fact' ORDER BY id DESC LIMIT 1",
+        (task_id, run_id),
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        payload = json.loads(row["payload"] or "{}")
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if set(payload) != {
+        "task_id", "run_id", "prior_status", "new_status", "event_id",
+        "audit_outcome_sha256", "disposition", "continuation_task_ids",
+    }:
+        return None
+    return payload
+
+
+def _earlier_v3_continuation_targets(
+    conn: sqlite3.Connection, author_task_id: str, audit_task_id: str,
+) -> tuple[Optional[str], Optional[list[str]]]:
+    """Recompute the earlier-v3 disposition + bound continuation target ids.
+
+    Mirrors the pre-merge resolver: the author's non-audit, non-terminal
+    children are the continuation targets. A child id that does not resolve to
+    a live task row fails closed.
+    """
+    rows = conn.execute(
+        "SELECT child_id FROM task_links WHERE parent_id = ? AND child_id != ?",
+        (author_task_id, audit_task_id),
+    ).fetchall()
+    targets: list[str] = []
+    for row in rows:
+        child_id = str(row["child_id"])
+        live = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (child_id,),
+        ).fetchone()
+        if live is None:
+            return None, None
+        if live["status"] in ("done", "archived"):
+            continue
+        targets.append(child_id)
+    targets.sort()
+    if targets:
+        return _EARLIER_V3_DISPOSITION_CONTINUATION, targets
+    return _EARLIER_V3_DISPOSITION_FINAL, []
+
+
+def _earlier_v3_current_audit_outcome(
+    conn: sqlite3.Connection, author_task_id: str, row: sqlite3.Row,
+    envelope: dict[str, Any],
+) -> tuple[bool, Optional[dict[str, Any]]]:
+    """Validate one authentic earlier-v3 envelope and map it to the current receipt.
+
+    The pre-merge PR98 resident persisted the canonical audit-outcome envelope in
+    the earlier v3 key set. This read-only ingress validates that exact shape
+    (digest, role separation, direct review handoff, author/audit task+run, PASS)
+    and maps it in memory to the current semantic receipt so the existing
+    finalizer can terminalize the author. No historical byte is mutated and no
+    second outcome is emitted; any mixed-key, wrong digest/role/task/run/handoff,
+    or conflicting record fails closed (present=True, receipt=None).
+    """
+    if envelope.get("version") != 3 or envelope.get("verdict") != "PASS":
+        return True, None
+    if envelope.get("author_task_id") != author_task_id:
+        return True, None
+    evidence = envelope.get("evidence")
+    if not isinstance(evidence, dict) or set(evidence) != _CANONICAL_AUDIT_EVIDENCE_KEYS:
+        return True, None
+    if _canonical_audit_evidence(evidence) != evidence:
+        return True, None
+    evidence_sha256 = envelope.get("evidence_sha256")
+    if (
+        not isinstance(evidence_sha256, str)
+        or evidence_sha256 != _canonical_audit_outcome_evidence_sha256(evidence)
+    ):
+        return True, None
+    if not isinstance(envelope.get("reason"), str) or not envelope["reason"].strip():
+        return True, None
+    if isinstance(envelope.get("created_at"), bool) or not isinstance(envelope.get("created_at"), int):
+        return True, None
+    role = envelope.get("role_separation")
+    if not isinstance(role, dict) or set(role) != _EARLIER_V3_AUDIT_ROLE_KEYS:
+        return True, None
+    author_profile = role.get("author_profile")
+    auditor_profile = role.get("auditor_profile")
+    if (
+        not isinstance(author_profile, str) or not author_profile
+        or not isinstance(auditor_profile, str) or not auditor_profile
+        or author_profile == auditor_profile
+    ):
+        return True, None
+    author_run_id = envelope.get("author_run_id")
+    audit_run_id = envelope.get("audit_run_id")
+    handoff_event_id = envelope.get("handoff_event_id")
+    audit_task_id = envelope.get("audit_task_id")
+    if (
+        not isinstance(audit_task_id, str) or not audit_task_id
+        or isinstance(author_run_id, bool) or not isinstance(author_run_id, int)
+        or isinstance(audit_run_id, bool) or not isinstance(audit_run_id, int)
+        or isinstance(handoff_event_id, bool) or not isinstance(handoff_event_id, int)
+    ):
+        return True, None
+    if audit_task_id != row["task_id"] or audit_run_id != row["run_id"]:
+        return True, None
+    if conn.execute(
+        "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ?",
+        (author_task_id, audit_task_id),
+    ).fetchone() is None:
+        return True, None
+    author_row = conn.execute(
+        "SELECT status, assignee, current_run_id FROM tasks WHERE id = ?",
+        (author_task_id,),
+    ).fetchone()
+    audit_row = conn.execute(
+        "SELECT status, assignee, current_run_id, factory_build_gate, "
+        "factory_terminal_receipt_sha256 FROM tasks WHERE id = ?",
+        (audit_task_id,),
+    ).fetchone()
+    if author_row is None or audit_row is None:
+        return True, None
+    if (
+        author_profile != author_row["assignee"]
+        or auditor_profile != audit_row["assignee"]
+        or author_row["assignee"] == audit_row["assignee"]
+    ):
+        return True, None
+    if author_row["status"] != "review" or author_row["current_run_id"] is not None:
+        return True, None
+    if audit_row["status"] not in {"done", "archived"} or audit_row["current_run_id"] is not None:
+        return True, None
+    if audit_row["factory_build_gate"] and (
+        not isinstance(audit_row["factory_terminal_receipt_sha256"], str)
+        or re.fullmatch(r"[0-9a-f]{64}", audit_row["factory_terminal_receipt_sha256"]) is None
+    ):
+        return True, None
+    author_run = conn.execute(
+        "SELECT profile, status, outcome, ended_at FROM task_runs WHERE id = ? AND task_id = ?",
+        (author_run_id, author_task_id),
+    ).fetchone()
+    audit_run = conn.execute(
+        "SELECT profile, status, outcome, ended_at FROM task_runs WHERE id = ? AND task_id = ?",
+        (audit_run_id, audit_task_id),
+    ).fetchone()
+    if (
+        author_run is None or author_run["profile"] != author_profile
+        or (author_run["status"], author_run["outcome"]) != ("review_required", "review_required")
+        or author_run["ended_at"] is None
+    ):
+        return True, None
+    if (
+        audit_run is None or audit_run["profile"] != auditor_profile
+        or (audit_run["status"], audit_run["outcome"]) != ("done", "completed")
+        or audit_run["ended_at"] is None
+    ):
+        return True, None
+    author_mirror = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND run_id = ? "
+        "AND kind = 'canonical_audit_outcome'",
+        (author_task_id, author_run_id),
+    ).fetchone()
+    if author_mirror is None:
+        return True, None
+    try:
+        author_envelope = json.loads(author_mirror["payload"] or "{}")
+    except (TypeError, ValueError):
+        return True, None
+    if author_envelope != envelope:
+        return True, None
+    handoff_row = conn.execute(
+        "SELECT id, run_id, payload FROM task_events WHERE id = ? AND task_id = ? "
+        "AND kind = 'review_handoff'",
+        (handoff_event_id, author_task_id),
+    ).fetchone()
+    handoff = _review_handoff_receipt_from_row(author_task_id, handoff_row) if handoff_row else None
+    if (
+        handoff is None
+        or handoff.review_task_id != audit_task_id
+        or handoff.expected_run_id != author_run_id
+    ):
+        return True, None
+    author_fact = _earlier_v3_changed_fact(conn, author_task_id, author_run_id)
+    audit_fact = _earlier_v3_changed_fact(conn, audit_task_id, audit_run_id)
+    if author_fact is None or audit_fact is None or author_fact != audit_fact:
+        return True, None
+    fact = author_fact
+    if (
+        fact.get("task_id") != audit_task_id
+        or fact.get("run_id") != audit_run_id
+        or fact.get("event_id") != row["id"]
+        or fact.get("prior_status") != "running"
+        or fact.get("new_status") != "done"
+        or fact.get("audit_outcome_sha256") != evidence_sha256
+    ):
+        return True, None
+    disposition = fact.get("disposition")
+    continuation_ids = fact.get("continuation_task_ids")
+    if disposition == _EARLIER_V3_DISPOSITION_FINAL:
+        if continuation_ids != []:
+            return True, None
+    elif disposition == _EARLIER_V3_DISPOSITION_CONTINUATION:
+        if not isinstance(continuation_ids, list) or not continuation_ids:
+            return True, None
+        seen: set[str] = set()
+        for cid in continuation_ids:
+            if not isinstance(cid, str) or not cid or cid in seen or cid == audit_task_id:
+                return True, None
+            seen.add(cid)
+            if conn.execute(
+                "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ?",
+                (author_task_id, cid),
+            ).fetchone() is None:
+                return True, None
+    else:
+        return True, None
+    live_disposition, live_targets = _earlier_v3_continuation_targets(
+        conn, author_task_id, audit_task_id,
+    )
+    if live_disposition is None or live_disposition != disposition or continuation_ids != live_targets:
+        return True, None
+    receipt = {
+        "task_id": author_task_id,
+        "subject_id": f"{author_task_id}/{author_run_id}",
+        "subject_version_or_exact_hash": evidence_sha256,
+        "author_task_id": author_task_id,
+        "author_run_id": author_run_id,
+        "author_profile": author_profile,
+        "auditor_task_id": audit_task_id,
+        "auditor_run_id": audit_run_id,
+        "auditor_profile": auditor_profile,
+        "verdict": "PASS",
+        "issued_at": int(row["id"]),
+    }
+    receipt_hash = hashlib.sha256(
+        json.dumps(receipt, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+    return True, {**receipt, "receipt_hash": receipt_hash, "authenticated": True}
+
+
 def _canonical_current_audit_outcome(
     conn: sqlite3.Connection, author_task_id: str,
 ) -> tuple[bool, Optional[dict[str, Any]]]:
@@ -9339,6 +9608,13 @@ def _canonical_current_audit_outcome(
     row = rows[0]
     try:
         envelope = json.loads(row["payload"] or "{}")
+    except (TypeError, ValueError):
+        return True, None
+    if not isinstance(envelope, dict):
+        return True, None
+    if set(envelope) == _EARLIER_V3_AUDIT_OUTCOME_KEYS:
+        return _earlier_v3_current_audit_outcome(conn, author_task_id, row, envelope)
+    try:
         payload = {key: value for key, value in envelope.items() if key != "envelope_sha256"}
         digest = envelope["envelope_sha256"]
     except (AttributeError, KeyError, TypeError, ValueError):
