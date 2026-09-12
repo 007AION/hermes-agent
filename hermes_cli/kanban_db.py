@@ -7307,7 +7307,10 @@ def _summary_bears_exact_commit_identity(
     """True when the terminal summary re-states the receipt identity without conflict.
 
     The historical terminal summary names only the head/tree/base SHAs and
-    omits the repository/PR; that omission remains compatible.  Any repository
+    omits the repository/PR; that omission remains compatible.  The three
+    head/tree/base SHAs must be the *only* 40-hex tokens present and must be
+    labelled byte-exactly, so a summary naming a second conflicting labelled
+    head/tree/base (or any extra 40-hex token) fails closed.  Any repository
     or ``#<pr>`` token the summary *does* name must be unique and byte-equal to
     the receipt's repository/PR, so a summary naming ``other/repo PR #970``
     with the correct SHAs fails closed.  A missing or non-string summary, or
@@ -7315,9 +7318,36 @@ def _summary_bears_exact_commit_identity(
     """
     if not isinstance(summary, str) or not summary:
         return False
-    for key in ("head", "tree", "base"):
-        if not (isinstance(receipt.get(key), str) and receipt[key] in summary):
-            return False
+    receipt_head = receipt.get("head")
+    receipt_tree = receipt.get("tree")
+    receipt_base = receipt.get("base")
+    if not (
+        isinstance(receipt_head, str)
+        and isinstance(receipt_tree, str)
+        and isinstance(receipt_base, str)
+        and receipt_head
+        and receipt_tree
+        and receipt_base
+    ):
+        return False
+    head_l = receipt_head.lower()
+    tree_l = receipt_tree.lower()
+    base_l = receipt_base.lower()
+    expected = [head_l, tree_l, base_l]
+    shas = [token.lower() for token in _SHA40_TOKEN_RE.findall(summary)]
+    if len(shas) != 3 or len(set(shas)) != 3 or sorted(shas) != sorted(expected):
+        return False
+    head_match = re.search(r"\bhead\s+([0-9a-fA-F]{40})\b", summary)
+    tree_match = re.search(r"\btree\s+([0-9a-fA-F]{40})\b", summary)
+    base_match = re.search(r"\bbase\s+([0-9a-fA-F]{40})\b", summary)
+    if not (head_match and tree_match and base_match):
+        return False
+    if (
+        head_match.group(1).lower() != head_l
+        or tree_match.group(1).lower() != tree_l
+        or base_match.group(1).lower() != base_l
+    ):
+        return False
     repos = _REPO_TOKEN_RE.findall(summary)
     if repos and (len(repos) != 1 or repos[0] != receipt.get("repository")):
         return False

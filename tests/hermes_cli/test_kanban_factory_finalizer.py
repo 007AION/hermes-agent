@@ -7075,3 +7075,69 @@ def test_crashed_pass_verdictless_recovery_rejects_conflicting_terminal_summary(
             kb.complete_task(conn, chain["author"], summary="reject conflicting summary")
         assert _native_state_snapshot(conn) == before
 
+
+def test_crashed_pass_verdictless_recovery_rejects_extra_head_sha_in_summary(
+    kanban_home, aion_gov_src,
+):
+    """A terminal summary naming the exact head/tree/base plus a second
+    conflicting labelled 40-hex head must fail closed.
+
+    The legacy terminal-summary SHA check was substring-only: it required only
+    that each of head/tree/base appear *somewhere* in the summary, so a summary
+    naming the exact PR97 head/tree/base plus an extra conflicting
+    ``head <40-hex>`` token still authenticated as the canonical candidate.
+    The corrected check requires the head/tree/base SHAs to be the *only*
+    40-hex tokens present and labelled byte-exactly, so any extra or
+    conflicting 40-hex token fails closed with zero native-state mutation.
+    """
+    head, tree, base = _CRASHED_PASS_HEAD, _CRASHED_PASS_TREE, _CRASHED_PASS_BASE
+    with kb.connect() as conn:
+        chain = _crashed_pass_verdictless_recovery_chain(conn)
+        summary = (
+            f"Recovered and terminalized the already-recorded independent PASS "
+            f"from review run {chain['reviewer_run_a']} at exact head {head}, "
+            f"tree {tree}, base {base}; superseding head {'f' * 40}; "
+            f"no merge, install, or restart performed."
+        )
+        conn.execute(
+            "UPDATE task_runs SET summary=? WHERE id=?",
+            (summary, chain["reviewer_run_b"]),
+        )
+        conn.commit()
+        before = _native_state_snapshot(conn)
+
+        assert kb._canonical_audit_receipt(conn, chain["author"]) is None
+        assert kb._reviewed_author_finalizer_run_id(conn, chain["author"]) is None
+        with pytest.raises(kb.FactoryTerminalReceiptRequiredError):
+            kb.complete_task(conn, chain["author"], summary="reject extra head sha")
+        assert _native_state_snapshot(conn) == before
+
+
+def test_crashed_pass_verdictless_recovery_rejects_extra_tree_sha_in_summary(
+    kanban_home, aion_gov_src,
+):
+    """A terminal summary naming an extra conflicting labelled 40-hex tree in
+    addition to the exact head/tree/base must fail closed (any extra 40-hex
+    token is ambiguity, not just a conflicting head)."""
+    head, tree, base = _CRASHED_PASS_HEAD, _CRASHED_PASS_TREE, _CRASHED_PASS_BASE
+    with kb.connect() as conn:
+        chain = _crashed_pass_verdictless_recovery_chain(conn)
+        summary = (
+            f"Recovered and terminalized the already-recorded independent PASS "
+            f"from review run {chain['reviewer_run_a']} at exact head {head}, "
+            f"tree {tree}, base {base}; contested tree {'e' * 40}; "
+            f"no merge, install, or restart performed."
+        )
+        conn.execute(
+            "UPDATE task_runs SET summary=? WHERE id=?",
+            (summary, chain["reviewer_run_b"]),
+        )
+        conn.commit()
+        before = _native_state_snapshot(conn)
+
+        assert kb._canonical_audit_receipt(conn, chain["author"]) is None
+        assert kb._reviewed_author_finalizer_run_id(conn, chain["author"]) is None
+        with pytest.raises(kb.FactoryTerminalReceiptRequiredError):
+            kb.complete_task(conn, chain["author"], summary="reject extra tree sha")
+        assert _native_state_snapshot(conn) == before
+
