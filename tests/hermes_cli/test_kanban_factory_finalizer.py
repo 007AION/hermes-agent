@@ -6633,9 +6633,8 @@ def _crashed_pass_verdictless_recovery_chain(
     }
     summary = (
         f"Recovered and terminalized the already-recorded independent PASS "
-        f"from review run {reviewer_run_a} for kiddhu/hermes-agent PR #97 "
-        f"at exact head {head}, tree {tree}, base {base}; "
-        f"no merge, install, or restart performed."
+        f"from review run {reviewer_run_a} at exact head {head} (tree {tree}, "
+        f"base {base}); no merge, install, or restart performed."
     )
     assert kb.complete_task(
         conn, reviewer, expected_run_id=reviewer_run_b,

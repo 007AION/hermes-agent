@@ -7301,6 +7301,36 @@ def _reason_bears_commit_identity(reason: Any, receipt: dict[str, Any]) -> bool:
     )
 
 
+def _summary_bears_exact_commit_identity(
+    summary: Any, receipt: dict[str, Any],
+) -> bool:
+    """True when the terminal summary re-states the receipt identity without conflict.
+
+    The historical terminal summary names only the head/tree/base SHAs and
+    omits the repository/PR; that omission remains compatible.  Any repository
+    or ``#<pr>`` token the summary *does* name must be unique and byte-equal to
+    the receipt's repository/PR, so a summary naming ``other/repo PR #970``
+    with the correct SHAs fails closed.  A missing or non-string summary, or
+    any head/tree/base drift, fails closed.
+    """
+    if not isinstance(summary, str) or not summary:
+        return False
+    for key in ("head", "tree", "base"):
+        if not (isinstance(receipt.get(key), str) and receipt[key] in summary):
+            return False
+    repos = _REPO_TOKEN_RE.findall(summary)
+    if repos and (len(repos) != 1 or repos[0] != receipt.get("repository")):
+        return False
+    prs = _PR_TOKEN_RE.findall(summary)
+    if prs and (
+        len(prs) != 1
+        or not isinstance(receipt.get("pr"), int)
+        or int(prs[0]) != receipt["pr"]
+    ):
+        return False
+    return True
+
+
 _SHA40_TOKEN_RE = re.compile(r"\b[0-9a-fA-F]{40}\b")
 _REPO_TOKEN_RE = re.compile(r"\b[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\b")
 _PR_TOKEN_RE = re.compile(r"#(\d+)\b")
@@ -8685,25 +8715,18 @@ def _recovered_verdictless_pass_audit_receipt(
         "SELECT summary FROM task_runs WHERE id = ? AND task_id = ?",
         (terminal_run_id, auditor_task_id),
     ).fetchone()
-    # The terminal summary must name exactly one candidate tuple whose
-    # repository/pr/head/tree/base byte-equal the terminal receipt.  The legacy
-    # check only substring-matched head/tree/base, so a summary naming the
-    # correct SHAs but a different ``owner/repo`` (e.g. ``other/repo``) or a
-    # different ``#<pr>`` (e.g. ``#970``) authenticated as the canonical
-    # candidate.  Binding the summary through the same exactly-one identity
-    # parser as the precursor and handoff closes that hole: ``other/repo``
-    # fails repository byte-equality and ``#970`` yields pr=970 != 97.
-    summary_identity = _single_commit_identity_from_reason(
-        terminal_summary["summary"] if terminal_summary is not None else None
-    )
+    # The terminal summary re-states the receipt's head/tree/base SHAs and,
+    # when it names a repository or PR, that identity must be unique and
+    # byte-equal to the terminal receipt.  The legacy check only substring-
+    # matched head/tree/base, so a summary naming the correct SHAs but a
+    # conflicting ``owner/repo`` (``other/repo``) or ``#<pr>`` (``#970``)
+    # authenticated as the canonical candidate.  A summary that omits
+    # repository/PR (the historical shape) remains compatible.
     if (
         terminal_summary is None
-        or summary_identity is None
-        or summary_identity["repository"] != receipt_identity["repository"]
-        or summary_identity["pr"] != receipt_identity["pr"]
-        or summary_identity["head"] != receipt_identity["head"].lower()
-        or summary_identity["tree"] != receipt_identity["tree"].lower()
-        or summary_identity["base"] != receipt_identity["base"].lower()
+        or not _summary_bears_exact_commit_identity(
+            terminal_summary["summary"], receipt_identity
+        )
     ):
         return None
 
