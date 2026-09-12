@@ -6572,12 +6572,16 @@ _CRASHED_PASS_TREE = "033502b4dc2f3291bcaa94a736de4256626843ab"
 _CRASHED_PASS_BASE = "13d9faadb3cf1215888a59d9911c5b8e8a2114df"
 
 
-def _crashed_pass_verdictless_recovery_chain(conn, *, handoff_reason=None):
+def _crashed_pass_verdictless_recovery_chain(
+    conn, *, handoff_reason=None, precursor_reason=None,
+):
     head, tree, base = _CRASHED_PASS_HEAD, _CRASHED_PASS_TREE, _CRASHED_PASS_BASE
-    reason = (
-        f"PASS_EXACT_HEAD: independently audited kiddhu/hermes-agent PR #97 "
-        f"at head {head}, tree {tree}, base {base}"
-    )
+    if precursor_reason is None:
+        precursor_reason = (
+            f"PASS_EXACT_HEAD: independently audited kiddhu/hermes-agent PR #97 "
+            f"at head {head}, tree {tree}, base {base}"
+        )
+    reason = precursor_reason
     author = kb.create_task(
         conn, title="crashed-PASS reviewed author", factory_build_gate=1,
         assignee="agent007",
@@ -6966,3 +6970,64 @@ def test_crashed_pass_verdictless_recovery_rejects_extra_signed_handoff(
         with pytest.raises(kb.FactoryTerminalReceiptRequiredError):
             kb.complete_task(conn, chain["author"], summary="reject extra handoff")
         assert _native_state_snapshot(conn) == before
+
+
+def test_crashed_pass_verdictless_recovery_rejects_substring_pr_precursor(
+    kanban_home, aion_gov_src,
+):
+    """A precursor v1 PASS reason naming wrong PR ``#970`` (whose ``#97`` prefix
+    would substring-match the terminal receipt PR) must fail closed.
+
+    The legacy precursor check only required ``#97`` to appear as a substring
+    of the reason, so a precursor reason naming ``#970`` authenticated as PR 97.
+    The corrected check binds the precursor reason through the exactly-one
+    identity parser, so ``#970`` yields pr=970 != 97 and fails closed.
+    """
+    head, tree, base = _CRASHED_PASS_HEAD, _CRASHED_PASS_TREE, _CRASHED_PASS_BASE
+    precursor_reason = (
+        f"PASS_EXACT_HEAD: independently audited kiddhu/hermes-agent PR #970 "
+        f"at head {head}, tree {tree}, base {base}"
+    )
+    with kb.connect() as conn:
+        chain = _crashed_pass_verdictless_recovery_chain(
+            conn, precursor_reason=precursor_reason,
+        )
+        conn.commit()
+        before = _native_state_snapshot(conn)
+
+        assert kb._canonical_audit_receipt(conn, chain["author"]) is None
+        assert kb._reviewed_author_finalizer_run_id(conn, chain["author"]) is None
+        with pytest.raises(kb.FactoryTerminalReceiptRequiredError):
+            kb.complete_task(conn, chain["author"], summary="reject substring PR")
+        assert _native_state_snapshot(conn) == before
+
+
+def test_crashed_pass_verdictless_recovery_rejects_wrong_precursor_repository(
+    kanban_home, aion_gov_src,
+):
+    """A precursor v1 PASS reason naming the correct PR but a wrong repository
+    must fail closed.
+
+    The legacy precursor check never validated the repository, so a precursor
+    reason naming ``other/repo PR #97`` authenticated as the canonical repo.
+    The corrected check binds the precursor through the exactly-one identity
+    parser and requires repository byte-equality, so this fails closed.
+    """
+    head, tree, base = _CRASHED_PASS_HEAD, _CRASHED_PASS_TREE, _CRASHED_PASS_BASE
+    precursor_reason = (
+        f"PASS_EXACT_HEAD: independently audited other/repo PR #97 "
+        f"at head {head}, tree {tree}, base {base}"
+    )
+    with kb.connect() as conn:
+        chain = _crashed_pass_verdictless_recovery_chain(
+            conn, precursor_reason=precursor_reason,
+        )
+        conn.commit()
+        before = _native_state_snapshot(conn)
+
+        assert kb._canonical_audit_receipt(conn, chain["author"]) is None
+        assert kb._reviewed_author_finalizer_run_id(conn, chain["author"]) is None
+        with pytest.raises(kb.FactoryTerminalReceiptRequiredError):
+            kb.complete_task(conn, chain["author"], summary="reject wrong precursor repo")
+        assert _native_state_snapshot(conn) == before
+

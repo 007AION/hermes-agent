@@ -8640,10 +8640,24 @@ def _recovered_verdictless_pass_audit_receipt(
     if corroboration is None:
         return None
     receipt_identity = corroboration["receipt"]
+    if corroboration["prior_review_run_id"] != precursor_run_id:
+        return None
+    # The precursor v1 PASS reason must itself name exactly one candidate tuple
+    # whose repository/pr/head/tree/base byte-equal the terminal receipt.  The
+    # legacy check was loose: it only substring-matched head/tree/base and
+    # substring-matched ``#<pr>`` (so receipt PR #97 accepted a precursor reason
+    # naming wrong PR #970), and never checked the repository.  Binding the
+    # precursor through the same exactly-one identity parser as the handoff
+    # closes both holes: ``#970`` yields pr=970 != 97 and a wrong repository
+    # token fails byte-equality, both fail closed.
+    precursor_identity = _single_commit_identity_from_reason(precursor["reason"])
     if (
-        corroboration["prior_review_run_id"] != precursor_run_id
-        or not _reason_bears_commit_identity(precursor["reason"], receipt_identity)
-        or f"#{receipt_identity['pr']}" not in precursor["reason"]
+        precursor_identity is None
+        or precursor_identity["repository"] != receipt_identity["repository"]
+        or precursor_identity["pr"] != receipt_identity["pr"]
+        or precursor_identity["head"] != receipt_identity["head"].lower()
+        or precursor_identity["tree"] != receipt_identity["tree"].lower()
+        or precursor_identity["base"] != receipt_identity["base"].lower()
     ):
         return None
 
