@@ -7303,7 +7303,7 @@ def _reason_bears_commit_identity(reason: Any, receipt: dict[str, Any]) -> bool:
 
 _SHA40_TOKEN_RE = re.compile(r"\b[0-9a-fA-F]{40}\b")
 _REPO_TOKEN_RE = re.compile(r"\b[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\b")
-_PR_TOKEN_RE = re.compile(r"#(\d{1,6})\b")
+_PR_TOKEN_RE = re.compile(r"#(\d+)\b")
 
 
 def _single_commit_identity_from_reason(reason: Any) -> Optional[dict[str, Any]]:

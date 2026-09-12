@@ -6912,6 +6912,38 @@ def test_crashed_pass_verdictless_recovery_rejects_ambiguous_handoff(
         assert _native_state_snapshot(conn) == before
 
 
+def test_crashed_pass_verdictless_recovery_rejects_extra_7digit_pr_token(
+    kanban_home, aion_gov_src,
+):
+    """A handoff naming ``#97`` plus an additional 7+ digit PR token must fail
+    closed.
+
+    The legacy ``_PR_TOKEN_RE`` capped PR numbers at six digits, so ``#1234567``
+    was silently ignored and the handoff parsed as exactly one ``#97`` identity;
+    the end-to-end hostile probe then authenticated a canonical PASS receipt
+    instead of failing closed.  The corrected token regex must capture the extra
+    7+ digit token and reject the handoff as naming more than one candidate
+    tuple (exactly-one equality, no history mutation).
+    """
+    head, tree, base = _CRASHED_PASS_HEAD, _CRASHED_PASS_TREE, _CRASHED_PASS_BASE
+    extra_pr_reason = (
+        f"PR #97 (kiddhu/hermes-agent) head {head}, tree {tree}, base {base} "
+        f"(supersedes PR #1234567)"
+    )
+    with kb.connect() as conn:
+        chain = _crashed_pass_verdictless_recovery_chain(
+            conn, handoff_reason=extra_pr_reason,
+        )
+        conn.commit()
+        before = _native_state_snapshot(conn)
+
+        assert kb._canonical_audit_receipt(conn, chain["author"]) is None
+        assert kb._reviewed_author_finalizer_run_id(conn, chain["author"]) is None
+        with pytest.raises(kb.FactoryTerminalReceiptRequiredError):
+            kb.complete_task(conn, chain["author"], summary="reject extra 7-digit PR")
+        assert _native_state_snapshot(conn) == before
+
+
 def test_crashed_pass_verdictless_recovery_rejects_extra_signed_handoff(
     kanban_home, aion_gov_src,
 ):
