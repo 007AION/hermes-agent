@@ -1004,6 +1004,9 @@ def _handle_resume_reviewed_author(args: dict, **kw) -> str:
                 event_id=receipt["event_id"],
                 receipt_sha256=receipt["receipt_sha256"],
                 controller_profile=receipt["controller_profile"],
+                blocker=receipt["blocker"],
+                handoff_reason_sha256=receipt["handoff_reason_sha256"],
+                author_target_status=receipt["author_target_status"],
             )
         finally:
             conn.close()
@@ -2091,9 +2094,11 @@ KANBAN_RESUME_REVIEWED_AUTHOR_SCHEMA = {
         "GM/GM2-controller recovery: resume one reviewed author whose direct "
         "independent auditor child failed closed before a Native verdict, so "
         "the SAME author can re-issue a corrected structured review handoff. "
-        "Returns the author to ready and resets only the SAME audit child to "
-        "todo. Idempotent on exact replay; fails closed on any stale/forged/"
-        "mismatched lineage, active identity, or non-GM controller."
+        "Returns the author to ready (or ordinary parent-gated todo when it has "
+        "unfinished parents) and resets only the SAME audit child to todo. "
+        "Idempotent on exact replay; fails closed on any stale/forged/"
+        "mismatched lineage, active identity, non-GM controller, or an "
+        "already-valid structured handoff."
     ),
     "parameters": {
         "type": "object",

@@ -9747,7 +9747,9 @@ def _review_handoff_recovery_receipt_from_row(
         return None
     required = {
         "version", "author_task_id", "audit_task_id", "review_handoff_event_id",
-        "author_run_id", "audit_run_id", "controller_profile", "receipt_sha256",
+        "author_run_id", "audit_run_id", "controller_profile",
+        "blocker", "handoff_reason_sha256", "author_target_status",
+        "receipt_sha256",
     }
     if not isinstance(payload, dict) or set(payload) != required:
         return None
@@ -9759,6 +9761,9 @@ def _review_handoff_recovery_receipt_from_row(
         (payload["author_run_id"], int),
         (payload["audit_run_id"], int),
         (payload["controller_profile"], str),
+        (payload["blocker"], str),
+        (payload["handoff_reason_sha256"], str),
+        (payload["author_target_status"], str),
         (payload["receipt_sha256"], str),
     )
     if any(type(value) is not expected for value, expected in strict_types):
@@ -9772,6 +9777,9 @@ def _review_handoff_recovery_receipt_from_row(
         or payload["author_run_id"] <= 0
         or payload["audit_run_id"] <= 0
         or payload["controller_profile"] not in FACTORY_REVIEW_VERDICT_RECOVERY_CONTROLLER_PROFILES
+        or not payload["blocker"].strip()
+        or re.fullmatch(r"[0-9a-f]{64}", payload["handoff_reason_sha256"]) is None
+        or payload["author_target_status"] not in {"ready", "todo"}
     ):
         return None
     signed = {
@@ -9782,6 +9790,9 @@ def _review_handoff_recovery_receipt_from_row(
         "author_run_id": payload["author_run_id"],
         "audit_run_id": payload["audit_run_id"],
         "controller_profile": payload["controller_profile"],
+        "blocker": payload["blocker"],
+        "handoff_reason_sha256": payload["handoff_reason_sha256"],
+        "author_target_status": payload["author_target_status"],
     }
     expected_hash = hashlib.sha256(
         json.dumps(
@@ -9798,6 +9809,90 @@ _REVIEW_IDENTITY_FIELDS = (
     "worker_starttime", "fence_lineage", "fence_disposition",
 )
 
+# Normalized blocker for the one exact deadlock this recovery repairs: an
+# author handed a candidate off to a direct independent auditor child whose
+# ``review_handoff`` ``reason`` is prose (not a structured candidate
+# envelope), so the current Native PASS path cannot parse it.
+REVIEW_HANDOFF_MALFORMED_ENVELOPE_BLOCKER = "malformed_review_handoff_envelope"
+
+
+def _review_handoff_reason_is_structured_candidate(reason: str) -> bool:
+    """Return ``True`` when ``reason`` is a strict structured candidate envelope.
+
+    The current Native PASS path only accepts a handoff whose ``reason`` parses
+    to the exact JSON envelope ``{"version": 1, "candidate": {repository, pr,
+    head, tree, base}, "summary": <non-empty str>}`` (see
+    :func:`_record_review_verdict`). A prose / malformed reason fails this
+    parser — and that exact failure is the SAME-author deadlock fingerprint
+    this recovery exists to repair. If the author already emitted a valid
+    structured candidate, the recovery must NOT fire: the author is stuck for
+    an unrelated reason and this is not the malformed-envelope deadlock.
+    """
+    try:
+        target = json.loads(reason)
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(target, dict) or set(target) != {
+        "version", "candidate", "summary",
+    }:
+        return False
+    if target.get("version") != 1:
+        return False
+    candidate = target.get("candidate")
+    if not isinstance(candidate, dict) or set(candidate) != _CANONICAL_AUDIT_TARGET_KEYS:
+        return False
+    summary = target.get("summary")
+    if not isinstance(summary, str) or not summary.strip():
+        return False
+    if isinstance(candidate.get("pr"), bool) or not isinstance(
+        candidate.get("pr"), int
+    ):
+        return False
+    for key in ("repository", "head", "tree", "base"):
+        if not isinstance(candidate.get(key), str):
+            return False
+    return True
+
+
+def _authenticated_resume_controller_profile() -> str:
+    """Resolve the authenticated GM controller profile, fail-closed.
+
+    The recovery may only be issued by the resident GM patrol lane (gm|gm2).
+    A bare ``HERMES_PROFILE`` env var is mutable and can be rewritten to assert
+    GM authority (environment-based escalation), so the controller is resolved
+    from the active Hermes profile (``HERMES_HOME``) and the env marker must
+    agree with it. Delegated children are rejected at this boundary too.
+    """
+    _assert_not_delegated_child_mutation()
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+
+        home_profile = (get_active_profile_name() or "").strip()
+    except Exception:
+        home_profile = ""
+    env_profile = (os.environ.get("HERMES_PROFILE") or "").strip()
+    gm_lanes = FACTORY_REVIEW_VERDICT_RECOVERY_CONTROLLER_PROFILES
+    if home_profile in gm_lanes:
+        if env_profile and env_profile not in gm_lanes:
+            raise PermissionError(
+                "reviewed-author resume controller identity mismatch: "
+                "HERMES_HOME resolves to GM lane "
+                f"{home_profile!r} but HERMES_PROFILE={env_profile!r}"
+            )
+        return home_profile
+    if env_profile in gm_lanes:
+        raise PermissionError(
+            "reviewed-author resume refused: HERMES_PROFILE claims GM lane "
+            f"{env_profile!r} but the active Hermes profile "
+            f"({home_profile or 'unresolved'!r}) is not a GM lane "
+            "(environment-based escalation)"
+        )
+    raise PermissionError(
+        "reviewed-author resume may only be invoked by the authenticated "
+        "GM controller lane (gm|gm2); authenticated "
+        f"profile={home_profile or env_profile!r}"
+    )
+
 
 def _resume_reviewed_author(
     conn: sqlite3.Connection,
@@ -9812,19 +9907,15 @@ def _resume_reviewed_author(
     This is the narrow recovery for the SAME-author procedural-handoff
     deadlock: the author is nonterminal in ``review``, its direct independent
     auditor child ended in ``blocked``/``triage``/``todo`` without recording a
-    verdict, and the only way forward is for the SAME author to re-run and
-    re-issue a corrected structured handoff. It returns the author to
-    ``ready`` (letting the Dispatcher claim it naturally) and resets only the
-    SAME audit child to ordinary parent-gated ``todo``. It records exactly one
+    verdict, the handoff ``reason`` is a malformed (prose) envelope that the
+    strict candidate-envelope parser rejects, and the only way forward is for
+    the SAME author to re-run and re-issue a corrected structured handoff. It
+    returns the author to ``ready`` (or ordinary parent-gated ``todo`` when it
+    has unfinished parents) and resets only the SAME audit child to ordinary
+    parent-gated ``todo``. It records exactly one
     typed recovery receipt and is idempotent on exact replay.
     """
-    controller = (os.environ.get("HERMES_PROFILE") or "").strip()
-    if controller not in FACTORY_REVIEW_VERDICT_RECOVERY_CONTROLLER_PROFILES:
-        raise PermissionError(
-            "reviewed-author resume may only be invoked by the authenticated "
-            "GM controller lane (gm|gm2); authenticated "
-            f"profile={controller!r}"
-        )
+    controller = _authenticated_resume_controller_profile()
     try:
         review_handoff_event_id = int(review_handoff_event_id)
     except (TypeError, ValueError):
@@ -9893,6 +9984,17 @@ def _resume_reviewed_author(
         if handoff is None or handoff.review_task_id != audit_task_id:
             return None
 
+        # The recovery exists ONLY for the malformed-envelope deadlock: the
+        # handoff ``reason`` must FAIL the strict candidate-envelope parser
+        # (prose, not a structured {version, candidate, summary} envelope). If
+        # the author already emitted a valid structured candidate, it is stuck
+        # for an unrelated reason and this operation must fail closed.
+        if _review_handoff_reason_is_structured_candidate(handoff.reason):
+            return None
+        handoff_reason_sha256 = hashlib.sha256(
+            handoff.reason.encode("utf-8")
+        ).hexdigest()
+
         author_run = conn.execute(
             "SELECT id, status, outcome, ended_at FROM task_runs "
             "WHERE id = ? AND task_id = ?",
@@ -9912,10 +10014,16 @@ def _resume_reviewed_author(
             return None
 
         audit_run = conn.execute(
-            "SELECT id, ended_at FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+            "SELECT id, status, outcome, ended_at FROM task_runs "
+            "WHERE task_id = ? ORDER BY id DESC LIMIT 1",
             (audit_task_id,),
         ).fetchone()
-        if audit_run is None or audit_run["ended_at"] is None:
+        if (
+            audit_run is None
+            or audit_run["ended_at"] is None
+            or audit_run["status"] != "blocked"
+            or audit_run["outcome"] != "blocked"
+        ):
             return None
 
         # No verdict may already have resolved this handoff.
@@ -9926,13 +10034,33 @@ def _resume_reviewed_author(
         ).fetchone() is not None:
             return None
 
+        # The author returns to ``ready`` only when all of its parents are
+        # already satisfied; otherwise it lands in ordinary parent-gated
+        # ``todo`` and ``recompute_ready`` promotes it once the parents finish.
+        # Writing ``ready`` unconditionally would falsely advertise runnable
+        # state (the dispatcher would claim then demote it).
+        author_parents = conn.execute(
+            "SELECT t.id, t.status FROM tasks t "
+            "JOIN task_links l ON l.parent_id = t.id WHERE l.child_id = ?",
+            (author_task_id,),
+        ).fetchall()
+        author_target_status = (
+            "ready"
+            if all(
+                _review_handoff_parent_satisfies_child(
+                    conn, parent["id"], parent["status"], author_task_id
+                )
+                for parent in author_parents
+            )
+            else "todo"
+        )
         author_update = conn.execute(
-            "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+            "UPDATE tasks SET status = ?, claim_lock = NULL, "
             "claim_expires = NULL, worker_pid = NULL, worker_starttime = NULL, "
             "fence_lineage = NULL, fence_disposition = NULL, "
             "block_kind = NULL, block_recurrences = 0 "
             "WHERE id = ? AND status = 'review'",
-            (author_task_id,),
+            (author_target_status, author_task_id),
         )
         if author_update.rowcount != 1:
             raise _ReviewHandoffConflict
@@ -9955,6 +10083,9 @@ def _resume_reviewed_author(
             "author_run_id": int(handoff.expected_run_id),
             "audit_run_id": int(audit_run["id"]),
             "controller_profile": controller,
+            "blocker": REVIEW_HANDOFF_MALFORMED_ENVELOPE_BLOCKER,
+            "handoff_reason_sha256": handoff_reason_sha256,
+            "author_target_status": author_target_status,
         }
         receipt_sha256 = hashlib.sha256(
             json.dumps(

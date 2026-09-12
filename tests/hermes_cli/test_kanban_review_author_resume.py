@@ -8,13 +8,20 @@ transition can return the author to a runnable state: ``REQUEST_CHANGES``
 requires a live running child, ``PASS`` requires a structured handoff
 envelope, and neither ``claim_task`` nor ``recompute_ready`` can reach a
 ``review`` author. ``resume_reviewed_author`` is the narrow authenticated
-recovery that returns the SAME author to ``ready`` and resets only the SAME
-audit child to ``todo``.
+recovery that returns the SAME author to ``ready`` (or ordinary parent-gated
+``todo``) and resets only the SAME audit child to ``todo``.
+
+The recovery is fingerprint-bound: it fires ONLY for a malformed (prose)
+handoff envelope whose ``reason`` fails the strict candidate-envelope parser,
+and whose direct auditor child's latest run ended ``blocked``. It is issued
+only by the durable GM controller lane (``gm``/``gm2``), resolved from
+``HERMES_HOME`` (never a bare mutable ``HERMES_PROFILE``).
 """
 
 from __future__ import annotations
 
 import concurrent.futures
+import hashlib
 import json
 import threading
 from pathlib import Path
@@ -31,6 +38,11 @@ def kanban_home(tmp_path, monkeypatch):
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_PROFILE", "gm2")
+    # Durable controller identity is resolved from the active Hermes profile
+    # (HERMES_HOME), NOT from the mutable HERMES_PROFILE env var.
+    monkeypatch.setattr(
+        "hermes_cli.profiles.get_active_profile_name", lambda: "gm2"
+    )
     monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
     monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
@@ -84,6 +96,40 @@ def _deadlocked_review(conn):
         expected_run_id=review_run.current_run_id,
     )
     return author, receipt, review_task, review_run.current_run_id
+
+
+def _rewrite_handoff_reason(conn, author_task_id, receipt, reason):
+    """Rewrite a review_handoff event's reason with a valid receipt hash."""
+    core = {
+        "version": 1,
+        "expected_run_id": receipt.expected_run_id,
+        "review_task_id": receipt.review_task_id,
+        "reason": reason,
+        "recovery": receipt.recovery,
+    }
+    sha = hashlib.sha256(
+        json.dumps(
+            {"task_id": author_task_id, **core},
+            sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    conn.execute(
+        "UPDATE task_events SET payload = ? WHERE id = ?",
+        (json.dumps({**core, "receipt_sha256": sha}), receipt.event_id),
+    )
+
+
+_STRUCTURED_REASON = json.dumps({
+    "version": 1,
+    "candidate": {
+        "repository": "kiddhu/hermes-agent",
+        "pr": 101,
+        "head": "a" * 40,
+        "tree": "b" * 40,
+        "base": "c" * 40,
+    },
+    "summary": "structured candidate",
+})
 
 
 def _identity_snapshot(conn, author, review_task):
@@ -151,6 +197,11 @@ def test_resume_reviewed_author_recovers_deadlock(kanban_home):
         assert recovered["controller_profile"] == "gm2"
         assert recovered["author_run_id"] == receipt.expected_run_id
         assert recovered["audit_run_id"] == review_run_id
+        assert recovered["blocker"] == kb.REVIEW_HANDOFF_MALFORMED_ENVELOPE_BLOCKER
+        assert recovered["handoff_reason_sha256"] == hashlib.sha256(
+            receipt.reason.encode("utf-8")
+        ).hexdigest()
+        assert recovered["author_target_status"] == "ready"
         assert len(recovered["receipt_sha256"]) == 64
 
         assert _task(conn, author).status == "ready"
@@ -212,6 +263,9 @@ def test_resume_reviewed_author_is_idempotent(kanban_home):
 @pytest.mark.parametrize("controller", ["gm", "gm2"])
 def test_resume_reviewed_author_accepts_gm_and_gm2(kanban_home, monkeypatch, controller):
     monkeypatch.setenv("HERMES_PROFILE", controller)
+    monkeypatch.setattr(
+        "hermes_cli.profiles.get_active_profile_name", lambda: controller
+    )
     with kb.connect() as conn:
         author, receipt, review_task, _ = _deadlocked_review(conn)
         recovered = kb.resume_reviewed_author(
@@ -227,6 +281,9 @@ def test_resume_reviewed_author_accepts_gm_and_gm2(kanban_home, monkeypatch, con
 @pytest.mark.parametrize("controller", ["", "agent007", "bafuxunan", "merger", "worker"])
 def test_resume_reviewed_author_rejects_non_gm_controller(kanban_home, monkeypatch, controller):
     monkeypatch.setenv("HERMES_PROFILE", controller)
+    monkeypatch.setattr(
+        "hermes_cli.profiles.get_active_profile_name", lambda: controller
+    )
     with kb.connect() as conn:
         author, receipt, review_task, _ = _deadlocked_review(conn)
         before = _identity_snapshot(conn, author, review_task)
@@ -238,6 +295,129 @@ def test_resume_reviewed_author_rejects_non_gm_controller(kanban_home, monkeypat
                 review_handoff_event_id=receipt.event_id,
             )
         assert _identity_snapshot(conn, author, review_task) == before
+
+
+def test_resume_reviewed_author_rejects_env_escalation(kanban_home, monkeypatch):
+    """A mutable HERMES_PROFILE=gm cannot override a non-GM durable profile."""
+    monkeypatch.setenv("HERMES_PROFILE", "gm")
+    monkeypatch.setattr(
+        "hermes_cli.profiles.get_active_profile_name", lambda: "agent007"
+    )
+    with kb.connect() as conn:
+        author, receipt, review_task, _ = _deadlocked_review(conn)
+        before = _identity_snapshot(conn, author, review_task)
+        with pytest.raises(PermissionError):
+            kb.resume_reviewed_author(
+                conn,
+                author_task_id=author,
+                audit_task_id=review_task,
+                review_handoff_event_id=receipt.event_id,
+            )
+        assert _identity_snapshot(conn, author, review_task) == before
+
+
+def test_resume_reviewed_author_rejects_env_mismatch(kanban_home, monkeypatch):
+    """A non-GM HERMES_PROFILE contradicting a GM durable profile fails closed."""
+    monkeypatch.setenv("HERMES_PROFILE", "agent007")
+    monkeypatch.setattr(
+        "hermes_cli.profiles.get_active_profile_name", lambda: "gm2"
+    )
+    with kb.connect() as conn:
+        author, receipt, review_task, _ = _deadlocked_review(conn)
+        with pytest.raises(PermissionError):
+            kb.resume_reviewed_author(
+                conn,
+                author_task_id=author,
+                audit_task_id=review_task,
+                review_handoff_event_id=receipt.event_id,
+            )
+
+
+def test_resume_reviewed_author_rejects_delegated_child(kanban_home, monkeypatch):
+    """A delegate_task child can never act as the GM controller."""
+    with kb.connect() as conn:
+        author, receipt, review_task, _ = _deadlocked_review(conn)
+    monkeypatch.setenv("HERMES_DELEGATED_CHILD_CONTEXT", "1")
+    with kb.connect() as conn:
+        before = _identity_snapshot(conn, author, review_task)
+        with pytest.raises(PermissionError):
+            kb.resume_reviewed_author(
+                conn,
+                author_task_id=author,
+                audit_task_id=review_task,
+                review_handoff_event_id=receipt.event_id,
+            )
+        assert _identity_snapshot(conn, author, review_task) == before
+
+
+def test_resume_reviewed_author_cli_denylist_and_delegated_guard(kanban_home, monkeypatch):
+    """The CLI fast-fail denylist covers ``resume-reviewed-author``."""
+    from hermes_cli import kanban
+
+    assert "resume-reviewed-author" in kanban._DELEGATED_CHILD_DENIED_ACTIONS
+
+    class _Args:
+        kanban_action = "resume-reviewed-author"
+        boards_action = None
+
+    monkeypatch.setenv("HERMES_DELEGATED_CHILD_CONTEXT", "1")
+    assert kanban._is_delegated_child_cli_mutation(_Args()) is True
+    monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT")
+    assert kanban._is_delegated_child_cli_mutation(_Args()) is False
+
+
+def test_resume_reviewed_author_rejects_valid_structured_handoff(kanban_home):
+    """The recovery must NOT fire for an already-valid structured candidate."""
+    with kb.connect() as conn:
+        author, receipt, review_task, _ = _deadlocked_review(conn)
+        _rewrite_handoff_reason(conn, author, receipt, _STRUCTURED_REASON)
+        conn.commit()
+        before = _identity_snapshot(conn, author, review_task)
+        assert kb.resume_reviewed_author(
+            conn,
+            author_task_id=author,
+            audit_task_id=review_task,
+            review_handoff_event_id=receipt.event_id,
+        ) is None
+        assert _identity_snapshot(conn, author, review_task) == before
+
+
+def test_resume_reviewed_author_rejects_timed_out_audit_run(kanban_home):
+    """The recovery requires the exact latest audit run to end ``blocked``."""
+    with kb.connect() as conn:
+        author, receipt, review_task, review_run_id = _deadlocked_review(conn)
+        conn.execute(
+            "UPDATE task_runs SET status = 'timed_out', outcome = 'timed_out' "
+            "WHERE id = ?",
+            (review_run_id,),
+        )
+        conn.commit()
+        before = _identity_snapshot(conn, author, review_task)
+        assert kb.resume_reviewed_author(
+            conn,
+            author_task_id=author,
+            audit_task_id=review_task,
+            review_handoff_event_id=receipt.event_id,
+        ) is None
+        assert _identity_snapshot(conn, author, review_task) == before
+
+
+def test_resume_reviewed_author_parent_gated_todo(kanban_home):
+    """An author with an unfinished parent returns to ``todo``, not ``ready``."""
+    with kb.connect() as conn:
+        author, receipt, review_task, _ = _deadlocked_review(conn)
+        upstream = kb.create_task(conn, title="unfinished parent", assignee="upstream")
+        kb.link_tasks(conn, upstream, author)
+        recovered = kb.resume_reviewed_author(
+            conn,
+            author_task_id=author,
+            audit_task_id=review_task,
+            review_handoff_event_id=receipt.event_id,
+        )
+        assert recovered is not None
+        assert recovered["author_target_status"] == "todo"
+        assert _task(conn, author).status == "todo"
+        assert _task(conn, review_task).status == "todo"
 
 
 @pytest.mark.parametrize(

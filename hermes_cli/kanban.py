@@ -1189,6 +1189,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "schedule",
     "unblock",
     "promote",
+    "resume-reviewed-author",
     "archive",
     "dispatch",
     "daemon",
@@ -2469,7 +2470,7 @@ def _cmd_resume_reviewed_author(args: argparse.Namespace) -> int:
             )
             return 1
         print(
-            f"Resumed {author_task_id} -> ready; "
+            f"Resumed {author_task_id} -> {receipt['author_target_status']}; "
             f"{audit_task_id} -> todo "
             f"(recovery event {receipt['event_id']}, "
             f"sha256 {receipt['receipt_sha256']})"
