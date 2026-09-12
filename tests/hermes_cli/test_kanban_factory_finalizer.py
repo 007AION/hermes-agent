@@ -6572,7 +6572,7 @@ _CRASHED_PASS_TREE = "033502b4dc2f3291bcaa94a736de4256626843ab"
 _CRASHED_PASS_BASE = "13d9faadb3cf1215888a59d9911c5b8e8a2114df"
 
 
-def _crashed_pass_verdictless_recovery_chain(conn):
+def _crashed_pass_verdictless_recovery_chain(conn, *, handoff_reason=None):
     head, tree, base = _CRASHED_PASS_HEAD, _CRASHED_PASS_TREE, _CRASHED_PASS_BASE
     reason = (
         f"PASS_EXACT_HEAD: independently audited kiddhu/hermes-agent PR #97 "
@@ -6587,9 +6587,13 @@ def _crashed_pass_verdictless_recovery_chain(conn):
         assignee="bafuxunan", parents=[author],
     )
     author_run = _claim_and_run_id(conn, author)
+    if handoff_reason is None:
+        handoff_reason = (
+            f"PR #97 (kiddhu/hermes-agent) head {head}, tree {tree}, base {base}"
+        )
     handoff = kb.request_review_handoff(
         conn, author, expected_run_id=author_run, review_task_id=reviewer,
-        reason=f"PR #97 (kiddhu/hermes-agent) head {head}, tree {tree}, base {base}",
+        reason=handoff_reason,
     )
     assert handoff is not None
     reviewer_run_a = _claim_and_run_id(conn, reviewer)
@@ -6823,4 +6827,110 @@ def test_crashed_pass_verdictless_recovery_hostile_drift_zero_mutation(
         assert kb._reviewed_author_finalizer_run_id(conn, chain["author"]) is None
         with pytest.raises(kb.FactoryTerminalReceiptRequiredError):
             kb.complete_task(conn, chain["author"], summary=f"reject {drift}")
+        assert _native_state_snapshot(conn) == before
+
+
+def _coherently_reanchor_recovery_to_alternate(conn, chain):
+    """Rewrite precursor PASS reason + terminal metadata + summary to a DIFFERENT
+    valid candidate tuple (PR #98 / b*40 / c*40 / d*40), leaving the immutable
+    receipt-signed handoff untouched."""
+    reviewer = chain["reviewer"]
+    run_b = chain["reviewer_run_b"]
+    alt_pr, alt_head = 98, "b" * 40
+    alt_tree, alt_base = "c" * 40, "d" * 40
+    alt_reason = (
+        f"PASS_EXACT_HEAD: independently audited kiddhu/hermes-agent "
+        f"PR #{alt_pr} at head {alt_head}, tree {alt_tree}, base {alt_base}"
+    )
+    alt_payload = {
+        "version": 1,
+        "review_task_id": reviewer,
+        "review_run_id": chain["reviewer_run_a"],
+        "verdict": "pass",
+        "reason": alt_reason,
+    }
+    for tid in (chain["author"], reviewer):
+        conn.execute(
+            "UPDATE task_events SET payload=? "
+            "WHERE task_id=? AND kind='review_verdict' AND run_id=?",
+            (json.dumps(alt_payload), tid, chain["reviewer_run_a"]),
+        )
+    metadata = json.loads(
+        conn.execute(
+            "SELECT metadata FROM task_runs WHERE id=?", (run_b,),
+        ).fetchone()["metadata"]
+    )
+    metadata["exact_artifact"] = {
+        "repository": "kiddhu/hermes-agent", "pr": alt_pr,
+        "head": alt_head, "tree": alt_tree, "base": alt_base,
+    }
+    conn.execute(
+        "UPDATE task_runs SET metadata=? WHERE id=?",
+        (json.dumps(metadata), run_b),
+    )
+    conn.execute(
+        "UPDATE task_runs SET summary=? WHERE id=?",
+        (
+            f"Recovered PASS from run {chain['reviewer_run_a']} at exact "
+            f"head {alt_head} (tree {alt_tree}, base {alt_base})",
+            run_b,
+        ),
+    )
+
+
+def test_crashed_pass_verdictless_recovery_rejects_ambiguous_handoff(
+    kanban_home, aion_gov_src,
+):
+    """An authentic receipt-signed handoff naming TWO candidate tuples must fail
+    closed.
+
+    The handoff is receipt-signed over the ambiguous reason (so its
+    ``receipt_sha256`` still validates), and the precursor PASS reason + terminal
+    metadata + summary are coherently re-anchored to the alternate tuple.  The
+    recovered identity must bind to exactly one handoff tuple, so this ambiguity
+    must produce no receipt.
+    """
+    head, tree, base = _CRASHED_PASS_HEAD, _CRASHED_PASS_TREE, _CRASHED_PASS_BASE
+    alt_head, alt_tree, alt_base = "b" * 40, "c" * 40, "d" * 40
+    ambiguous_reason = (
+        f"PR #97 (kiddhu/hermes-agent) head {head}, tree {tree}, base {base} "
+        f"or PR #98 (kiddhu/hermes-agent) head {alt_head}, tree {alt_tree}, "
+        f"base {alt_base}"
+    )
+    with kb.connect() as conn:
+        chain = _crashed_pass_verdictless_recovery_chain(
+            conn, handoff_reason=ambiguous_reason,
+        )
+        _coherently_reanchor_recovery_to_alternate(conn, chain)
+        conn.commit()
+        before = _native_state_snapshot(conn)
+
+        assert kb._canonical_audit_receipt(conn, chain["author"]) is None
+        assert kb._reviewed_author_finalizer_run_id(conn, chain["author"]) is None
+        with pytest.raises(kb.FactoryTerminalReceiptRequiredError):
+            kb.complete_task(conn, chain["author"], summary="reject ambiguous handoff")
+        assert _native_state_snapshot(conn) == before
+
+
+def test_crashed_pass_verdictless_recovery_rejects_extra_signed_handoff(
+    kanban_home, aion_gov_src,
+):
+    """A handoff reason carrying an extra 40-hex token beyond the single
+    candidate tuple must fail closed (exactly-one identity)."""
+    head, tree, base = _CRASHED_PASS_HEAD, _CRASHED_PASS_TREE, _CRASHED_PASS_BASE
+    extra_reason = (
+        f"PR #97 (kiddhu/hermes-agent) head {head}, tree {tree}, base {base} "
+        f"(supersedes head {'e' * 40})"
+    )
+    with kb.connect() as conn:
+        chain = _crashed_pass_verdictless_recovery_chain(
+            conn, handoff_reason=extra_reason,
+        )
+        conn.commit()
+        before = _native_state_snapshot(conn)
+
+        assert kb._canonical_audit_receipt(conn, chain["author"]) is None
+        assert kb._reviewed_author_finalizer_run_id(conn, chain["author"]) is None
+        with pytest.raises(kb.FactoryTerminalReceiptRequiredError):
+            kb.complete_task(conn, chain["author"], summary="reject extra handoff")
         assert _native_state_snapshot(conn) == before

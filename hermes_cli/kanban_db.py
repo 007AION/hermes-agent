@@ -7301,6 +7301,59 @@ def _reason_bears_commit_identity(reason: Any, receipt: dict[str, Any]) -> bool:
     )
 
 
+_SHA40_TOKEN_RE = re.compile(r"\b[0-9a-fA-F]{40}\b")
+_REPO_TOKEN_RE = re.compile(r"\b[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\b")
+_PR_TOKEN_RE = re.compile(r"#(\d{1,6})\b")
+
+
+def _single_commit_identity_from_reason(reason: Any) -> Optional[dict[str, Any]]:
+    """Extract exactly one commit-bound candidate identity from prose.
+
+    Returns ``{"repository", "pr", "head", "tree", "base"}`` only when ``reason``
+    names exactly one candidate tuple: a single ``owner/repo`` token, a single
+    ``#<pr>`` token, and exactly three distinct 40-hex SHAs (the labelled
+    ``head``/``tree``/``base``) with no other 40-hex token present.  Zero,
+    ambiguous, or extra identities fail closed (``None``), so a receipt-signed
+    handoff that names two candidate tuples — or whose SHAs merely contain the
+    recovered identity as a substring — can never be re-anchored to a different
+    tuple via substring matching.
+    """
+    if not isinstance(reason, str) or not reason:
+        return None
+    shas = [token.lower() for token in _SHA40_TOKEN_RE.findall(reason)]
+    if len(shas) != 3 or len(set(shas)) != 3:
+        return None
+    head_match = re.search(r"\bhead\s+([0-9a-fA-F]{40})\b", reason)
+    tree_match = re.search(r"\btree\s+([0-9a-fA-F]{40})\b", reason)
+    base_match = re.search(r"\bbase\s+([0-9a-fA-F]{40})\b", reason)
+    if not (head_match and tree_match and base_match):
+        return None
+    head = head_match.group(1).lower()
+    tree = tree_match.group(1).lower()
+    base = base_match.group(1).lower()
+    if sorted(shas) != sorted((head, tree, base)):
+        return None
+    repos = _REPO_TOKEN_RE.findall(reason)
+    if len(repos) != 1:
+        return None
+    prs = _PR_TOKEN_RE.findall(reason)
+    if len(prs) != 1:
+        return None
+    try:
+        pr = int(prs[0])
+    except ValueError:
+        return None
+    if pr <= 0:
+        return None
+    return {
+        "repository": repos[0],
+        "pr": pr,
+        "head": head,
+        "tree": tree,
+        "base": base,
+    }
+
+
 def _run_is_protocol_violation(row: sqlite3.Row) -> bool:
     """True when a closed run is a clean-exit protocol-violation crash.
 
@@ -8594,15 +8647,23 @@ def _recovered_verdictless_pass_audit_receipt(
     ):
         return None
 
-    # Bind the recovered candidate identity to the exact immutable handoff.
-    # The handoff reason is the receipt-signed durable record of what the author
-    # actually handed off; a coordinated rewrite of the precursor PASS reason
-    # plus the terminal metadata/summary cannot re-anchor that identity without
-    # also tampering with the handoff (which fails its receipt_sha256 check).
+    # Bind the recovered candidate identity to the exact immutable handoff with
+    # exactly-one equality (not substring containment).  The handoff reason is
+    # the receipt-signed durable record of what the author actually handed off;
+    # it must name exactly one candidate tuple and that tuple must byte-equal
+    # the recovered identity.  A coordinated rewrite of the precursor PASS
+    # reason plus the terminal metadata/summary therefore cannot re-anchor the
+    # chain to a different candidate — the immutable handoff (whose
+    # receipt_sha256 would break on any reason edit) names only one tuple, and a
+    # handoff that already names two tuples fails closed here as ambiguous.
+    handoff_identity = _single_commit_identity_from_reason(handoff.reason)
     if (
-        not _reason_bears_commit_identity(handoff.reason, receipt_identity)
-        or f"#{receipt_identity['pr']}" not in handoff.reason
-        or receipt_identity["repository"] not in handoff.reason
+        handoff_identity is None
+        or handoff_identity["repository"] != receipt_identity["repository"]
+        or handoff_identity["pr"] != receipt_identity["pr"]
+        or handoff_identity["head"] != receipt_identity["head"].lower()
+        or handoff_identity["tree"] != receipt_identity["tree"].lower()
+        or handoff_identity["base"] != receipt_identity["base"].lower()
     ):
         return None
 
