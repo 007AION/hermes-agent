@@ -751,17 +751,30 @@ def _resolve_cgroup_starvation_psi_threshold() -> float:
     return DEFAULT_CGROUP_MEMORY_STARVATION_PSI_THRESHOLD
 
 
-def _read_cgroup_memory_pressure_some_avg10() -> "float | None":
+def _read_cgroup_memory_pressure_some_avg10(
+    cgroup_path: Optional[str] = None,
+) -> "float | None":
     """Best-effort cgroup v2 memory PSI ``some avg10`` (percent); None if absent.
 
-    Reads the dispatcher's own cgroup ``memory.pressure`` file. The ``some``
-    line reports the fraction of time at least one task was stalled on memory
-    over the trailing window; ``avg10`` is the 10-second average, matching the
-    incident readback (``memory_pressure_some_avg10``). Returns ``None`` on
-    cgroup v1, an unreadable file, or a malformed value (fail-open).
+    Reads ``memory.pressure`` from the dispatcher's own cgroup — the *same*
+    cgroup whose ``memory.current``/``memory.high`` drive the starvation
+    classification — so the pressure signal is attributed to the cgroup under
+    evaluation, never the host root. Reading root here produces the exact
+    false negative the AION-790 audit reproduced: GM2 over-high with GM2 PSI 92
+    while root PSI reads 0 → ``starving`` wrongly false.
+
+    *cgroup_path* is the cgroup v2 path (e.g.
+    ``/system.slice/hermes-gateway-gm2.service``) resolved by
+    :func:`_read_cgroup_attribution`. When it is ``None``/empty the read
+    degrades to the root cgroup, mirroring attribution's own fallback so the
+    pressure signal and the memory counters always come from the same place.
+    Returns ``None`` on cgroup v1, an unreadable file, or a malformed value
+    (fail-open).
     """
+    rel = cgroup_path.lstrip("/") if cgroup_path else ""
+    path = os.path.join("/sys/fs/cgroup", rel, "memory.pressure")
     try:
-        with open("/sys/fs/cgroup/memory.pressure", "r", encoding="utf-8") as fh:
+        with open(path, "r", encoding="utf-8") as fh:
             raw = fh.read().strip()
     except Exception:
         return None
@@ -781,25 +794,28 @@ def _classify_cgroup_memory_starvation(psi_threshold=None) -> "tuple[bool, dict]
     """Detect the typed cgroup starvation invariant (AION-790).
 
     Starvation is true iff the dispatcher's own cgroup ``memory.current`` is at
-    or above ``memory.high`` AND the cgroup memory PSI ``some avg10`` is at or
-    above the configured threshold. Returns ``(is_starving, evidence)`` where
-    ``evidence`` carries the exact readback used for the typed event. Never
-    raises; an unreadable cgroup/PSI degrades to not-starving (fail-open).
+    or above ``memory.high`` AND the *same* cgroup's memory PSI ``some avg10``
+    is at or above the configured threshold. Returns ``(is_starving, evidence)``
+    where ``evidence`` carries the exact readback (including the cgroup path)
+    used for the typed event. Never raises; an unreadable cgroup/PSI degrades
+    to not-starving (fail-open).
     """
     threshold = (
         psi_threshold
         if psi_threshold is not None
         else _resolve_cgroup_starvation_psi_threshold()
     )
-    current = None
-    high = None
     attr = _read_cgroup_attribution()
-    if attr:
-        current = attr.get("memory_current")
-        high = attr.get("memory_high")
-    psi = _read_cgroup_memory_pressure_some_avg10()
+    cgroup_path = attr.get("cgroup_path") if attr else None
+    current = attr.get("memory_current") if attr else None
+    high = attr.get("memory_high") if attr else None
+    # PSI MUST be read from the same cgroup as current/high — reading root
+    # (as the first candidate did) yields a false negative when the dispatcher
+    # cgroup is throttled but the host root is quiescent.
+    psi = _read_cgroup_memory_pressure_some_avg10(cgroup_path=cgroup_path)
     evidence = {
         "classification": RESOURCE_CGROUP_MEMORY_STARVATION,
+        "cgroup_path": cgroup_path,
         "memory_current": current,
         "memory_high": high,
         "psi_some_avg10": psi,
@@ -17994,6 +18010,7 @@ def dispatch_once(
         Callable[[Task, NativeLifecycleRequest], NativeLifecycleDecision]
     ] = None,
     spawn_admission_min_free_bytes: Optional[int] = None,
+    cgroup_starvation_psi_threshold: Optional[float] = None,
     worker_isolation: Optional[dict] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
@@ -18031,6 +18048,7 @@ def dispatch_once(
             max_in_progress_per_profile=max_in_progress_per_profile,
             lifecycle_request_fn=lifecycle_request_fn,
             spawn_admission_min_free_bytes=spawn_admission_min_free_bytes,
+            cgroup_starvation_psi_threshold=cgroup_starvation_psi_threshold,
             worker_isolation=worker_isolation,
         )
     with _dispatch_tick_lock(db_path) as held:
@@ -18050,6 +18068,7 @@ def dispatch_once(
             max_in_progress_per_profile=max_in_progress_per_profile,
             lifecycle_request_fn=lifecycle_request_fn,
             spawn_admission_min_free_bytes=spawn_admission_min_free_bytes,
+            cgroup_starvation_psi_threshold=cgroup_starvation_psi_threshold,
             worker_isolation=worker_isolation,
         )
         # Still under the dispatch lock: opportunistically truncate the WAL
@@ -18075,6 +18094,7 @@ def _dispatch_once_locked(
         Callable[[Task, NativeLifecycleRequest], NativeLifecycleDecision]
     ] = None,
     spawn_admission_min_free_bytes: Optional[int] = None,
+    cgroup_starvation_psi_threshold: Optional[float] = None,
     worker_isolation: Optional[dict] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick.
@@ -18426,7 +18446,14 @@ def _dispatch_once_locked(
         # PSI, refuse the new heavy spawn and emit the typed classification
         # instead of deferring (which would leave the task stuck in an
         # unbounded WAIT_MACHINE loop while the cgroup is genuinely starving).
-        _psi_threshold = _resolve_cgroup_starvation_psi_threshold()
+        # The threshold is resolved from the dispatcher parameter (config.yaml
+        # kanban.cgroup_starvation_psi_threshold, plumbed via CLI/gateway)
+        # first, then the internal env-var bridge for tests/back-compat.
+        _psi_threshold = (
+            cgroup_starvation_psi_threshold
+            if cgroup_starvation_psi_threshold is not None
+            else _resolve_cgroup_starvation_psi_threshold()
+        )
         if _psi_threshold >= 0:
             _starving, _starv_evidence = _classify_cgroup_memory_starvation(
                 psi_threshold=_psi_threshold

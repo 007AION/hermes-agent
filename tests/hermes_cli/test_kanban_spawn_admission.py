@@ -302,7 +302,7 @@ def test_classify_cgroup_memory_starvation_below_high_not_starving(monkeypatch):
             "memory_high": 200, "memory_max": 300,
         },
     )
-    monkeypatch.setattr(kb, "_read_cgroup_memory_pressure_some_avg10", lambda: 5.0)
+    monkeypatch.setattr(kb, "_read_cgroup_memory_pressure_some_avg10", lambda cgroup_path=None: 5.0)
     starving, ev = kb._classify_cgroup_memory_starvation(psi_threshold=50.0)
     assert starving is False
     assert ev["classification"] == kb.RESOURCE_CGROUP_MEMORY_STARVATION
@@ -317,7 +317,7 @@ def test_classify_cgroup_memory_starvation_requires_high_psi(monkeypatch):
             "memory_high": 200, "memory_max": 400,
         },
     )
-    monkeypatch.setattr(kb, "_read_cgroup_memory_pressure_some_avg10", lambda: 5.0)
+    monkeypatch.setattr(kb, "_read_cgroup_memory_pressure_some_avg10", lambda cgroup_path=None: 5.0)
     starving, _ = kb._classify_cgroup_memory_starvation(psi_threshold=50.0)
     assert starving is False
 
@@ -331,7 +331,7 @@ def test_classify_cgroup_memory_starvation_requires_at_or_over_high(monkeypatch)
             "memory_high": 200, "memory_max": 300,
         },
     )
-    monkeypatch.setattr(kb, "_read_cgroup_memory_pressure_some_avg10", lambda: 92.0)
+    monkeypatch.setattr(kb, "_read_cgroup_memory_pressure_some_avg10", lambda cgroup_path=None: 92.0)
     starving, _ = kb._classify_cgroup_memory_starvation(psi_threshold=50.0)
     assert starving is False
 
@@ -344,7 +344,7 @@ def test_classify_cgroup_memory_starvation_true_on_combined_invariant(monkeypatc
             "memory_high": 200, "memory_max": 400,
         },
     )
-    monkeypatch.setattr(kb, "_read_cgroup_memory_pressure_some_avg10", lambda: 92.0)
+    monkeypatch.setattr(kb, "_read_cgroup_memory_pressure_some_avg10", lambda cgroup_path=None: 92.0)
     starving, ev = kb._classify_cgroup_memory_starvation(psi_threshold=50.0)
     assert starving is True
     assert ev["memory_current"] == 300
@@ -359,9 +359,107 @@ def test_classify_cgroup_memory_starvation_unreadable_fails_open(monkeypatch):
             "memory_high": None, "memory_max": None,
         },
     )
-    monkeypatch.setattr(kb, "_read_cgroup_memory_pressure_some_avg10", lambda: None)
+    monkeypatch.setattr(kb, "_read_cgroup_memory_pressure_some_avg10", lambda cgroup_path=None: None)
     starving, _ = kb._classify_cgroup_memory_starvation(psi_threshold=50.0)
     assert starving is False
+
+
+def test_classify_cgroup_memory_starvation_reads_psi_from_same_cgroup(monkeypatch):
+    # AION-790 audit hostile proof: the classifier MUST attribute PSI to the
+    # dispatcher's own cgroup, not the host root. The first candidate read
+    # root `/sys/fs/cgroup/memory.pressure`, producing a false negative when
+    # the dispatcher cgroup was over-high + throttled (PSI 92) while root was
+    # quiescent (PSI 0). Here the PSI reader returns 92 only for the dispatcher
+    # cgroup and 0 for anything else — the classifier must hand it the
+    # dispatcher path or it reports not-starving.
+    dispatcher_cgroup = "/system.slice/hermes-gateway-gm2.service"
+    seen_paths = []
+
+    def fake_attribution(pid=None):
+        return {
+            "cgroup_path": dispatcher_cgroup,
+            "memory_current": 7000000000,  # > high
+            "memory_high": 6442450944,
+            "memory_max": 8589934592,
+        }
+
+    def fake_psi(cgroup_path=None):
+        seen_paths.append(cgroup_path)
+        return 92.0 if cgroup_path == dispatcher_cgroup else 0.0
+
+    monkeypatch.setattr(kb, "_read_cgroup_attribution", fake_attribution)
+    monkeypatch.setattr(kb, "_read_cgroup_memory_pressure_some_avg10", fake_psi)
+
+    starving, ev = kb._classify_cgroup_memory_starvation(psi_threshold=50.0)
+    assert starving is True
+    # The classifier asked for the dispatcher's own cgroup — never root/None.
+    assert seen_paths == [dispatcher_cgroup]
+    assert ev["cgroup_path"] == dispatcher_cgroup
+    assert ev["psi_some_avg10"] == 92.0
+
+
+def test_starvation_gate_honors_parameter_threshold(kanban_home, monkeypatch):
+    # The config/CLI/gateway path passes the threshold as a parameter to
+    # dispatch_once; it must be threaded through to the classifier (and not
+    # depend on the env-var bridge).
+    conn = kb.connect()
+    try:
+        t = _mk_task(conn)
+        monkeypatch.delenv(
+            "HERMES_KANBAN_CGROUP_STARVATION_PSI_THRESHOLD", raising=False
+        )
+        seen_thresholds = []
+
+        def _classify(psi_threshold=None):
+            seen_thresholds.append(psi_threshold)
+            return (True, {"classification": kb.RESOURCE_CGROUP_MEMORY_STARVATION})
+
+        monkeypatch.setattr(kb, "_classify_cgroup_memory_starvation", _classify)
+        spawn_calls = []
+
+        def spawn_fn(task, workspace, board=None):
+            spawn_calls.append(task.id)
+            return 424242
+
+        result = kb.dispatch_once(
+            conn, spawn_fn=spawn_fn, stale_timeout_seconds=0,
+            cgroup_starvation_psi_threshold=60.0,
+        )
+        assert spawn_calls == []
+        assert seen_thresholds == [60.0]
+        assert any(tid == t for (tid, _ev) in result.starvation_blocked)
+    finally:
+        conn.close()
+
+
+def test_starvation_gate_disabled_when_parameter_negative(kanban_home, monkeypatch):
+    # A negative threshold plumbed via the config/CLI/gateway parameter disables
+    # the gate (mirroring the env-var path) without consulting the classifier.
+    conn = kb.connect()
+    try:
+        t = _mk_task(conn)
+        called = []
+
+        def _classify(psi_threshold=None):
+            called.append(True)
+            return (True, {"classification": kb.RESOURCE_CGROUP_MEMORY_STARVATION})
+
+        monkeypatch.setattr(kb, "_classify_cgroup_memory_starvation", _classify)
+        spawn_calls = []
+
+        def spawn_fn(task, workspace, board=None):
+            spawn_calls.append(task.id)
+            return 424242
+
+        result = kb.dispatch_once(
+            conn, spawn_fn=spawn_fn, stale_timeout_seconds=0,
+            cgroup_starvation_psi_threshold=-1.0,
+        )
+        assert spawn_calls == [t]
+        assert called == []
+        assert result.starvation_blocked == []
+    finally:
+        conn.close()
 
 
 def test_starvation_gate_blocks_heavy_spawn(kanban_home, monkeypatch):
