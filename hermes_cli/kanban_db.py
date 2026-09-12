@@ -589,6 +589,17 @@ DEFAULT_SPAWN_ADMISSION_MIN_FREE_BYTES = 0
 # unknown headroom must never gate (fail-open, no admission refusal).
 _SPAWN_ADMISSION_UNKNOWN_HEADROOM = 1 << 62
 
+# R06 A-2 — typed cgroup memory starvation classification (AION-790). When the
+# dispatcher's own cgroup is at/above its memory.high watermark AND memory
+# pressure (PSI ``some avg10``) is at or above this threshold, the generic
+# headroom deferral below would keep the task ``ready`` forever (WAIT_MACHINE).
+# The typed gate instead emits RESOURCE_CGROUP_MEMORY_STARVATION and refuses the
+# heavy spawn (fail-closed) so operators can distinguish a genuine cgroup
+# starvation (requires GM2 envelope repair) from a transient headroom dip.
+# A negative threshold disables the gate.
+DEFAULT_CGROUP_MEMORY_STARVATION_PSI_THRESHOLD = 50.0  # percent (some avg10)
+RESOURCE_CGROUP_MEMORY_STARVATION = "RESOURCE_CGROUP_MEMORY_STARVATION"
+
 
 def _resolve_spawn_admission_min_free_bytes() -> int:
     """Return the pre-spawn admission floor in bytes (0 = disabled)."""
@@ -715,6 +726,88 @@ def _spawn_resource_headroom_bytes(headroom_fn=None) -> int:
 def _spawn_admission_defers(headroom_bytes: int, min_free_bytes: int) -> bool:
     """True when aggregate headroom is below the admission floor."""
     return min_free_bytes > 0 and headroom_bytes < min_free_bytes
+
+
+def _resolve_cgroup_starvation_psi_threshold() -> float:
+    """Return the typed starvation PSI threshold in percent (negative = off).
+
+    Mirrors the R06-A admission-floor env bridge. Reads
+    ``HERMES_KANBAN_CGROUP_STARVATION_PSI_THRESHOLD``; a non-negative float
+    enables the gate, a negative (or unparseable) value disables it, and an
+    absent/empty value falls back to
+    :data:`DEFAULT_CGROUP_MEMORY_STARVATION_PSI_THRESHOLD`.
+    """
+    raw = os.environ.get(
+        "HERMES_KANBAN_CGROUP_STARVATION_PSI_THRESHOLD", ""
+    ).strip()
+    if raw:
+        try:
+            parsed = float(raw)
+        except ValueError:
+            parsed = -1.0
+        if parsed >= 0:
+            return parsed
+        return -1.0
+    return DEFAULT_CGROUP_MEMORY_STARVATION_PSI_THRESHOLD
+
+
+def _read_cgroup_memory_pressure_some_avg10() -> "float | None":
+    """Best-effort cgroup v2 memory PSI ``some avg10`` (percent); None if absent.
+
+    Reads the dispatcher's own cgroup ``memory.pressure`` file. The ``some``
+    line reports the fraction of time at least one task was stalled on memory
+    over the trailing window; ``avg10`` is the 10-second average, matching the
+    incident readback (``memory_pressure_some_avg10``). Returns ``None`` on
+    cgroup v1, an unreadable file, or a malformed value (fail-open).
+    """
+    try:
+        with open("/sys/fs/cgroup/memory.pressure", "r", encoding="utf-8") as fh:
+            raw = fh.read().strip()
+    except Exception:
+        return None
+    for line in raw.splitlines():
+        if not line.startswith("some"):
+            continue
+        for token in line.split():
+            if token.startswith("avg10="):
+                try:
+                    return float(token.split("=", 1)[1])
+                except ValueError:
+                    return None
+    return None
+
+
+def _classify_cgroup_memory_starvation(psi_threshold=None) -> "tuple[bool, dict]":
+    """Detect the typed cgroup starvation invariant (AION-790).
+
+    Starvation is true iff the dispatcher's own cgroup ``memory.current`` is at
+    or above ``memory.high`` AND the cgroup memory PSI ``some avg10`` is at or
+    above the configured threshold. Returns ``(is_starving, evidence)`` where
+    ``evidence`` carries the exact readback used for the typed event. Never
+    raises; an unreadable cgroup/PSI degrades to not-starving (fail-open).
+    """
+    threshold = (
+        psi_threshold
+        if psi_threshold is not None
+        else _resolve_cgroup_starvation_psi_threshold()
+    )
+    current = None
+    high = None
+    attr = _read_cgroup_attribution()
+    if attr:
+        current = attr.get("memory_current")
+        high = attr.get("memory_high")
+    psi = _read_cgroup_memory_pressure_some_avg10()
+    evidence = {
+        "classification": RESOURCE_CGROUP_MEMORY_STARVATION,
+        "memory_current": current,
+        "memory_high": high,
+        "psi_some_avg10": psi,
+        "psi_threshold": threshold,
+    }
+    if current is None or high is None or psi is None:
+        return False, evidence
+    return (current >= high and psi >= threshold), evidence
 
 
 # ---------------------------------------------------------------------------
@@ -14917,6 +15010,13 @@ class DispatchResult:
     ``(task_id, min_free_bytes, headroom_bytes)`` triples. The task is left
     ``ready``/unclaimed with no failure counted — the next dispatcher tick
     re-reads headroom and admits it once the floor is met."""
+    starvation_blocked: list[tuple[str, dict]] = field(default_factory=list)
+    """Tasks fail-closed this tick by the typed cgroup starvation gate
+    (AION-790 R06 A-2), as ``(task_id, evidence)`` tuples. The task is left
+    ``ready``/unclaimed with no failure counted, but a distinct typed
+    ``spawn_blocked_starvation`` event is emitted so operators can distinguish
+    a genuine cgroup starvation (requires GM2 envelope repair) from a transient
+    headroom deferral."""
     terminal_runs_reconciled: int = 0
     """Count of orphaned open ``task_runs`` rows closed this tick because their
     source task is terminal (``done``/``archived``) with ``current_run_id``
@@ -18321,6 +18421,25 @@ def _dispatch_once_locked(
                             },
                         )
             continue
+        # R06 A-2 — typed cgroup memory starvation gate (AION-790). Fail-closed:
+        # when the dispatcher's own cgroup is at/above memory.high with high
+        # PSI, refuse the new heavy spawn and emit the typed classification
+        # instead of deferring (which would leave the task stuck in an
+        # unbounded WAIT_MACHINE loop while the cgroup is genuinely starving).
+        _psi_threshold = _resolve_cgroup_starvation_psi_threshold()
+        if _psi_threshold >= 0:
+            _starving, _starv_evidence = _classify_cgroup_memory_starvation(
+                psi_threshold=_psi_threshold
+            )
+            if _starving:
+                result.starvation_blocked.append((row["id"], _starv_evidence))
+                if not dry_run:
+                    with write_txn(conn):
+                        _append_event(
+                            conn, row["id"], "spawn_blocked_starvation",
+                            _starv_evidence,
+                        )
+                continue
         # R06 A — pre-spawn resource admission: refuse to spawn a new worker
         # while aggregate host+cgroup memory headroom is below the configured
         # floor. The task stays ready/unclaimed with no failure counted, so a
