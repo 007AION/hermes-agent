@@ -495,6 +495,15 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Provider the model belongs to (worker is spawned with "
              "--provider <name>). Cleared together with the model.",
     )
+    p_set_model.add_argument(
+        "--expect-model", default=None,
+        help="Fail-closed CAS: require this exact current model ('none' for NULL)",
+    )
+    p_set_model.add_argument(
+        "--expect-provider", default=None,
+        help="Fail-closed CAS: require this exact current provider ('none' for NULL). "
+             "Requires --expect-model and an authenticated assignee profile.",
+    )
 
     # --- reclaim / reassign (recovery) ---
     p_reclaim = sub.add_parser(
@@ -1851,10 +1860,35 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
     if model is not None and model.lower() in {"none", "-", "null", ""}:
         model = None
     provider = getattr(args, "provider", None)
+    expected_model = getattr(args, "expect_model", None)
+    expected_provider = getattr(args, "expect_provider", None)
+    cas_requested = expected_model is not None or expected_provider is not None
+    if cas_requested and (expected_model is None or expected_provider is None):
+        print(
+            "kanban: --expect-model and --expect-provider must be supplied together",
+            file=sys.stderr,
+        )
+        return 2
+    if expected_model is not None and expected_model.lower() in {"none", "-", "null", ""}:
+        expected_model = None
+    if expected_provider is not None and expected_provider.lower() in {"none", "-", "null", ""}:
+        expected_provider = None
     try:
         with kb.connect_closing() as conn:
-            ok = kb.set_model_override(conn, args.task_id, model, provider=provider)
-    except (ValueError, RuntimeError) as exc:
+            if cas_requested:
+                outcome = kb.compare_and_set_model_override(
+                    conn,
+                    args.task_id,
+                    expected_model=expected_model,
+                    expected_provider=expected_provider,
+                    model=model,
+                    provider=provider,
+                )
+                ok = True
+            else:
+                ok = kb.set_model_override(conn, args.task_id, model, provider=provider)
+                outcome = "updated"
+    except (LookupError, PermissionError, ValueError, RuntimeError) as exc:
         print(f"kanban: {exc}", file=sys.stderr)
         return 2
     if not ok:
@@ -1862,7 +1896,8 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
         return 1
     if model:
         label = f"{provider}:{model}" if provider else model
-        print(f"Set model override on {args.task_id}: {label} "
+        verb = "Already set" if outcome == "already_applied" else "Set"
+        print(f"{verb} model override on {args.task_id}: {label} "
               "(applies on next dispatch)")
     else:
         print(f"Cleared model override on {args.task_id} "
