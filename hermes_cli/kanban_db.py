@@ -9515,7 +9515,7 @@ def _canonical_blocking_packet(
     value: Any,
     *,
     audit_round: int,
-    expected_candidate: dict[str, Any],
+    expected_candidate: Optional[dict[str, Any]],
     prior_blocker_ids: set[str],
     prior_blocker_families: set[str],
 ) -> Optional[dict[str, Any]]:
@@ -9901,10 +9901,13 @@ def _record_review_verdict(
         if (
             verdict == "request_changes"
             and bool(author["factory_build_gate"])
-            and candidate is not None
         ):
-            # AUDIT_FIRST_PASS_BLOCKING_PACKET_V1 hard gate. Fail closed (zero
-            # mutation) when the packet is missing/malformed/stale/mismatched.
+            # AUDIT_FIRST_PASS_BLOCKING_PACKET_V1 hard gate. Applicability is
+            # NON-OPTIONAL for a factory (factory_build_gate=1) author: any
+            # REQUEST_CHANGES must carry a valid, exact-head-bound packet. When
+            # the handoff omitted the durable candidate, ``candidate`` is None
+            # and the packet can never bind to it, so the verdict fails closed
+            # (zero mutation) exactly like a missing packet would.
             audit_round, prior_blocker_ids, prior_blocker_families = _prior_blocking_state(
                 conn, task_id, exclude_review_run_id=expected_review_run_id,
             )
@@ -10054,15 +10057,26 @@ def _record_review_verdict(
             if parent_ids(conn, review_task_id) != [task_id] or handoff is None:
                 return False
             receipt = _review_handoff_receipt_from_row(task_id, handoff)
-            try:
-                target = json.loads(receipt.reason) if receipt is not None else None
-            except (TypeError, ValueError):
+            if receipt is None:
                 return False
             expected = {key: normalized_evidence[key] for key in sorted(_CANONICAL_AUDIT_TARGET_KEYS)}
-            if not isinstance(target, dict) or target != {
-                "version": 1, "candidate": expected, "summary": target.get("summary")
-            } or type(target["summary"]) is not str or not target["summary"].strip():
-                return False
+            if receipt.candidate is not None:
+                # Durable exact-head candidate is authoritative for PASS: the
+                # evidence must bind the SAME repository/pr/head/tree/base the
+                # author signed into the handoff. Any disagreement fails closed.
+                if receipt.candidate != expected:
+                    return False
+            else:
+                # Legacy fallback (no durable candidate): the handoff reason
+                # carries the JSON candidate envelope the evidence must match.
+                try:
+                    target = json.loads(receipt.reason) if receipt is not None else None
+                except (TypeError, ValueError):
+                    return False
+                if not isinstance(target, dict) or target != {
+                    "version": 1, "candidate": expected, "summary": target.get("summary")
+                } or type(target["summary"]) is not str or not target["summary"].strip():
+                    return False
             return _terminalize_review_pass(
                 conn, author_task_id=task_id, audit_task_id=review_task_id,
                 audit_run_id=expected_review_run_id, reason=reason,

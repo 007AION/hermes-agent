@@ -154,16 +154,14 @@ def _record_legacy_review_verdict_fixture(
     reason,
     **_superseded_recovery_fields,
 ):
-    """Seed historical v1 PASS rows without invoking current write authority."""
-    if verdict != "pass":
-        return kb.record_review_verdict(
-            conn,
-            task_id,
-            review_task_id=review_task_id,
-            expected_review_run_id=expected_review_run_id,
-            verdict=verdict,
-            reason=reason,
-        )
+    """Seed historical v1 PASS/REQUEST_CHANGES rows without invoking current
+    write authority.
+
+    These fixtures replay the pre-gate review-verdict transition (the proof-
+    kernel / canonical-audit-receipt history), so they must NOT be subject to
+    the AUDIT_FIRST_PASS_BLOCKING_PACKET_V1 gate: they seed the legacy
+    ``review_verdict`` event and the author/child/run transition directly.
+    """
     payload = {
         "version": 1,
         "review_task_id": review_task_id,
@@ -171,6 +169,41 @@ def _record_legacy_review_verdict_fixture(
         "verdict": verdict,
         "reason": reason,
     }
+    if verdict == "request_changes":
+        now = int(time.time())
+        with kb.write_txn(conn):
+            child_reset = conn.execute(
+                "UPDATE tasks SET status = 'todo', current_run_id = NULL, "
+                "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
+                "block_kind = NULL, block_recurrences = 0 "
+                "WHERE id = ? AND status = 'running' AND current_run_id = ?",
+                (review_task_id, expected_review_run_id),
+            )
+            assert child_reset.rowcount == 1
+            review_run = conn.execute(
+                "UPDATE task_runs SET status = 'request_changes', "
+                "outcome = 'request_changes', summary = ?, ended_at = ?, "
+                "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
+                "WHERE id = ? AND task_id = ? AND ended_at IS NULL",
+                (reason, now, expected_review_run_id, review_task_id),
+            )
+            assert review_run.rowcount == 1
+            resumed = conn.execute(
+                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                "claim_expires = NULL, worker_pid = NULL, block_kind = NULL, "
+                "block_recurrences = 0 WHERE id = ? AND status = 'review'",
+                (task_id,),
+            )
+            assert resumed.rowcount == 1
+            kb._append_event(
+                conn, task_id, "review_verdict", payload,
+                run_id=expected_review_run_id,
+            )
+            kb._append_event(
+                conn, review_task_id, "review_verdict", payload,
+                run_id=expected_review_run_id,
+            )
+        return True
     with kb.write_txn(conn):
         kb._append_event(
             conn, task_id, "review_verdict", payload,

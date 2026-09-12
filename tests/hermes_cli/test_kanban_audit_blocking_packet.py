@@ -182,6 +182,23 @@ def _verdict_payloads(conn, task_id):
     return [json.loads(r["payload"]) for r in rows]
 
 
+def _evidence_for(candidate, github_review_id=123):
+    """Build closed PASS evidence bound to ``candidate``'s target keys."""
+    return {
+        "repository": candidate["repository"],
+        "pr": candidate["pr"],
+        "head": candidate["head"],
+        "tree": candidate["tree"],
+        "base": candidate["base"],
+        "github_review_id": github_review_id,
+        "github_review_url": (
+            f"https://github.com/{candidate['repository']}/pull/{candidate['pr']}"
+            f"#pullrequestreview-{github_review_id}"
+        ),
+        "github_review_state": "APPROVED",
+    }
+
+
 # ---------------------------------------------------------------------------
 # Round-1 negative gates (fail closed, zero state mutation)
 # ---------------------------------------------------------------------------
@@ -632,20 +649,36 @@ def test_replay_mutated_blocking_packet_rejected(kanban_home):
 # Applicability boundary: the gate must NOT break legacy / non-factory reviews
 # ---------------------------------------------------------------------------
 
-def test_factory_prose_handoff_request_changes_unchanged(kanban_home):
-    """A factory handoff WITHOUT a durable candidate is not an exact-head audit."""
+def test_factory_prompt_omission_request_changes_fails_closed(kanban_home):
+    """B1: a factory handoff omitting the durable candidate must NOT bypass the
+    gate — a REQUEST_CHANGES with no blocking_packet fails closed, zero mutation."""
     with kb.connect() as conn:
         author, auditor, _cand, auditor_run = _setup_audit(conn, with_candidate=False)
+        before = _snapshot(conn, author, auditor)
         ok = kb.record_review_verdict(
             conn, author, review_task_id=auditor,
             expected_review_run_id=auditor_run,
-            verdict="request_changes", reason="legacy prose handoff",
+            verdict="request_changes", reason="prompt omission, no packet",
         )
-        assert ok is True
-        author_row = conn.execute(
-            "SELECT status FROM tasks WHERE id = ?", (author,),
-        ).fetchone()
-        assert author_row["status"] == "ready"
+        assert ok is False
+        assert _snapshot(conn, author, auditor) == before
+
+
+def test_factory_prompt_omission_with_packet_still_fails_closed(kanban_home):
+    """B1: even a well-formed packet cannot bind when the handoff omitted the
+    durable candidate, so it must fail closed with zero mutation."""
+    with kb.connect() as conn:
+        author, auditor, cand, auditor_run = _setup_audit(conn, with_candidate=False)
+        packet = _packet(cand, 1, [_blocker("B1", family="contract_scope")])
+        before = _snapshot(conn, author, auditor)
+        ok = kb.record_review_verdict(
+            conn, author, review_task_id=auditor,
+            expected_review_run_id=auditor_run,
+            verdict="request_changes", reason="packet but no durable candidate",
+            blocking_packet=packet,
+        )
+        assert ok is False
+        assert _snapshot(conn, author, auditor) == before
 
 
 def test_non_factory_structured_handoff_request_changes_unchanged(kanban_home):
@@ -657,6 +690,81 @@ def test_non_factory_structured_handoff_request_changes_unchanged(kanban_home):
             verdict="request_changes", reason="non-factory review",
         )
         assert ok is True
+
+
+# ---------------------------------------------------------------------------
+# PASS path: signed durable candidate is authoritative (B5) and legacy
+# fallback only applies when no durable candidate is bound (B6).
+# ---------------------------------------------------------------------------
+
+def test_pass_rejects_mismatched_durable_candidate_evidence(kanban_home):
+    """B5: PASS must bind evidence to the SIGNED receipt.candidate, not a
+    candidate smuggled through the prose reason or evidence."""
+    with kb.connect() as conn:
+        author, auditor, cand, auditor_run = _setup_audit(conn, factory=False)
+        wrong = dict(cand, head="f" * 40)
+        before = _snapshot(conn, author, auditor)
+        ok = kb.record_review_verdict(
+            conn, author, review_task_id=auditor,
+            expected_review_run_id=auditor_run,
+            verdict="pass", reason="signed A, evidence B",
+            evidence=_evidence_for(wrong),
+        )
+        assert ok is False
+        assert _snapshot(conn, author, auditor) == before
+
+
+def test_pass_durable_candidate_prose_handoff_matching_evidence_succeeds(kanban_home):
+    """B6: a durable candidate + prose handoff + matching evidence is a
+    legitimate PASS and must terminalize the auditor."""
+    with kb.connect() as conn:
+        author, auditor, cand, auditor_run = _setup_audit(conn, factory=False)
+        ok = kb.record_review_verdict(
+            conn, author, review_task_id=auditor,
+            expected_review_run_id=auditor_run,
+            verdict="pass", reason="exact head approved",
+            evidence=_evidence_for(cand),
+        )
+        assert ok is True
+        assert kb.get_task(conn, auditor).status == "done"
+
+
+def test_pass_legacy_reason_json_fallback_without_durable_candidate(kanban_home):
+    """Legacy fallback (no durable candidate) still resolves the candidate from
+    the reason JSON envelope so pre-existing PASS reviews remain green."""
+    with kb.connect() as conn:
+        author = kb.create_task(
+            conn, title="implementation", assignee="agent007",
+            factory_build_gate=0,
+        )
+        auditor = kb.create_task(
+            conn, title="exact-head audit", assignee="bafuxunan",
+            parents=[author], factory_build_gate=0,
+        )
+        author_run = kb.claim_task(conn, author)
+        assert author_run is not None
+        cand = _candidate()
+        legacy_reason = json.dumps({
+            "version": 1,
+            "candidate": {k: cand[k] for k in sorted(kb._CANONICAL_AUDIT_TARGET_KEYS)},
+            "summary": "candidate frozen",
+        }, sort_keys=True, separators=(",", ":"))
+        receipt = kb.request_review_handoff(
+            conn, author, expected_run_id=author_run.current_run_id,
+            review_task_id=auditor, reason=legacy_reason, candidate=None,
+        )
+        assert receipt is not None
+        assert receipt.candidate is None
+        auditor_run = kb.claim_task(conn, auditor)
+        assert auditor_run is not None
+        ok = kb.record_review_verdict(
+            conn, author, review_task_id=auditor,
+            expected_review_run_id=auditor_run.current_run_id,
+            verdict="pass", reason="exact head approved",
+            evidence=_evidence_for(cand),
+        )
+        assert ok is True
+        assert kb.get_task(conn, auditor).status == "done"
 
 
 def test_canonical_review_verdict_payload_accepts_plain_pass(kanban_home):
