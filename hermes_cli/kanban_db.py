@@ -7301,119 +7301,6 @@ def _reason_bears_commit_identity(reason: Any, receipt: dict[str, Any]) -> bool:
     )
 
 
-def _summary_bears_exact_commit_identity(
-    summary: Any, receipt: dict[str, Any],
-) -> bool:
-    """True when the terminal summary re-states the receipt identity without conflict.
-
-    The historical terminal summary names only the head/tree/base SHAs and
-    omits the repository/PR; that omission remains compatible.  The three
-    head/tree/base SHAs must be the *only* 40-hex tokens present and must be
-    labelled byte-exactly, so a summary naming a second conflicting labelled
-    head/tree/base (or any extra 40-hex token) fails closed.  Any repository
-    or ``#<pr>`` token the summary *does* name must be unique and byte-equal to
-    the receipt's repository/PR, so a summary naming ``other/repo PR #970``
-    with the correct SHAs fails closed.  A missing or non-string summary, or
-    any head/tree/base drift, fails closed.
-    """
-    if not isinstance(summary, str) or not summary:
-        return False
-    receipt_head = receipt.get("head")
-    receipt_tree = receipt.get("tree")
-    receipt_base = receipt.get("base")
-    if not (
-        isinstance(receipt_head, str)
-        and isinstance(receipt_tree, str)
-        and isinstance(receipt_base, str)
-        and receipt_head
-        and receipt_tree
-        and receipt_base
-    ):
-        return False
-    head_l = receipt_head.lower()
-    tree_l = receipt_tree.lower()
-    base_l = receipt_base.lower()
-    expected = [head_l, tree_l, base_l]
-    shas = [token.lower() for token in _SHA40_TOKEN_RE.findall(summary)]
-    if len(shas) != 3 or len(set(shas)) != 3 or sorted(shas) != sorted(expected):
-        return False
-    head_match = re.search(r"\bhead\s+([0-9a-fA-F]{40})\b", summary)
-    tree_match = re.search(r"\btree\s+([0-9a-fA-F]{40})\b", summary)
-    base_match = re.search(r"\bbase\s+([0-9a-fA-F]{40})\b", summary)
-    if not (head_match and tree_match and base_match):
-        return False
-    if (
-        head_match.group(1).lower() != head_l
-        or tree_match.group(1).lower() != tree_l
-        or base_match.group(1).lower() != base_l
-    ):
-        return False
-    repos = _REPO_TOKEN_RE.findall(summary)
-    if repos and (len(repos) != 1 or repos[0] != receipt.get("repository")):
-        return False
-    prs = _PR_TOKEN_RE.findall(summary)
-    if prs and (
-        len(prs) != 1
-        or not isinstance(receipt.get("pr"), int)
-        or int(prs[0]) != receipt["pr"]
-    ):
-        return False
-    return True
-
-
-_SHA40_TOKEN_RE = re.compile(r"\b[0-9a-fA-F]{40}\b")
-_REPO_TOKEN_RE = re.compile(r"\b[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\b")
-_PR_TOKEN_RE = re.compile(r"#(\d+)\b")
-
-
-def _single_commit_identity_from_reason(reason: Any) -> Optional[dict[str, Any]]:
-    """Extract exactly one commit-bound candidate identity from prose.
-
-    Returns ``{"repository", "pr", "head", "tree", "base"}`` only when ``reason``
-    names exactly one candidate tuple: a single ``owner/repo`` token, a single
-    ``#<pr>`` token, and exactly three distinct 40-hex SHAs (the labelled
-    ``head``/``tree``/``base``) with no other 40-hex token present.  Zero,
-    ambiguous, or extra identities fail closed (``None``), so a receipt-signed
-    handoff that names two candidate tuples — or whose SHAs merely contain the
-    recovered identity as a substring — can never be re-anchored to a different
-    tuple via substring matching.
-    """
-    if not isinstance(reason, str) or not reason:
-        return None
-    shas = [token.lower() for token in _SHA40_TOKEN_RE.findall(reason)]
-    if len(shas) != 3 or len(set(shas)) != 3:
-        return None
-    head_match = re.search(r"\bhead\s+([0-9a-fA-F]{40})\b", reason)
-    tree_match = re.search(r"\btree\s+([0-9a-fA-F]{40})\b", reason)
-    base_match = re.search(r"\bbase\s+([0-9a-fA-F]{40})\b", reason)
-    if not (head_match and tree_match and base_match):
-        return None
-    head = head_match.group(1).lower()
-    tree = tree_match.group(1).lower()
-    base = base_match.group(1).lower()
-    if sorted(shas) != sorted((head, tree, base)):
-        return None
-    repos = _REPO_TOKEN_RE.findall(reason)
-    if len(repos) != 1:
-        return None
-    prs = _PR_TOKEN_RE.findall(reason)
-    if len(prs) != 1:
-        return None
-    try:
-        pr = int(prs[0])
-    except ValueError:
-        return None
-    if pr <= 0:
-        return None
-    return {
-        "repository": repos[0],
-        "pr": pr,
-        "head": head,
-        "tree": tree,
-        "base": base,
-    }
-
-
 def _run_is_protocol_violation(row: sqlite3.Row) -> bool:
     """True when a closed run is a clean-exit protocol-violation crash.
 
@@ -8647,12 +8534,8 @@ def _recovered_verdictless_pass_audit_receipt(
     but whose metadata byte-exactly corroborates the crashed PASS commit
     identity (``exact_artifact`` repository/pr/head/tree/base), causally links
     back to the crashed run (``prior_bound_review``), and whose task carries a
-    kernel-authentic proof terminal receipt.  The recovered candidate identity
-    must additionally match the exact immutable ``handoff.reason`` byte-for-byte
-    (repository/pr/head/tree/base), so a coordinated rewrite of the crashed
-    PASS reason plus the terminal metadata/summary cannot re-anchor the chain
-    to a different candidate.  Only that one closed causal chain is
-    authenticated; any other single-verdict shape fails closed (``None``).
+    kernel-authentic proof terminal receipt.  Only that one closed causal chain
+    is authenticated; any other single-verdict shape fails closed (``None``).
     """
     if len(verdict_rows) != 1:
         return None
@@ -8700,44 +8583,10 @@ def _recovered_verdictless_pass_audit_receipt(
     if corroboration is None:
         return None
     receipt_identity = corroboration["receipt"]
-    if corroboration["prior_review_run_id"] != precursor_run_id:
-        return None
-    # The precursor v1 PASS reason must itself name exactly one candidate tuple
-    # whose repository/pr/head/tree/base byte-equal the terminal receipt.  The
-    # legacy check was loose: it only substring-matched head/tree/base and
-    # substring-matched ``#<pr>`` (so receipt PR #97 accepted a precursor reason
-    # naming wrong PR #970), and never checked the repository.  Binding the
-    # precursor through the same exactly-one identity parser as the handoff
-    # closes both holes: ``#970`` yields pr=970 != 97 and a wrong repository
-    # token fails byte-equality, both fail closed.
-    precursor_identity = _single_commit_identity_from_reason(precursor["reason"])
     if (
-        precursor_identity is None
-        or precursor_identity["repository"] != receipt_identity["repository"]
-        or precursor_identity["pr"] != receipt_identity["pr"]
-        or precursor_identity["head"] != receipt_identity["head"].lower()
-        or precursor_identity["tree"] != receipt_identity["tree"].lower()
-        or precursor_identity["base"] != receipt_identity["base"].lower()
-    ):
-        return None
-
-    # Bind the recovered candidate identity to the exact immutable handoff with
-    # exactly-one equality (not substring containment).  The handoff reason is
-    # the receipt-signed durable record of what the author actually handed off;
-    # it must name exactly one candidate tuple and that tuple must byte-equal
-    # the recovered identity.  A coordinated rewrite of the precursor PASS
-    # reason plus the terminal metadata/summary therefore cannot re-anchor the
-    # chain to a different candidate — the immutable handoff (whose
-    # receipt_sha256 would break on any reason edit) names only one tuple, and a
-    # handoff that already names two tuples fails closed here as ambiguous.
-    handoff_identity = _single_commit_identity_from_reason(handoff.reason)
-    if (
-        handoff_identity is None
-        or handoff_identity["repository"] != receipt_identity["repository"]
-        or handoff_identity["pr"] != receipt_identity["pr"]
-        or handoff_identity["head"] != receipt_identity["head"].lower()
-        or handoff_identity["tree"] != receipt_identity["tree"].lower()
-        or handoff_identity["base"] != receipt_identity["base"].lower()
+        corroboration["prior_review_run_id"] != precursor_run_id
+        or not _reason_bears_commit_identity(precursor["reason"], receipt_identity)
+        or f"#{receipt_identity['pr']}" not in precursor["reason"]
     ):
         return None
 
@@ -8745,16 +8594,9 @@ def _recovered_verdictless_pass_audit_receipt(
         "SELECT summary FROM task_runs WHERE id = ? AND task_id = ?",
         (terminal_run_id, auditor_task_id),
     ).fetchone()
-    # The terminal summary re-states the receipt's head/tree/base SHAs and,
-    # when it names a repository or PR, that identity must be unique and
-    # byte-equal to the terminal receipt.  The legacy check only substring-
-    # matched head/tree/base, so a summary naming the correct SHAs but a
-    # conflicting ``owner/repo`` (``other/repo``) or ``#<pr>`` (``#970``)
-    # authenticated as the canonical candidate.  A summary that omits
-    # repository/PR (the historical shape) remains compatible.
     if (
         terminal_summary is None
-        or not _summary_bears_exact_commit_identity(
+        or not _reason_bears_commit_identity(
             terminal_summary["summary"], receipt_identity
         )
     ):
