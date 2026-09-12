@@ -6661,6 +6661,7 @@ def _has_protocol_violation_fence(conn: sqlite3.Connection, task_id: str) -> boo
 def recompute_ready(
     conn: sqlite3.Connection, failure_limit: int = None,
     *, promoted_ids: Optional[list[str]] = None,
+    promoted_events: Optional[list[tuple[str, int, int]]] = None,
 ) -> int:
     """Promote tasks whose terminal or typed-review parents are satisfied.
 
@@ -6779,6 +6780,15 @@ def recompute_ready(
                 promoted += 1
                 if promoted_ids is not None:
                     promoted_ids.append(task_id)
+                if promoted_events is not None:
+                    event_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+                    event_created_at = int(
+                        conn.execute(
+                            "SELECT created_at FROM task_events WHERE id = ?",
+                            (event_id,),
+                        ).fetchone()[0]
+                    )
+                    promoted_events.append((task_id, event_id, event_created_at))
     return promoted
 
 
@@ -9898,41 +9908,43 @@ def _current_v3_bound_verdict(
 
 def _current_v3_continuation_targets(
     conn: sqlite3.Connection, author_task_id: str, audit_task_id: str,
-    audit_run_id: int, outcome_event_id: int,
+    audit_run_id: int, outcome_event_id: int, continuation_receipts: Any,
 ) -> Optional[tuple[str, list[str]]]:
-    """Reconstruct the immutable terminal-transaction promotion fact.
+    """Authenticate the closed immutable terminal-transaction promotion receipt.
 
-    The terminal producer emits ``continuation_ids`` as exactly the task ids
-    promoted by ``recompute_ready`` in its terminal transaction; each such task
-    carries a durable ``promoted`` event appended after the audit run's own
-    ``completed`` marker and before the ``canonical_audit_outcome`` event
-    (id = ``outcome_event_id``). This helper reconstructs that exact set from
-    those promotion events alone — the immutable, causally-scoped
-    terminal-transaction promotion fact — rather than from present-day
-    ``task_links``/``tasks`` relationship or status state, so the producer and
-    the validator consume one identical fact and supported post-outcome
-    link/unlink evolution cannot erase a producer-promoted continuation.
+    The terminal producer does not emit a bare task-id set. It binds, for every
+    task its terminal ``recompute_ready`` actually promoted, the exact promoted
+    event identity — ``task_id`` + ``event_id`` + ``created_at`` — as an
+    immutable receipt inside the hashed envelope. The validator re-reads each
+    receipt entry's exact event row *by id* and fails closed on any divergence,
+    rather than reconstructing a partial task-id set from any row named
+    ``promoted``.
 
     The lower boundary is the audit run's *singleton* ``completed`` marker: the
     terminal transaction emits exactly one such marker, and its id must precede
     the outcome. A missing, duplicate, or post-outcome same-run ``completed``
-    marker fails closed (returns ``None``), because the boundary must be a stable
-    producer marker — a later duplicate ``completed`` event appended before the
-    outcome would otherwise move the boundary past the promoted set and erase a
-    producer-promoted continuation. A ``promoted`` event from an earlier
-    transaction (a prior parent's completion) is NOT this terminal transaction's
-    output, so it must not count as a continuation.
+    marker fails closed (returns ``None``).
 
-    The promotion fact is *closed and exact*, not a task-id set inferred from
-    any row named ``promoted``. The producer's terminal ``recompute_ready``
-    emits exactly one ``promoted`` event per promoted task, each canonically
-    shaped as ``run_id IS NULL`` and ``payload IS NULL``. The validator reads
-    every matching row (preserving multiplicity) and fails closed — returning
-    ``None`` — if any row is noncanonically shaped (non-null ``run_id`` or
-    non-null ``payload``) or if the same task id appears in more than one
-    promoted row (ambiguous duplicate fact), rather than deduplicating a
-    partial column projection into the producer's one-member list.
+    The receipt is *closed and exact*:
+
+    * every receipt entry must be a strict ``{task_id, event_id, created_at}``
+      dict with an integer ``event_id``/``created_at`` and a non-empty string
+      ``task_id``; repeated task ids or event ids are ambiguous duplicates and
+      fail closed;
+    * the terminal window ``(completed_id, outcome_event_id)`` must contain
+      exactly the receipt's promoted events — no extra synthetic row and no
+      missing producer row;
+    * each bound event must be canonically shaped (``run_id IS NULL`` and
+      ``payload IS NULL``) and its ``created_at`` must still be the exact
+      integer the producer recorded (a mutated TEXT ``created_at`` fails
+      closed);
+    * each bound task must still exist, be ``ready``, and have been *created*
+      as ``todo``/``blocked`` (``recompute_ready`` only ever promotes a
+      ``todo``/``blocked`` task), so a synthetic promotion of an already-ready
+      or nonexistent task cannot masquerade as the producer's causal output.
     """
+    if type(continuation_receipts) is not list:
+        return None
     completed_rows = conn.execute(
         "SELECT id FROM task_events WHERE task_id = ? AND run_id = ? "
         "AND kind = 'completed'",
@@ -9943,27 +9955,64 @@ def _current_v3_continuation_targets(
     lower = int(completed_rows[0]["id"])
     if lower >= outcome_event_id:
         return None
-    rows = conn.execute(
-        "SELECT task_id, run_id, payload FROM task_events "
+    # Index the receipt by event id, rejecting any malformed or ambiguous entry
+    # up front so the terminal window comparison below is a true bijection.
+    receipt_by_event: dict[int, dict[str, Any]] = {}
+    seen_task: set[str] = set()
+    for entry in continuation_receipts:
+        if not isinstance(entry, dict) or set(entry) != {"task_id", "event_id", "created_at"}:
+            return None
+        task_id = entry.get("task_id")
+        event_id = entry.get("event_id")
+        created_at = entry.get("created_at")
+        if type(task_id) is not str or not task_id:
+            return None
+        if type(event_id) is not int or type(created_at) is not int:
+            return None
+        if task_id in seen_task or event_id in receipt_by_event:
+            return None
+        seen_task.add(task_id)
+        receipt_by_event[event_id] = entry
+    window_rows = conn.execute(
+        "SELECT id, task_id, run_id, payload, created_at FROM task_events "
         "WHERE kind = 'promoted' AND id > ? AND id < ? ORDER BY id",
         (lower, outcome_event_id),
     ).fetchall()
+    if len(window_rows) != len(receipt_by_event):
+        return None
     targets: list[str] = []
-    seen: set[str] = set()
-    for row in rows:
-        # Canonical producer shape: dependency promotion is run-unscoped and
-        # payload-less (NULL/NULL). Any non-null run_id or payload is a
-        # noncanonical event shape, and any repeated task id is an ambiguous
-        # duplicate fact — the producer emits exactly one NULL/NULL promoted
-        # row per promoted task, so both fail closed instead of silently
-        # normalizing a partial projection.
+    for row in window_rows:
+        event_id = int(row["id"])
+        entry = receipt_by_event.get(event_id)
+        if entry is None:
+            # An extra promoted event inside the terminal window that the
+            # producer's receipt does not bind is a synthetic injection.
+            return None
         if row["run_id"] is not None or row["payload"] is not None:
             return None
-        task_id = row["task_id"]
-        if not isinstance(task_id, str) or not task_id or task_id in seen:
+        if row["task_id"] != entry["task_id"]:
             return None
-        seen.add(task_id)
-        targets.append(task_id)
+        if type(row["created_at"]) is not int or int(row["created_at"]) != entry["created_at"]:
+            return None
+        task_row = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (entry["task_id"],),
+        ).fetchone()
+        if task_row is None or task_row["status"] != "ready":
+            return None
+        created = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'created' "
+            "ORDER BY id LIMIT 1",
+            (entry["task_id"],),
+        ).fetchone()
+        if created is None:
+            return None
+        try:
+            created_obj = _strict_json_loads(created["payload"] or "{}")
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(created_obj, dict) or created_obj.get("status") not in ("todo", "blocked"):
+            return None
+        targets.append(entry["task_id"])
     targets.sort()
     if targets:
         return _EARLIER_V3_DISPOSITION_CONTINUATION, targets
@@ -9973,7 +10022,7 @@ def _current_v3_continuation_targets(
 def _current_v3_continuation_ids_valid(
     conn: sqlite3.Connection, author_task_id: str, audit_task_id: str,
     audit_run_id: int, continuation_ids: Any, disposition: Any,
-    outcome_event_id: int,
+    outcome_event_id: int, continuation_receipts: Any,
 ) -> bool:
     """Validate the current-v3 continuation list against the immutable
     terminal-transaction promotion fact.
@@ -10007,6 +10056,7 @@ def _current_v3_continuation_ids_valid(
             return False
     live = _current_v3_continuation_targets(
         conn, author_task_id, audit_task_id, audit_run_id, outcome_event_id,
+        continuation_receipts,
     )
     if live is None:
         return False
@@ -10106,9 +10156,10 @@ def _canonical_current_audit_outcome(
     required = {
         "version", "author_task_id", "author_run_id", "author_profile", "audit_task_id",
         "audit_run_id", "auditor_profile", "review_handoff_event_id", "verdict", "reason",
-        "evidence", "scope", "disposition", "continuation_ids",
+        "evidence", "scope", "disposition", "continuation_ids", "continuation_receipts",
     }
     continuation_ids = payload.get("continuation_ids")
+    continuation_receipts = payload.get("continuation_receipts")
     verdict_rows = conn.execute(
         "SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind='review_verdict'",
         (row["task_id"], row["run_id"]),
@@ -10147,7 +10198,7 @@ def _canonical_current_audit_outcome(
         and (run["status"], run["outcome"]) == ("done", "completed") and run["ended_at"] is not None
         and _current_v3_continuation_ids_valid(
             conn, author_task_id, row["task_id"], row["run_id"], continuation_ids,
-            payload.get("disposition"), row["id"],
+            payload.get("disposition"), row["id"], continuation_receipts,
         )
         and len(facts) == 1
         and len(verdict_rows) == 1
@@ -10227,8 +10278,14 @@ def _terminalize_review_pass(
         {"result_len": len(reason), "summary": reason[:400]}, run_id=audit_run_id,
     )
     promoted: list[str] = []
-    recompute_ready(conn, promoted_ids=promoted)
+    promoted_events: list[tuple[str, int, int]] = []
+    recompute_ready(conn, promoted_ids=promoted, promoted_events=promoted_events)
     promoted.sort()
+    promoted_events.sort(key=lambda entry: entry[0])
+    continuation_receipts = [
+        {"task_id": task_id, "event_id": event_id, "created_at": created_at}
+        for (task_id, event_id, created_at) in promoted_events
+    ]
     core = {
         "version": 3, "author_task_id": author_task_id, "author_run_id": receipt.expected_run_id,
         "author_profile": author["assignee"], "audit_task_id": audit_task_id,
@@ -10237,6 +10294,7 @@ def _terminalize_review_pass(
         "evidence": evidence, "scope": "audit_obligation",
         "disposition": "CONTINUATION_COMMITTED" if promoted else "FINAL_ACCEPTED",
         "continuation_ids": promoted,
+        "continuation_receipts": continuation_receipts,
     }
     digest = hashlib.sha256(
         json.dumps(core, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()

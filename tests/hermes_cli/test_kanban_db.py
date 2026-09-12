@@ -7349,6 +7349,12 @@ def test_current_v3_outcome_later_completed_event_fails_closed(kanban_home):
             "SELECT MAX(id) FROM task_events WHERE task_id=? AND kind='canonical_audit_outcome'",
             (review_task,),
         ).fetchone()[0]
+        envelope = json.loads(
+            conn.execute(
+                "SELECT payload FROM task_events WHERE id=?",
+                (outcome_event_id,),
+            ).fetchone()["payload"]
+        )
         with kb.write_txn(conn):
             kb._append_event(
                 conn, review_task, "completed",
@@ -7356,6 +7362,7 @@ def test_current_v3_outcome_later_completed_event_fails_closed(kanban_home):
             )
         assert kb._current_v3_continuation_targets(
             conn, author, review_task, audit_run, outcome_event_id,
+            envelope["continuation_receipts"],
         ) is None
         present, receipt = kb._canonical_current_audit_outcome(conn, author)
         assert present is True and receipt is None
@@ -7636,6 +7643,165 @@ def test_current_v3_outcome_erases_promoted_child_fails_closed(kanban_home):
             obj["continuation_ids"] = []
 
         _rewrite_current_v3_envelope(conn, review_task, audit_run, mutate_envelope=mutate)
+        assert kb._canonical_current_audit_outcome(conn, author) == (True, None)
+        assert kb._reviewed_author_finalizer_run_id(conn, author) is None
+
+
+def _inject_synthetic_promotion_and_rewrite(
+    conn, review_task, audit_run, synthetic_task_id,
+):
+    """Delete the authentic outcome+fact, inject one NULL/NULL ``promoted`` row
+    for ``synthetic_task_id``, and recompute the envelope digest + fact pointer
+    so the mutated state is internally coherent. Mirrors the hostile
+    delete-and-reappend replay the producer receipt must reject causally."""
+    outcome = conn.execute(
+        "SELECT id, payload, created_at FROM task_events WHERE task_id=? AND run_id=? "
+        "AND kind='canonical_audit_outcome'",
+        (review_task, audit_run),
+    ).fetchone()
+    fact = conn.execute(
+        "SELECT id, payload, created_at FROM task_events WHERE task_id=? AND run_id=? "
+        "AND kind='changed_fact'",
+        (review_task, audit_run),
+    ).fetchone()
+    envelope_obj = json.loads(outcome["payload"])
+    fact_obj = json.loads(fact["payload"])
+    with kb.write_txn(conn):
+        conn.execute(
+            "DELETE FROM task_events WHERE id IN (?, ?)", (outcome["id"], fact["id"]),
+        )
+        kb._append_event(conn, synthetic_task_id, "promoted", None)
+        synthetic_event_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+        synthetic_created = int(conn.execute(
+            "SELECT created_at FROM task_events WHERE id=?", (synthetic_event_id,),
+        ).fetchone()[0])
+        env = dict(envelope_obj)
+        env.pop("envelope_sha256", None)
+        env["disposition"] = "CONTINUATION_COMMITTED"
+        env["continuation_ids"] = [synthetic_task_id]
+        env["continuation_receipts"] = [
+            {
+                "task_id": synthetic_task_id,
+                "event_id": synthetic_event_id,
+                "created_at": synthetic_created,
+            }
+        ]
+        digest = hashlib.sha256(
+            json.dumps(env, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+        ).hexdigest()
+        env["envelope_sha256"] = digest
+        kb._append_event(
+            conn, review_task, "canonical_audit_outcome", env,
+            run_id=audit_run, created_at=outcome["created_at"],
+        )
+        new_outcome_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+        fact_obj["outcome_event_id"] = new_outcome_id
+        fact_obj["envelope_sha256"] = digest
+        kb._append_event(
+            conn, review_task, "changed_fact", fact_obj,
+            run_id=audit_run, created_at=fact["created_at"],
+        )
+
+
+def test_current_v3_outcome_promoted_created_at_mutation_fails_closed(kanban_home):
+    """Mutating a bound promoted event's created_at to TEXT fails closed.
+
+    The producer binds the exact integer ``created_at`` of each promoted event
+    into the hashed receipt; changing the sole promoted row's ``created_at`` to
+    a non-integer without altering the receipt no longer authenticates.
+    """
+    with kb.connect() as conn:
+        author, run_id, review_task = _review_handoff_pair(conn)
+        assert kb.request_review_handoff(
+            conn, author, expected_run_id=run_id, review_task_id=review_task,
+            reason=_APPROVED_HANDOFF,
+        )
+        child = kb.create_task(
+            conn, title="promoted continuation", assignee="merger",
+            parents=[review_task],
+        )
+        audit_run = kb.claim_task(conn, review_task).current_run_id
+        assert kb.record_review_verdict(
+            conn, author, review_task_id=review_task,
+            expected_review_run_id=audit_run, verdict="pass",
+            reason="PASS_CURRENT_V3_FIXTURE", evidence=_APPROVED_EVIDENCE,
+        )
+        assert kb._canonical_current_audit_outcome(conn, author)[1]["authenticated"] is True
+        promoted = conn.execute(
+            "SELECT id FROM task_events WHERE task_id=? AND kind='promoted'",
+            (child,),
+        ).fetchone()
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_events SET created_at=? WHERE id=?",
+                ("not-an-int", promoted["id"]),
+            )
+        assert kb._canonical_current_audit_outcome(conn, author) == (True, None)
+        assert kb._reviewed_author_finalizer_run_id(conn, author) is None
+
+
+def test_current_v3_outcome_nonexistent_continuation_synthetic_promotion_fails_closed(kanban_home):
+    """A synthetic promotion bound to a nonexistent task fails closed.
+
+    Rebinding ``continuation_ids`` to a task id with no live task row, plus a
+    matching injected NULL/NULL ``promoted`` event and a recomputed envelope +
+    pointer, must still fail closed because the producer only ever binds tasks
+    that actually exist and were genuinely promoted.
+    """
+    with kb.connect() as conn:
+        author, run_id, review_task = _review_handoff_pair(conn)
+        assert kb.request_review_handoff(
+            conn, author, expected_run_id=run_id, review_task_id=review_task,
+            reason=_APPROVED_HANDOFF,
+        )
+        child = kb.create_task(
+            conn, title="promoted continuation", assignee="merger",
+            parents=[review_task],
+        )
+        audit_run = kb.claim_task(conn, review_task).current_run_id
+        assert kb.record_review_verdict(
+            conn, author, review_task_id=review_task,
+            expected_review_run_id=audit_run, verdict="pass",
+            reason="PASS_CURRENT_V3_FIXTURE", evidence=_APPROVED_EVIDENCE,
+        )
+        assert kb._canonical_current_audit_outcome(conn, author)[1]["authenticated"] is True
+        _inject_synthetic_promotion_and_rewrite(
+            conn, review_task, audit_run, "t_nonexistent",
+        )
+        assert kb._canonical_current_audit_outcome(conn, author) == (True, None)
+        assert kb._reviewed_author_finalizer_run_id(conn, author) is None
+
+
+def test_current_v3_outcome_already_ready_synthetic_promotion_fails_closed(kanban_home):
+    """A synthetic promotion of an already-ready task fails closed.
+
+    A task created ``ready`` was never promoted by ``recompute_ready``. Injecting
+    a unique canonical-shaped NULL/NULL ``promoted`` row for it and recomputing
+    the envelope/pointer must still fail closed because the producer's promotion
+    is causally bound to a ``todo``/``blocked`` -> ``ready`` transition.
+    """
+    with kb.connect() as conn:
+        author, run_id, review_task = _review_handoff_pair(conn)
+        assert kb.request_review_handoff(
+            conn, author, expected_run_id=run_id, review_task_id=review_task,
+            reason=_APPROVED_HANDOFF,
+        )
+        child = kb.create_task(
+            conn, title="promoted continuation", assignee="merger",
+            parents=[review_task],
+        )
+        audit_run = kb.claim_task(conn, review_task).current_run_id
+        assert kb.record_review_verdict(
+            conn, author, review_task_id=review_task,
+            expected_review_run_id=audit_run, verdict="pass",
+            reason="PASS_CURRENT_V3_FIXTURE", evidence=_APPROVED_EVIDENCE,
+        )
+        assert kb._canonical_current_audit_outcome(conn, author)[1]["authenticated"] is True
+        already_ready = kb.create_task(conn, title="already ready", assignee="worker")
+        assert kb.get_task(conn, already_ready).status == "ready"
+        _inject_synthetic_promotion_and_rewrite(
+            conn, review_task, audit_run, already_ready,
+        )
         assert kb._canonical_current_audit_outcome(conn, author) == (True, None)
         assert kb._reviewed_author_finalizer_run_id(conn, author) is None
 
