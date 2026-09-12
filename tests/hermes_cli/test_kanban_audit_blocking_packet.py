@@ -6,13 +6,16 @@ Regression + hostile coverage for the hard Native invariant on the existing
 valid exact-head-bound ``blocking_packet`` with complete required-family
 coverage and all known blockers in one packet.  Re-audits (VERIFY) must
 disposition prior blockers and classify new ones; from round 3 on, any
-non-``PATCH_INTRODUCED`` finding freezes into the ``CONTRACT_TOO_BROAD``
-stop-loss disposition instead of another ordinary repair loop.
+same-family non-``PATCH_INTRODUCED`` finding freezes into the
+``CONTRACT_TOO_BROAD`` stop-loss disposition instead of another ordinary repair
+loop.
 
-Applicability is deliberately narrow: the gate only fires when the author task
-is ``factory_build_gate=1`` *and* its review handoff carries a structured
-exact-head candidate envelope.  Ordinary prose handoffs, non-factory reviews,
-and the legitimate PASS path are untouched.
+Applicability is bound to a durable exact-head ``candidate`` carried on the
+review handoff (not a JSON envelope parsed out of the prose ``reason``), and is
+deliberately narrow: the gate only fires when the author task is
+``factory_build_gate=1`` *and* its review handoff carries that candidate.
+Ordinary prose handoffs, non-factory reviews, and the legitimate PASS path are
+untouched.
 """
 
 from __future__ import annotations
@@ -47,15 +50,16 @@ def _candidate(pr=102, head="a" * 40, tree="b" * 40, base="c" * 40):
     }
 
 
-def _structured_reason(candidate):
-    return json.dumps(
-        {"version": 1, "candidate": candidate, "summary": "exact-head candidate"}
-    )
-
-
-def _family_coverage(overrides=None):
+def _family_coverage(blockers=(), overrides=None):
+    """FAIL for every blocker family, PASS otherwise (B2 consistency rule)."""
+    fail_families = {
+        b["family"] for b in blockers if isinstance(b, dict) and b.get("family")
+    }
     cov = {
-        family: {"disposition": "PASS", "evidence_ref": f"ev-{family}"}
+        family: {
+            "disposition": "FAIL" if family in fail_families else "PASS",
+            "evidence_ref": f"ev-{family}",
+        }
         for family in kb.AUDIT_BLOCKING_REQUIRED_FAMILIES
     }
     if overrides:
@@ -86,14 +90,14 @@ def _packet(candidate, audit_round, blockers, *, disposition="REQUEST_CHANGES",
         "audit_round": audit_round,
         "mode": mode,
         "candidate": candidate,
-        "family_coverage": coverage if coverage is not None else _family_coverage(),
+        "family_coverage": coverage if coverage is not None else _family_coverage(blockers),
         "blockers": blockers,
         "coverage_complete": coverage_complete,
         "disposition": disposition,
     }
 
 
-def _setup_audit(conn, *, structured=True, factory=True, candidate=None):
+def _setup_audit(conn, *, factory=True, candidate=None, with_candidate=True):
     """Author (claimed, handed off) + direct auditor child (claimed)."""
     author = kb.create_task(
         conn, title="implementation", assignee="agent007",
@@ -106,10 +110,10 @@ def _setup_audit(conn, *, structured=True, factory=True, candidate=None):
     author_run = kb.claim_task(conn, author)
     assert author_run is not None
     candidate = candidate or _candidate()
-    reason = _structured_reason(candidate) if structured else "prose handoff reason"
     receipt = kb.request_review_handoff(
         conn, author, expected_run_id=author_run.current_run_id,
-        review_task_id=auditor, reason=reason,
+        review_task_id=auditor, reason="exact-head handoff",
+        candidate=candidate if with_candidate else None,
     )
     assert receipt is not None
     auditor_run = kb.claim_task(conn, auditor)
@@ -133,7 +137,7 @@ def _prepare_round(conn, author, auditor, candidate):
     assert author_run is not None
     receipt = kb.request_review_handoff(
         conn, author, expected_run_id=author_run.current_run_id,
-        review_task_id=auditor, reason=_structured_reason(candidate),
+        review_task_id=auditor, reason="exact-head handoff", candidate=candidate,
     )
     assert receipt is not None
     auditor_run = kb.claim_task(conn, auditor)
@@ -258,6 +262,76 @@ def test_round1_stop_loss_disposition_rejected(kanban_home):
 
 
 # ---------------------------------------------------------------------------
+# Round-1 B2 semantic strictness (closed/strict blocker + family fields)
+# ---------------------------------------------------------------------------
+
+def test_round1_empty_blockers_rejected_zero_mutation(kanban_home):
+    with kb.connect() as conn:
+        author, auditor, cand, auditor_run = _setup_audit(conn)
+        packet = _packet(cand, 1, [])  # no blockers
+        before = _snapshot(conn, author, auditor)
+        ok = kb.record_review_verdict(
+            conn, author, review_task_id=auditor,
+            expected_review_run_id=auditor_run,
+            verdict="request_changes", reason="empty blockers",
+            blocking_packet=packet,
+        )
+        assert ok is False
+        assert _snapshot(conn, author, auditor) == before
+
+
+def test_round1_unknown_blocker_family_rejected_zero_mutation(kanban_home):
+    with kb.connect() as conn:
+        author, auditor, cand, auditor_run = _setup_audit(conn)
+        packet = _packet(cand, 1, [_blocker("B1", family="not_a_family")])
+        before = _snapshot(conn, author, auditor)
+        ok = kb.record_review_verdict(
+            conn, author, review_task_id=auditor,
+            expected_review_run_id=auditor_run,
+            verdict="request_changes", reason="unknown family",
+            blocking_packet=packet,
+        )
+        assert ok is False
+        assert _snapshot(conn, author, auditor) == before
+
+
+def test_round1_blocker_in_pass_family_rejected_zero_mutation(kanban_home):
+    with kb.connect() as conn:
+        author, auditor, cand, auditor_run = _setup_audit(conn)
+        # blocker in contract_scope, but coverage marks it PASS → contradiction.
+        packet = _packet(cand, 1, [_blocker("B1", family="contract_scope")],
+                         coverage=_family_coverage())
+        before = _snapshot(conn, author, auditor)
+        ok = kb.record_review_verdict(
+            conn, author, review_task_id=auditor,
+            expected_review_run_id=auditor_run,
+            verdict="request_changes", reason="blocker in PASS family",
+            blocking_packet=packet,
+        )
+        assert ok is False
+        assert _snapshot(conn, author, auditor) == before
+
+
+def test_round1_fail_family_without_blocker_rejected_zero_mutation(kanban_home):
+    with kb.connect() as conn:
+        author, auditor, cand, auditor_run = _setup_audit(conn)
+        # fail_closed is FAIL but has no blocker → inverse contradiction.
+        coverage = _family_coverage([_blocker("B1", family="contract_scope")])
+        coverage["fail_closed"] = {"disposition": "FAIL", "evidence_ref": "ev-fail_closed"}
+        packet = _packet(cand, 1, [_blocker("B1", family="contract_scope")],
+                         coverage=coverage)
+        before = _snapshot(conn, author, auditor)
+        ok = kb.record_review_verdict(
+            conn, author, review_task_id=auditor,
+            expected_review_run_id=auditor_run,
+            verdict="request_changes", reason="FAIL family without blocker",
+            blocking_packet=packet,
+        )
+        assert ok is False
+        assert _snapshot(conn, author, auditor) == before
+
+
+# ---------------------------------------------------------------------------
 # Round-1 positive gate
 # ---------------------------------------------------------------------------
 
@@ -363,7 +437,7 @@ def test_reaudit_valid_verify_round_accepted(kanban_home):
 
 
 # ---------------------------------------------------------------------------
-# Round >= 3 stop-loss
+# Round >= 3 same-family stop-loss
 # ---------------------------------------------------------------------------
 
 def test_round3_same_family_non_patch_introduced_yields_stop_loss(kanban_home):
@@ -437,6 +511,41 @@ def test_round3_same_family_requires_stop_loss_disposition(kanban_home):
         assert _snapshot(conn, author, auditor) == before
 
 
+def test_round3_unique_family_audit_miss_allows_request_changes(kanban_home):
+    """A round-3 AUDIT_MISS in a never-before-blocking family is NOT stop-loss."""
+    with kb.connect() as conn:
+        author, auditor, cand, _run = _setup_audit(conn)
+        assert _round1(
+            conn, author, auditor, _run, cand,
+            packet=_packet(cand, 1, [_blocker("A", family="contract_scope")]),
+        )
+        assert _do_round(
+            conn, author, auditor, cand,
+            packet=_packet(
+                cand, 2,
+                [_blocker("A", family="contract_scope", disposition="CLOSED"),
+                 _blocker("B", family="fail_closed", classification="PATCH_INTRODUCED")],
+            ),
+        )
+        # C is a new AUDIT_MISS in state_lifecycle (never previously a blocker
+        # family), so it is an ordinary finding, not a same-family recurrence.
+        ok = _do_round(
+            conn, author, auditor, cand,
+            packet=_packet(
+                cand, 3,
+                [_blocker("A", family="contract_scope", disposition="CLOSED"),
+                 _blocker("B", family="fail_closed", disposition="CLOSED"),
+                 _blocker("C", family="state_lifecycle", classification="AUDIT_MISS")],
+                disposition="REQUEST_CHANGES",
+            ),
+        )
+        assert ok is True
+        author_row = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (author,),
+        ).fetchone()
+        assert author_row["status"] == "ready"
+
+
 def test_round3_patch_introduced_still_allows_request_changes(kanban_home):
     with kb.connect() as conn:
         author, auditor, cand, _run = _setup_audit(conn)
@@ -471,12 +580,62 @@ def test_round3_patch_introduced_still_allows_request_changes(kanban_home):
 
 
 # ---------------------------------------------------------------------------
+# Idempotency / concurrency (B3)
+# ---------------------------------------------------------------------------
+
+def test_replay_exact_duplicate_is_idempotent(kanban_home):
+    with kb.connect() as conn:
+        author, auditor, cand, auditor_run = _setup_audit(conn)
+        packet = _packet(cand, 1, [_blocker("B1", family="contract_scope")])
+        ok = kb.record_review_verdict(
+            conn, author, review_task_id=auditor,
+            expected_review_run_id=auditor_run,
+            verdict="request_changes", reason="request changes",
+            blocking_packet=packet,
+        )
+        assert ok is True
+        ok2 = kb.record_review_verdict(
+            conn, author, review_task_id=auditor,
+            expected_review_run_id=auditor_run,
+            verdict="request_changes", reason="request changes",
+            blocking_packet=packet,
+        )
+        assert ok2 is True
+
+
+def test_replay_mutated_blocking_packet_rejected(kanban_home):
+    with kb.connect() as conn:
+        author, auditor, cand, auditor_run = _setup_audit(conn)
+        packet = _packet(cand, 1, [_blocker("B1", family="contract_scope")])
+        ok = kb.record_review_verdict(
+            conn, author, review_task_id=auditor,
+            expected_review_run_id=auditor_run,
+            verdict="request_changes", reason="request changes",
+            blocking_packet=packet,
+        )
+        assert ok is True
+        # Replay the SAME verdict with a different (but valid) packet — the
+        # canonical packet differs, so this must fail closed.
+        mutated = _packet(cand, 1, [_blocker("B2", family="fail_closed")])
+        before = _snapshot(conn, author, auditor)
+        ok2 = kb.record_review_verdict(
+            conn, author, review_task_id=auditor,
+            expected_review_run_id=auditor_run,
+            verdict="request_changes", reason="request changes",
+            blocking_packet=mutated,
+        )
+        assert ok2 is False
+        assert _snapshot(conn, author, auditor) == before
+
+
+# ---------------------------------------------------------------------------
 # Applicability boundary: the gate must NOT break legacy / non-factory reviews
 # ---------------------------------------------------------------------------
 
 def test_factory_prose_handoff_request_changes_unchanged(kanban_home):
+    """A factory handoff WITHOUT a durable candidate is not an exact-head audit."""
     with kb.connect() as conn:
-        author, auditor, _cand, auditor_run = _setup_audit(conn, structured=False)
+        author, auditor, _cand, auditor_run = _setup_audit(conn, with_candidate=False)
         ok = kb.record_review_verdict(
             conn, author, review_task_id=auditor,
             expected_review_run_id=auditor_run,

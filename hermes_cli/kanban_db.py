@@ -1940,6 +1940,7 @@ class ReviewHandoffReceipt:
     reason: str
     recovery: bool
     receipt_sha256: str
+    candidate: Optional[dict] = None
 
 
 class _ReviewHandoffConflict(Exception):
@@ -6963,6 +6964,29 @@ def _review_handoff_event_for_child(
     return None
 
 
+def _latest_review_handoff_receipt(
+    conn: sqlite3.Connection,
+    task_id: str,
+    review_task_id: str,
+) -> Optional[ReviewHandoffReceipt]:
+    """Return the latest typed handoff binding to this child, provenance-free.
+
+    Unlike ``_review_handoff_event_for_child`` this does not require the author
+    to still be in ``review``, so it can recover the durable candidate binding
+    during an idempotent verdict replay.
+    """
+    rows = conn.execute(
+        "SELECT id, run_id, payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'review_handoff' ORDER BY id DESC",
+        (task_id,),
+    ).fetchall()
+    for row in rows:
+        receipt = _review_handoff_receipt_from_row(task_id, row)
+        if receipt is not None and receipt.review_task_id == review_task_id:
+            return receipt
+    return None
+
+
 def _review_handoff_parent_satisfies_child(
     conn: sqlite3.Connection,
     parent_id: str,
@@ -6988,7 +7012,10 @@ def _review_handoff_receipt_from_row(
             "version", "expected_run_id", "review_task_id", "reason",
             "recovery", "receipt_sha256",
         }
-        if not isinstance(payload, dict) or set(payload) != required:
+        if not isinstance(payload, dict):
+            return None
+        keys = set(payload)
+        if keys not in (required, required | {"candidate"}):
             return None
         strict_types = (
             (payload["version"], int), (payload["expected_run_id"], int),
@@ -7001,6 +7028,14 @@ def _review_handoff_receipt_from_row(
             payload["reason"].strip()
         ):
             return None
+        candidate = None
+        if "candidate" in payload:
+            # The durable exact-head candidate is canonicalized at write time;
+            # only the closed shape is re-verified here (full semantic
+            # validation lives in the review-verdict write gate).
+            if _canonical_audit_target(payload["candidate"]) is None:
+                return None
+            candidate = _canonical_audit_target(payload["candidate"])
         signed = {
             "task_id": task_id,
             "version": payload["version"],
@@ -7009,6 +7044,8 @@ def _review_handoff_receipt_from_row(
             "reason": payload["reason"],
             "recovery": payload["recovery"],
         }
+        if candidate is not None:
+            signed["candidate"] = candidate
         expected_hash = hashlib.sha256(
             json.dumps(
                 signed,
@@ -7029,6 +7066,7 @@ def _review_handoff_receipt_from_row(
             reason=str(payload["reason"]),
             recovery=bool(payload["recovery"]),
             receipt_sha256=str(payload["receipt_sha256"]),
+            candidate=candidate,
         )
     except (KeyError, TypeError, ValueError):
         return None
@@ -9090,6 +9128,7 @@ def _request_review_handoff(
     review_task_id: str,
     reason: str,
     recovery: bool = False,
+    candidate: Optional[dict] = None,
 ) -> Optional[ReviewHandoffReceipt]:
     """Atomically hand one author run to one existing role-separated child.
 
@@ -9098,10 +9137,15 @@ def _request_review_handoff(
     terminal. ``recovery=True`` is narrowly limited to a triage task whose
     exact last ended run produced a ``review-required:`` block-loop event.
     Replaying the same ``(task, run, child)`` key returns the original receipt.
+
+    ``candidate`` (optional) is the durable exact-head binding
+    ``{repository, pr, head, tree, base}`` carried into the signed receipt and
+    used by the AUDIT_FIRST_PASS_BLOCKING_PACKET_V1 gate.
     """
     reason = str(reason or "").strip()
     if not reason or not review_task_id:
         return None
+    normalized_candidate = _canonical_audit_target(candidate) if candidate is not None else None
     expected_run_id = int(expected_run_id)
     with write_txn(conn):
         existing_rows = conn.execute(
@@ -9117,7 +9161,11 @@ def _request_review_handoff(
                 receipt.expected_run_id == expected_run_id
                 and receipt.review_task_id == review_task_id
             ):
-                if receipt.reason != reason or receipt.recovery != bool(recovery):
+                if (
+                    receipt.reason != reason
+                    or receipt.recovery != bool(recovery)
+                    or receipt.candidate != normalized_candidate
+                ):
                     return None
                 if receipt.recovery and not _reconcile_review_handoff_replay(
                     conn, receipt, event_rows=existing_rows
@@ -9264,6 +9312,8 @@ def _request_review_handoff(
             "reason": reason,
             "recovery": bool(recovery),
         }
+        if normalized_candidate is not None:
+            core_payload["candidate"] = normalized_candidate
         receipt_sha256 = hashlib.sha256(
             json.dumps(
                 {"task_id": task_id, **core_payload},
@@ -9291,6 +9341,7 @@ def _request_review_handoff(
             reason=reason,
             recovery=bool(recovery),
             receipt_sha256=receipt_sha256,
+            candidate=normalized_candidate,
         )
 
 
@@ -9302,6 +9353,7 @@ def request_review_handoff(
     review_task_id: str,
     reason: str,
     recovery: bool = False,
+    candidate: Optional[dict] = None,
 ) -> Optional[ReviewHandoffReceipt]:
     """Public fail-closed wrapper for the atomic review-handoff transaction."""
     try:
@@ -9312,6 +9364,7 @@ def request_review_handoff(
             review_task_id=review_task_id,
             reason=reason,
             recovery=recovery,
+            candidate=candidate,
         )
     except _ReviewHandoffConflict:
         return None
@@ -9376,51 +9429,46 @@ AUDIT_BLOCKING_BLOCKER_BASE_KEYS = (
 )
 
 
-def _exact_head_candidate_from_handoff(reason: str) -> Optional[dict[str, Any]]:
-    """Parse a structured exact-head candidate envelope from a handoff reason.
+def _canonical_audit_target(value: Any) -> Optional[dict[str, Any]]:
+    """Validate one closed ``{repository, pr, head, tree, base}`` candidate.
 
-    Returns the canonical ``{repository, pr, head, tree, base}`` candidate, or
-    ``None`` when ``reason`` is prose/malformed.  This mirrors the PASS-path
-    parser so the blocking-packet gate applies *exactly* to structured
-    exact-head factory audits, never to ordinary prose handoffs or non-factory
-    reviews.
+    Returns the canonical sorted-key dict, or ``None`` when the candidate is
+    malformed.  This is the single exact-head binding shared by the durable
+    review-handoff field and the blocking_packet gate.
     """
-    try:
-        target = json.loads(reason)
-    except (TypeError, ValueError):
+    if not isinstance(value, dict) or set(value) != _CANONICAL_AUDIT_TARGET_KEYS:
         return None
-    if not isinstance(target, dict) or set(target) != {"version", "candidate", "summary"}:
-        return None
-    if target.get("version") != 1:
-        return None
-    candidate = target.get("candidate")
-    if not isinstance(candidate, dict) or set(candidate) != _CANONICAL_AUDIT_TARGET_KEYS:
-        return None
-    if not isinstance(target.get("summary"), str) or not target["summary"].strip():
-        return None
-    repository, pr = candidate["repository"], candidate["pr"]
+    repository, pr = value["repository"], value["pr"]
     if (
         type(repository) is not str
         or re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository) is None
         or type(pr) is not int or pr <= 0
         or any(
-            type(candidate[key]) is not str
-            or re.fullmatch(r"[0-9a-fA-F]{40}", candidate[key]) is None
+            type(value[key]) is not str
+            or re.fullmatch(r"[0-9a-fA-F]{40}", value[key]) is None
             for key in ("head", "tree", "base")
         )
     ):
         return None
-    return {key: candidate[key] for key in sorted(_CANONICAL_AUDIT_TARGET_KEYS)}
+    return {key: value[key] for key in sorted(_CANONICAL_AUDIT_TARGET_KEYS)}
 
 
 def _prior_blocking_state(
     conn: sqlite3.Connection, task_id: str,
-) -> tuple[int, set[str]]:
-    """Return ``(audit_round, prior_blocker_ids)`` for a review-verdict write.
+    *,
+    exclude_review_run_id: Optional[int] = None,
+) -> tuple[int, set[str], set[str]]:
+    """Return ``(audit_round, prior_blocker_ids, prior_blocker_families)``.
 
     ``audit_round`` is one plus the number of prior REQUEST_CHANGES verdicts on
     the author task.  ``prior_blocker_ids`` is the blocker-id set of the most
     recent prior blocking_packet, which a VERIFY round must disposition in full.
+    ``prior_blocker_families`` is the union of every blocker family seen across
+    all prior rounds, which the round>=3 same-family stop-loss predicate keys on.
+
+    ``exclude_review_run_id`` skips the verdict with that review run id, so an
+    idempotent replay re-derives the exact pre-verdict context it was validated
+    under (without the current round counting itself).
     """
     rows = conn.execute(
         "SELECT payload FROM task_events WHERE task_id = ? "
@@ -9429,12 +9477,18 @@ def _prior_blocking_state(
     ).fetchall()
     request_changes_count = 0
     prior_blocker_ids: set[str] = set()
+    prior_blocker_families: set[str] = set()
     for row in rows:
         try:
             payload = json.loads(row["payload"] or "{}")
         except (TypeError, ValueError):
             continue
         if not isinstance(payload, dict) or payload.get("verdict") != "request_changes":
+            continue
+        if (
+            exclude_review_run_id is not None
+            and payload.get("review_run_id") == exclude_review_run_id
+        ):
             continue
         request_changes_count += 1
         prior_blocker_ids = set()
@@ -9443,13 +9497,18 @@ def _prior_blocking_state(
             blockers = packet.get("blockers")
             if isinstance(blockers, list):
                 for blocker in blockers:
+                    if not isinstance(blocker, dict):
+                        continue
+                    blocker_id = blocker.get("id")
+                    blocker_family = blocker.get("family")
+                    if isinstance(blocker_id, str) and blocker_id.strip():
+                        prior_blocker_ids.add(blocker_id)
                     if (
-                        isinstance(blocker, dict)
-                        and isinstance(blocker.get("id"), str)
-                        and blocker["id"].strip()
+                        isinstance(blocker_family, str)
+                        and blocker_family in AUDIT_BLOCKING_REQUIRED_FAMILIES
                     ):
-                        prior_blocker_ids.add(blocker["id"])
-    return request_changes_count + 1, prior_blocker_ids
+                        prior_blocker_families.add(blocker_family)
+    return request_changes_count + 1, prior_blocker_ids, prior_blocker_families
 
 
 def _canonical_blocking_packet(
@@ -9458,6 +9517,7 @@ def _canonical_blocking_packet(
     audit_round: int,
     expected_candidate: dict[str, Any],
     prior_blocker_ids: set[str],
+    prior_blocker_families: set[str],
 ) -> Optional[dict[str, Any]]:
     """Validate one closed blocking_packet for a factory exact-head re/audit.
 
@@ -9483,20 +9543,8 @@ def _canonical_blocking_packet(
         return None
     if mode != ("BOUNDED_EXHAUSTIVE_DISCOVERY" if audit_round == 1 else "VERIFY"):
         return None
-    candidate = value.get("candidate")
-    if not isinstance(candidate, dict) or set(candidate) != _CANONICAL_AUDIT_TARGET_KEYS:
-        return None
-    repository, pr = candidate["repository"], candidate["pr"]
-    if (
-        type(repository) is not str
-        or re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository) is None
-        or type(pr) is not int or pr <= 0
-        or any(
-            type(candidate[key]) is not str
-            or re.fullmatch(r"[0-9a-fA-F]{40}", candidate[key]) is None
-            for key in ("head", "tree", "base")
-        )
-    ):
+    candidate = _canonical_audit_target(value.get("candidate"))
+    if candidate is None:
         return None
     if candidate != expected_candidate:
         return None  # exact-head mismatch
@@ -9524,10 +9572,11 @@ def _canonical_blocking_packet(
     if disposition not in AUDIT_BLOCKING_DISPOSITIONS:
         return None
     blockers = value.get("blockers")
-    if not isinstance(blockers, list):
-        return None
+    if not isinstance(blockers, list) or not blockers:
+        return None  # REQUEST_CHANGES must carry at least one blocker
     normalized_blockers: list[dict[str, Any]] = []
     seen_ids: set[str] = set()
+    blocker_families: set[str] = set()
     for blocker in blockers:
         if not isinstance(blocker, dict):
             return None
@@ -9538,6 +9587,10 @@ def _canonical_blocking_packet(
         for key in AUDIT_BLOCKING_BLOCKER_BASE_KEYS:
             if type(blocker[key]) is not str or not blocker[key].strip():
                 return None
+        blocker_family = blocker["family"]
+        if blocker_family not in AUDIT_BLOCKING_REQUIRED_FAMILIES:
+            return None  # unknown blocker family
+        blocker_families.add(blocker_family)
         blocker_id = blocker["id"]
         if blocker_id in seen_ids:
             return None  # duplicate blocker id
@@ -9569,6 +9622,14 @@ def _canonical_blocking_packet(
             entry["disposition"] = None
             entry["classification"] = blocker["classification"]
         normalized_blockers.append(entry)
+    # B2: blocker families must map consistently to FAIL coverage, and every
+    # FAIL family must be backed by at least one blocker.
+    for blocker in normalized_blockers:
+        if normalized_coverage[blocker["family"]]["disposition"] != "FAIL":
+            return None  # blocker in a non-FAIL family
+    for family in AUDIT_BLOCKING_REQUIRED_FAMILIES:
+        if normalized_coverage[family]["disposition"] == "FAIL" and family not in blocker_families:
+            return None  # FAIL family without a blocker
     if audit_round >= 2:
         dispositioned = {
             blocker["id"] for blocker in normalized_blockers
@@ -9576,13 +9637,15 @@ def _canonical_blocking_packet(
         }
         if not prior_blocker_ids.issubset(dispositioned):
             return None  # missing prior-blocker disposition
-    # From round 3 on, any non-PATCH_INTRODUCED finding freezes the loop.
+    # From round 3 on, a same-family non-PATCH_INTRODUCED finding freezes the
+    # loop into the CONTRACT_TOO_BROAD stop-loss disposition.
     stop_loss_required = False
     if audit_round >= 3:
         for blocker in normalized_blockers:
             is_closed = blocker.get("disposition") == "CLOSED"
             is_patch_introduced = blocker.get("classification") == "PATCH_INTRODUCED"
-            if not is_closed and not is_patch_introduced:
+            same_family = blocker["family"] in prior_blocker_families
+            if same_family and not is_closed and not is_patch_introduced:
                 stop_loss_required = True
                 break
     if stop_loss_required:
@@ -9827,6 +9890,35 @@ def _record_review_verdict(
                 return existing["reason"] == reason and existing["evidence"] == normalized_evidence
         elif verdict == "request_changes" and evidence is not None:
             return False
+        author = conn.execute(
+            "SELECT status, assignee, factory_build_gate FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        # Durable exact-head candidate binding (provenance-free, so it is also
+        # recoverable during an idempotent verdict replay).
+        receipt = _latest_review_handoff_receipt(conn, task_id, review_task_id)
+        candidate = receipt.candidate if receipt is not None else None
+        if (
+            verdict == "request_changes"
+            and bool(author["factory_build_gate"])
+            and candidate is not None
+        ):
+            # AUDIT_FIRST_PASS_BLOCKING_PACKET_V1 hard gate. Fail closed (zero
+            # mutation) when the packet is missing/malformed/stale/mismatched.
+            audit_round, prior_blocker_ids, prior_blocker_families = _prior_blocking_state(
+                conn, task_id, exclude_review_run_id=expected_review_run_id,
+            )
+            normalized_blocking_packet = _canonical_blocking_packet(
+                blocking_packet,
+                audit_round=audit_round,
+                expected_candidate=candidate,
+                prior_blocker_ids=prior_blocker_ids,
+                prior_blocker_families=prior_blocker_families,
+            )
+            if normalized_blocking_packet is None:
+                return False  # fail closed, zero mutation
+        # Idempotent replay: an exact duplicate is idempotent; any mismatch
+        # (including a different or malformed blocking_packet) fails closed.
         prior = conn.execute(
             "SELECT run_id, payload FROM task_events WHERE task_id = ? "
             "AND kind = 'review_verdict' ORDER BY id DESC",
@@ -9847,6 +9939,9 @@ def _record_review_verdict(
                     or payload.get("reason") != reason
                 ):
                     return False
+                if verdict == "request_changes":
+                    if payload.get("blocking_packet") != normalized_blocking_packet:
+                        return False
                 if verdict == "pass":
                     replay = conn.execute(
                         "SELECT 1 FROM tasks author JOIN tasks child ON child.id = ? "
@@ -9873,10 +9968,6 @@ def _record_review_verdict(
         handoff = _review_handoff_event_for_child(conn, task_id, review_task_id)
         if handoff is None:
             return False
-        author = conn.execute(
-            "SELECT status, assignee, factory_build_gate FROM tasks WHERE id = ?",
-            (task_id,),
-        ).fetchone()
         child = conn.execute(
             "SELECT status, current_run_id, assignee FROM tasks WHERE id = ?",
             (review_task_id,),
@@ -9901,25 +9992,6 @@ def _record_review_verdict(
             or review_run["ended_at"] is not None
         ):
             return False
-        if verdict == "request_changes":
-            # AUDIT_FIRST_PASS_BLOCKING_PACKET_V1 hard gate. Applicable exactly
-            # to factory exact-head audits (factory_build_gate=1 author whose
-            # handoff carries a structured exact-head candidate envelope).
-            receipt = _review_handoff_receipt_from_row(task_id, handoff)
-            candidate = (
-                _exact_head_candidate_from_handoff(receipt.reason)
-                if receipt is not None else None
-            )
-            if bool(author["factory_build_gate"]) and candidate is not None:
-                audit_round, prior_blocker_ids = _prior_blocking_state(conn, task_id)
-                normalized_blocking_packet = _canonical_blocking_packet(
-                    blocking_packet,
-                    audit_round=audit_round,
-                    expected_candidate=candidate,
-                    prior_blocker_ids=prior_blocker_ids,
-                )
-                if normalized_blocking_packet is None:
-                    return False  # fail closed, zero mutation
         payload = {
             "version": 1,
             "review_task_id": review_task_id,

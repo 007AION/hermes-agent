@@ -854,6 +854,7 @@ def _handle_request_review(args: dict, **kw) -> str:
                 expected_run_id=run_id,
                 review_task_id=review_task_id,
                 reason=reason,
+                candidate=args.get("candidate"),
             )
             if receipt is None:
                 return tool_error(
@@ -1985,6 +1986,25 @@ KANBAN_REQUEST_REVIEW_SCHEMA = {
             "reason": {
                 "type": "string",
                 "description": "Concise review handoff reason and candidate identity.",
+            },
+            "candidate": {
+                "type": "object",
+                "description": (
+                    "Durable exact-head candidate binding "
+                    "{repository, pr, head, tree, base}. Required for a factory "
+                    "exact-head audit so the AUDIT_FIRST_PASS_BLOCKING_PACKET_V1 "
+                    "gate can bind the auditor's blocking_packet to the declared "
+                    "candidate; omit for non-exact-head reviews."
+                ),
+                "properties": {
+                    "repository": {"type": "string"},
+                    "pr": {"type": "integer"},
+                    "head": {"type": "string"},
+                    "tree": {"type": "string"},
+                    "base": {"type": "string"},
+                },
+                "required": ["repository", "pr", "head", "tree", "base"],
+                "additionalProperties": False,
             },
             "board": _board_schema_prop(),
         },
