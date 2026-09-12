@@ -496,13 +496,19 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
              "--provider <name>). Cleared together with the model.",
     )
     p_set_model.add_argument(
+        "--expect-task-id", default=None,
+        help="Fail-closed CAS: independently repeat the exact intended task id. "
+             "Required with --expect-model and --expect-provider.",
+    )
+    p_set_model.add_argument(
         "--expect-model", default=None,
         help="Fail-closed CAS: require this exact current model ('none' for NULL)",
     )
     p_set_model.add_argument(
         "--expect-provider", default=None,
         help="Fail-closed CAS: require this exact current provider ('none' for NULL). "
-             "Requires --expect-model and an authenticated assignee profile.",
+             "Requires both other --expect-* values and an authenticated "
+             "assignee profile.",
     )
 
     # --- reclaim / reassign (recovery) ---
@@ -1860,12 +1866,18 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
     if model is not None and model.lower() in {"none", "-", "null", ""}:
         model = None
     provider = getattr(args, "provider", None)
+    expected_task_id = getattr(args, "expect_task_id", None)
     expected_model = getattr(args, "expect_model", None)
     expected_provider = getattr(args, "expect_provider", None)
-    cas_requested = expected_model is not None or expected_provider is not None
-    if cas_requested and (expected_model is None or expected_provider is None):
+    cas_requested = any(value is not None for value in (
+        expected_task_id, expected_model, expected_provider,
+    ))
+    if cas_requested and any(value is None for value in (
+        expected_task_id, expected_model, expected_provider,
+    )):
         print(
-            "kanban: --expect-model and --expect-provider must be supplied together",
+            "kanban: --expect-task-id, --expect-model, and --expect-provider "
+            "must be supplied together",
             file=sys.stderr,
         )
         return 2
@@ -1879,6 +1891,7 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
                 outcome = kb.compare_and_set_model_override(
                     conn,
                     args.task_id,
+                    expected_task_id=expected_task_id,
                     expected_model=expected_model,
                     expected_provider=expected_provider,
                     model=model,

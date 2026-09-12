@@ -139,6 +139,7 @@ def test_compare_and_set_model_override_exact_transition(conn, monkeypatch):
 
     outcome = kb.compare_and_set_model_override(
         conn, tid,
+        expected_task_id=tid,
         expected_model="deepseek-v4-pro",
         expected_provider="openrouter",
         model="gpt-5.6-sol",
@@ -167,6 +168,7 @@ def test_compare_and_set_model_override_idempotent_replay_is_noop(conn, monkeypa
         model_override="deepseek-v4-pro", provider_override="openrouter",
     )
     args = dict(
+        expected_task_id=tid,
         expected_model="deepseek-v4-pro",
         expected_provider="openrouter",
         model="gpt-5.6-sol",
@@ -177,6 +179,62 @@ def test_compare_and_set_model_override_idempotent_replay_is_noop(conn, monkeypa
 
     assert kb.compare_and_set_model_override(conn, tid, **args) == "already_applied"
     assert len(kb.list_events(conn, tid)) == event_count
+
+
+def test_compare_and_set_model_override_already_desired_without_receipt_rejects(
+    conn, monkeypatch,
+):
+    monkeypatch.setenv("HERMES_PROFILE", "worker")
+    tid = kb.create_task(
+        conn, title="t", assignee="worker",
+        model_override="gpt-5.6-sol", provider_override="openai-codex",
+    )
+    before = kb.get_task(conn, tid)
+    before_events = len(kb.list_events(conn, tid))
+
+    with pytest.raises(RuntimeError, match="CAS mismatch"):
+        kb.compare_and_set_model_override(
+            conn, tid,
+            expected_task_id=tid,
+            expected_model="definitely-stale-model",
+            expected_provider="definitely-stale-provider",
+            model="gpt-5.6-sol",
+            provider="openai-codex",
+        )
+
+    assert kb.get_task(conn, tid) == before
+    assert len(kb.list_events(conn, tid)) == before_events
+
+
+def test_compare_and_set_model_override_replay_requires_exact_receipt(conn, monkeypatch):
+    monkeypatch.setenv("HERMES_PROFILE", "worker")
+    tid = kb.create_task(
+        conn, title="t", assignee="worker",
+        model_override="deepseek-v4-pro", provider_override="openrouter",
+    )
+    assert kb.compare_and_set_model_override(
+        conn, tid,
+        expected_task_id=tid,
+        expected_model="deepseek-v4-pro",
+        expected_provider="openrouter",
+        model="gpt-5.6-sol",
+        provider="openai-codex",
+    ) == "updated"
+    before = kb.get_task(conn, tid)
+    before_events = len(kb.list_events(conn, tid))
+
+    with pytest.raises(RuntimeError, match="matching prior CAS receipt"):
+        kb.compare_and_set_model_override(
+            conn, tid,
+            expected_task_id=tid,
+            expected_model="some-other-old-model",
+            expected_provider="openrouter",
+            model="gpt-5.6-sol",
+            provider="openai-codex",
+        )
+
+    assert kb.get_task(conn, tid) == before
+    assert len(kb.list_events(conn, tid)) == before_events
 
 
 @pytest.mark.parametrize(
@@ -203,6 +261,7 @@ def test_compare_and_set_model_override_hostile_inputs_do_not_mutate(
     with pytest.raises((LookupError, PermissionError, RuntimeError)):
         kb.compare_and_set_model_override(
             conn, target_id,
+            expected_task_id=target_id,
             expected_model=expected_model,
             expected_provider=expected_provider,
             model="gpt-5.6-sol",
@@ -225,6 +284,7 @@ def test_compare_and_set_model_override_rejects_active_run(conn, monkeypatch):
     with pytest.raises(RuntimeError, match="active run"):
         kb.compare_and_set_model_override(
             conn, tid,
+            expected_task_id=tid,
             expected_model="deepseek-v4-pro",
             expected_provider="openrouter",
             model="gpt-5.6-sol",
@@ -249,6 +309,7 @@ def test_compare_and_set_model_override_requires_authenticated_profile(conn, mon
     with pytest.raises(PermissionError, match="authenticated HERMES_PROFILE"):
         kb.compare_and_set_model_override(
             conn, tid,
+            expected_task_id=tid,
             expected_model="deepseek-v4-pro",
             expected_provider="openrouter",
             model="gpt-5.6-sol",
@@ -259,7 +320,7 @@ def test_compare_and_set_model_override_requires_authenticated_profile(conn, mon
     assert len(kb.list_events(conn, tid)) == before_events
 
 
-def test_compare_and_set_model_override_wrong_existing_task_fails_role_gate(
+def test_compare_and_set_model_override_same_assignee_wrong_task_fails_identity_gate(
     conn, monkeypatch,
 ):
     monkeypatch.setenv("HERMES_PROFILE", "worker")
@@ -268,15 +329,16 @@ def test_compare_and_set_model_override_wrong_existing_task_fails_role_gate(
         model_override="deepseek-v4-pro", provider_override="openrouter",
     )
     wrong = kb.create_task(
-        conn, title="wrong", assignee="other-worker",
+        conn, title="wrong", assignee="worker",
         model_override="deepseek-v4-pro", provider_override="openrouter",
     )
     target_before = kb.get_task(conn, target)
     wrong_before = kb.get_task(conn, wrong)
 
-    with pytest.raises(PermissionError, match="current assignee"):
+    with pytest.raises(ValueError, match="expected task"):
         kb.compare_and_set_model_override(
             conn, wrong,
+            expected_task_id=target,
             expected_model="deepseek-v4-pro",
             expected_provider="openrouter",
             model="gpt-5.6-sol",
@@ -304,6 +366,7 @@ def test_compare_and_set_model_override_concurrent_replay_writes_once(
             barrier.wait()
             outcomes.append(kb.compare_and_set_model_override(
                 worker_conn, tid,
+                expected_task_id=tid,
                 expected_model="deepseek-v4-pro",
                 expected_provider="openrouter",
                 model="gpt-5.6-sol",
@@ -342,6 +405,7 @@ def test_compare_and_set_model_override_preserves_task_and_edge_fields(conn, mon
 
     assert kb.compare_and_set_model_override(
         conn, tid,
+        expected_task_id=tid,
         expected_model="deepseek-v4-pro", expected_provider="openrouter",
         model="gpt-5.6-sol", provider="openai-codex",
     ) == "updated"
@@ -366,10 +430,12 @@ def test_set_model_cli_parses_exact_binding_cas_flags():
     args = parser.parse_args([
         "kanban", "set-model", "t_exact", "gpt-5.6-sol",
         "--provider", "openai-codex",
+        "--expect-task-id", "t_exact",
         "--expect-model", "deepseek-v4-pro",
         "--expect-provider", "openrouter",
     ])
 
+    assert args.expect_task_id == "t_exact"
     assert args.expect_model == "deepseek-v4-pro"
     assert args.expect_provider == "openrouter"
 

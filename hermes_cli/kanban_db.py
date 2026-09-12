@@ -5049,6 +5049,7 @@ def compare_and_set_model_override(
     conn: sqlite3.Connection,
     task_id: str,
     *,
+    expected_task_id: str,
     expected_model: Optional[str],
     expected_provider: Optional[str],
     model: Optional[str],
@@ -5057,13 +5058,20 @@ def compare_and_set_model_override(
     """Atomically migrate one idle task's exact model/provider binding.
 
     This is the fail-closed recovery counterpart to :func:`set_model_override`.
-    The authenticated ``HERMES_PROFILE`` must be the task's current assignee,
-    the task must have no active run, and both old binding fields must match.
-    Replaying the same old-to-new request after success is an idempotent no-op.
+    The caller must independently repeat the intended task id, the authenticated
+    ``HERMES_PROFILE`` must be that task's current assignee, the task must have
+    no active run, and both old binding fields must match. Replaying the same
+    old-to-new request is a no-op only when its prior event receipt matches.
 
     Returns ``"updated"`` or ``"already_applied"``. Every failed precondition
     raises before either the task row or event history is mutated.
     """
+    task_id = (task_id or "").strip()
+    expected_task_id = (expected_task_id or "").strip()
+    if not expected_task_id or task_id != expected_task_id:
+        raise ValueError(
+            f"model override CAS expected task {expected_task_id!r}, got {task_id!r}"
+        )
     expected_model = (expected_model or "").strip() or None
     expected_provider = (expected_provider or "").strip() or None
     model = (model or "").strip() or None
@@ -5103,7 +5111,30 @@ def compare_and_set_model_override(
         current = (row["model_override"], row["provider_override"])
         desired = (model, provider)
         if current == desired:
-            return "already_applied"
+            receipt_rows = conn.execute(
+                "SELECT payload FROM task_events "
+                "WHERE task_id = ? AND kind = 'model_override_cas' "
+                "ORDER BY id DESC",
+                (expected_task_id,),
+            ).fetchall()
+            for receipt_row in receipt_rows:
+                try:
+                    receipt = json.loads(receipt_row["payload"] or "null")
+                except (TypeError, ValueError):
+                    continue
+                if isinstance(receipt, dict) and all((
+                    receipt.get("actor") == actor,
+                    receipt.get("old_model") == expected_model,
+                    receipt.get("old_provider") == expected_provider,
+                    receipt.get("model") == model,
+                    receipt.get("provider") == provider,
+                )):
+                    return "already_applied"
+            raise RuntimeError(
+                "model override CAS mismatch for "
+                f"{task_id}: desired binding is present without a matching "
+                "prior CAS receipt"
+            )
         expected = (expected_model, expected_provider)
         if current != expected:
             raise RuntimeError(
