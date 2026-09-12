@@ -8685,11 +8685,25 @@ def _recovered_verdictless_pass_audit_receipt(
         "SELECT summary FROM task_runs WHERE id = ? AND task_id = ?",
         (terminal_run_id, auditor_task_id),
     ).fetchone()
+    # The terminal summary must name exactly one candidate tuple whose
+    # repository/pr/head/tree/base byte-equal the terminal receipt.  The legacy
+    # check only substring-matched head/tree/base, so a summary naming the
+    # correct SHAs but a different ``owner/repo`` (e.g. ``other/repo``) or a
+    # different ``#<pr>`` (e.g. ``#970``) authenticated as the canonical
+    # candidate.  Binding the summary through the same exactly-one identity
+    # parser as the precursor and handoff closes that hole: ``other/repo``
+    # fails repository byte-equality and ``#970`` yields pr=970 != 97.
+    summary_identity = _single_commit_identity_from_reason(
+        terminal_summary["summary"] if terminal_summary is not None else None
+    )
     if (
         terminal_summary is None
-        or not _reason_bears_commit_identity(
-            terminal_summary["summary"], receipt_identity
-        )
+        or summary_identity is None
+        or summary_identity["repository"] != receipt_identity["repository"]
+        or summary_identity["pr"] != receipt_identity["pr"]
+        or summary_identity["head"] != receipt_identity["head"].lower()
+        or summary_identity["tree"] != receipt_identity["tree"].lower()
+        or summary_identity["base"] != receipt_identity["base"].lower()
     ):
         return None
 

@@ -6633,8 +6633,9 @@ def _crashed_pass_verdictless_recovery_chain(
     }
     summary = (
         f"Recovered and terminalized the already-recorded independent PASS "
-        f"from review run {reviewer_run_a} at exact head {head} (tree {tree}, "
-        f"base {base}); no merge/install/restart performed."
+        f"from review run {reviewer_run_a} for kiddhu/hermes-agent PR #97 "
+        f"at exact head {head}, tree {tree}, base {base}; "
+        f"no merge, install, or restart performed."
     )
     assert kb.complete_task(
         conn, reviewer, expected_run_id=reviewer_run_b,
@@ -7029,5 +7030,49 @@ def test_crashed_pass_verdictless_recovery_rejects_wrong_precursor_repository(
         assert kb._reviewed_author_finalizer_run_id(conn, chain["author"]) is None
         with pytest.raises(kb.FactoryTerminalReceiptRequiredError):
             kb.complete_task(conn, chain["author"], summary="reject wrong precursor repo")
+        assert _native_state_snapshot(conn) == before
+
+
+@pytest.mark.parametrize(
+    "repository, pr_token",
+    [
+        ("other/repo", "97"),           # correct PR, conflicting repository
+        ("kiddhu/hermes-agent", "970"),  # correct repository, conflicting PR
+        ("other/repo", "970"),           # both conflicting (auditor's exact probe)
+    ],
+)
+def test_crashed_pass_verdictless_recovery_rejects_conflicting_terminal_summary(
+    kanban_home, aion_gov_src, repository, pr_token,
+):
+    """A terminal summary naming the correct head/tree/base SHAs but a
+    conflicting repository and/or PR must fail closed.
+
+    The legacy terminal-summary check only substring-matched head/tree/base, so
+    a summary naming ``other/repo PR #970`` with the exact PR97 SHAs still
+    authenticated as the canonical candidate.  Binding the summary through the
+    exactly-one identity parser requires repository/pr/head/tree/base
+    byte-equality, so any conflicting repository or PR token fails closed with
+    zero native-state mutation.
+    """
+    head, tree, base = _CRASHED_PASS_HEAD, _CRASHED_PASS_TREE, _CRASHED_PASS_BASE
+    with kb.connect() as conn:
+        chain = _crashed_pass_verdictless_recovery_chain(conn)
+        summary = (
+            f"Recovered and terminalized the already-recorded independent PASS "
+            f"from review run {chain['reviewer_run_a']} for {repository} "
+            f"PR #{pr_token} at exact head {head}, tree {tree}, base {base}; "
+            f"no merge, install, or restart performed."
+        )
+        conn.execute(
+            "UPDATE task_runs SET summary=? WHERE id=?",
+            (summary, chain["reviewer_run_b"]),
+        )
+        conn.commit()
+        before = _native_state_snapshot(conn)
+
+        assert kb._canonical_audit_receipt(conn, chain["author"]) is None
+        assert kb._reviewed_author_finalizer_run_id(conn, chain["author"]) is None
+        with pytest.raises(kb.FactoryTerminalReceiptRequiredError):
+            kb.complete_task(conn, chain["author"], summary="reject conflicting summary")
         assert _native_state_snapshot(conn) == before
 
