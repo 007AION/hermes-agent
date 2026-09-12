@@ -8271,6 +8271,19 @@ def _canonical_audit_receipt(
         )
         if recovered is not None:
             return recovered
+    if len(verdict_rows) == 1:
+        verdictless = _recovered_verdictless_pass_audit_receipt(
+            conn,
+            verdict_rows,
+            task_id=task_id,
+            author_run_id=author_run_id,
+            author_profile=author_profile,
+            auditor_task_id=auditor_task_id,
+            auditor_profile=auditor_profile,
+            handoff=handoff,
+        )
+        if verdictless is not None:
+            return verdictless
     if len(verdict_rows) != 1:
         return None
     verdict_row = verdict_rows[0]
@@ -8437,6 +8450,170 @@ def _recovered_pass_audit_receipt(
         "auditor_profile": auditor_profile,
         "verdict": "PASS",
         "issued_at": int(recovery_row["created_at"]),
+    }
+    receipt_hash = hashlib.sha256(
+        json.dumps(
+            receipt, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    return {**receipt, "receipt_hash": receipt_hash, "authenticated": True}
+
+
+def _verdictless_completed_pass_corroboration(
+    metadata: Any,
+) -> Optional[dict[str, Any]]:
+    """Validate the verdict-less completed recovery's byte-exact corroboration.
+
+    Accepts exactly one closed metadata shape emitted by a completed auditor run
+    that re-read the same candidate but emitted no version-2 recovery verdict and
+    no version-3 canonical outcome: ``verdict`` in the closed terminal-audit
+    success set, a closed ``exact_artifact`` (repository / pr / head / tree /
+    base), and a closed ``prior_bound_review`` (``review_run_id`` / ``verdict ==
+    "pass"``) causally linking back to the crashed PASS run.  Returns the
+    canonical commit receipt plus the prior review link.  Any partial,
+    ambiguous, malformed, or non-APPROVED shape fails closed (``None``).
+    """
+    if not isinstance(metadata, dict):
+        return None
+    if metadata.get("verdict") not in FACTORY_TERMINAL_AUDIT_SUCCESS_VERDICTS:
+        return None
+    artifact = metadata.get("exact_artifact")
+    if not isinstance(artifact, dict) or set(artifact) != _CANONICAL_AUDIT_TARGET_KEYS:
+        return None
+    repository, pr_number = artifact["repository"], artifact["pr"]
+    if (
+        repository != FACTORY_REVIEW_REPOSITORY
+        or isinstance(pr_number, bool)
+        or not isinstance(pr_number, int)
+        or pr_number <= 0
+        or any(
+            type(artifact[key]) is not str
+            or re.fullmatch(r"[0-9a-fA-F]{40}", artifact[key]) is None
+            for key in ("head", "tree", "base")
+        )
+    ):
+        return None
+    prior = metadata.get("prior_bound_review")
+    if (
+        not isinstance(prior, dict)
+        or set(prior) != {"review_run_id", "verdict"}
+        or prior.get("verdict") != "pass"
+        or isinstance(prior.get("review_run_id"), bool)
+        or not isinstance(prior.get("review_run_id"), int)
+        or prior["review_run_id"] <= 0
+    ):
+        return None
+    return {
+        "receipt": {
+            "repository": repository,
+            "pr": pr_number,
+            "head": artifact["head"],
+            "tree": artifact["tree"],
+            "base": artifact["base"],
+        },
+        "prior_review_run_id": prior["review_run_id"],
+    }
+
+
+def _recovered_verdictless_pass_audit_receipt(
+    conn: sqlite3.Connection,
+    verdict_rows: list[sqlite3.Row],
+    *,
+    task_id: str,
+    author_run_id: int,
+    author_profile: str,
+    auditor_task_id: str,
+    auditor_profile: str,
+    handoff: Any,
+) -> Optional[dict[str, Any]]:
+    """Resolve one PASS from a crashed v1 PASS + verdict-less completed recovery.
+
+    The exact shape this accepts is a single version-1 PASS bound to a crashed
+    protocol-violation run, followed by a *later* completed terminal run that
+    emitted no version-2 recovery verdict and no version-3 canonical outcome,
+    but whose metadata byte-exactly corroborates the crashed PASS commit
+    identity (``exact_artifact`` repository/pr/head/tree/base), causally links
+    back to the crashed run (``prior_bound_review``), and whose task carries a
+    kernel-authentic proof terminal receipt.  Only that one closed causal chain
+    is authenticated; any other single-verdict shape fails closed (``None``).
+    """
+    if len(verdict_rows) != 1:
+        return None
+    if (
+        author_profile != FACTORY_REVIEW_AUTHOR_PROFILE
+        or auditor_profile != FACTORY_REVIEW_AUDITOR_PROFILE
+    ):
+        return None
+    precursor_row = verdict_rows[0]
+    precursor = _canonical_review_verdict_payload(precursor_row)
+    if (
+        precursor is None
+        or precursor["verdict"] != "pass"
+        or precursor["review_task_id"] != auditor_task_id
+        or precursor_row["run_id"] != precursor["review_run_id"]
+        or type(precursor_row["created_at"]) is not int
+    ):
+        return None
+    precursor_run_id = int(precursor["review_run_id"])
+
+    terminal = _authenticated_factory_run_metadata(conn, auditor_task_id)
+    if terminal is None:
+        return None
+    terminal_run_id, terminal_assignee, metadata = terminal
+    if (
+        terminal_assignee != auditor_profile
+        or int(terminal_run_id) <= precursor_run_id
+    ):
+        return None
+
+    precursor_run = conn.execute(
+        "SELECT profile, status, outcome, ended_at, metadata FROM task_runs "
+        "WHERE id = ? AND task_id = ?",
+        (precursor_run_id, auditor_task_id),
+    ).fetchone()
+    if (
+        precursor_run is None
+        or precursor_run["profile"] != auditor_profile
+        or precursor_run["ended_at"] is None
+        or not _run_is_protocol_violation(precursor_run)
+    ):
+        return None
+
+    corroboration = _verdictless_completed_pass_corroboration(metadata)
+    if corroboration is None:
+        return None
+    receipt_identity = corroboration["receipt"]
+    if (
+        corroboration["prior_review_run_id"] != precursor_run_id
+        or not _reason_bears_commit_identity(precursor["reason"], receipt_identity)
+        or f"#{receipt_identity['pr']}" not in precursor["reason"]
+    ):
+        return None
+
+    terminal_summary = conn.execute(
+        "SELECT summary FROM task_runs WHERE id = ? AND task_id = ?",
+        (terminal_run_id, auditor_task_id),
+    ).fetchone()
+    if (
+        terminal_summary is None
+        or not _reason_bears_commit_identity(
+            terminal_summary["summary"], receipt_identity
+        )
+    ):
+        return None
+
+    receipt = {
+        "task_id": task_id,
+        "subject_id": f"{task_id}/{author_run_id}",
+        "subject_version_or_exact_hash": handoff.receipt_sha256,
+        "author_task_id": task_id,
+        "author_run_id": author_run_id,
+        "author_profile": author_profile,
+        "auditor_task_id": auditor_task_id,
+        "auditor_run_id": terminal_run_id,
+        "auditor_profile": auditor_profile,
+        "verdict": "PASS",
+        "issued_at": int(precursor_row["created_at"]),
     }
     receipt_hash = hashlib.sha256(
         json.dumps(

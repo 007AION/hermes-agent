@@ -6561,3 +6561,218 @@ def test_canonical_audit_receipt_authenticates_legacy_blocked_provider_failure(
         )
         author_task = kb.get_task(conn, chain["author"])
         assert author_task is not None and author_task.status == "done"
+
+
+# ---------------------------------------------------------------------------
+# Crashed v1 PASS + verdict-less completed recovery (PR #97 fingerprint)
+# ---------------------------------------------------------------------------
+
+_CRASHED_PASS_HEAD = "a9a82eb99164f14cec2cbfa7c19b5e39057b8676"
+_CRASHED_PASS_TREE = "033502b4dc2f3291bcaa94a736de4256626843ab"
+_CRASHED_PASS_BASE = "13d9faadb3cf1215888a59d9911c5b8e8a2114df"
+
+
+def _crashed_pass_verdictless_recovery_chain(conn):
+    head, tree, base = _CRASHED_PASS_HEAD, _CRASHED_PASS_TREE, _CRASHED_PASS_BASE
+    reason = (
+        f"PASS_EXACT_HEAD: independently audited kiddhu/hermes-agent PR #97 "
+        f"at head {head}, tree {tree}, base {base}"
+    )
+    author = kb.create_task(
+        conn, title="crashed-PASS reviewed author", factory_build_gate=1,
+        assignee="agent007",
+    )
+    reviewer = kb.create_task(
+        conn, title="crashed-PASS auditor", factory_build_gate=1,
+        assignee="bafuxunan", parents=[author],
+    )
+    author_run = _claim_and_run_id(conn, author)
+    handoff = kb.request_review_handoff(
+        conn, author, expected_run_id=author_run, review_task_id=reviewer,
+        reason=f"PR #97 (kiddhu/hermes-agent) head {head}, tree {tree}, base {base}",
+    )
+    assert handoff is not None
+    reviewer_run_a = _claim_and_run_id(conn, reviewer)
+    assert _record_legacy_review_verdict_fixture(
+        conn, author, review_task_id=reviewer,
+        expected_review_run_id=reviewer_run_a, verdict="pass", reason=reason,
+    )
+    # Crash the precursor run as a clean protocol violation.
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE task_runs SET status='crashed', outcome='crashed', "
+            "ended_at=?, metadata=? WHERE id=? AND task_id=?",
+            (int(time.time()), json.dumps({"protocol_violation": True}),
+             reviewer_run_a, reviewer),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='ready', current_run_id=NULL, "
+            "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, "
+            "worker_starttime=NULL, fence_lineage=NULL, fence_disposition=NULL, "
+            "block_kind=NULL, block_recurrences=0 WHERE id=?",
+            (reviewer,),
+        )
+    reviewer_run_b = _claim_and_run_id(conn, reviewer)
+    assert reviewer_run_b > reviewer_run_a
+    metadata = {
+        "verdict": "PASS_EXACT_HEAD",
+        "exact_artifact": {
+            "repository": "kiddhu/hermes-agent", "pr": 97,
+            "head": head, "tree": tree, "base": base,
+        },
+        "prior_bound_review": {"review_run_id": reviewer_run_a, "verdict": "pass"},
+        "role_separation": {"author": "007AION", "auditor": "GemAION", "holds": True},
+    }
+    summary = (
+        f"Recovered and terminalized the already-recorded independent PASS "
+        f"from review run {reviewer_run_a} at exact head {head} (tree {tree}, "
+        f"base {base}); no merge/install/restart performed."
+    )
+    assert kb.complete_task(
+        conn, reviewer, expected_run_id=reviewer_run_b,
+        summary=summary, metadata=metadata,
+    )
+    return {
+        "author": author, "author_run": author_run, "reviewer": reviewer,
+        "reviewer_run_a": reviewer_run_a, "reviewer_run_b": reviewer_run_b,
+        "handoff": handoff, "head": head, "tree": tree, "base": base,
+        "reason": reason, "metadata": metadata, "summary": summary,
+    }
+
+
+def test_crashed_pass_verdictless_recovery_authenticates(
+    kanban_home, aion_gov_src,
+):
+    with kb.connect() as conn:
+        chain = _crashed_pass_verdictless_recovery_chain(conn)
+        before = _native_state_snapshot(conn)
+
+        receipt = kb._canonical_audit_receipt(conn, chain["author"])
+
+        assert receipt is not None
+        assert receipt["authenticated"] is True
+        assert receipt["verdict"] == "PASS"
+        assert receipt["author_task_id"] == chain["author"]
+        assert receipt["author_run_id"] == chain["author_run"]
+        assert receipt["author_profile"] == "agent007"
+        assert receipt["auditor_task_id"] == chain["reviewer"]
+        assert receipt["auditor_run_id"] == chain["reviewer_run_b"]
+        assert receipt["auditor_profile"] == "bafuxunan"
+        # Deterministic recompute and zero-mutation read.
+        assert receipt == kb._canonical_audit_receipt(conn, chain["author"])
+        assert _native_state_snapshot(conn) == before
+        # The reviewed-author finalizer consumes the receipt and terminalizes.
+        assert (
+            kb._reviewed_author_finalizer_run_id(conn, chain["author"])
+            == chain["author_run"]
+        )
+        assert kb.complete_task(
+            conn, chain["author"], summary="recovered crash-PASS terminalized",
+        )
+        author_task = kb.get_task(conn, chain["author"])
+        assert author_task is not None and author_task.status == "done"
+
+
+def _crashed_pass_verdictless_drift(conn, chain, drift):
+    reviewer = chain["reviewer"]
+    run_b = chain["reviewer_run_b"]
+    if drift == "missing_metadata":
+        conn.execute(
+            "UPDATE task_runs SET metadata=NULL WHERE id=?", (run_b,),
+        )
+    elif drift == "empty_metadata":
+        conn.execute(
+            "UPDATE task_runs SET metadata='{}' WHERE id=?", (run_b,),
+        )
+    elif drift == "missing_receipt":
+        conn.execute(
+            "UPDATE tasks SET factory_terminal_receipt_sha256=NULL WHERE id=?",
+            (reviewer,),
+        )
+    elif drift == "wrong_role":
+        conn.execute("UPDATE tasks SET assignee='gm' WHERE id=?", (reviewer,))
+    elif drift == "duplicate_verdict":
+        row = conn.execute(
+            "SELECT task_id, kind, payload, run_id, created_at FROM task_events "
+            "WHERE task_id=? AND kind='review_verdict' AND run_id=?",
+            (chain["author"], chain["reviewer_run_a"]),
+        ).fetchone()
+        conn.execute(
+            "INSERT INTO task_events(task_id, kind, payload, run_id, created_at) "
+            "VALUES (?,?,?,?,?)", tuple(row),
+        )
+    elif drift == "extra_crashed_run":
+        conn.execute(
+            "INSERT INTO task_runs(task_id, profile, status, outcome, "
+            "started_at, ended_at, metadata) "
+            "VALUES (?, 'bafuxunan', 'crashed', 'crashed', 1, 2, ?)",
+            (reviewer, json.dumps({"protocol_violation": True})),
+        )
+    elif drift == "summary_no_identity":
+        conn.execute(
+            "UPDATE task_runs SET summary='recovered but no shas' WHERE id=?",
+            (run_b,),
+        )
+    else:
+        # Metadata field mutations on the terminal recovery run.
+        metadata = json.loads(
+            conn.execute(
+                "SELECT metadata FROM task_runs WHERE id=?", (run_b,),
+            ).fetchone()["metadata"]
+        )
+        if drift == "wrong_verdict":
+            metadata["verdict"] = "REQUEST_CHANGES_EXACT_HEAD"
+        elif drift == "missing_exact_artifact":
+            metadata.pop("exact_artifact")
+        elif drift == "mismatched_head":
+            metadata["exact_artifact"]["head"] = "f" * 40
+        elif drift == "mismatched_tree":
+            metadata["exact_artifact"]["tree"] = "f" * 40
+        elif drift == "mismatched_base":
+            metadata["exact_artifact"]["base"] = "f" * 40
+        elif drift == "mismatched_pr":
+            metadata["exact_artifact"]["pr"] = 98
+        elif drift == "wrong_repository":
+            metadata["exact_artifact"]["repository"] = "other/repo"
+        elif drift == "non_hex_head":
+            metadata["exact_artifact"]["head"] = "not-a-sha"
+        elif drift == "missing_prior":
+            metadata.pop("prior_bound_review")
+        elif drift == "prior_run_mismatch":
+            metadata["prior_bound_review"]["review_run_id"] = run_b
+        elif drift == "prior_verdict_not_pass":
+            metadata["prior_bound_review"]["verdict"] = "request_changes"
+        elif drift == "prior_extra_key":
+            metadata["prior_bound_review"]["extra"] = 1
+        else:
+            raise AssertionError(f"unknown drift {drift}")
+        conn.execute(
+            "UPDATE task_runs SET metadata=? WHERE id=?", (json.dumps(metadata), run_b),
+        )
+
+
+@pytest.mark.parametrize(
+    "drift",
+    [
+        "missing_metadata", "empty_metadata", "missing_receipt", "wrong_role",
+        "duplicate_verdict", "extra_crashed_run", "summary_no_identity",
+        "wrong_verdict", "missing_exact_artifact", "mismatched_head",
+        "mismatched_tree", "mismatched_base", "mismatched_pr",
+        "wrong_repository", "non_hex_head", "missing_prior",
+        "prior_run_mismatch", "prior_verdict_not_pass", "prior_extra_key",
+    ],
+)
+def test_crashed_pass_verdictless_recovery_hostile_drift_zero_mutation(
+    kanban_home, aion_gov_src, drift,
+):
+    with kb.connect() as conn:
+        chain = _crashed_pass_verdictless_recovery_chain(conn)
+        _crashed_pass_verdictless_drift(conn, chain, drift)
+        conn.commit()
+        before = _native_state_snapshot(conn)
+
+        assert kb._canonical_audit_receipt(conn, chain["author"]) is None
+        assert kb._reviewed_author_finalizer_run_id(conn, chain["author"]) is None
+        with pytest.raises(kb.FactoryTerminalReceiptRequiredError):
+            kb.complete_task(conn, chain["author"], summary=f"reject {drift}")
+        assert _native_state_snapshot(conn) == before
