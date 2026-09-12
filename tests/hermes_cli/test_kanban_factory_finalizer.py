@@ -6713,6 +6713,53 @@ def _crashed_pass_verdictless_drift(conn, chain, drift):
             "UPDATE task_runs SET summary='recovered but no shas' WHERE id=?",
             (run_b,),
         )
+    elif drift == "coupled_rewrite":
+        # Coordinated rewrite: the precursor PASS reason plus the terminal
+        # metadata exact_artifact and summary all re-point to a DIFFERENT valid
+        # PR/head/tree/base, while the immutable receipt-signed handoff still
+        # references the original identity. The recovered candidate identity
+        # must be bound to the handoff, so this self-consistent crash-recovery
+        # rewrite must still fail closed.
+        alt_pr, alt_head = 98, "b" * 40
+        alt_tree, alt_base = "c" * 40, "d" * 40
+        alt_reason = (
+            f"PASS_EXACT_HEAD: independently audited kiddhu/hermes-agent "
+            f"PR #{alt_pr} at head {alt_head}, tree {alt_tree}, base {alt_base}"
+        )
+        alt_payload = {
+            "version": 1,
+            "review_task_id": reviewer,
+            "review_run_id": chain["reviewer_run_a"],
+            "verdict": "pass",
+            "reason": alt_reason,
+        }
+        for tid in (chain["author"], reviewer):
+            conn.execute(
+                "UPDATE task_events SET payload=? "
+                "WHERE task_id=? AND kind='review_verdict' AND run_id=?",
+                (json.dumps(alt_payload), tid, chain["reviewer_run_a"]),
+            )
+        metadata = json.loads(
+            conn.execute(
+                "SELECT metadata FROM task_runs WHERE id=?", (run_b,),
+            ).fetchone()["metadata"]
+        )
+        metadata["exact_artifact"] = {
+            "repository": "kiddhu/hermes-agent", "pr": alt_pr,
+            "head": alt_head, "tree": alt_tree, "base": alt_base,
+        }
+        conn.execute(
+            "UPDATE task_runs SET metadata=? WHERE id=?",
+            (json.dumps(metadata), run_b),
+        )
+        conn.execute(
+            "UPDATE task_runs SET summary=? WHERE id=?",
+            (
+                f"Recovered PASS from run {chain['reviewer_run_a']} at exact "
+                f"head {alt_head} (tree {alt_tree}, base {alt_base})",
+                run_b,
+            ),
+        )
     else:
         # Metadata field mutations on the terminal recovery run.
         metadata = json.loads(
@@ -6760,6 +6807,7 @@ def _crashed_pass_verdictless_drift(conn, chain, drift):
         "mismatched_tree", "mismatched_base", "mismatched_pr",
         "wrong_repository", "non_hex_head", "missing_prior",
         "prior_run_mismatch", "prior_verdict_not_pass", "prior_extra_key",
+        "coupled_rewrite",
     ],
 )
 def test_crashed_pass_verdictless_recovery_hostile_drift_zero_mutation(

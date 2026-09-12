@@ -8534,8 +8534,12 @@ def _recovered_verdictless_pass_audit_receipt(
     but whose metadata byte-exactly corroborates the crashed PASS commit
     identity (``exact_artifact`` repository/pr/head/tree/base), causally links
     back to the crashed run (``prior_bound_review``), and whose task carries a
-    kernel-authentic proof terminal receipt.  Only that one closed causal chain
-    is authenticated; any other single-verdict shape fails closed (``None``).
+    kernel-authentic proof terminal receipt.  The recovered candidate identity
+    must additionally match the exact immutable ``handoff.reason`` byte-for-byte
+    (repository/pr/head/tree/base), so a coordinated rewrite of the crashed
+    PASS reason plus the terminal metadata/summary cannot re-anchor the chain
+    to a different candidate.  Only that one closed causal chain is
+    authenticated; any other single-verdict shape fails closed (``None``).
     """
     if len(verdict_rows) != 1:
         return None
@@ -8587,6 +8591,18 @@ def _recovered_verdictless_pass_audit_receipt(
         corroboration["prior_review_run_id"] != precursor_run_id
         or not _reason_bears_commit_identity(precursor["reason"], receipt_identity)
         or f"#{receipt_identity['pr']}" not in precursor["reason"]
+    ):
+        return None
+
+    # Bind the recovered candidate identity to the exact immutable handoff.
+    # The handoff reason is the receipt-signed durable record of what the author
+    # actually handed off; a coordinated rewrite of the precursor PASS reason
+    # plus the terminal metadata/summary cannot re-anchor that identity without
+    # also tampering with the handoff (which fails its receipt_sha256 check).
+    if (
+        not _reason_bears_commit_identity(handoff.reason, receipt_identity)
+        or f"#{receipt_identity['pr']}" not in handoff.reason
+        or receipt_identity["repository"] not in handoff.reason
     ):
         return None
 
