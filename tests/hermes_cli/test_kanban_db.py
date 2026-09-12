@@ -7728,6 +7728,122 @@ def test_current_v3_outcome_link_evolution_cannot_erase_promotion(kanban_home):
         assert kb._reviewed_author_finalizer_run_id(conn, author) is None
 
 
+
+
+def test_current_v3_outcome_duplicate_promoted_fact_fails_closed(kanban_home):
+    """A duplicated terminal-window promoted fact fails closed, not collapsed.
+
+    The terminal producer emits exactly one ``promoted`` event per promoted
+    task. Appending a second byte-shape-identical ``promoted`` row for the
+    same task inside the terminal window while the signed
+    ``continuation_ids`` lists that task exactly once is an ambiguous
+    duplicate fact; the reader must reject it rather than deduplicate a
+    partial column projection into the producer's one-member list.
+    """
+    with kb.connect() as conn:
+        author, run_id, review_task = _review_handoff_pair(conn)
+        assert kb.request_review_handoff(
+            conn, author, expected_run_id=run_id, review_task_id=review_task,
+            reason=_APPROVED_HANDOFF,
+        )
+        child = kb.create_task(
+            conn, title="promoted continuation", assignee="merger",
+            parents=[review_task],
+        )
+        assert kb.get_task(conn, child).status == "todo"
+        audit_run = kb.claim_task(conn, review_task).current_run_id
+        assert kb.record_review_verdict(
+            conn, author, review_task_id=review_task,
+            expected_review_run_id=audit_run, verdict="pass",
+            reason="PASS_CURRENT_V3_FIXTURE", evidence=_APPROVED_EVIDENCE,
+        )
+        assert kb.get_task(conn, child).status == "ready"
+        present, receipt = kb._canonical_current_audit_outcome(conn, author)
+        assert present is True and receipt is not None
+        assert receipt["authenticated"] is True
+
+        outcome = conn.execute(
+            "SELECT id, payload, created_at FROM task_events "
+            "WHERE task_id=? AND run_id=? AND kind='canonical_audit_outcome'",
+            (review_task, audit_run),
+        ).fetchone()
+        fact = conn.execute(
+            "SELECT id, payload, created_at FROM task_events "
+            "WHERE task_id=? AND run_id=? AND kind='changed_fact'",
+            (review_task, audit_run),
+        ).fetchone()
+        outcome_obj = json.loads(outcome["payload"])
+        fact_obj = json.loads(fact["payload"])
+        assert outcome_obj["continuation_ids"] == [child]
+        with kb.write_txn(conn):
+            conn.execute(
+                "DELETE FROM task_events WHERE id IN (?, ?)",
+                (outcome["id"], fact["id"]),
+            )
+            kb._append_event(conn, child, "promoted", None)
+            kb._append_event(
+                conn, review_task, "canonical_audit_outcome", outcome_obj,
+                run_id=audit_run, created_at=outcome["created_at"],
+            )
+            new_outcome_id = int(
+                conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+            )
+            fact_obj["outcome_event_id"] = new_outcome_id
+            kb._append_event(
+                conn, review_task, "changed_fact", fact_obj,
+                run_id=audit_run, created_at=fact["created_at"],
+            )
+        assert kb._canonical_current_audit_outcome(conn, author) == (True, None)
+        assert kb._reviewed_author_finalizer_run_id(conn, author) is None
+
+
+def test_current_v3_outcome_noncanonical_promoted_shape_fails_closed(kanban_home):
+    """A promoted event with non-null run_id/payload fails closed, not partial.
+
+    Dependency promotion events are canonically emitted with run_id NULL and
+    payload NULL. Mutating the sole terminal-window promoted event to carry a
+    non-null run_id and an unexpected payload must fail closed even though the
+    task id is unchanged and the signed ``continuation_ids`` still list it.
+    """
+    with kb.connect() as conn:
+        author, run_id, review_task = _review_handoff_pair(conn)
+        assert kb.request_review_handoff(
+            conn, author, expected_run_id=run_id, review_task_id=review_task,
+            reason=_APPROVED_HANDOFF,
+        )
+        child = kb.create_task(
+            conn, title="promoted continuation", assignee="merger",
+            parents=[review_task],
+        )
+        assert kb.get_task(conn, child).status == "todo"
+        audit_run = kb.claim_task(conn, review_task).current_run_id
+        assert kb.record_review_verdict(
+            conn, author, review_task_id=review_task,
+            expected_review_run_id=audit_run, verdict="pass",
+            reason="PASS_CURRENT_V3_FIXTURE", evidence=_APPROVED_EVIDENCE,
+        )
+        assert kb.get_task(conn, child).status == "ready"
+        present, receipt = kb._canonical_current_audit_outcome(conn, author)
+        assert present is True and receipt is not None
+        assert receipt["authenticated"] is True
+
+        promoted = conn.execute(
+            "SELECT id FROM task_events WHERE task_id=? AND kind='promoted'",
+            (child,),
+        ).fetchone()
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_events SET run_id=?, payload=? WHERE id=?",
+                (
+                    audit_run,
+                    json.dumps({"unexpected": "not dependency promotion shape"}),
+                    promoted["id"],
+                ),
+            )
+        assert kb._canonical_current_audit_outcome(conn, author) == (True, None)
+        assert kb._reviewed_author_finalizer_run_id(conn, author) is None
+
+
 def test_current_v3_outcome_bool_fact_version_fails_closed(kanban_home):
     with kb.connect() as conn:
         author, run_id, review_task, audit_run = _current_v3_outcome(conn)

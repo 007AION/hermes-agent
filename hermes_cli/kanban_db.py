@@ -9922,6 +9922,16 @@ def _current_v3_continuation_targets(
     producer-promoted continuation. A ``promoted`` event from an earlier
     transaction (a prior parent's completion) is NOT this terminal transaction's
     output, so it must not count as a continuation.
+
+    The promotion fact is *closed and exact*, not a task-id set inferred from
+    any row named ``promoted``. The producer's terminal ``recompute_ready``
+    emits exactly one ``promoted`` event per promoted task, each canonically
+    shaped as ``run_id IS NULL`` and ``payload IS NULL``. The validator reads
+    every matching row (preserving multiplicity) and fails closed — returning
+    ``None`` — if any row is noncanonically shaped (non-null ``run_id`` or
+    non-null ``payload``) or if the same task id appears in more than one
+    promoted row (ambiguous duplicate fact), rather than deduplicating a
+    partial column projection into the producer's one-member list.
     """
     completed_rows = conn.execute(
         "SELECT id FROM task_events WHERE task_id = ? AND run_id = ? "
@@ -9934,11 +9944,27 @@ def _current_v3_continuation_targets(
     if lower >= outcome_event_id:
         return None
     rows = conn.execute(
-        "SELECT DISTINCT task_id FROM task_events "
-        "WHERE kind = 'promoted' AND id > ? AND id < ?",
+        "SELECT task_id, run_id, payload FROM task_events "
+        "WHERE kind = 'promoted' AND id > ? AND id < ? ORDER BY id",
         (lower, outcome_event_id),
     ).fetchall()
-    targets: list[str] = sorted(str(row["task_id"]) for row in rows)
+    targets: list[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        # Canonical producer shape: dependency promotion is run-unscoped and
+        # payload-less (NULL/NULL). Any non-null run_id or payload is a
+        # noncanonical event shape, and any repeated task id is an ambiguous
+        # duplicate fact — the producer emits exactly one NULL/NULL promoted
+        # row per promoted task, so both fail closed instead of silently
+        # normalizing a partial projection.
+        if row["run_id"] is not None or row["payload"] is not None:
+            return None
+        task_id = row["task_id"]
+        if not isinstance(task_id, str) or not task_id or task_id in seen:
+            return None
+        seen.add(task_id)
+        targets.append(task_id)
+    targets.sort()
     if targets:
         return _EARLIER_V3_DISPOSITION_CONTINUATION, targets
     return _EARLIER_V3_DISPOSITION_FINAL, []
