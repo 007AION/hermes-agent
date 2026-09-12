@@ -7037,10 +7037,23 @@ def _review_handoff_receipt_from_row(
 def _canonical_review_verdict_payload(row: sqlite3.Row) -> Optional[dict[str, Any]]:
     try:
         payload = json.loads(row["payload"] or "{}")
+        if not isinstance(payload, dict):
+            return None
+        base = {"version", "review_task_id", "review_run_id", "verdict", "reason"}
+        keys = set(payload)
+        if keys not in (base, base | {"blocking_packet"}):
+            return None
+        if "blocking_packet" in payload:
+            # The blocking_packet is only ever attached to a REQUEST_CHANGES
+            # verdict, and is a machine packet (full validation happens at the
+            # write gate; here we only require the structural shape).
+            if payload.get("verdict") != "request_changes":
+                return None
+            if not isinstance(payload["blocking_packet"], dict):
+                return None
         schema = {"version": int, "review_task_id": str, "review_run_id": int,
                   "verdict": str, "reason": str}
-        if (not isinstance(payload, dict) or set(payload) != set(schema)
-                or any(type(payload[key]) is not expected for key, expected in schema.items())):
+        if any(type(payload[key]) is not expected for key, expected in schema.items()):
             return None
         return payload if (
             payload["version"] == 1 and bool(payload["review_task_id"].strip())
@@ -9323,6 +9336,272 @@ def _canonical_audit_evidence(value: Any) -> Optional[dict[str, Any]]:
     return {key: value[key] for key in sorted(_CANONICAL_AUDIT_EVIDENCE_KEYS)}
 
 
+# ---------------------------------------------------------------------------
+# AUDIT_FIRST_PASS_BLOCKING_PACKET_V1 — bounded-exhaustive first-pass gate
+# ---------------------------------------------------------------------------
+# A factory exact-head audit's first round is BOUNDED_EXHAUSTIVE_DISCOVERY: the
+# auditor must cover every required failure family and emit all known blockers
+# in one compact, exact-head-bound blocking_packet.  Re-audits are VERIFY: each
+# prior blocker is dispositioned OPEN|CLOSED and each new blocker is classified
+# PATCH_INTRODUCED|AUDIT_MISS.  From round 3 on, any non-PATCH_INTRODUCED
+# finding freezes into the CONTRACT_TOO_BROAD stop-loss disposition instead of
+# another ordinary repair loop.
+
+AUDIT_BLOCKING_PACKET_VERSION = 1
+
+AUDIT_BLOCKING_REQUIRED_FAMILIES = (
+    "contract_scope",
+    "identity_binding",
+    "authorization",
+    "state_lifecycle",
+    "dependency_semantics",
+    "fail_closed",
+    "evidence_provenance",
+    "idempotency_concurrency",
+    "regression_surface",
+)
+
+AUDIT_BLOCKING_FAMILY_DISPOSITIONS = frozenset({"PASS", "FAIL", "NA"})
+AUDIT_BLOCKING_MODES = frozenset({"BOUNDED_EXHAUSTIVE_DISCOVERY", "VERIFY"})
+AUDIT_BLOCKING_BLOCKER_DISPOSITIONS = frozenset({"OPEN", "CLOSED"})
+AUDIT_BLOCKING_BLOCKER_CLASSIFICATIONS = frozenset({"PATCH_INTRODUCED", "AUDIT_MISS"})
+AUDIT_BLOCKING_DISPOSITIONS = frozenset({"REQUEST_CHANGES", "CONTRACT_TOO_BROAD"})
+AUDIT_BLOCKING_STOP_LOSS_DISPOSITION = "CONTRACT_TOO_BROAD"
+AUDIT_BLOCKING_STOP_LOSS_SEQUENCE = (
+    "CONTRACT_TOO_BROAD -> STOP_PATCHING -> SHRINK_ACCEPTANCE_SURFACE"
+)
+
+AUDIT_BLOCKING_BLOCKER_BASE_KEYS = (
+    "id", "family", "invariant", "severity", "evidence_ref", "required_fix",
+)
+
+
+def _exact_head_candidate_from_handoff(reason: str) -> Optional[dict[str, Any]]:
+    """Parse a structured exact-head candidate envelope from a handoff reason.
+
+    Returns the canonical ``{repository, pr, head, tree, base}`` candidate, or
+    ``None`` when ``reason`` is prose/malformed.  This mirrors the PASS-path
+    parser so the blocking-packet gate applies *exactly* to structured
+    exact-head factory audits, never to ordinary prose handoffs or non-factory
+    reviews.
+    """
+    try:
+        target = json.loads(reason)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(target, dict) or set(target) != {"version", "candidate", "summary"}:
+        return None
+    if target.get("version") != 1:
+        return None
+    candidate = target.get("candidate")
+    if not isinstance(candidate, dict) or set(candidate) != _CANONICAL_AUDIT_TARGET_KEYS:
+        return None
+    if not isinstance(target.get("summary"), str) or not target["summary"].strip():
+        return None
+    repository, pr = candidate["repository"], candidate["pr"]
+    if (
+        type(repository) is not str
+        or re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository) is None
+        or type(pr) is not int or pr <= 0
+        or any(
+            type(candidate[key]) is not str
+            or re.fullmatch(r"[0-9a-fA-F]{40}", candidate[key]) is None
+            for key in ("head", "tree", "base")
+        )
+    ):
+        return None
+    return {key: candidate[key] for key in sorted(_CANONICAL_AUDIT_TARGET_KEYS)}
+
+
+def _prior_blocking_state(
+    conn: sqlite3.Connection, task_id: str,
+) -> tuple[int, set[str]]:
+    """Return ``(audit_round, prior_blocker_ids)`` for a review-verdict write.
+
+    ``audit_round`` is one plus the number of prior REQUEST_CHANGES verdicts on
+    the author task.  ``prior_blocker_ids`` is the blocker-id set of the most
+    recent prior blocking_packet, which a VERIFY round must disposition in full.
+    """
+    rows = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? "
+        "AND kind = 'review_verdict' ORDER BY id",
+        (task_id,),
+    ).fetchall()
+    request_changes_count = 0
+    prior_blocker_ids: set[str] = set()
+    for row in rows:
+        try:
+            payload = json.loads(row["payload"] or "{}")
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(payload, dict) or payload.get("verdict") != "request_changes":
+            continue
+        request_changes_count += 1
+        prior_blocker_ids = set()
+        packet = payload.get("blocking_packet")
+        if isinstance(packet, dict):
+            blockers = packet.get("blockers")
+            if isinstance(blockers, list):
+                for blocker in blockers:
+                    if (
+                        isinstance(blocker, dict)
+                        and isinstance(blocker.get("id"), str)
+                        and blocker["id"].strip()
+                    ):
+                        prior_blocker_ids.add(blocker["id"])
+    return request_changes_count + 1, prior_blocker_ids
+
+
+def _canonical_blocking_packet(
+    value: Any,
+    *,
+    audit_round: int,
+    expected_candidate: dict[str, Any],
+    prior_blocker_ids: set[str],
+) -> Optional[dict[str, Any]]:
+    """Validate one closed blocking_packet for a factory exact-head re/audit.
+
+    Fails closed (``None``) on any malformed, stale, incomplete-coverage,
+    exact-head-mismatched, or wrongly-dispositioned shape.  Returns the
+    canonical (sorted-key) packet on success.
+    """
+    if not isinstance(value, dict):
+        return None
+    required_top = {
+        "version", "audit_round", "mode", "candidate", "family_coverage",
+        "blockers", "coverage_complete", "disposition",
+    }
+    if set(value) != required_top:
+        return None
+    if value.get("version") != AUDIT_BLOCKING_PACKET_VERSION:
+        return None
+    round_ = value.get("audit_round")
+    if type(round_) is not int or round_ < 1 or round_ != audit_round:
+        return None  # stale / mismatched round
+    mode = value.get("mode")
+    if mode not in AUDIT_BLOCKING_MODES:
+        return None
+    if mode != ("BOUNDED_EXHAUSTIVE_DISCOVERY" if audit_round == 1 else "VERIFY"):
+        return None
+    candidate = value.get("candidate")
+    if not isinstance(candidate, dict) or set(candidate) != _CANONICAL_AUDIT_TARGET_KEYS:
+        return None
+    repository, pr = candidate["repository"], candidate["pr"]
+    if (
+        type(repository) is not str
+        or re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository) is None
+        or type(pr) is not int or pr <= 0
+        or any(
+            type(candidate[key]) is not str
+            or re.fullmatch(r"[0-9a-fA-F]{40}", candidate[key]) is None
+            for key in ("head", "tree", "base")
+        )
+    ):
+        return None
+    if candidate != expected_candidate:
+        return None  # exact-head mismatch
+    coverage = value.get("family_coverage")
+    if not isinstance(coverage, dict) or set(coverage) != set(AUDIT_BLOCKING_REQUIRED_FAMILIES):
+        return None  # incomplete required-family coverage
+    normalized_coverage: dict[str, dict[str, str]] = {}
+    for family in AUDIT_BLOCKING_REQUIRED_FAMILIES:
+        entry = coverage[family]
+        if (
+            not isinstance(entry, dict)
+            or set(entry) != {"disposition", "evidence_ref"}
+            or entry.get("disposition") not in AUDIT_BLOCKING_FAMILY_DISPOSITIONS
+            or type(entry.get("evidence_ref")) is not str
+            or not entry["evidence_ref"].strip()
+        ):
+            return None
+        normalized_coverage[family] = {
+            "disposition": entry["disposition"],
+            "evidence_ref": entry["evidence_ref"],
+        }
+    if value.get("coverage_complete") is not True:
+        return None
+    disposition = value.get("disposition")
+    if disposition not in AUDIT_BLOCKING_DISPOSITIONS:
+        return None
+    blockers = value.get("blockers")
+    if not isinstance(blockers, list):
+        return None
+    normalized_blockers: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for blocker in blockers:
+        if not isinstance(blocker, dict):
+            return None
+        keys = set(blocker)
+        base = set(AUDIT_BLOCKING_BLOCKER_BASE_KEYS)
+        if not base.issubset(keys):
+            return None
+        for key in AUDIT_BLOCKING_BLOCKER_BASE_KEYS:
+            if type(blocker[key]) is not str or not blocker[key].strip():
+                return None
+        blocker_id = blocker["id"]
+        if blocker_id in seen_ids:
+            return None  # duplicate blocker id
+        seen_ids.add(blocker_id)
+        extra = keys - base
+        if audit_round == 1:
+            if extra:
+                return None  # discovery round carries no disposition/classification
+            normalized_blockers.append(
+                {key: blocker[key] for key in AUDIT_BLOCKING_BLOCKER_BASE_KEYS}
+            )
+            continue
+        # VERIFY round: prior blockers are dispositioned, new blockers classified.
+        is_prior = blocker_id in prior_blocker_ids
+        if is_prior:
+            if extra != {"disposition"}:
+                return None
+            if blocker["disposition"] not in AUDIT_BLOCKING_BLOCKER_DISPOSITIONS:
+                return None
+            entry = {key: blocker[key] for key in AUDIT_BLOCKING_BLOCKER_BASE_KEYS}
+            entry["disposition"] = blocker["disposition"]
+            entry["classification"] = None
+        else:
+            if extra != {"classification"}:
+                return None
+            if blocker["classification"] not in AUDIT_BLOCKING_BLOCKER_CLASSIFICATIONS:
+                return None
+            entry = {key: blocker[key] for key in AUDIT_BLOCKING_BLOCKER_BASE_KEYS}
+            entry["disposition"] = None
+            entry["classification"] = blocker["classification"]
+        normalized_blockers.append(entry)
+    if audit_round >= 2:
+        dispositioned = {
+            blocker["id"] for blocker in normalized_blockers
+            if blocker.get("disposition") is not None
+        }
+        if not prior_blocker_ids.issubset(dispositioned):
+            return None  # missing prior-blocker disposition
+    # From round 3 on, any non-PATCH_INTRODUCED finding freezes the loop.
+    stop_loss_required = False
+    if audit_round >= 3:
+        for blocker in normalized_blockers:
+            is_closed = blocker.get("disposition") == "CLOSED"
+            is_patch_introduced = blocker.get("classification") == "PATCH_INTRODUCED"
+            if not is_closed and not is_patch_introduced:
+                stop_loss_required = True
+                break
+    if stop_loss_required:
+        if disposition != AUDIT_BLOCKING_STOP_LOSS_DISPOSITION:
+            return None
+    elif disposition != "REQUEST_CHANGES":
+        return None
+    return {
+        "version": AUDIT_BLOCKING_PACKET_VERSION,
+        "audit_round": audit_round,
+        "mode": mode,
+        "candidate": {key: candidate[key] for key in sorted(_CANONICAL_AUDIT_TARGET_KEYS)},
+        "family_coverage": normalized_coverage,
+        "blockers": normalized_blockers,
+        "coverage_complete": True,
+        "disposition": disposition,
+    }
+
+
 def _canonical_current_audit_outcome(
     conn: sqlite3.Connection, author_task_id: str,
 ) -> tuple[bool, Optional[dict[str, Any]]]:
@@ -9513,8 +9792,14 @@ def _record_review_verdict(
     verdict: str,
     reason: str,
     evidence: Optional[dict] = None,
+    blocking_packet: Optional[dict] = None,
 ) -> bool:
-    """Record a bound child verdict; only REQUEST_CHANGES resumes the author."""
+    """Record a bound child verdict; only REQUEST_CHANGES resumes the author.
+
+    For an applicable factory exact-head audit, a REQUEST_CHANGES verdict must
+    carry a valid AUDIT_FIRST_PASS_BLOCKING_PACKET_V1 ``blocking_packet``; the
+    verdict fails closed (zero state mutation) otherwise.
+    """
     verdict = str(verdict or "").strip().lower()
     reason = str(reason or "").strip()
     if verdict not in {"pass", "request_changes"} or not reason:
@@ -9526,6 +9811,7 @@ def _record_review_verdict(
     if verdict == "pass" and evidence is None:
         return False
     normalized_evidence: Optional[dict[str, Any]] = None
+    normalized_blocking_packet: Optional[dict[str, Any]] = None
     with write_txn(conn):
         if verdict == "pass" and evidence is not None:
             if (normalized_evidence := _canonical_audit_evidence(evidence)) is None:
@@ -9584,10 +9870,12 @@ def _record_review_verdict(
                         (review_task_id, expected_review_run_id, task_id),
                     ).fetchone()
                 return replay is not None
-        if _review_handoff_event_for_child(conn, task_id, review_task_id) is None:
+        handoff = _review_handoff_event_for_child(conn, task_id, review_task_id)
+        if handoff is None:
             return False
         author = conn.execute(
-            "SELECT status, assignee FROM tasks WHERE id = ?", (task_id,)
+            "SELECT status, assignee, factory_build_gate FROM tasks WHERE id = ?",
+            (task_id,),
         ).fetchone()
         child = conn.execute(
             "SELECT status, current_run_id, assignee FROM tasks WHERE id = ?",
@@ -9613,6 +9901,25 @@ def _record_review_verdict(
             or review_run["ended_at"] is not None
         ):
             return False
+        if verdict == "request_changes":
+            # AUDIT_FIRST_PASS_BLOCKING_PACKET_V1 hard gate. Applicable exactly
+            # to factory exact-head audits (factory_build_gate=1 author whose
+            # handoff carries a structured exact-head candidate envelope).
+            receipt = _review_handoff_receipt_from_row(task_id, handoff)
+            candidate = (
+                _exact_head_candidate_from_handoff(receipt.reason)
+                if receipt is not None else None
+            )
+            if bool(author["factory_build_gate"]) and candidate is not None:
+                audit_round, prior_blocker_ids = _prior_blocking_state(conn, task_id)
+                normalized_blocking_packet = _canonical_blocking_packet(
+                    blocking_packet,
+                    audit_round=audit_round,
+                    expected_candidate=candidate,
+                    prior_blocker_ids=prior_blocker_ids,
+                )
+                if normalized_blocking_packet is None:
+                    return False  # fail closed, zero mutation
         payload = {
             "version": 1,
             "review_task_id": review_task_id,
@@ -9620,8 +9927,17 @@ def _record_review_verdict(
             "verdict": verdict,
             "reason": reason,
         }
+        if normalized_blocking_packet is not None:
+            payload["blocking_packet"] = normalized_blocking_packet
         if verdict == "request_changes":
             now = int(time.time())
+            stop_loss = (
+                normalized_blocking_packet is not None
+                and normalized_blocking_packet["disposition"] == AUDIT_BLOCKING_STOP_LOSS_DISPOSITION
+            )
+            run_summary = (
+                f"{AUDIT_BLOCKING_STOP_LOSS_SEQUENCE}: {reason}" if stop_loss else reason
+            )
             child_reset = conn.execute(
                 "UPDATE tasks SET status = 'todo', current_run_id = NULL, "
                 "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
@@ -9636,18 +9952,31 @@ def _record_review_verdict(
                 "outcome = 'request_changes', summary = ?, ended_at = ?, "
                 "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
                 "WHERE id = ? AND task_id = ? AND ended_at IS NULL",
-                (reason, now, expected_review_run_id, review_task_id),
+                (run_summary, now, expected_review_run_id, review_task_id),
             )
             if review_run.rowcount != 1:
                 raise _ReviewHandoffConflict
-            resumed = conn.execute(
-                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
-                "claim_expires = NULL, worker_pid = NULL, block_kind = NULL, "
-                "block_recurrences = 0 WHERE id = ? AND status = 'review'",
-                (task_id,),
-            )
-            if resumed.rowcount != 1:
-                raise _ReviewHandoffConflict
+            if stop_loss:
+                # Frozen stop-loss disposition: do NOT resume the author into
+                # another ordinary repair loop. Block it for a human to shrink
+                # the acceptance surface.
+                author_blocked = conn.execute(
+                    "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
+                    "claim_expires = NULL, worker_pid = NULL, block_kind = 'needs_input', "
+                    "block_recurrences = 0 WHERE id = ? AND status = 'review'",
+                    (task_id,),
+                )
+                if author_blocked.rowcount != 1:
+                    raise _ReviewHandoffConflict
+            else:
+                resumed = conn.execute(
+                    "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                    "claim_expires = NULL, worker_pid = NULL, block_kind = NULL, "
+                    "block_recurrences = 0 WHERE id = ? AND status = 'review'",
+                    (task_id,),
+                )
+                if resumed.rowcount != 1:
+                    raise _ReviewHandoffConflict
         elif normalized_evidence is not None:
             handoff = _review_handoff_event_for_child(conn, task_id, review_task_id)
             if parent_ids(conn, review_task_id) != [task_id] or handoff is None:
@@ -9711,6 +10040,7 @@ def record_review_verdict(
     verdict: str,
     reason: str,
     evidence: Optional[dict] = None,
+    blocking_packet: Optional[dict] = None,
 ) -> bool:
     """Public fail-closed wrapper for the bound review-verdict transaction."""
     try:
@@ -9722,6 +10052,7 @@ def record_review_verdict(
             verdict=verdict,
             reason=reason,
             evidence=evidence,
+            blocking_packet=blocking_packet,
         )
     except _ReviewHandoffConflict:
         return False

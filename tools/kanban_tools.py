@@ -914,6 +914,7 @@ def _handle_review_verdict(args: dict, **kw) -> str:
                 verdict=verdict,
                 reason=reason,
                 evidence=args.get("evidence"),
+                blocking_packet=args.get("blocking_packet"),
             )
             if not ok:
                 return tool_error(
@@ -2023,6 +2024,27 @@ KANBAN_REVIEW_VERDICT_SCHEMA = {
                 },
                 "required": ["repository", "pr", "head", "tree", "base", "github_review_id", "github_review_url", "github_review_state"],
                 "additionalProperties": False,
+            },
+            "blocking_packet": {
+                "type": "object",
+                "description": (
+                    "AUDIT_FIRST_PASS_BLOCKING_PACKET_V1 — required for a "
+                    "REQUEST_CHANGES verdict on an applicable factory exact-head "
+                    "audit. First round (mode=BOUNDED_EXHAUSTIVE_DISCOVERY) must "
+                    "carry full required-family coverage and every blocker; "
+                    "re-audits (mode=VERIFY) must disposition prior blockers and "
+                    "classify new ones. See the blocking_packet schema fields."
+                ),
+                "properties": {
+                    "version": {"type": "integer"},
+                    "audit_round": {"type": "integer"},
+                    "mode": {"type": "string", "enum": ["BOUNDED_EXHAUSTIVE_DISCOVERY", "VERIFY"]},
+                    "candidate": {"type": "object"},
+                    "family_coverage": {"type": "object"},
+                    "blockers": {"type": "array"},
+                    "coverage_complete": {"type": "boolean"},
+                    "disposition": {"type": "string", "enum": ["REQUEST_CHANGES", "CONTRACT_TOO_BROAD"]},
+                },
             },
             "board": _board_schema_prop(),
         },
