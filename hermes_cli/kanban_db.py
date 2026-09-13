@@ -9205,6 +9205,92 @@ def _terminal_rearm_capability(
     }
 
 
+def _review_author_amend_resume_capability(
+    conn: sqlite3.Connection,
+    *,
+    author_task_id: str,
+    expected_run_id: int,
+    auditor_task_id: str,
+) -> Optional[dict[str, Any]]:
+    """Authenticate one unconsumed exact-run AMEND-resume receipt."""
+    rows = conn.execute(
+        "SELECT id, payload FROM task_events WHERE task_id=? AND kind=? ORDER BY id",
+        (author_task_id, REVIEW_AUTHOR_AMEND_RESUMED_EVENT_KIND),
+    ).fetchall()
+    if len(rows) != 1:
+        return None
+    try:
+        payload = json.loads(rows[0]["payload"] or "{}")
+        receipt_sha256 = payload.pop("receipt_sha256")
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return None
+    if (
+        hashlib.sha256(json.dumps(
+            payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        ).encode("utf-8")).hexdigest() != receipt_sha256
+        or payload.get("version") != 1
+        or payload.get("author_task_id") != author_task_id
+        or payload.get("review_task_id") != auditor_task_id
+        or type(payload.get("author_run_id")) is not int
+        or type(payload.get("review_run_id")) is not int
+        or expected_run_id <= payload["author_run_id"]
+        or not isinstance(payload.get("terminal_evidence_sha256"), str)
+    ):
+        return None
+    review_run = conn.execute(
+        "SELECT id, profile, status, outcome, ended_at, summary, metadata "
+        "FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1",
+        (auditor_task_id,),
+    ).fetchone()
+    completed = conn.execute(
+        "SELECT id, payload FROM task_events WHERE task_id=? AND run_id=? "
+        "AND kind='completed' ORDER BY id",
+        (auditor_task_id, payload["review_run_id"]),
+    ).fetchall()
+    if (
+        review_run is None
+        or int(review_run["id"]) != payload["review_run_id"]
+        or review_run["profile"] != FACTORY_REVIEW_AUDITOR_PROFILE
+        or (review_run["status"], review_run["outcome"]) != ("done", "completed")
+        or review_run["ended_at"] is None
+        or len(completed) != 1
+    ):
+        return None
+    evidence = {
+        "review_run_summary": review_run["summary"],
+        "review_run_metadata": review_run["metadata"],
+        "completed_event_id": int(completed[0]["id"]),
+        "completed_event_payload": completed[0]["payload"],
+    }
+    evidence_sha256 = hashlib.sha256(json.dumps(
+        evidence, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    ).encode("utf-8")).hexdigest()
+    if evidence_sha256 != payload["terminal_evidence_sha256"]:
+        return None
+    for row in conn.execute(
+        "SELECT payload FROM task_events WHERE task_id=? "
+        "AND kind='terminal_auditor_rearm_capability_consumed' ORDER BY id",
+        (author_task_id,),
+    ).fetchall():
+        try:
+            consumed = json.loads(row["payload"] or "{}")
+        except (TypeError, ValueError):
+            return None
+        if consumed.get("capability_id") == receipt_sha256:
+            return None
+    return {
+        "version": 1,
+        "schema": "aion.review_author_amend_resume_consumed.v1",
+        "capability_id": receipt_sha256,
+        "capability_task_id": author_task_id,
+        "capability_run_id": payload["author_run_id"],
+        "author_task_id": author_task_id,
+        "author_run_id": expected_run_id,
+        "auditor_task_id": auditor_task_id,
+        "manifest_sha256": evidence_sha256,
+    }
+
+
 def _terminal_request_changes_auditor_can_rearm(
     conn: sqlite3.Connection,
     *,
@@ -9262,7 +9348,15 @@ def _terminal_request_changes_auditor_can_rearm(
     ).fetchall()
     if [str(row["id"]) for row in same_profile_children] != [auditor_task_id]:
         return None
-    return _terminal_rearm_capability(
+    capability = _terminal_rearm_capability(
+        conn,
+        author_task_id=author_task_id,
+        expected_run_id=expected_run_id,
+        auditor_task_id=auditor_task_id,
+    )
+    if capability is not None:
+        return capability
+    return _review_author_amend_resume_capability(
         conn,
         author_task_id=author_task_id,
         expected_run_id=expected_run_id,
@@ -9815,6 +9909,214 @@ def repromote_blocked_review_child(
             controller_run_id=controller_run_id,
             exact_candidate=exact_candidate,
         )
+    except _ReviewHandoffConflict:
+        return None
+
+
+REVIEW_AUTHOR_AMEND_RESUMED_EVENT_KIND = "review_author_amend_resumed"
+
+
+def _resume_reviewed_author_for_amend(
+    conn: sqlite3.Connection,
+    author_task_id: str,
+    *,
+    author_run_id: int,
+    review_task_id: str,
+    review_run_id: int,
+    review_handoff_event_id: int,
+    amend_reason: str,
+    amend_receipt_sha256: str,
+    controller_task_id: str,
+    controller_run_id: int,
+) -> Optional[dict[str, Any]]:
+    """Resume one reviewed author after an exact terminal audit generation.
+
+    This does not reinterpret, fabricate, or rewrite an audit verdict. It binds
+    a GM/GM2 AMEND decision to the exact author handoff and latest completed
+    independent-review run, preserves the terminal child/history, and makes
+    only the same author runnable again.
+    """
+    actor = (os.environ.get("HERMES_PROFILE") or "").strip()
+    amend_reason = str(amend_reason or "").strip()
+    amend_receipt_sha256 = str(amend_receipt_sha256 or "").lower()
+    if (
+        actor not in FACTORY_REVIEW_VERDICT_RECOVERY_CONTROLLER_PROFILES
+        or not author_task_id or not review_task_id or not controller_task_id
+        or not amend_reason
+        or re.fullmatch(r"[0-9a-f]{64}", amend_receipt_sha256) is None
+    ):
+        return None
+    try:
+        author_run_id = int(author_run_id)
+        review_run_id = int(review_run_id)
+        review_handoff_event_id = int(review_handoff_event_id)
+        controller_run_id = int(controller_run_id)
+    except (TypeError, ValueError):
+        return None
+    if min(author_run_id, review_run_id, review_handoff_event_id, controller_run_id) <= 0:
+        return None
+
+    requested = {
+        "version": 1,
+        "author_task_id": author_task_id,
+        "author_run_id": author_run_id,
+        "review_task_id": review_task_id,
+        "review_run_id": review_run_id,
+        "review_handoff_event_id": review_handoff_event_id,
+        "controller_profile": actor,
+        "controller_task_id": controller_task_id,
+        "controller_run_id": controller_run_id,
+        "amend_reason": amend_reason,
+        "amend_receipt_sha256": amend_receipt_sha256,
+    }
+
+    with write_txn(conn):
+        prior = conn.execute(
+            "SELECT id, payload FROM task_events WHERE task_id=? AND kind=? ORDER BY id",
+            (author_task_id, REVIEW_AUTHOR_AMEND_RESUMED_EVENT_KIND),
+        ).fetchall()
+        if prior:
+            if len(prior) != 1:
+                return None
+            try:
+                payload = json.loads(prior[0]["payload"] or "{}")
+                digest = payload.pop("receipt_sha256")
+            except (AttributeError, KeyError, TypeError, ValueError):
+                return None
+            expected = hashlib.sha256(json.dumps(
+                payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+            ).encode("utf-8")).hexdigest()
+            if any(payload.get(key) != value for key, value in requested.items()) or digest != expected:
+                return None
+            return {**payload, "receipt_sha256": digest, "event_id": int(prior[0]["id"])}
+
+        controller = conn.execute(
+            "SELECT 1 FROM tasks task JOIN task_runs run "
+            "ON run.id=? AND run.task_id=task.id WHERE task.id=? "
+            "AND task.assignee=? AND task.status='running' "
+            "AND task.current_run_id=run.id AND run.profile=? "
+            "AND run.status='running' AND run.outcome IS NULL AND run.ended_at IS NULL",
+            (controller_run_id, controller_task_id, actor, actor),
+        ).fetchone()
+        if controller is None or controller_task_id in {author_task_id, review_task_id}:
+            return None
+
+        identity = (
+            "current_run_id", "claim_lock", "claim_expires", "worker_pid",
+            "worker_starttime", "fence_lineage", "fence_disposition",
+        )
+        columns = "status, assignee, completed_at, " + ", ".join(identity)
+        author = conn.execute(f"SELECT {columns} FROM tasks WHERE id=?", (author_task_id,)).fetchone()
+        review = conn.execute(f"SELECT {columns} FROM tasks WHERE id=?", (review_task_id,)).fetchone()
+        if (
+            author is None or review is None
+            or author["status"] != "review"
+            or author["assignee"] != FACTORY_REVIEW_AUTHOR_PROFILE
+            or author["completed_at"] is not None
+            or review["status"] != "done"
+            or review["assignee"] != FACTORY_REVIEW_AUDITOR_PROFILE
+            or review["completed_at"] is None
+            or any(author[field] is not None for field in identity)
+            or any(review[field] is not None for field in identity)
+            or parent_ids(conn, review_task_id) != [author_task_id]
+        ):
+            return None
+
+        handoff_row = conn.execute(
+            "SELECT id, run_id, payload FROM task_events WHERE task_id=? "
+            "AND kind='review_handoff' ORDER BY id DESC LIMIT 1", (author_task_id,),
+        ).fetchone()
+        handoff = _review_handoff_receipt_from_row(author_task_id, handoff_row) if handoff_row else None
+        if (
+            handoff is None or handoff.event_id != review_handoff_event_id
+            or handoff.expected_run_id != author_run_id
+            or handoff.review_task_id != review_task_id
+        ):
+            return None
+
+        author_run = conn.execute(
+            "SELECT id, profile, status, outcome, ended_at FROM task_runs "
+            "WHERE task_id=? ORDER BY id DESC LIMIT 1", (author_task_id,),
+        ).fetchone()
+        review_run = conn.execute(
+            "SELECT id, profile, status, outcome, ended_at, summary, metadata "
+            "FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1", (review_task_id,),
+        ).fetchone()
+        if (
+            author_run is None or int(author_run["id"]) != author_run_id
+            or author_run["profile"] != FACTORY_REVIEW_AUTHOR_PROFILE
+            or (author_run["status"], author_run["outcome"]) != ("review_required", "review_required")
+            or author_run["ended_at"] is None
+            or review_run is None or int(review_run["id"]) != review_run_id
+            or review_run["profile"] != FACTORY_REVIEW_AUDITOR_PROFILE
+            or (review_run["status"], review_run["outcome"]) != ("done", "completed")
+            or review_run["ended_at"] is None or not str(review_run["summary"] or "").strip()
+        ):
+            return None
+        completed = conn.execute(
+            "SELECT id, payload FROM task_events WHERE task_id=? AND run_id=? "
+            "AND kind='completed' ORDER BY id", (review_task_id, review_run_id),
+        ).fetchall()
+        if len(completed) != 1:
+            return None
+        if conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id=? AND run_id=? "
+            "AND kind IN ('review_verdict','canonical_audit_outcome') LIMIT 1",
+            (review_task_id, review_run_id),
+        ).fetchone() is not None:
+            return None
+
+        evidence = {
+            "review_run_summary": review_run["summary"],
+            "review_run_metadata": review_run["metadata"],
+            "completed_event_id": int(completed[0]["id"]),
+            "completed_event_payload": completed[0]["payload"],
+        }
+        terminal_evidence_sha256 = hashlib.sha256(json.dumps(
+            evidence, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        ).encode("utf-8")).hexdigest()
+        blockers = conn.execute(
+            "SELECT parent.id, parent.status FROM task_links edge JOIN tasks parent "
+            "ON parent.id=edge.parent_id WHERE edge.child_id=?", (author_task_id,),
+        ).fetchall()
+        target_status = "ready" if all(
+            _review_handoff_parent_satisfies_child(
+                conn, row["id"], row["status"], author_task_id
+            ) for row in blockers
+        ) else "todo"
+        core = {
+            **requested,
+            "terminal_evidence_sha256": terminal_evidence_sha256,
+            "author_target_status": target_status,
+        }
+        receipt_sha256 = hashlib.sha256(json.dumps(
+            core, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        ).encode("utf-8")).hexdigest()
+        updated = conn.execute(
+            "UPDATE tasks SET status=? WHERE id=? AND status='review' "
+            "AND current_run_id IS NULL AND claim_lock IS NULL AND claim_expires IS NULL "
+            "AND worker_pid IS NULL AND worker_starttime IS NULL "
+            "AND fence_lineage IS NULL AND fence_disposition IS NULL",
+            (target_status, author_task_id),
+        )
+        if updated.rowcount != 1:
+            raise _ReviewHandoffConflict
+        _append_event(
+            conn, author_task_id, REVIEW_AUTHOR_AMEND_RESUMED_EVENT_KIND,
+            {**core, "receipt_sha256": receipt_sha256}, run_id=review_run_id,
+        )
+        event_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+        return {**core, "receipt_sha256": receipt_sha256, "event_id": event_id}
+
+
+def resume_reviewed_author_for_amend(
+    conn: sqlite3.Connection,
+    author_task_id: str,
+    **kwargs: Any,
+) -> Optional[dict[str, Any]]:
+    """Fail-closed wrapper for exact terminal-evidence AMEND resume."""
+    try:
+        return _resume_reviewed_author_for_amend(conn, author_task_id, **kwargs)
     except _ReviewHandoffConflict:
         return None
 
