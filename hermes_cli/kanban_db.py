@@ -9697,25 +9697,10 @@ def _repromote_blocked_review_child(
             or handoff.receipt_sha256 != handoff_receipt_sha256
         ):
             return None
-        legacy_tuples = re.findall(
-            r"PR(?P<pr>[1-9][0-9]*) exact candidate (?P<head>[0-9a-fA-F]{40}) "
-            r"\(tree (?P<tree>[0-9a-fA-F]{40}), base (?P<base>[0-9a-fA-F]{40})\)",
-            handoff.reason,
-        )
         strict_target = _canonical_audit_target_from_handoff_reason(handoff.reason)
         strict_match = (
             strict_target is not None
             and strict_target.get("candidate") == exact_candidate
-        )
-        legacy_match = (
-            len(legacy_tuples) == 1
-            and legacy_tuples[0] == (
-                str(exact_candidate["pr"]), exact_candidate["head"],
-                exact_candidate["tree"], exact_candidate["base"],
-            )
-            and f"https://github.com/{exact_candidate['repository']}/" in (
-                author["body"] or ""
-            )
         )
         # Historical migration only: one immutable PR109 prose handoff may
         # bootstrap a strict correction. Every identity/run/receipt field is
@@ -9732,7 +9717,7 @@ def _repromote_blocked_review_child(
             and exact_candidate["pr"] == incident["pr"]
             and exact_candidate["base"] == incident["base"]
         )
-        if not strict_match and not legacy_match and not historical_recovery_match:
+        if not strict_match and not historical_recovery_match:
             return None
 
         author_run = conn.execute(

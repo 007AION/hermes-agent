@@ -19,6 +19,23 @@ CANDIDATE = {
     "base": "adfccfef42a26df3e1c78fe311d1cae36a036ff2",
 }
 
+CANDIDATE_HANDOFF = json.dumps(
+    {
+        "version": 1,
+        "candidate": CANDIDATE,
+        "summary": "PR961 exact candidate is ready for independent audit",
+    },
+    sort_keys=True,
+    separators=(",", ":"),
+)
+
+GENERIC_PROSE_HANDOFF = (
+    "PR961 exact candidate 650819825c0d92b819e33b26e8ebc4c32ab1fd56 "
+    "(tree edebc7f8d22099f19d82437f8db77532107e1e77, "
+    "base adfccfef42a26df3e1c78fe311d1cae36a036ff2) "
+    "is OPEN/CLEAN/MERGEABLE with 3/3 hosted checks PASS"
+)
+
 PR109_CANDIDATE = {
     "repository": "kiddhu/hermes-agent",
     "pr": 109,
@@ -69,13 +86,7 @@ def _shape(conn, *, handoff_reason=None):
         author,
         expected_run_id=author_run,
         review_task_id=child,
-        reason=handoff_reason or (
-            "PR961 exact candidate "
-            "650819825c0d92b819e33b26e8ebc4c32ab1fd56 "
-            "(tree edebc7f8d22099f19d82437f8db77532107e1e77, "
-            "base adfccfef42a26df3e1c78fe311d1cae36a036ff2) "
-            "is OPEN/CLEAN/MERGEABLE with 3/3 hosted checks PASS"
-        ),
+        reason=handoff_reason or CANDIDATE_HANDOFF,
     )
     assert handoff
     child_claim = kb.claim_task(conn, child, claimer="host:auditor")
@@ -420,6 +431,17 @@ def test_prose_recovery_is_rejected_outside_frozen_historical_incident(
             exact_candidate=PR109_CANDIDATE,
             reason="must not generalize prose authority",
         ) is None
+        assert "\n".join(conn.iterdump()) == before
+
+
+def test_generic_exact_candidate_prose_is_rejected_without_mutation(
+    kanban_home, monkeypatch,
+):
+    monkeypatch.setenv("HERMES_PROFILE", "gm2")
+    with kb.connect() as conn:
+        shape = _shape(conn, handoff_reason=GENERIC_PROSE_HANDOFF)
+        before = "\n".join(conn.iterdump())
+        assert _call(conn, shape) is None
         assert "\n".join(conn.iterdump()) == before
 
 
