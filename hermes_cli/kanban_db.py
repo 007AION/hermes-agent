@@ -1959,6 +1959,7 @@ class ReviewRepromotionReceipt:
     controller_run_id: int
     exact_candidate: dict[str, Any]
     receipt_sha256: str
+    strict_handoff_reason: Optional[str] = None
 
 
 class _ReviewHandoffConflict(Exception):
@@ -9536,8 +9537,18 @@ def _repromote_blocked_review_child(
         return None
     exact_candidate = {key: exact_candidate[key] for key in sorted(exact_candidate)}
 
+    strict_handoff_reason = json.dumps(
+        {
+            "version": 1,
+            "candidate": exact_candidate,
+            "summary": correction_reason,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
     core_payload = {
-        "version": 1,
+        "version": 2,
         "author_task_id": author_task_id,
         "author_run_id": author_run_id,
         "review_task_id": review_task_id,
@@ -9548,6 +9559,7 @@ def _repromote_blocked_review_child(
         "controller_task_id": controller_task_id,
         "controller_run_id": controller_run_id,
         "exact_candidate": exact_candidate,
+        "strict_handoff_reason": strict_handoff_reason,
     }
     receipt_sha256 = hashlib.sha256(
         json.dumps(
@@ -9579,11 +9591,32 @@ def _repromote_blocked_review_child(
                 payload = json.loads(row["payload"] or "{}")
             except (TypeError, ValueError):
                 return None
-            if (
-                row["run_id"] != prior_review_run_id
-                or payload != {**core_payload, "receipt_sha256": receipt_sha256}
-            ):
+            if row["run_id"] != prior_review_run_id:
                 return None
+            if payload != {**core_payload, "receipt_sha256": receipt_sha256}:
+                # Keep immutable v1 receipts replayable. They predate strict
+                # PASS-target binding and therefore cannot authorize it.
+                legacy_core = {
+                    key: value
+                    for key, value in core_payload.items()
+                    if key != "strict_handoff_reason"
+                }
+                legacy_core["version"] = 1
+                legacy_hash = hashlib.sha256(
+                    json.dumps(
+                        legacy_core,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        ensure_ascii=False,
+                    ).encode("utf-8")
+                ).hexdigest()
+                if payload != {**legacy_core, "receipt_sha256": legacy_hash}:
+                    return None
+                return ReviewRepromotionReceipt(
+                    event_id=int(row["id"]),
+                    receipt_sha256=legacy_hash,
+                    **legacy_core,
+                )
             return ReviewRepromotionReceipt(
                 event_id=int(row["id"]),
                 receipt_sha256=receipt_sha256,
@@ -9662,7 +9695,20 @@ def _repromote_blocked_review_child(
                 author["body"] or ""
             )
         )
-        if not strict_match and not legacy_match:
+        recovery_match = re.fullmatch(
+            r"Round-[1-9][0-9]* repair candidate PR #(?P<pr>[1-9][0-9]*) "
+            r"is frozen at exact head (?P<head>[0-9a-fA-F]{40}) "
+            r"\(tree (?P<tree>[0-9a-fA-F]{40}), "
+            r"base (?P<base>[0-9a-fA-F]{40})\)\. .+",
+            handoff.reason,
+        )
+        factory_recovery_match = (
+            recovery_match is not None
+            and exact_candidate["repository"] == FACTORY_REVIEW_REPOSITORY
+            and int(recovery_match.group("pr")) == exact_candidate["pr"]
+            and recovery_match.group("base") == exact_candidate["base"]
+        )
+        if not strict_match and not legacy_match and not factory_recovery_match:
             return None
 
         author_run = conn.execute(
@@ -9839,6 +9885,73 @@ def _canonical_audit_target_from_handoff_reason(reason: Any) -> Optional[dict[st
     }
 
 
+def _strict_audit_target_for_handoff(
+    conn: sqlite3.Connection,
+    author_task_id: str,
+    handoff: Optional[ReviewHandoffReceipt],
+) -> Optional[dict[str, Any]]:
+    """Resolve a strict target from the handoff or its signed v2 correction.
+
+    Immutable prose handoffs cannot be rewritten.  The GM/GM2 same-child
+    repromotion path therefore appends one hash-bound v2 receipt carrying the
+    canonical JSON that a fresh auditor run must match.  Any malformed,
+    duplicate, stale-run, wrong-child, or conflicting correction fails closed.
+    """
+    if handoff is None:
+        return None
+    direct = _canonical_audit_target_from_handoff_reason(handoff.reason)
+    if direct is not None:
+        return direct
+    rows = conn.execute(
+        "SELECT id, run_id, payload FROM task_events WHERE task_id=? "
+        "AND kind='review_repromoted' ORDER BY id",
+        (author_task_id,),
+    ).fetchall()
+    if len(rows) != 1 or int(rows[0]["id"]) <= handoff.event_id:
+        return None
+    row = rows[0]
+    try:
+        payload = json.loads(row["payload"] or "{}")
+        digest = payload.pop("receipt_sha256")
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return None
+    required = {
+        "version", "author_task_id", "author_run_id", "review_task_id",
+        "prior_review_run_id", "handoff_receipt_sha256", "correction_actor",
+        "correction_reason", "controller_task_id", "controller_run_id",
+        "exact_candidate", "strict_handoff_reason",
+    }
+    encoded = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    ).encode("utf-8")
+    target = _canonical_audit_target_from_handoff_reason(
+        payload.get("strict_handoff_reason")
+    )
+    if (
+        set(payload) != required
+        or payload.get("version") != 2
+        or payload.get("author_task_id") != author_task_id
+        or payload.get("author_run_id") != handoff.expected_run_id
+        or payload.get("review_task_id") != handoff.review_task_id
+        or payload.get("handoff_receipt_sha256") != handoff.receipt_sha256
+        or payload.get("correction_actor")
+        not in FACTORY_REVIEW_VERDICT_RECOVERY_CONTROLLER_PROFILES
+        or type(payload.get("controller_task_id")) is not str
+        or not payload["controller_task_id"].strip()
+        or type(payload.get("controller_run_id")) is not int
+        or type(payload.get("prior_review_run_id")) is not int
+        or row["run_id"] != payload.get("prior_review_run_id")
+        or type(digest) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        or hashlib.sha256(encoded).hexdigest() != digest
+        or target is None
+        or target.get("candidate") != payload.get("exact_candidate")
+        or target.get("summary") != payload.get("correction_reason")
+    ):
+        return None
+    return target
+
+
 def _recovery_audit_target_from_handoff_reason(reason: Any) -> Optional[dict[str, Any]]:
     """Resolve strict JSON or the one recovery-only pre-JSON grammar."""
     strict = _canonical_audit_target_from_handoff_reason(reason)
@@ -9936,10 +10049,7 @@ def _canonical_current_audit_outcome(
         (payload.get("review_handoff_event_id"), author_task_id),
     ).fetchone()
     handoff = _review_handoff_receipt_from_row(author_task_id, handoff_row) if handoff_row else None
-    target = (
-        _canonical_audit_target_from_handoff_reason(handoff.reason)
-        if handoff is not None else None
-    )
+    target = _strict_audit_target_for_handoff(conn, author_task_id, handoff)
     task = conn.execute(
         "SELECT status, assignee, current_run_id, factory_build_gate, "
         "factory_terminal_receipt_sha256 FROM tasks WHERE id=?", (row["task_id"],),
@@ -10239,10 +10349,7 @@ def _record_review_verdict(
             if parent_ids(conn, review_task_id) != [task_id] or handoff is None:
                 return False
             receipt = _review_handoff_receipt_from_row(task_id, handoff)
-            target = (
-                _canonical_audit_target_from_handoff_reason(receipt.reason)
-                if receipt is not None else None
-            )
+            target = _strict_audit_target_for_handoff(conn, task_id, receipt)
             if not _audit_target_matches_evidence(target, normalized_evidence):
                 return False
             return _terminalize_review_pass(

@@ -19,6 +19,22 @@ CANDIDATE = {
     "base": "adfccfef42a26df3e1c78fe311d1cae36a036ff2",
 }
 
+PR109_CANDIDATE = {
+    "repository": "kiddhu/hermes-agent",
+    "pr": 109,
+    "head": "ec758e25523d2a618744f315f33836f41ac1a44c",
+    "tree": "4a0d87a9900c89a1f5431a402db4fe7bec6fa2e7",
+    "base": "edcc2d39258739cd0625366d91b20bac9a6a8096",
+}
+
+PR109_PROSE_HANDOFF = (
+    "Round-3 repair candidate PR #109 is frozen at exact head "
+    "ec758e25523d2a618744f315f33836f41ac1a44c "
+    "(tree 4a0d87a9900c89a1f5431a402db4fe7bec6fa2e7, "
+    "base edcc2d39258739cd0625366d91b20bac9a6a8096). "
+    "The ambiguous historical live-identity gap now fails closed."
+)
+
 
 @pytest.fixture
 def kanban_home(tmp_path, monkeypatch):
@@ -35,7 +51,7 @@ def kanban_home(tmp_path, monkeypatch):
     return home
 
 
-def _shape(conn):
+def _shape(conn, *, handoff_reason=None):
     author = kb.create_task(
         conn,
         title="author",
@@ -53,7 +69,7 @@ def _shape(conn):
         author,
         expected_run_id=author_run,
         review_task_id=child,
-        reason=(
+        reason=handoff_reason or (
             "PR961 exact candidate "
             "650819825c0d92b819e33b26e8ebc4c32ab1fd56 "
             "(tree edebc7f8d22099f19d82437f8db77532107e1e77, "
@@ -194,6 +210,184 @@ def test_gm_repromotes_one_exact_generation_and_replay_is_idempotent(
         ).fetchone()[0] == 1
 
 
+def test_repromotion_converts_copied_pr109_prose_handoff_to_strict_pass_target(
+    kanban_home, monkeypatch,
+):
+    """RED for the live run4654 -> run4655 PASS-binding refusal."""
+    monkeypatch.setenv("HERMES_PROFILE", "gm2")
+    with kb.connect() as conn:
+        shape = _shape(conn, handoff_reason=PR109_PROSE_HANDOFF)
+        author, _, child, *_ = shape
+        receipt = _call(
+            conn,
+            shape,
+            exact_candidate=PR109_CANDIDATE,
+            reason="PR109 strict PASS target recovery",
+        )
+        assert receipt is not None
+        assert json.loads(receipt.strict_handoff_reason) == {
+            "version": 1,
+            "candidate": PR109_CANDIDATE,
+            "summary": "PR109 strict PASS target recovery",
+        }
+
+        claimed = kb.claim_task(conn, child, claimer="host:fresh-auditor")
+        assert claimed is not None and claimed.current_run_id is not None
+        evidence = {
+            **PR109_CANDIDATE,
+            "github_review_id": 5189891566,
+            "github_review_url": (
+                "https://github.com/kiddhu/hermes-agent/pull/109"
+                "#pullrequestreview-5189891566"
+            ),
+            "github_review_state": "APPROVED",
+        }
+        assert kb.record_review_verdict(
+            conn,
+            author,
+            review_task_id=child,
+            expected_review_run_id=claimed.current_run_id,
+            verdict="pass",
+            reason="fresh exact-head PASS",
+            evidence=evidence,
+        )
+
+
+@pytest.mark.parametrize("field", ["repository", "pr", "head", "tree", "base"])
+def test_repromotion_strict_target_rejects_drifted_pass_evidence_without_mutation(
+    kanban_home, monkeypatch, field,
+):
+    monkeypatch.setenv("HERMES_PROFILE", "gm2")
+    with kb.connect() as conn:
+        shape = _shape(conn, handoff_reason=PR109_PROSE_HANDOFF)
+        author, _, child, *_ = shape
+        assert _call(
+            conn,
+            shape,
+            exact_candidate=PR109_CANDIDATE,
+            reason="PR109 strict PASS target recovery",
+        ) is not None
+        claimed = kb.claim_task(conn, child, claimer="host:fresh-auditor")
+        assert claimed is not None and claimed.current_run_id is not None
+        evidence = {
+            **PR109_CANDIDATE,
+            "github_review_id": 5189891566,
+            "github_review_url": (
+                "https://github.com/kiddhu/hermes-agent/pull/109"
+                "#pullrequestreview-5189891566"
+            ),
+            "github_review_state": "APPROVED",
+        }
+        evidence[field] = (
+            110 if field == "pr"
+            else "wrong/repo" if field == "repository"
+            else "1" * 40
+        )
+        if field in {"repository", "pr"}:
+            evidence["github_review_url"] = (
+                f"https://github.com/{evidence['repository']}/pull/{evidence['pr']}"
+                "#pullrequestreview-5189891566"
+            )
+        before = "\n".join(conn.iterdump())
+        assert not kb.record_review_verdict(
+            conn,
+            author,
+            review_task_id=child,
+            expected_review_run_id=claimed.current_run_id,
+            verdict="pass",
+            reason="must fail closed",
+            evidence=evidence,
+        )
+        assert "\n".join(conn.iterdump()) == before
+
+
+@pytest.mark.parametrize("drift", ["duplicate", "target", "run", "child"])
+def test_repromotion_strict_correction_drift_is_zero_mutation_at_pass(
+    kanban_home, monkeypatch, drift,
+):
+    monkeypatch.setenv("HERMES_PROFILE", "gm2")
+    with kb.connect() as conn:
+        shape = _shape(conn, handoff_reason=PR109_PROSE_HANDOFF)
+        author, _, child, *_ = shape
+        assert _call(
+            conn,
+            shape,
+            exact_candidate=PR109_CANDIDATE,
+            reason="PR109 strict PASS target recovery",
+        ) is not None
+        claimed = kb.claim_task(conn, child, claimer="host:fresh-auditor")
+        assert claimed is not None and claimed.current_run_id is not None
+        row = conn.execute(
+            "SELECT id,run_id,payload FROM task_events WHERE task_id=? "
+            "AND kind='review_repromoted'", (author,),
+        ).fetchone()
+        if drift == "duplicate":
+            conn.execute(
+                "INSERT INTO task_events(task_id,run_id,kind,payload,created_at) "
+                "VALUES (?,?, 'review_repromoted',?,1)",
+                (author, row["run_id"], row["payload"]),
+            )
+        else:
+            payload = json.loads(row["payload"])
+            if drift == "target":
+                target = json.loads(payload["strict_handoff_reason"])
+                target["candidate"]["head"] = "1" * 40
+                payload["strict_handoff_reason"] = json.dumps(target)
+            elif drift == "run":
+                payload["prior_review_run_id"] += 1
+            else:
+                payload["review_task_id"] = "t_wrong"
+            conn.execute(
+                "UPDATE task_events SET payload=? WHERE id=?",
+                (json.dumps(payload), row["id"]),
+            )
+        conn.commit()
+        evidence = {
+            **PR109_CANDIDATE,
+            "github_review_id": 5189891566,
+            "github_review_url": (
+                "https://github.com/kiddhu/hermes-agent/pull/109"
+                "#pullrequestreview-5189891566"
+            ),
+            "github_review_state": "APPROVED",
+        }
+        before = "\n".join(conn.iterdump())
+        assert not kb.record_review_verdict(
+            conn,
+            author,
+            review_task_id=child,
+            expected_review_run_id=claimed.current_run_id,
+            verdict="pass",
+            reason="must fail closed",
+            evidence=evidence,
+        )
+        assert "\n".join(conn.iterdump()) == before
+
+
+@pytest.mark.parametrize(
+    "candidate",
+    [
+        {**PR109_CANDIDATE, "repository": "wrong/repo"},
+        {**PR109_CANDIDATE, "pr": 110},
+        {**PR109_CANDIDATE, "base": "1" * 40},
+    ],
+)
+def test_prose_recovery_rejects_wrong_repo_pr_or_base_without_mutation(
+    kanban_home, monkeypatch, candidate,
+):
+    monkeypatch.setenv("HERMES_PROFILE", "gm2")
+    with kb.connect() as conn:
+        shape = _shape(conn, handoff_reason=PR109_PROSE_HANDOFF)
+        before = "\n".join(conn.iterdump())
+        assert _call(
+            conn,
+            shape,
+            exact_candidate=candidate,
+            reason="PR109 strict PASS target recovery",
+        ) is None
+        assert "\n".join(conn.iterdump()) == before
+
+
 @pytest.mark.parametrize(
     ("profile", "change"),
     [
@@ -325,6 +519,11 @@ def test_repromotion_tool_requires_gm_controller_run(kanban_home, monkeypatch):
     }))
     assert result["ok"] is True
     assert result["review_task_id"] == child
+    assert json.loads(result["strict_handoff_reason"]) == {
+        "version": 1,
+        "candidate": CANDIDATE,
+        "summary": "audit first; install follows",
+    }
 
 
 def test_repromotion_tool_is_visible_to_controller_task_workers(monkeypatch):

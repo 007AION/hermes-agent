@@ -926,6 +926,7 @@ def _handle_repromote_review(args: dict, **kw) -> str:
                 prior_review_run_id=receipt.prior_review_run_id,
                 event_id=receipt.event_id,
                 receipt_sha256=receipt.receipt_sha256,
+                strict_handoff_reason=receipt.strict_handoff_reason,
             )
         finally:
             conn.close()
