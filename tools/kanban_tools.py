@@ -874,6 +874,59 @@ def _handle_request_review(args: dict, **kw) -> str:
         return tool_error(f"kanban_request_review: {e}")
 
 
+def _handle_repromote_review(args: dict, **kw) -> str:
+    """Controller-authorized retry of one exact blocked review generation."""
+    delegated_err = _reject_delegated_child_mutation("kanban_repromote_review")
+    if delegated_err:
+        return delegated_err
+    controller_task_id = _default_task_id(None)
+    controller_run_id = _worker_run_id(controller_task_id or "")
+    if not controller_task_id or controller_run_id is None:
+        return tool_error("authenticated controller task/run is required")
+    required = (
+        "author_task_id", "author_run_id", "review_task_id",
+        "prior_review_run_id", "handoff_receipt_sha256", "correction_reason",
+        "exact_candidate",
+    )
+    missing = [name for name in required if args.get(name) in (None, "")]
+    if missing:
+        return tool_error(f"missing required fields: {', '.join(missing)}")
+    reason = redact_sensitive_text(str(args["correction_reason"]), force=True)
+    try:
+        kb, conn = _connect(board=args.get("board"))
+        try:
+            receipt = kb.repromote_blocked_review_child(
+                conn,
+                str(args["author_task_id"]),
+                author_run_id=args["author_run_id"],
+                review_task_id=str(args["review_task_id"]),
+                prior_review_run_id=args["prior_review_run_id"],
+                handoff_receipt_sha256=str(args["handoff_receipt_sha256"]),
+                correction_reason=reason,
+                controller_task_id=controller_task_id,
+                controller_run_id=controller_run_id,
+                exact_candidate=args["exact_candidate"],
+            )
+            if receipt is None:
+                return tool_error(
+                    "review repromotion refused: controller, author/child/run/role/edge, "
+                    "handoff receipt, latest blocked generation, or parent gate drifted"
+                )
+            return _ok(
+                author_task_id=receipt.author_task_id,
+                author_run_id=receipt.author_run_id,
+                review_task_id=receipt.review_task_id,
+                prior_review_run_id=receipt.prior_review_run_id,
+                event_id=receipt.event_id,
+                receipt_sha256=receipt.receipt_sha256,
+            )
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.exception("kanban_repromote_review failed")
+        return tool_error(f"kanban_repromote_review: {e}")
+
+
 def _handle_review_verdict(args: dict, **kw) -> str:
     """Record this auditor child's PASS or REQUEST_CHANGES verdict."""
     delegated_err = _reject_delegated_child_mutation("kanban_review_verdict")
@@ -1991,6 +2044,43 @@ KANBAN_REQUEST_REVIEW_SCHEMA = {
     },
 }
 
+KANBAN_REPROMOTE_REVIEW_SCHEMA = {
+    "name": "kanban_repromote_review",
+    "description": (
+        "GM/GM2-only exact-generation recovery: re-promote the same blocked "
+        "direct audit child after an accountable correction without a live author run."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "author_task_id": {"type": "string"},
+            "author_run_id": {"type": "integer"},
+            "review_task_id": {"type": "string"},
+            "prior_review_run_id": {"type": "integer"},
+            "handoff_receipt_sha256": {"type": "string"},
+            "correction_reason": {"type": "string"},
+            "exact_candidate": {
+                "type": "object",
+                "properties": {
+                    "repository": {"type": "string"}, "pr": {"type": "integer"},
+                    "head": {"type": "string"}, "tree": {"type": "string"},
+                    "base": {"type": "string"},
+                },
+                "required": ["repository", "pr", "head", "tree", "base"],
+                "additionalProperties": False,
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": [
+            "author_task_id", "author_run_id", "review_task_id",
+            "prior_review_run_id", "handoff_receipt_sha256", "correction_reason",
+            "exact_candidate",
+        ],
+        "additionalProperties": False,
+    },
+}
+
+
 KANBAN_REVIEW_VERDICT_SCHEMA = {
     "name": "kanban_review_verdict",
     "description": (
@@ -2538,6 +2628,15 @@ registry.register(
     handler=_handle_request_review,
     check_fn=_check_kanban_mode,
     emoji="🔎",
+)
+
+registry.register(
+    name="kanban_repromote_review",
+    toolset="kanban",
+    schema=KANBAN_REPROMOTE_REVIEW_SCHEMA,
+    handler=_handle_repromote_review,
+    check_fn=_check_kanban_mode,
+    emoji="🔁",
 )
 
 registry.register(

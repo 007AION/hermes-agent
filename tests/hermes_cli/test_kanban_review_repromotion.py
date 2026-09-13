@@ -1,0 +1,357 @@
+"""Exact-generation recovery for a blocked same-child audit."""
+
+from __future__ import annotations
+
+import concurrent.futures
+import json
+import threading
+from pathlib import Path
+
+import pytest
+
+from hermes_cli import kanban_db as kb
+
+CANDIDATE = {
+    "repository": "kiddhu/aion-governance",
+    "pr": 961,
+    "head": "650819825c0d92b819e33b26e8ebc4c32ab1fd56",
+    "tree": "edebc7f8d22099f19d82437f8db77532107e1e77",
+    "base": "adfccfef42a26df3e1c78fe311d1cae36a036ff2",
+}
+
+
+@pytest.fixture
+def kanban_home(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    return home
+
+
+def _shape(conn):
+    author = kb.create_task(
+        conn,
+        title="author",
+        assignee="agent007",
+        body="formal_record: https://github.com/kiddhu/aion-governance/issues/790",
+    )
+    author_claim = kb.claim_task(conn, author, claimer="host:author")
+    assert author_claim and author_claim.current_run_id
+    author_run = author_claim.current_run_id
+    child = kb.create_task(
+        conn, title="audit", assignee="bafuxunan", parents=[author]
+    )
+    handoff = kb.request_review_handoff(
+        conn,
+        author,
+        expected_run_id=author_run,
+        review_task_id=child,
+        reason=(
+            "PR961 exact candidate "
+            "650819825c0d92b819e33b26e8ebc4c32ab1fd56 "
+            "(tree edebc7f8d22099f19d82437f8db77532107e1e77, "
+            "base adfccfef42a26df3e1c78fe311d1cae36a036ff2) "
+            "is OPEN/CLEAN/MERGEABLE with 3/3 hosted checks PASS"
+        ),
+    )
+    assert handoff
+    child_claim = kb.claim_task(conn, child, claimer="host:auditor")
+    assert child_claim and child_claim.current_run_id
+    first_child_run = child_claim.current_run_id
+    assert kb.block_task(
+        conn,
+        child,
+        reason="installed runtime was incorrectly required before audit PASS",
+        kind="needs_input",
+        expected_run_id=first_child_run,
+    )
+    blocked_child = kb.get_task(conn, child)
+    assert blocked_child is not None and blocked_child.status == "blocked"
+    assert kb.unblock_task(conn, child)
+    kb.recompute_ready(conn)
+    second_claim = kb.claim_task(conn, child, claimer="host:auditor-retry")
+    assert second_claim and second_claim.current_run_id
+    child_run = second_claim.current_run_id
+    assert kb.block_task(
+        conn,
+        child,
+        reason="same-child re-promotion requires a live author run",
+        kind="dependency",
+        expected_run_id=child_run,
+    )
+    assert kb.get_task(conn, child).status == "todo"
+    controller = kb.create_task(conn, title="GM correction", assignee="gm2")
+    controller_claim = kb.claim_task(
+        conn, controller, claimer="gm2:controller"
+    )
+    assert controller_claim and controller_claim.current_run_id
+    return (
+        author, author_run, child, child_run, handoff,
+        controller, controller_claim.current_run_id,
+    )
+
+
+def _call(conn, shape, *, reason="audit first; install follows", **changes):
+    author, author_run, child, child_run, handoff, controller, controller_run = shape
+    args = {
+        "author_task_id": author,
+        "author_run_id": author_run,
+        "review_task_id": child,
+        "prior_review_run_id": child_run,
+        "handoff_receipt_sha256": handoff.receipt_sha256,
+        "correction_reason": reason,
+        "controller_task_id": controller,
+        "controller_run_id": controller_run,
+        "exact_candidate": CANDIDATE,
+    }
+    args.update(changes)
+    return kb.repromote_blocked_review_child(conn, **args)
+
+
+def _history(conn, author, child):
+    return (
+        tuple(tuple(row) for row in conn.execute(
+            "SELECT id, task_id, profile, status, outcome, summary, ended_at "
+            "FROM task_runs WHERE task_id IN (?, ?) ORDER BY id",
+            (author, child),
+        )),
+        tuple(tuple(row) for row in conn.execute(
+            "SELECT id, task_id, run_id, kind, payload, created_at FROM task_events "
+            "WHERE task_id IN (?, ?) AND kind != 'review_repromoted' "
+            "AND NOT (task_id = ? AND kind = 'promoted') ORDER BY id",
+            (author, child, child),
+        )),
+    )
+
+
+def test_existing_tool_cannot_repromote_without_live_author(kanban_home, monkeypatch):
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("HERMES_PROFILE", "agent007")
+    with kb.connect() as conn:
+        shape = _shape(conn)
+        author, _, child, _, handoff, *_ = shape
+    monkeypatch.setenv("HERMES_KANBAN_TASK", author)
+    monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
+    result = json.loads(kt._handle_request_review({
+        "task_id": author,
+        "review_task_id": child,
+        "reason": handoff.reason,
+    }))
+    assert "current dispatcher run id is required" in result["error"]
+
+
+def test_copied_live_two_blocked_run_shape_uses_latest_generation(kanban_home, monkeypatch):
+    monkeypatch.setenv("HERMES_PROFILE", "gm2")
+    with kb.connect() as conn:
+        shape = _shape(conn)
+        child, latest_run = shape[2], shape[3]
+        runs = conn.execute(
+            "SELECT id, status, outcome FROM task_runs WHERE task_id=? ORDER BY id",
+            (child,),
+        ).fetchall()
+        assert [(row["status"], row["outcome"]) for row in runs] == [
+            ("blocked", "blocked"),
+            ("blocked", "blocked"),
+        ]
+        assert int(runs[-1]["id"]) == latest_run
+        assert _call(conn, shape) is not None
+
+
+def test_gm_repromotes_one_exact_generation_and_replay_is_idempotent(
+    kanban_home, monkeypatch,
+):
+    monkeypatch.setenv("HERMES_PROFILE", "gm2")
+    with kb.connect() as conn:
+        shape = _shape(conn)
+        author, _, child, child_run, *_ = shape
+        history = _history(conn, author, child)
+        blocked_state = conn.execute(
+            "SELECT block_kind, block_recurrences FROM tasks WHERE id=?", (child,)
+        ).fetchone()
+        receipt = _call(conn, shape)
+        assert receipt is not None
+        assert receipt.correction_actor == "gm2"
+        assert kb.get_task(conn, author).status == "review"
+        assert kb.get_task(conn, child).status == "ready"
+        assert _history(conn, author, child) == history
+        assert tuple(conn.execute(
+            "SELECT block_kind, block_recurrences FROM tasks WHERE id=?", (child,)
+        ).fetchone()) == tuple(blocked_state)
+        replay = _call(conn, shape)
+        assert replay == receipt
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? "
+            "AND kind='review_repromoted' AND run_id=?",
+            (author, child_run),
+        ).fetchone()[0] == 1
+
+
+@pytest.mark.parametrize(
+    ("profile", "change"),
+    [
+        ("agent007", {}),
+        ("bafuxunan", {}),
+        ("gm2", {"author_task_id": "t_wrong"}),
+        ("gm2", {"author_run_id": 999999}),
+        ("gm2", {"review_task_id": "t_wrong"}),
+        ("gm2", {"prior_review_run_id": 999999}),
+        ("gm2", {"handoff_receipt_sha256": "0" * 64}),
+        ("gm2", {"controller_task_id": "t_wrong"}),
+        ("gm2", {"controller_run_id": 999999}),
+        ("gm2", {"exact_candidate": {**CANDIDATE, "repository": "wrong/repo"}}),
+        ("gm2", {"exact_candidate": {**CANDIDATE, "head": "1" * 40}}),
+    ],
+)
+def test_repromotion_hostile_identity_drift_is_zero_mutation(
+    kanban_home, monkeypatch, profile, change,
+):
+    monkeypatch.setenv("HERMES_PROFILE", profile)
+    with kb.connect() as conn:
+        shape = _shape(conn)
+        before = "\n".join(conn.iterdump())
+        assert _call(conn, shape, **change) is None
+        assert "\n".join(conn.iterdump()) == before
+
+
+@pytest.mark.parametrize("drift", ["role", "edge", "candidate", "newer_run", "verdict"])
+def test_repromotion_hostile_board_drift_is_zero_mutation(
+    kanban_home, monkeypatch, drift,
+):
+    monkeypatch.setenv("HERMES_PROFILE", "gm")
+    with kb.connect() as conn:
+        shape = _shape(conn)
+        author, _, child, child_run, handoff, *_ = shape
+        if drift == "role":
+            conn.execute("UPDATE tasks SET assignee='other' WHERE id=?", (child,))
+        elif drift == "edge":
+            conn.execute(
+                "DELETE FROM task_links WHERE parent_id=? AND child_id=?", (author, child)
+            )
+        elif drift == "candidate":
+            payload = json.loads(conn.execute(
+                "SELECT payload FROM task_events WHERE task_id=? "
+                "AND kind='review_handoff'", (author,)
+            ).fetchone()[0])
+            payload["reason"] += " drift"
+            conn.execute(
+                "UPDATE task_events SET payload=? WHERE task_id=? AND kind='review_handoff'",
+                (json.dumps(payload), author),
+            )
+        elif drift == "newer_run":
+            conn.execute(
+                "INSERT INTO task_runs(task_id, profile, status, started_at, ended_at, outcome) "
+                "VALUES (?, 'bafuxunan', 'blocked', 1, 2, 'blocked')",
+                (child,),
+            )
+        else:
+            kb._append_event(
+                conn, child, "review_verdict", {"verdict": "request_changes"},
+                run_id=child_run,
+            )
+        conn.commit()
+        before = "\n".join(conn.iterdump())
+        assert _call(
+            conn, shape, handoff_receipt_sha256=handoff.receipt_sha256
+        ) is None
+        assert "\n".join(conn.iterdump()) == before
+
+
+def test_repromotion_waits_for_other_parent_then_succeeds(kanban_home, monkeypatch):
+    monkeypatch.setenv("HERMES_PROFILE", "gm2")
+    with kb.connect() as conn:
+        shape = _shape(conn)
+        child = shape[2]
+        gate = kb.create_task(conn, title="install gate", assignee="merger")
+        kb.link_tasks(conn, gate, child)
+        before = "\n".join(conn.iterdump())
+        assert _call(conn, shape) is None
+        assert "\n".join(conn.iterdump()) == before
+        conn.execute(
+            "UPDATE tasks SET status='done', completed_at=1 WHERE id=?", (gate,)
+        )
+        conn.commit()
+        assert _call(conn, shape) is not None
+
+
+def test_repromotion_partial_cas_rolls_back(kanban_home, monkeypatch):
+    monkeypatch.setenv("HERMES_PROFILE", "gm2")
+    with kb.connect() as conn:
+        shape = _shape(conn)
+        conn.execute(
+            "CREATE TRIGGER reject_repromotion BEFORE UPDATE ON tasks "
+            "WHEN NEW.status='ready' BEGIN SELECT RAISE(IGNORE); END"
+        )
+        conn.commit()
+        before = "\n".join(conn.iterdump())
+        assert _call(conn, shape) is None
+        assert "\n".join(conn.iterdump()) == before
+
+
+def test_repromotion_conflicting_replay_is_zero_mutation(kanban_home, monkeypatch):
+    monkeypatch.setenv("HERMES_PROFILE", "gm2")
+    with kb.connect() as conn:
+        shape = _shape(conn)
+        assert _call(conn, shape) is not None
+        before = "\n".join(conn.iterdump())
+        assert _call(conn, shape, reason="different correction") is None
+        assert "\n".join(conn.iterdump()) == before
+
+
+def test_repromotion_tool_requires_gm_controller_run(kanban_home, monkeypatch):
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("HERMES_PROFILE", "gm2")
+    with kb.connect() as conn:
+        shape = _shape(conn)
+    author, author_run, child, child_run, handoff, controller, controller_run = shape
+    monkeypatch.setenv("HERMES_KANBAN_TASK", controller)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(controller_run))
+    result = json.loads(kt._handle_repromote_review({
+        "author_task_id": author,
+        "author_run_id": author_run,
+        "review_task_id": child,
+        "prior_review_run_id": child_run,
+        "handoff_receipt_sha256": handoff.receipt_sha256,
+        "correction_reason": "audit first; install follows",
+        "exact_candidate": CANDIDATE,
+    }))
+    assert result["ok"] is True
+    assert result["review_task_id"] == child
+
+
+def test_repromotion_tool_is_visible_to_controller_task_workers(monkeypatch):
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("HERMES_PROFILE", "gm2")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_controller")
+    assert kt._check_kanban_mode() is True
+
+
+def test_repromotion_concurrent_race_emits_one_generation(kanban_home, monkeypatch):
+    monkeypatch.setenv("HERMES_PROFILE", "gm2")
+    with kb.connect() as conn:
+        shape = _shape(conn)
+        author = shape[0]
+    barrier = threading.Barrier(2)
+
+    def invoke():
+        with kb.connect() as conn:
+            barrier.wait()
+            return _call(conn, shape)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda _: invoke(), range(2)))
+    assert results[0] is not None and results[0] == results[1]
+    with kb.connect() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? "
+            "AND kind='review_repromoted'", (author,)
+        ).fetchone()[0] == 1
