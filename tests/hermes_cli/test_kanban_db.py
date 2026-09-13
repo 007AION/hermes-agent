@@ -6013,6 +6013,68 @@ def test_logical_successor_conflicting_replay_is_zero_mutation(kanban_home):
         assert kb.get_task(conn, child).title == "audit"
 
 
+@pytest.mark.parametrize(
+    "changed",
+    [
+        {"initial_status": "blocked"},
+        {"max_runtime_seconds": 600},
+        {"goal_mode": True, "goal_max_turns": 9},
+        {"max_retries": 7},
+        {"model_override": "different-model"},
+        {"workspace_kind": "dir", "workspace_path": "/tmp/different"},
+    ],
+)
+def test_logical_successor_runtime_replay_conflicts_are_zero_mutation(
+    kanban_home, changed,
+):
+    """A replay cannot silently alter lifecycle or worker runtime semantics."""
+    with kb.connect() as conn:
+        source = kb.create_task(conn, title="source", assignee="author")
+        original = {
+            "title": "audit",
+            "assignee": "auditor",
+            "parents": [source],
+            "logical_successor_key": "audit",
+            "max_runtime_seconds": 60,
+        }
+        child = kb.create_task(conn, **original)
+        before = "\n".join(conn.iterdump())
+
+        with pytest.raises(ValueError, match="conflicting logical successor"):
+            kb.create_task(conn, **{**original, **changed})
+
+        assert "\n".join(conn.iterdump()) == before
+        task = kb.get_task(conn, child)
+        assert task is not None
+        assert task.status == "todo"
+        assert task.max_runtime_seconds == 60
+        assert task.goal_mode is False
+
+
+def test_logical_successor_exact_runtime_replay_converges_after_status_change(
+    kanban_home,
+):
+    """Mutable task status is not part of the immutable create contract."""
+    with kb.connect() as conn:
+        source = kb.create_task(conn, title="source", assignee="author")
+        request = {
+            "title": "audit",
+            "assignee": "auditor",
+            "parents": [source],
+            "logical_successor_key": "audit",
+            "max_runtime_seconds": 60,
+            "goal_mode": True,
+            "goal_max_turns": 9,
+        }
+        child = kb.create_task(conn, **request)
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (child,))
+        conn.commit()
+        before = "\n".join(conn.iterdump())
+
+        assert kb.create_task(conn, **request) == child
+        assert "\n".join(conn.iterdump()) == before
+
+
 def test_completion_handoff_conserves_prebound_required_successors(kanban_home):
     with kb.connect() as conn:
         source = kb.create_task(conn, title="source", assignee="author")

@@ -4665,6 +4665,34 @@ def create_task(
         if board_default:
             workspace_path = str(board_default)
 
+    successor_contract = None
+    if logical_successor_key is not None:
+        successor_contract = _logical_successor_creation_contract(
+            title=title.strip(),
+            body=body,
+            assignee=assignee,
+            created_by=created_by,
+            workspace_kind=workspace_kind,
+            workspace_path=workspace_path,
+            branch_name=branch_name,
+            project_id=project_id,
+            tenant=tenant,
+            priority=int(priority),
+            parents=parents,
+            triage=bool(triage),
+            initial_status=initial_status,
+            max_runtime_seconds=max_runtime_seconds,
+            skills=skills_list,
+            max_retries=max_retries,
+            model_override=model_override,
+            provider_override=provider_override,
+            goal_mode=bool(goal_mode),
+            goal_max_turns=goal_max_turns,
+            session_id=session_id,
+            factory_build_gate=factory_gate,
+            factory_preflight_required=preflight_required,
+        )
+
     # Retry once on the extremely unlikely id collision.
     for attempt in range(2):
         task_id = _new_task_id()
@@ -4687,15 +4715,10 @@ def create_task(
                     if existing:
                         row = existing[0]
                         if logical_successor_key is not None:
-                            existing_parents = tuple(parent_ids(conn, row["id"]))
-                            expected = (
-                                title.strip(), body, assignee, tenant, int(priority), parents,
+                            actual_contract = _stored_logical_successor_contract(
+                                conn, row
                             )
-                            actual = (
-                                row["title"], row["body"], row["assignee"], row["tenant"],
-                                int(row["priority"] or 0), existing_parents,
-                            )
-                            if actual != expected:
+                            if actual_contract != successor_contract:
                                 raise ValueError(
                                     "conflicting logical successor replay for "
                                     f"{parents[0]!r}/{logical_successor_key!r}"
@@ -4795,24 +4818,27 @@ def create_task(
                         "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
                         (pid, task_id),
                     )
+                created_payload = {
+                    "assignee": assignee,
+                    "status": task_status,
+                    "parents": list(parents),
+                    "tenant": tenant,
+                    "workspace_kind": workspace_kind,
+                    "workspace_path": workspace_path,
+                    "branch_name": branch_name,
+                    "project_id": project_id,
+                    "skills": list(skills_list) if skills_list else None,
+                    "goal_mode": bool(goal_mode) or None,
+                    "model_override": model_override,
+                    "provider_override": provider_override,
+                }
+                if successor_contract is not None:
+                    created_payload["logical_successor_contract"] = successor_contract
                 _append_event(
                     conn,
                     task_id,
                     "created",
-                    {
-                        "assignee": assignee,
-                        "status": task_status,
-                        "parents": list(parents),
-                        "tenant": tenant,
-                        "workspace_kind": workspace_kind,
-                        "workspace_path": workspace_path,
-                        "branch_name": branch_name,
-                        "project_id": project_id,
-                        "skills": list(skills_list) if skills_list else None,
-                        "goal_mode": bool(goal_mode) or None,
-                        "model_override": model_override,
-                        "provider_override": provider_override,
-                    },
+                    created_payload,
                 )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
             return task_id
@@ -4825,6 +4851,77 @@ def create_task(
 
 
 _LOGICAL_SUCCESSOR_KEY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,63}")
+
+
+def _logical_successor_creation_contract(**values: Any) -> dict[str, Any]:
+    """Return the closed v1 identity of a logical successor create request."""
+    contract = {"version": 1, **values}
+    contract["parents"] = list(contract["parents"])
+    contract["skills"] = (
+        list(contract["skills"]) if contract["skills"] is not None else None
+    )
+    for field in ("max_runtime_seconds", "max_retries", "goal_max_turns"):
+        if contract[field] is not None:
+            contract[field] = int(contract[field])
+    return contract
+
+
+def _stored_logical_successor_contract(
+    conn: sqlite3.Connection, row: sqlite3.Row,
+) -> dict[str, Any]:
+    """Read the immutable create contract, reconstructing pre-v1 rows safely."""
+    event = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id=? AND kind='created' "
+        "ORDER BY id ASC LIMIT 1",
+        (row["id"],),
+    ).fetchone()
+    payload: dict[str, Any] = {}
+    if event is not None and event["payload"]:
+        try:
+            decoded = json.loads(event["payload"])
+            if isinstance(decoded, dict):
+                payload = decoded
+        except (TypeError, json.JSONDecodeError):
+            pass
+    stored = payload.get("logical_successor_contract")
+    if isinstance(stored, dict):
+        return stored
+
+    # Compatibility for successors created by the immediately preceding
+    # implementation, which persisted the task but not its closed replay
+    # contract. Creation status (unlike tasks.status) is immutable in the
+    # event and distinguishes blocked/triage/inherited lifecycle requests.
+    created_status = payload.get("status")
+    raw_skills = row["skills"]
+    try:
+        stored_skills = json.loads(raw_skills) if raw_skills is not None else None
+    except (TypeError, json.JSONDecodeError):
+        stored_skills = None
+    return _logical_successor_creation_contract(
+        title=row["title"],
+        body=row["body"],
+        assignee=row["assignee"],
+        created_by=row["created_by"],
+        workspace_kind=row["workspace_kind"],
+        workspace_path=row["workspace_path"],
+        branch_name=row["branch_name"],
+        project_id=row["project_id"],
+        tenant=row["tenant"],
+        priority=int(row["priority"] or 0),
+        parents=tuple(parent_ids(conn, row["id"])),
+        triage=created_status == "triage",
+        initial_status="blocked" if created_status == "blocked" else "running",
+        max_runtime_seconds=row["max_runtime_seconds"],
+        skills=stored_skills,
+        max_retries=row["max_retries"],
+        model_override=row["model_override"],
+        provider_override=row["provider_override"],
+        goal_mode=bool(row["goal_mode"]),
+        goal_max_turns=row["goal_max_turns"],
+        session_id=row["session_id"],
+        factory_build_gate=int(row["factory_build_gate"] or 0),
+        factory_preflight_required=int(row["factory_preflight_required"] or 0),
+    )
 
 
 def logical_successor_idempotency_key(source_task_id: str, key: str) -> str:

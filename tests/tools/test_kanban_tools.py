@@ -343,6 +343,45 @@ def test_tools_create_and_complete_closed_successor_handoff(worker_env):
     assert completed["ok"] is True
 
 
+def test_tool_create_rejects_conflicting_successor_runtime_replay(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    request = {
+        "title": "independent audit",
+        "assignee": "auditor",
+        "parents": [worker_env],
+        "logical_successor_key": "audit",
+        "max_runtime_seconds": 60,
+    }
+    created = json.loads(kt._handle_create(request))
+    assert created["ok"] is True
+
+    conn = kb.connect()
+    try:
+        before = "\n".join(conn.iterdump())
+    finally:
+        conn.close()
+    conflict = json.loads(kt._handle_create({
+        **request,
+        "initial_status": "blocked",
+        "max_runtime_seconds": 600,
+        "goal_mode": True,
+        "goal_max_turns": 9,
+    }))
+    assert "conflicting logical successor replay" in conflict["error"]
+    conn = kb.connect()
+    try:
+        assert "\n".join(conn.iterdump()) == before
+        child = kb.get_task(conn, created["task_id"])
+        assert child is not None
+        assert child.status == "todo"
+        assert child.max_runtime_seconds == 60
+        assert child.goal_mode is False
+    finally:
+        conn.close()
+
+
 def test_tool_completion_rejects_unbound_successor_without_mutation(worker_env):
     from hermes_cli import kanban_db as kb
     from tools import kanban_tools as kt
