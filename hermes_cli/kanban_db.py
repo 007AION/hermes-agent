@@ -1942,6 +1942,25 @@ class ReviewHandoffReceipt:
     receipt_sha256: str
 
 
+@dataclass(frozen=True)
+class ReviewRepromotionReceipt:
+    """Durable identity of one controller-authorized same-child re-review."""
+
+    event_id: int
+    version: int
+    author_task_id: str
+    author_run_id: int
+    review_task_id: str
+    prior_review_run_id: int
+    handoff_receipt_sha256: str
+    correction_actor: str
+    correction_reason: str
+    controller_task_id: str
+    controller_run_id: int
+    exact_candidate: dict[str, Any]
+    receipt_sha256: str
+
+
 class _ReviewHandoffConflict(Exception):
     """Internal sentinel that forces write_txn rollback on a failed CAS."""
 
@@ -9312,6 +9331,288 @@ def request_review_handoff(
             review_task_id=review_task_id,
             reason=reason,
             recovery=recovery,
+        )
+    except _ReviewHandoffConflict:
+        return None
+
+
+def _repromote_blocked_review_child(
+    conn: sqlite3.Connection,
+    author_task_id: str,
+    *,
+    author_run_id: int,
+    review_task_id: str,
+    prior_review_run_id: int,
+    handoff_receipt_sha256: str,
+    correction_reason: str,
+    controller_task_id: str,
+    controller_run_id: int,
+    exact_candidate: dict[str, Any],
+) -> Optional[ReviewRepromotionReceipt]:
+    """Authorize one exact same-child re-review without a live author run.
+
+    This is not a generic unblock. Only an authenticated GM controller may
+    consume the latest immutable author handoff plus the latest blocked audit
+    run, and every other parent must already be terminal. The original run,
+    handoff, and blocked history remain immutable; replay returns the one
+    signed repromotion receipt.
+    """
+    actor = (os.environ.get("HERMES_PROFILE") or "").strip()
+    correction_reason = str(correction_reason or "").strip()
+    handoff_receipt_sha256 = str(handoff_receipt_sha256 or "").lower()
+    if (
+        actor not in FACTORY_REVIEW_VERDICT_RECOVERY_CONTROLLER_PROFILES
+        or not author_task_id
+        or not review_task_id
+        or not correction_reason
+        or re.fullmatch(r"[0-9a-f]{64}", handoff_receipt_sha256) is None
+    ):
+        return None
+    try:
+        author_run_id = int(author_run_id)
+        prior_review_run_id = int(prior_review_run_id)
+        controller_run_id = int(controller_run_id)
+    except (TypeError, ValueError):
+        return None
+    if author_run_id <= 0 or prior_review_run_id <= 0 or controller_run_id <= 0:
+        return None
+    if (
+        not controller_task_id
+        or not isinstance(exact_candidate, dict)
+        or set(exact_candidate) != {"repository", "pr", "head", "tree", "base"}
+        or type(exact_candidate["repository"]) is not str
+        or re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", exact_candidate["repository"]) is None
+        or type(exact_candidate["pr"]) is not int
+        or exact_candidate["pr"] <= 0
+        or any(
+            type(exact_candidate[key]) is not str
+            or re.fullmatch(r"[0-9a-fA-F]{40}", exact_candidate[key]) is None
+            for key in ("head", "tree", "base")
+        )
+    ):
+        return None
+    exact_candidate = {key: exact_candidate[key] for key in sorted(exact_candidate)}
+
+    core_payload = {
+        "version": 1,
+        "author_task_id": author_task_id,
+        "author_run_id": author_run_id,
+        "review_task_id": review_task_id,
+        "prior_review_run_id": prior_review_run_id,
+        "handoff_receipt_sha256": handoff_receipt_sha256,
+        "correction_actor": actor,
+        "correction_reason": correction_reason,
+        "controller_task_id": controller_task_id,
+        "controller_run_id": controller_run_id,
+        "exact_candidate": exact_candidate,
+    }
+    receipt_sha256 = hashlib.sha256(
+        json.dumps(
+            core_payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ).encode("utf-8")
+    ).hexdigest()
+
+    with write_txn(conn):
+        controller = conn.execute(
+            "SELECT 1 FROM tasks task JOIN task_runs run "
+            "ON run.id=? AND run.task_id=task.id WHERE task.id=? "
+            "AND task.assignee=? AND task.status='running' "
+            "AND task.current_run_id=run.id AND run.profile=? "
+            "AND run.status='running' AND run.outcome IS NULL AND run.ended_at IS NULL",
+            (controller_run_id, controller_task_id, actor, actor),
+        ).fetchone()
+        if controller is None or controller_task_id in {author_task_id, review_task_id}:
+            return None
+        prior_events = conn.execute(
+            "SELECT id, run_id, payload FROM task_events "
+            "WHERE task_id = ? AND kind = 'review_repromoted' ORDER BY id",
+            (author_task_id,),
+        ).fetchall()
+        if prior_events:
+            if len(prior_events) != 1:
+                return None
+            row = prior_events[0]
+            try:
+                payload = json.loads(row["payload"] or "{}")
+            except (TypeError, ValueError):
+                return None
+            if (
+                row["run_id"] != prior_review_run_id
+                or payload != {**core_payload, "receipt_sha256": receipt_sha256}
+            ):
+                return None
+            return ReviewRepromotionReceipt(
+                event_id=int(row["id"]),
+                receipt_sha256=receipt_sha256,
+                **core_payload,
+            )
+
+        identity_fields = (
+            "current_run_id", "claim_lock", "claim_expires", "worker_pid",
+            "worker_starttime", "fence_lineage", "fence_disposition",
+        )
+        columns = "status, assignee, body, " + ", ".join(identity_fields)
+        author = conn.execute(
+            f"SELECT {columns} FROM tasks WHERE id = ?", (author_task_id,)
+        ).fetchone()
+        child = conn.execute(
+            f"SELECT {columns} FROM tasks WHERE id = ?", (review_task_id,)
+        ).fetchone()
+        if (
+            author is None
+            or child is None
+            or author["status"] != "review"
+            or author["assignee"] != FACTORY_REVIEW_AUTHOR_PROFILE
+            or child["status"] not in {"todo", "blocked"}
+            or child["assignee"] != FACTORY_REVIEW_AUDITOR_PROFILE
+            or any(author[field] is not None for field in identity_fields)
+            or any(child[field] is not None for field in identity_fields)
+        ):
+            return None
+        if conn.execute(
+            "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ?",
+            (author_task_id, review_task_id),
+        ).fetchone() is None:
+            return None
+        if conn.execute(
+            "SELECT 1 FROM task_links edge JOIN tasks parent "
+            "ON parent.id = edge.parent_id WHERE edge.child_id = ? "
+            "AND parent.status NOT IN ('done', 'archived') "
+            "AND parent.id != ? LIMIT 1",
+            (review_task_id, author_task_id),
+        ).fetchone() is not None:
+            return None
+
+        handoff_row = conn.execute(
+            "SELECT id, run_id, payload FROM task_events WHERE task_id = ? "
+            "AND kind = 'review_handoff' ORDER BY id DESC LIMIT 1",
+            (author_task_id,),
+        ).fetchone()
+        handoff = (
+            _review_handoff_receipt_from_row(author_task_id, handoff_row)
+            if handoff_row is not None else None
+        )
+        if (
+            handoff is None
+            or handoff.expected_run_id != author_run_id
+            or handoff.review_task_id != review_task_id
+            or handoff.receipt_sha256 != handoff_receipt_sha256
+        ):
+            return None
+        legacy_tuples = re.findall(
+            r"PR(?P<pr>[1-9][0-9]*) exact candidate (?P<head>[0-9a-fA-F]{40}) "
+            r"\(tree (?P<tree>[0-9a-fA-F]{40}), base (?P<base>[0-9a-fA-F]{40})\)",
+            handoff.reason,
+        )
+        strict_target = _canonical_audit_target_from_handoff_reason(handoff.reason)
+        strict_match = (
+            strict_target is not None
+            and strict_target.get("candidate") == exact_candidate
+        )
+        legacy_match = (
+            len(legacy_tuples) == 1
+            and legacy_tuples[0] == (
+                str(exact_candidate["pr"]), exact_candidate["head"],
+                exact_candidate["tree"], exact_candidate["base"],
+            )
+            and f"https://github.com/{exact_candidate['repository']}/" in (
+                author["body"] or ""
+            )
+        )
+        if not strict_match and not legacy_match:
+            return None
+
+        author_run = conn.execute(
+            "SELECT id, profile, status, outcome, ended_at FROM task_runs "
+            "WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+            (author_task_id,),
+        ).fetchone()
+        review_run = conn.execute(
+            "SELECT id, profile, status, outcome, ended_at FROM task_runs "
+            "WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+            (review_task_id,),
+        ).fetchone()
+        if (
+            author_run is None
+            or int(author_run["id"]) != author_run_id
+            or author_run["profile"] != FACTORY_REVIEW_AUTHOR_PROFILE
+            or author_run["status"] != "review_required"
+            or author_run["outcome"] != "review_required"
+            or author_run["ended_at"] is None
+            or review_run is None
+            or int(review_run["id"]) != prior_review_run_id
+            or review_run["profile"] != FACTORY_REVIEW_AUDITOR_PROFILE
+            or review_run["status"] != "blocked"
+            or review_run["outcome"] != "blocked"
+            or review_run["ended_at"] is None
+        ):
+            return None
+        if conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? AND run_id = ? "
+            "AND kind IN ('review_verdict', 'canonical_audit_outcome') LIMIT 1",
+            (review_task_id, prior_review_run_id),
+        ).fetchone() is not None:
+            return None
+
+        updated = conn.execute(
+            "UPDATE tasks SET status = 'ready', consecutive_failures = 0, "
+            "last_failure_error = NULL WHERE id = ? AND status IN ('todo', 'blocked') "
+            "AND current_run_id IS NULL AND claim_lock IS NULL "
+            "AND claim_expires IS NULL AND worker_pid IS NULL "
+            "AND worker_starttime IS NULL AND fence_lineage IS NULL "
+            "AND fence_disposition IS NULL",
+            (review_task_id,),
+        )
+        if updated.rowcount != 1:
+            raise _ReviewHandoffConflict
+        payload = {**core_payload, "receipt_sha256": receipt_sha256}
+        _append_event(
+            conn, author_task_id, "review_repromoted", payload,
+            run_id=prior_review_run_id,
+        )
+        event_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+        _append_event(
+            conn, review_task_id, "promoted",
+            {
+                "source": "review_repromotion",
+                "parent_id": author_task_id,
+                "prior_review_run_id": prior_review_run_id,
+                "receipt_sha256": receipt_sha256,
+            },
+        )
+        return ReviewRepromotionReceipt(
+            event_id=event_id,
+            receipt_sha256=receipt_sha256,
+            **core_payload,
+        )
+
+
+def repromote_blocked_review_child(
+    conn: sqlite3.Connection,
+    author_task_id: str,
+    *,
+    author_run_id: int,
+    review_task_id: str,
+    prior_review_run_id: int,
+    handoff_receipt_sha256: str,
+    correction_reason: str,
+    controller_task_id: str,
+    controller_run_id: int,
+    exact_candidate: dict[str, Any],
+) -> Optional[ReviewRepromotionReceipt]:
+    """Public fail-closed wrapper for exact same-child re-review recovery."""
+    try:
+        return _repromote_blocked_review_child(
+            conn,
+            author_task_id,
+            author_run_id=author_run_id,
+            review_task_id=review_task_id,
+            prior_review_run_id=prior_review_run_id,
+            handoff_receipt_sha256=handoff_receipt_sha256,
+            correction_reason=correction_reason,
+            controller_task_id=controller_task_id,
+            controller_run_id=controller_run_id,
+            exact_candidate=exact_candidate,
         )
     except _ReviewHandoffConflict:
         return None
