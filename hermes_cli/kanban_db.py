@@ -13315,6 +13315,18 @@ def _validate_prebound_transition_successors(
 ) -> None:
     """Conserve every known logical successor in the terminal CAS."""
     prefix = f"kanban-successor:v1:{source_task_id}:"
+    archived_only = conn.execute(
+        "SELECT t.idempotency_key FROM tasks t "
+        "WHERE substr(t.idempotency_key, 1, ?) = ? "
+        "GROUP BY t.idempotency_key "
+        "HAVING SUM(CASE WHEN t.status!='archived' THEN 1 ELSE 0 END) = 0 "
+        "ORDER BY t.idempotency_key",
+        (len(prefix), prefix),
+    ).fetchall()
+    if archived_only:
+        raise TransitionHandoffError(
+            "archived logical successor history is not a successful disposition"
+        )
     rows = conn.execute(
         "SELECT t.id, t.idempotency_key, EXISTS("
         "SELECT 1 FROM task_links l WHERE l.parent_id=? AND l.child_id=t.id"

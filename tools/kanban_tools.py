@@ -1958,7 +1958,7 @@ KANBAN_COMPLETE_SCHEMA = {
                     "version": {"type": "integer", "enum": [1]},
                     "required_successors": {
                         "type": "array",
-                        "minItems": 1,
+                        "minItems": 0,
                         "maxItems": 32,
                         "items": {
                             "type": "object",

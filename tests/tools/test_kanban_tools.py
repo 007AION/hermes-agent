@@ -343,6 +343,31 @@ def test_tools_create_and_complete_closed_successor_handoff(worker_env):
     assert completed["ok"] is True
 
 
+def test_tool_complete_accepts_explicit_zero_successor_handoff(worker_env):
+    from tools import kanban_tools as kt
+    from tools.registry import invalidate_check_fn_cache, registry
+    from toolsets import resolve_toolset
+
+    invalidate_check_fn_cache()
+    definitions = registry.get_definitions(
+        set(resolve_toolset("hermes-cli")), quiet=True,
+    )
+    schema = next(
+        tool for tool in definitions
+        if tool["function"]["name"] == "kanban_complete"
+    )
+    handoff_schema = schema["function"]["parameters"]["properties"][
+        "transition_handoff"
+    ]
+    assert handoff_schema["properties"]["required_successors"]["minItems"] == 0
+
+    completed = json.loads(kt._handle_complete({
+        "summary": "verified terminal leaf",
+        "transition_handoff": {"version": 1, "required_successors": []},
+    }))
+    assert completed["ok"] is True
+
+
 def test_tool_create_rejects_conflicting_successor_runtime_replay(worker_env):
     from hermes_cli import kanban_db as kb
     from tools import kanban_tools as kt

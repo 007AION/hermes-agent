@@ -6133,6 +6133,34 @@ def test_completion_explicit_zero_successor_handoff_is_supported(kanban_home):
         }
 
 
+@pytest.mark.parametrize("explicit_empty", [False, True])
+def test_archived_only_successor_history_cannot_disappear_at_completion(
+    kanban_home, explicit_empty,
+):
+    with kb.connect() as conn:
+        source = kb.create_task(conn, title="source", assignee="author")
+        child = kb.create_task(
+            conn, title="audit", assignee="auditor", parents=[source],
+            logical_successor_key="audit",
+        )
+        assert kb.archive_task(conn, child)
+        before = "\n".join(conn.iterdump())
+        with pytest.raises(kb.TransitionHandoffError):
+            if explicit_empty:
+                kb.complete_task(
+                    conn,
+                    source,
+                    summary="must remain nonterminal",
+                    transition_handoff={"version": 1, "required_successors": []},
+                )
+            else:
+                kb.complete_task(conn, source, summary="must remain nonterminal")
+
+        assert "\n".join(conn.iterdump()) == before
+        task = kb.get_task(conn, source)
+        assert task is not None and task.status == "ready"
+
+
 def test_completion_handoff_cannot_omit_one_of_multiple_known_successors(
     kanban_home,
 ):
