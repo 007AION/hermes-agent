@@ -4451,6 +4451,7 @@ def create_task(
     strategic_directive: Optional[Any] = None,
     authorized_scope: Optional[Any] = None,
     canonical_incident: Optional[str] = None,
+    logical_successor_key: Optional[str] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -4596,27 +4597,24 @@ def create_task(
                 # ``<repo>/.worktrees/<task-id>`` dir keyed on the new task id.
                 project_repo = str(project_obj.primary_path)
 
-    parents = tuple(p for p in parents if p)
+    parents = tuple(dict.fromkeys(p for p in parents if p))
+    if logical_successor_key is not None:
+        logical_successor_key = str(logical_successor_key).strip()
+        if len(parents) != 1:
+            raise ValueError("logical_successor_key requires exactly one parent")
+        derived_idempotency_key = logical_successor_idempotency_key(
+            parents[0], logical_successor_key
+        )
+        if idempotency_key is not None and idempotency_key != derived_idempotency_key:
+            raise ValueError(
+                "idempotency_key conflicts with the derived logical successor identity"
+            )
+        idempotency_key = derived_idempotency_key
 
     # Reject deterministic profile/skill mismatches before they consume the
     # dispatcher's retry budget.
     skills_list = _normalize_task_skills(skills)
     _validate_assignee_skills(assignee, skills_list)
-
-    # Idempotency check — return the existing task instead of creating a
-    # duplicate. Done BEFORE entering write_txn to keep the fast path fast
-    # and to avoid holding a write lock during the lookup. Race is
-    # acceptable: two concurrent creators with the same key might both
-    # insert, at which point both rows exist but the next lookup stabilises.
-    if idempotency_key:
-        row = conn.execute(
-            "SELECT id FROM tasks WHERE idempotency_key = ? "
-            "AND status != 'archived' "
-            "ORDER BY created_at DESC LIMIT 1",
-            (idempotency_key,),
-        ).fetchone()
-        if row:
-            return row["id"]
 
     now = int(time.time())
 
@@ -4672,6 +4670,37 @@ def create_task(
         task_id = _new_task_id()
         try:
             with write_txn(conn):
+                # Lookup and insert share one BEGIN IMMEDIATE lock. Concurrent
+                # retries therefore cannot both observe absence and create two
+                # live tasks for one logical identity.
+                if idempotency_key:
+                    existing = conn.execute(
+                        "SELECT * FROM tasks WHERE idempotency_key = ? "
+                        "AND status != 'archived' ORDER BY created_at DESC, id DESC",
+                        (idempotency_key,),
+                    ).fetchall()
+                    if len(existing) > 1:
+                        raise ValueError(
+                            f"ambiguous idempotency key {idempotency_key!r}: "
+                            "multiple live tasks already exist"
+                        )
+                    if existing:
+                        row = existing[0]
+                        if logical_successor_key is not None:
+                            existing_parents = tuple(parent_ids(conn, row["id"]))
+                            expected = (
+                                title.strip(), body, assignee, tenant, int(priority), parents,
+                            )
+                            actual = (
+                                row["title"], row["body"], row["assignee"], row["tenant"],
+                                int(row["priority"] or 0), existing_parents,
+                            )
+                            if actual != expected:
+                                raise ValueError(
+                                    "conflicting logical successor replay for "
+                                    f"{parents[0]!r}/{logical_successor_key!r}"
+                                )
+                        return row["id"]
                 # Determine task status from parent status, unless the caller
                 # parks it directly in blocked for human-ops review or in
                 # triage for a specifier.
@@ -4793,6 +4822,23 @@ def create_task(
             # Retry with a fresh id.
             continue
     raise RuntimeError("unreachable")
+
+
+_LOGICAL_SUCCESSOR_KEY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,63}")
+
+
+def logical_successor_idempotency_key(source_task_id: str, key: str) -> str:
+    """Return the deterministic v1 identity for one source obligation."""
+    source_task_id = str(source_task_id or "").strip()
+    key = str(key or "").strip()
+    if re.fullmatch(r"t_[0-9A-Za-z]+", source_task_id) is None:
+        raise ValueError("logical successor source must be a task id")
+    if _LOGICAL_SUCCESSOR_KEY_RE.fullmatch(key) is None:
+        raise ValueError(
+            "logical successor key must be 1..64 characters from "
+            "[A-Za-z0-9._:-] and start alphanumeric"
+        )
+    return f"kanban-successor:v1:{source_task_id}:{key}"
 
 
 def _find_missing_parents(conn: sqlite3.Connection, parents: Iterable[str]) -> list[str]:
@@ -12554,6 +12600,7 @@ def complete_task(
     metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
+    transition_handoff: Optional[dict] = None,
 ) -> bool:
     """Transition ``running|ready -> done`` and record ``result``.
 
@@ -12584,6 +12631,7 @@ def complete_task(
     and never blocks.
     """
     now = int(time.time())
+    canonical_handoff = _canonical_transition_handoff(transition_handoff)
 
     # Gate: verify created_cards BEFORE the main write txn. A rejected
     # completion still needs an auditable event, so we emit it in a
@@ -12714,6 +12762,9 @@ def complete_task(
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
+    if canonical_handoff is not None:
+        metadata = dict(metadata) if isinstance(metadata, dict) else {}
+        metadata["transition_handoff"] = canonical_handoff
     # --- Controller/manual completion (AION-RL2-CORE-01) ---
     # expected_run_id=None: controller terminalization of any non-terminal
     # status (triage, todo, scheduled, review, running, ready, blocked).
@@ -12741,6 +12792,10 @@ def complete_task(
     )
 
     with write_txn(conn):
+        if canonical_handoff is not None:
+            _validate_prebound_transition_successors(
+                conn, task_id, canonical_handoff
+            )
         if _run_finalizer:
             # AION-889 I1+I2 (architecture A): the kernel-owned finalizer owns
             # the terminal write (running -> done) AND the receipt binding
@@ -12865,6 +12920,8 @@ def complete_task(
         }
         if verified_cards:
             completed_payload["verified_cards"] = verified_cards
+        if canonical_handoff is not None:
+            completed_payload["transition_handoff"] = canonical_handoff
         # Record prior_status when controller completed a non-running task
         # (AION-RL2-CORE-01). Worker-completed tasks have no prior_status
         # because they were already running.
@@ -12956,6 +13013,82 @@ def complete_task(
         summary=(summary if summary is not None else result),
     )
     return True
+
+
+# ---------------------------------------------------------------------------
+# Closed terminal-transition handoff contract
+# ---------------------------------------------------------------------------
+
+
+class TransitionHandoffError(ValueError):
+    """The v1 terminal handoff is malformed or loses a declared obligation."""
+
+
+def _canonical_transition_handoff(handoff: Optional[dict]) -> Optional[dict]:
+    """Validate and canonicalize the bounded, closed v1 handoff schema."""
+    if handoff is None:
+        return None
+    if not isinstance(handoff, dict) or set(handoff) != {
+        "version", "required_successors",
+    }:
+        raise TransitionHandoffError(
+            "transition_handoff must contain exactly version and required_successors"
+        )
+    if type(handoff["version"]) is not int or handoff["version"] != 1:
+        raise TransitionHandoffError("transition_handoff.version must be integer 1")
+    successors = handoff["required_successors"]
+    if not isinstance(successors, list) or not 1 <= len(successors) <= 32:
+        raise TransitionHandoffError(
+            "required_successors must contain between 1 and 32 entries"
+        )
+    canonical: list[dict[str, str]] = []
+    seen_keys: set[str] = set()
+    seen_tasks: set[str] = set()
+    for item in successors:
+        if not isinstance(item, dict) or set(item) != {"key", "task_id"}:
+            raise TransitionHandoffError(
+                "each required successor must contain exactly key and task_id"
+            )
+        key = item["key"]
+        task_id = item["task_id"]
+        if type(key) is not str or _LOGICAL_SUCCESSOR_KEY_RE.fullmatch(key) is None:
+            raise TransitionHandoffError("invalid required successor key")
+        if type(task_id) is not str or re.fullmatch(r"t_[0-9A-Za-z]+", task_id) is None:
+            raise TransitionHandoffError("invalid required successor task_id")
+        if key in seen_keys or task_id in seen_tasks:
+            raise TransitionHandoffError(
+                "required successor keys and task ids must be unique"
+            )
+        seen_keys.add(key)
+        seen_tasks.add(task_id)
+        canonical.append({"key": key, "task_id": task_id})
+    canonical.sort(key=lambda item: item["key"])
+    return {"version": 1, "required_successors": canonical}
+
+
+def _validate_prebound_transition_successors(
+    conn: sqlite3.Connection, source_task_id: str, handoff: dict,
+) -> None:
+    """Prove every declared successor identity and edge before terminal CAS."""
+    for successor in handoff["required_successors"]:
+        expected_identity = logical_successor_idempotency_key(
+            source_task_id, successor["key"]
+        )
+        row = conn.execute(
+            "SELECT t.status, t.idempotency_key FROM tasks t "
+            "JOIN task_links l ON l.parent_id=? AND l.child_id=t.id "
+            "WHERE t.id=?",
+            (source_task_id, successor["task_id"]),
+        ).fetchone()
+        if (
+            row is None
+            or row["status"] == "archived"
+            or row["idempotency_key"] != expected_identity
+        ):
+            raise TransitionHandoffError(
+                "terminal transition would lose required successor "
+                f"{successor['key']!r}"
+            )
 
 
 # ---------------------------------------------------------------------------

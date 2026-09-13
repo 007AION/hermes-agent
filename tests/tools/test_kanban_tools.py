@@ -306,10 +306,12 @@ def test_complete_happy_path(worker_env):
     d = json.loads(out)
     assert d["ok"] is True
     assert d["task_id"] == worker_env
-    # Verify via kernel
+
     from hermes_cli import kanban_db as kb
     conn = kb.connect()
     try:
+        task = kb.get_task(conn, worker_env)
+        assert task.status == "done"
         run = kb.latest_run(conn, worker_env)
         assert run.outcome == "completed"
         assert run.summary == "got the thing done"
@@ -317,6 +319,53 @@ def test_complete_happy_path(worker_env):
     finally:
         conn.close()
 
+
+def test_tools_create_and_complete_closed_successor_handoff(worker_env):
+    from tools import kanban_tools as kt
+
+    created = json.loads(kt._handle_create({
+        "title": "independent audit",
+        "assignee": "auditor",
+        "parents": [worker_env],
+        "logical_successor_key": "audit",
+    }))
+    assert created["ok"] is True
+    child = created["task_id"]
+
+    completed = json.loads(kt._handle_complete({
+        "summary": "candidate frozen",
+        "created_cards": [child],
+        "transition_handoff": {
+            "version": 1,
+            "required_successors": [{"key": "audit", "task_id": child}],
+        },
+    }))
+    assert completed["ok"] is True
+
+
+def test_tool_completion_rejects_unbound_successor_without_mutation(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        before = "\n".join(conn.iterdump())
+    finally:
+        conn.close()
+    result = json.loads(kt._handle_complete({
+        "summary": "must fail",
+        "transition_handoff": {
+            "version": 1,
+            "required_successors": [{"key": "audit", "task_id": "t_missing0000"}],
+        },
+    }))
+    assert "transition_handoff" in result["error"]
+    conn = kb.connect()
+    try:
+        assert "\n".join(conn.iterdump()) == before
+        assert kb.get_task(conn, worker_env).status == "running"
+    finally:
+        conn.close()
 
 def test_complete_metadata_round_trips_through_show(worker_env):
     """Structured completion metadata should be visible to downstream agents."""

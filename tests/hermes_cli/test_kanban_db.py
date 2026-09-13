@@ -5923,6 +5923,153 @@ def test_request_review_handoff_atomically_binds_run_and_exact_child(kanban_home
         ]
 
 
+def test_idempotency_key_duplicate_attempts_converge_atomically(
+    kanban_home, monkeypatch,
+):
+    """The existing idempotency API must not split under concurrent create."""
+    barrier = __import__("threading").Barrier(2)
+    original_new_task_id = kb._new_task_id
+
+    def synchronized_new_task_id():
+        barrier.wait()
+        return original_new_task_id()
+
+    monkeypatch.setattr(kb, "_new_task_id", synchronized_new_task_id)
+
+    def create_once():
+        with kb.connect() as thread_conn:
+            return kb.create_task(
+                thread_conn, title="same", assignee="worker",
+                idempotency_key="same-logical-task",
+            )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda _: create_once(), range(2)))
+
+    assert results[0] == results[1]
+    with kb.connect() as conn:
+        rows = conn.execute(
+            "SELECT id FROM tasks WHERE idempotency_key='same-logical-task' "
+            "AND status!='archived'"
+        ).fetchall()
+        assert [row["id"] for row in rows] == [results[0]]
+
+
+def test_logical_successor_duplicate_attempts_converge_atomically(
+    kanban_home, monkeypatch,
+):
+    """One source/key identity produces one exact live successor under races."""
+    with kb.connect() as conn:
+        source = kb.create_task(conn, title="source", assignee="author")
+    barrier = __import__("threading").Barrier(2)
+    original_new_task_id = kb._new_task_id
+
+    def synchronized_new_task_id():
+        # Both callers cross the historical out-of-transaction lookup before
+        # either insert. This makes the pre-fix duplicate deterministic.
+        barrier.wait()
+        return original_new_task_id()
+
+    monkeypatch.setattr(kb, "_new_task_id", synchronized_new_task_id)
+
+    def create_once():
+        with kb.connect() as thread_conn:
+            return kb.create_task(
+                thread_conn,
+                title="audit",
+                assignee="auditor",
+                parents=[source],
+                logical_successor_key="audit",
+            )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda _: create_once(), range(2)))
+
+    assert results[0] == results[1]
+    with kb.connect() as conn:
+        key = kb.logical_successor_idempotency_key(source, "audit")
+        rows = conn.execute(
+            "SELECT id FROM tasks WHERE idempotency_key=? AND status!='archived'",
+            (key,),
+        ).fetchall()
+        assert [row["id"] for row in rows] == [results[0]]
+        assert kb.parent_ids(conn, results[0]) == [source]
+
+
+def test_logical_successor_conflicting_replay_is_zero_mutation(kanban_home):
+    with kb.connect() as conn:
+        source = kb.create_task(conn, title="source", assignee="author")
+        child = kb.create_task(
+            conn, title="audit", assignee="auditor", parents=[source],
+            logical_successor_key="audit",
+        )
+        before = "\n".join(conn.iterdump())
+        with pytest.raises(ValueError, match="conflicting logical successor"):
+            kb.create_task(
+                conn, title="different", assignee="other", parents=[source],
+                logical_successor_key="audit",
+            )
+        assert "\n".join(conn.iterdump()) == before
+        assert kb.get_task(conn, child).title == "audit"
+
+
+def test_completion_handoff_conserves_prebound_required_successors(kanban_home):
+    with kb.connect() as conn:
+        source = kb.create_task(conn, title="source", assignee="author")
+        child = kb.create_task(
+            conn, title="audit", assignee="auditor", parents=[source],
+            logical_successor_key="audit",
+        )
+        handoff = {
+            "version": 1,
+            "required_successors": [{"key": "audit", "task_id": child}],
+        }
+        assert kb.complete_task(
+            conn, source, summary="candidate", transition_handoff=handoff,
+        ) is True
+        event = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='completed' "
+            "ORDER BY id DESC LIMIT 1", (source,),
+        ).fetchone()
+        assert json.loads(event["payload"])["transition_handoff"] == handoff
+        run = kb.latest_run(conn, source)
+        assert run.metadata["transition_handoff"] == handoff
+
+
+@pytest.mark.parametrize("conflict", [
+    "unknown_field", "wrong_edge", "wrong_identity", "partial_successor",
+])
+def test_completion_handoff_conflicts_fail_closed_byte_equivalent(
+    kanban_home, conflict,
+):
+    with kb.connect() as conn:
+        source = kb.create_task(conn, title="source", assignee="author")
+        child = kb.create_task(
+            conn, title="audit", assignee="auditor", parents=[source],
+            logical_successor_key="audit",
+        )
+        entry = {"key": "audit", "task_id": child}
+        handoff = {"version": 1, "required_successors": [entry]}
+        if conflict == "unknown_field":
+            handoff["extra"] = True
+        elif conflict == "wrong_edge":
+            conn.execute("DELETE FROM task_links WHERE parent_id=? AND child_id=?", (source, child))
+            conn.commit()
+        elif conflict == "wrong_identity":
+            entry["key"] = "other"
+        else:
+            entry["task_id"] = "t_missing0000"
+        before = "\n".join(conn.iterdump())
+
+        with pytest.raises(kb.TransitionHandoffError):
+            kb.complete_task(
+                conn, source, summary="candidate", transition_handoff=handoff,
+            )
+
+        assert "\n".join(conn.iterdump()) == before
+        assert kb.get_task(conn, source).status == "ready"
+
+
 @pytest.mark.parametrize("run_delta", [-1, 1])
 def test_request_review_handoff_rejects_stale_run_without_mutation(
     kanban_home, run_delta,

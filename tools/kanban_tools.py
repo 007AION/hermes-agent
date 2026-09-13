@@ -565,6 +565,7 @@ def _handle_complete(args: dict, **kw) -> str:
         except json.JSONDecodeError:
             pass
     created_cards = args.get("created_cards")
+    transition_handoff = args.get("transition_handoff")
     artifacts = args.get("artifacts")
     if created_cards is not None:
         if isinstance(created_cards, str):
@@ -677,6 +678,12 @@ def _handle_complete(args: dict, **kw) -> str:
                     result=result, summary=summary, metadata=metadata,
                     created_cards=created_cards,
                     expected_run_id=_worker_run_id(tid),
+                    transition_handoff=transition_handoff,
+                )
+            except kb.TransitionHandoffError as handoff_err:
+                return tool_error(
+                    f"kanban_complete blocked by transition_handoff: {handoff_err}. "
+                    "Your task is still in-flight with no state change."
                 )
             except kb.ArtifactPreservationError as artifact_err:
                 return tool_error(
@@ -1386,6 +1393,7 @@ def _handle_create(args: dict, **kw) -> str:
     if bool_error:
         return tool_error(bool_error)
     idempotency_key = args.get("idempotency_key")
+    logical_successor_key = args.get("logical_successor_key")
     directive_source_ref = args.get("directive_source_ref")
     directive_source_sha = args.get("directive_source_sha")
     # Observer/selector identity is kernel-authenticated (HERMES_PROFILE), never
@@ -1452,6 +1460,7 @@ def _handle_create(args: dict, **kw) -> str:
                 project_source_task_id=project_source_task_id,
                 triage=triage,
                 idempotency_key=idempotency_key,
+                logical_successor_key=logical_successor_key,
                 max_runtime_seconds=(
                     int(max_runtime_seconds)
                     if max_runtime_seconds is not None else None
@@ -1938,14 +1947,38 @@ KANBAN_COMPLETE_SCHEMA = {
                 "description": (
                     "Optional structured manifest of task ids you "
                     "created via ``kanban_create`` during this run. "
-                    "The kernel verifies each id exists and was "
-                    "created by this worker's profile; any phantom "
-                    "id blocks the completion with an error listing "
-                    "what went wrong (auditable in the task's events). "
-                    "Only list ids you got back from a successful "
-                    "``kanban_create`` call — do not invent or "
-                    "remember ids from prose. Omit the field if you "
-                    "did not create any cards."
+                    "The kernel verifies each id exists + belongs to this worker."
+                ),
+            },
+            "transition_handoff": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "version": {"type": "integer", "enum": [1]},
+                    "required_successors": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 32,
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "properties": {
+                                "key": {
+                                    "type": "string",
+                                    "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$",
+                                },
+                                "task_id": {"type": "string"},
+                            },
+                            "required": ["key", "task_id"],
+                        },
+                    },
+                },
+                "required": ["version", "required_successors"],
+                "description": (
+                    "Optional closed v1 terminal obligation contract. Every "
+                    "successor must already be a direct child created with the "
+                    "matching logical_successor_key; otherwise the transition "
+                    "fails closed with no task/run/event mutation."
                 ),
             },
             "artifacts": {
@@ -2370,6 +2403,15 @@ KANBAN_CREATE_SCHEMA = {
                     "If a non-archived task with this key already "
                     "exists, return that task's id instead of creating "
                     "a duplicate. Useful for retry-safe automation."
+                ),
+            },
+            "logical_successor_key": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$",
+                "description": (
+                    "Deterministic obligation key for exactly one parent. "
+                    "Concurrent/retried identical creates converge to one "
+                    "exact successor; conflicting reuse fails closed."
                 ),
             },
             "directive_source_ref": {
