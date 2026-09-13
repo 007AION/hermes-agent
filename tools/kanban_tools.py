@@ -2177,8 +2177,15 @@ KANBAN_RESUME_REVIEWED_AUTHOR_AMEND_SCHEMA = {
             "review_task_id": {"type": "string"},
             "review_run_id": {"type": "integer"},
             "review_handoff_event_id": {"type": "integer"},
-            "amend_reason": {"type": "string"},
-            "amend_receipt_sha256": {"type": "string"},
+            "amend_reason": {
+                "type": "string",
+                "const": "Core Law Gate B AMEND: PR963 comment 5654208520",
+            },
+            "amend_receipt_sha256": {
+                "type": "string",
+                "const": "070a04c3c9df06d52710cb7a59100774ae8cda2804e1bc3a5d288a02abe9a46f",
+                "description": "SHA-256 of the frozen PR963 Gate-B record body.",
+            },
             "board": _board_schema_prop(),
         },
         "required": [

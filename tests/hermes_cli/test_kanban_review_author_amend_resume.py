@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import concurrent.futures
-import hashlib
 import json
 import threading
 from pathlib import Path
@@ -22,6 +21,11 @@ def kanban_home(tmp_path, monkeypatch):
     monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
     monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(
+        kb,
+        "REVIEW_AUTHOR_AMEND_INCIDENT_V1",
+        dict(kb.REVIEW_AUTHOR_AMEND_INCIDENT_V1),
+    )
     kb._INITIALIZED_PATHS.clear()
     kb.init_db()
     return home
@@ -60,7 +64,7 @@ def _fixture(conn):
         summary="APPROVED_EXACT_HEAD implementation evidence",
         metadata={"github_review_id": 5191125644},
     )
-    return {
+    fixture = {
         "controller": controller,
         "controller_run": controller_task.current_run_id,
         "author": author,
@@ -69,6 +73,14 @@ def _fixture(conn):
         "review_run": review_task.current_run_id,
         "handoff": handoff.event_id,
     }
+    kb.REVIEW_AUTHOR_AMEND_INCIDENT_V1.update({
+        "author_task_id": fixture["author"],
+        "author_run_id": fixture["author_run"],
+        "review_task_id": fixture["review"],
+        "review_run_id": fixture["review_run"],
+        "review_handoff_event_id": fixture["handoff"],
+    })
+    return fixture
 
 
 def _call(conn, f, **changes):
@@ -77,8 +89,8 @@ def _call(conn, f, **changes):
         "review_task_id": f["review"],
         "review_run_id": f["review_run"],
         "review_handoff_event_id": f["handoff"],
-        "amend_reason": "Gate B AMEND: repair same PR and lineage",
-        "amend_receipt_sha256": hashlib.sha256(b"gate-b-amend-record").hexdigest(),
+        "amend_reason": kb.REVIEW_AUTHOR_AMEND_REASON_V1,
+        "amend_receipt_sha256": kb.REVIEW_AUTHOR_AMEND_INCIDENT_V1["decision_record_sha256"],
         "controller_task_id": f["controller"],
         "controller_run_id": f["controller_run"],
     }
@@ -154,7 +166,9 @@ def test_exact_replay_is_byte_equivalent_idempotent(kanban_home):
         ("review_handoff_event_id", 999999),
         ("controller_run_id", 999999),
         ("amend_receipt_sha256", "0" * 63),
+        ("amend_receipt_sha256", "f" * 64),
         ("amend_reason", ""),
+        ("amend_reason", "caller-minted AMEND prose"),
     ],
 )
 def test_stale_wrong_identity_inputs_fail_closed_zero_mutation(kanban_home, field, value):
@@ -162,6 +176,18 @@ def test_stale_wrong_identity_inputs_fail_closed_zero_mutation(kanban_home, fiel
         f = _fixture(conn)
         before = _snapshot(conn)
         assert _call(conn, f, **{field: value}) is None
+        assert _snapshot(conn) == before
+
+
+def test_unrelated_future_audit_fails_closed_zero_mutation(kanban_home):
+    with kb.connect() as conn:
+        _fixture(conn)
+        frozen_binding = dict(kb.REVIEW_AUTHOR_AMEND_INCIDENT_V1)
+        unrelated = _fixture(conn)
+        kb.REVIEW_AUTHOR_AMEND_INCIDENT_V1.clear()
+        kb.REVIEW_AUTHOR_AMEND_INCIDENT_V1.update(frozen_binding)
+        before = _snapshot(conn)
+        assert _call(conn, unrelated) is None
         assert _snapshot(conn) == before
 
 

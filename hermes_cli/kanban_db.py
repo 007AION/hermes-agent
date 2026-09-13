@@ -9915,6 +9915,32 @@ def repromote_blocked_review_child(
 
 REVIEW_AUTHOR_AMEND_RESUMED_EVENT_KIND = "review_author_amend_resumed"
 
+# Incident-bounded authority for the one immutable-history migration that
+# introduced this transition. This is deliberately not a generic policy:
+# future AMEND decisions need their own authenticated typed decision envelope.
+REVIEW_AUTHOR_AMEND_INCIDENT_V1 = {
+    "author_task_id": "t_b5d9803d",
+    "author_run_id": 4702,
+    "review_task_id": "t_02309fc1",
+    "review_run_id": 4703,
+    "review_handoff_event_id": 95356,
+    "decision_record_url": (
+        "https://github.com/kiddhu/aion-governance/pull/963#issuecomment-5654208520"
+    ),
+    "decision_record_sha256": (
+        "070a04c3c9df06d52710cb7a59100774ae8cda2804e1bc3a5d288a02abe9a46f"
+    ),
+    "decision_record_node_id": "IC_kwDOR4g-fs8AAAABUQRgCA",
+    "decision_record_author": "kiddhu",
+    "decision_record_author_association": "OWNER",
+    "decision_record_created_at": "2026-09-13T15:29:57Z",
+    "decision_record_updated_at": "2026-09-13T15:29:57Z",
+    "verdict": "AMEND",
+}
+REVIEW_AUTHOR_AMEND_REASON_V1 = (
+    "Core Law Gate B AMEND: PR963 comment 5654208520"
+)
+
 
 def _resume_reviewed_author_for_amend(
     conn: sqlite3.Connection,
@@ -9956,6 +9982,24 @@ def _resume_reviewed_author_for_amend(
     if min(author_run_id, review_run_id, review_handoff_event_id, controller_run_id) <= 0:
         return None
 
+    incident_identity = {
+        "author_task_id": author_task_id,
+        "author_run_id": author_run_id,
+        "review_task_id": review_task_id,
+        "review_run_id": review_run_id,
+        "review_handoff_event_id": review_handoff_event_id,
+    }
+    if (
+        any(
+            incident_identity[key] != REVIEW_AUTHOR_AMEND_INCIDENT_V1[key]
+            for key in incident_identity
+        )
+        or amend_reason != REVIEW_AUTHOR_AMEND_REASON_V1
+        or amend_receipt_sha256
+        != REVIEW_AUTHOR_AMEND_INCIDENT_V1["decision_record_sha256"]
+    ):
+        return None
+
     requested = {
         "version": 1,
         "author_task_id": author_task_id,
@@ -9968,6 +10012,11 @@ def _resume_reviewed_author_for_amend(
         "controller_run_id": controller_run_id,
         "amend_reason": amend_reason,
         "amend_receipt_sha256": amend_receipt_sha256,
+        "decision_record": {
+            key: value
+            for key, value in REVIEW_AUTHOR_AMEND_INCIDENT_V1.items()
+            if key not in incident_identity
+        },
     }
 
     with write_txn(conn):
