@@ -262,6 +262,27 @@ FACTORY_REVIEW_MERGER_PROFILE = "merger"
 FACTORY_REVIEW_MERGER_ACTOR = "kiddhu"
 FACTORY_REVIEW_REPOSITORY = "kiddhu/hermes-agent"
 FACTORY_REVIEW_VERDICT_RECOVERY_CONTROLLER_PROFILES = frozenset({"gm", "gm2"})
+# One immutable pre-JSON incident may be adapted into a strict v2 correction.
+# This is migration data, not a reusable prose grammar or normal authority path.
+FACTORY_HISTORICAL_PROSE_REPROMOTION_INCIDENT = {
+    "author_task_id": "t_1d9142bd",
+    "author_run_id": 4654,
+    "review_task_id": "t_d2afcef5",
+    "prior_review_run_id": 4655,
+    "handoff_receipt_sha256": (
+        "1725939ccc2beb18d9555d1d7dc4e9039f01415cc5525b9d126bbc87c9429587"
+    ),
+    "repository": "kiddhu/hermes-agent",
+    "pr": 109,
+    "base": "edcc2d39258739cd0625366d91b20bac9a6a8096",
+    "handoff_reason": (
+        "Round-3 repair candidate PR #109 is frozen at exact head "
+        "ec758e25523d2a618744f315f33836f41ac1a44c "
+        "(tree 4a0d87a9900c89a1f5431a402db4fe7bec6fa2e7, "
+        "base edcc2d39258739cd0625366d91b20bac9a6a8096). "
+        "The ambiguous historical live-identity gap now fails closed."
+    ),
+}
 FACTORY_CONTROLLED_NO_PRODUCT_CLOSEOUT_REASON = (
     "MACHINE_CANARY_COMPLETE_NO_PRODUCT_PAYLOAD"
 )
@@ -9580,8 +9601,9 @@ def _repromote_blocked_review_child(
             return None
         prior_events = conn.execute(
             "SELECT id, run_id, payload FROM task_events "
-            "WHERE task_id = ? AND kind = 'review_repromoted' ORDER BY id",
-            (author_task_id,),
+            "WHERE task_id = ? AND kind = 'review_repromoted' AND run_id = ? "
+            "ORDER BY id",
+            (author_task_id, prior_review_run_id),
         ).fetchall()
         if prior_events:
             if len(prior_events) != 1:
@@ -9695,20 +9717,22 @@ def _repromote_blocked_review_child(
                 author["body"] or ""
             )
         )
-        recovery_match = re.fullmatch(
-            r"Round-[1-9][0-9]* repair candidate PR #(?P<pr>[1-9][0-9]*) "
-            r"is frozen at exact head (?P<head>[0-9a-fA-F]{40}) "
-            r"\(tree (?P<tree>[0-9a-fA-F]{40}), "
-            r"base (?P<base>[0-9a-fA-F]{40})\)\. .+",
-            handoff.reason,
+        # Historical migration only: one immutable PR109 prose handoff may
+        # bootstrap a strict correction. Every identity/run/receipt field is
+        # frozen so this cannot become a future prose authority family.
+        incident = FACTORY_HISTORICAL_PROSE_REPROMOTION_INCIDENT
+        historical_recovery_match = (
+            author_task_id == incident["author_task_id"]
+            and author_run_id == incident["author_run_id"]
+            and review_task_id == incident["review_task_id"]
+            and prior_review_run_id == incident["prior_review_run_id"]
+            and handoff_receipt_sha256 == incident["handoff_receipt_sha256"]
+            and handoff.reason == incident["handoff_reason"]
+            and exact_candidate["repository"] == incident["repository"]
+            and exact_candidate["pr"] == incident["pr"]
+            and exact_candidate["base"] == incident["base"]
         )
-        factory_recovery_match = (
-            recovery_match is not None
-            and exact_candidate["repository"] == FACTORY_REVIEW_REPOSITORY
-            and int(recovery_match.group("pr")) == exact_candidate["pr"]
-            and recovery_match.group("base") == exact_candidate["base"]
-        )
-        if not strict_match and not legacy_match and not factory_recovery_match:
+        if not strict_match and not legacy_match and not historical_recovery_match:
             return None
 
         author_run = conn.execute(
@@ -9889,25 +9913,33 @@ def _strict_audit_target_for_handoff(
     conn: sqlite3.Connection,
     author_task_id: str,
     handoff: Optional[ReviewHandoffReceipt],
+    *,
+    review_run_id: int,
 ) -> Optional[dict[str, Any]]:
-    """Resolve a strict target from the handoff or its signed v2 correction.
+    """Resolve the strict target bound to the current audit generation.
 
-    Immutable prose handoffs cannot be rewritten.  The GM/GM2 same-child
-    repromotion path therefore appends one hash-bound v2 receipt carrying the
-    canonical JSON that a fresh auditor run must match.  Any malformed,
-    duplicate, stale-run, wrong-child, or conflicting correction fails closed.
+    Immutable prose handoffs cannot be rewritten. The GM/GM2 same-child
+    repromotion path therefore appends a hash-bound v2 receipt carrying the
+    canonical JSON that a fresh auditor run must match. Earlier generations
+    remain immutable but do not poison later recovery; duplicate/conflicting
+    receipts within the latest generation still fail closed.
     """
-    if handoff is None:
+    if handoff is None or type(review_run_id) is not int or review_run_id <= 0:
         return None
     direct = _canonical_audit_target_from_handoff_reason(handoff.reason)
     if direct is not None:
         return direct
     rows = conn.execute(
         "SELECT id, run_id, payload FROM task_events WHERE task_id=? "
-        "AND kind='review_repromoted' ORDER BY id",
-        (author_task_id,),
+        "AND kind='review_repromoted' AND id>? AND run_id<? "
+        "ORDER BY run_id DESC, id",
+        (author_task_id, handoff.event_id, review_run_id),
     ).fetchall()
-    if len(rows) != 1 or int(rows[0]["id"]) <= handoff.event_id:
+    if not rows:
+        return None
+    latest_generation = rows[0]["run_id"]
+    rows = [row for row in rows if row["run_id"] == latest_generation]
+    if len(rows) != 1:
         return None
     row = rows[0]
     try:
@@ -10049,7 +10081,9 @@ def _canonical_current_audit_outcome(
         (payload.get("review_handoff_event_id"), author_task_id),
     ).fetchone()
     handoff = _review_handoff_receipt_from_row(author_task_id, handoff_row) if handoff_row else None
-    target = _strict_audit_target_for_handoff(conn, author_task_id, handoff)
+    target = _strict_audit_target_for_handoff(
+        conn, author_task_id, handoff, review_run_id=int(row["run_id"]),
+    )
     task = conn.execute(
         "SELECT status, assignee, current_run_id, factory_build_gate, "
         "factory_terminal_receipt_sha256 FROM tasks WHERE id=?", (row["task_id"],),
@@ -10349,7 +10383,12 @@ def _record_review_verdict(
             if parent_ids(conn, review_task_id) != [task_id] or handoff is None:
                 return False
             receipt = _review_handoff_receipt_from_row(task_id, handoff)
-            target = _strict_audit_target_for_handoff(conn, task_id, receipt)
+            target = _strict_audit_target_for_handoff(
+                conn,
+                task_id,
+                receipt,
+                review_run_id=expected_review_run_id,
+            )
             if not _audit_target_matches_evidence(target, normalized_evidence):
                 return False
             return _terminalize_review_pass(
@@ -12996,10 +13035,9 @@ def complete_task(
     )
 
     with write_txn(conn):
-        if canonical_handoff is not None:
-            _validate_prebound_transition_successors(
-                conn, task_id, canonical_handoff
-            )
+        _validate_prebound_transition_successors(
+            conn, task_id, canonical_handoff
+        )
         if _run_finalizer:
             # AION-889 I1+I2 (architecture A): the kernel-owned finalizer owns
             # the terminal write (running -> done) AND the receipt binding
@@ -13241,9 +13279,9 @@ def _canonical_transition_handoff(handoff: Optional[dict]) -> Optional[dict]:
     if type(handoff["version"]) is not int or handoff["version"] != 1:
         raise TransitionHandoffError("transition_handoff.version must be integer 1")
     successors = handoff["required_successors"]
-    if not isinstance(successors, list) or not 1 <= len(successors) <= 32:
+    if not isinstance(successors, list) or len(successors) > 32:
         raise TransitionHandoffError(
-            "required_successors must contain between 1 and 32 entries"
+            "required_successors must contain between 0 and 32 entries"
         )
     canonical: list[dict[str, str]] = []
     seen_keys: set[str] = set()
@@ -13271,14 +13309,40 @@ def _canonical_transition_handoff(handoff: Optional[dict]) -> Optional[dict]:
 
 
 def _validate_prebound_transition_successors(
-    conn: sqlite3.Connection, source_task_id: str, handoff: dict,
+    conn: sqlite3.Connection,
+    source_task_id: str,
+    handoff: Optional[dict],
 ) -> None:
-    """Prove every declared successor is the unique live identity before CAS."""
-    for successor in handoff["required_successors"]:
+    """Conserve every known logical successor in the terminal CAS."""
+    prefix = f"kanban-successor:v1:{source_task_id}:"
+    rows = conn.execute(
+        "SELECT t.id, t.idempotency_key, EXISTS("
+        "SELECT 1 FROM task_links l WHERE l.parent_id=? AND l.child_id=t.id"
+        ") AS is_direct_child "
+        "FROM tasks t WHERE substr(t.idempotency_key, 1, ?) = ? "
+        "AND t.status!='archived' ORDER BY t.idempotency_key, t.id",
+        (source_task_id, len(prefix), prefix),
+    ).fetchall()
+    known = [
+        {
+            "key": row["idempotency_key"][len(prefix):],
+            "task_id": row["id"],
+        }
+        for row in rows
+    ]
+    declared = handoff["required_successors"] if handoff is not None else []
+    if known != declared or any(not row["is_direct_child"] for row in rows):
+        raise TransitionHandoffError(
+            "terminal transition must declare every known logical successor exactly"
+        )
+
+    # Re-read each declared identity independently. This keeps the prior
+    # ambiguity check explicit and guards malformed historical identities.
+    for successor in declared:
         expected_identity = logical_successor_idempotency_key(
             source_task_id, successor["key"]
         )
-        rows = conn.execute(
+        matches = conn.execute(
             "SELECT t.id, EXISTS("
             "SELECT 1 FROM task_links l WHERE l.parent_id=? AND l.child_id=t.id"
             ") AS is_direct_child "
@@ -13287,9 +13351,9 @@ def _validate_prebound_transition_successors(
             (source_task_id, expected_identity),
         ).fetchall()
         if (
-            len(rows) != 1
-            or rows[0]["id"] != successor["task_id"]
-            or not rows[0]["is_direct_child"]
+            len(matches) != 1
+            or matches[0]["id"] != successor["task_id"]
+            or not matches[0]["is_direct_child"]
         ):
             raise TransitionHandoffError(
                 "terminal transition would lose required successor "

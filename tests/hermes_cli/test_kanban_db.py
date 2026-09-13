@@ -6098,6 +6098,72 @@ def test_completion_handoff_conserves_prebound_required_successors(kanban_home):
         assert run.metadata["transition_handoff"] == handoff
 
 
+def test_completion_cannot_omit_known_logical_successor(kanban_home):
+    with kb.connect() as conn:
+        source = kb.create_task(conn, title="source", assignee="author")
+        kb.create_task(
+            conn, title="audit", assignee="auditor", parents=[source],
+            logical_successor_key="audit",
+        )
+        before = "\n".join(conn.iterdump())
+
+        with pytest.raises(kb.TransitionHandoffError):
+            kb.complete_task(conn, source, summary="must remain nonterminal")
+
+        assert "\n".join(conn.iterdump()) == before
+        assert kb.get_task(conn, source).status == "ready"
+
+
+def test_completion_explicit_zero_successor_handoff_is_supported(kanban_home):
+    with kb.connect() as conn:
+        source = kb.create_task(conn, title="source", assignee="author")
+        assert kb.complete_task(
+            conn,
+            source,
+            summary="terminal leaf",
+            transition_handoff={"version": 1, "required_successors": []},
+        ) is True
+        event = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='completed' "
+            "ORDER BY id DESC LIMIT 1", (source,),
+        ).fetchone()
+        assert json.loads(event["payload"])["transition_handoff"] == {
+            "version": 1,
+            "required_successors": [],
+        }
+
+
+def test_completion_handoff_cannot_omit_one_of_multiple_known_successors(
+    kanban_home,
+):
+    with kb.connect() as conn:
+        source = kb.create_task(conn, title="source", assignee="author")
+        audit = kb.create_task(
+            conn, title="audit", assignee="auditor", parents=[source],
+            logical_successor_key="audit",
+        )
+        kb.create_task(
+            conn, title="merge", assignee="merger", parents=[source],
+            logical_successor_key="merge",
+        )
+        before = "\n".join(conn.iterdump())
+
+        with pytest.raises(kb.TransitionHandoffError):
+            kb.complete_task(
+                conn,
+                source,
+                summary="partial handoff",
+                transition_handoff={
+                    "version": 1,
+                    "required_successors": [
+                        {"key": "audit", "task_id": audit},
+                    ],
+                },
+            )
+
+        assert "\n".join(conn.iterdump()) == before
+
+
 @pytest.mark.parametrize("conflict", [
     "unknown_field", "wrong_edge", "wrong_identity", "partial_successor",
 ])

@@ -131,6 +131,21 @@ def _call(conn, shape, *, reason="audit first; install follows", **changes):
     return kb.repromote_blocked_review_child(conn, **args)
 
 
+def _allow_historical_pr109_incident(monkeypatch, shape):
+    author, author_run, child, child_run, handoff, *_ = shape
+    monkeypatch.setattr(kb, "FACTORY_HISTORICAL_PROSE_REPROMOTION_INCIDENT", {
+        "author_task_id": author,
+        "author_run_id": author_run,
+        "review_task_id": child,
+        "prior_review_run_id": child_run,
+        "handoff_receipt_sha256": handoff.receipt_sha256,
+        "repository": PR109_CANDIDATE["repository"],
+        "pr": PR109_CANDIDATE["pr"],
+        "base": PR109_CANDIDATE["base"],
+        "handoff_reason": PR109_PROSE_HANDOFF,
+    })
+
+
 def _history(conn, author, child):
     return (
         tuple(tuple(row) for row in conn.execute(
@@ -217,6 +232,7 @@ def test_repromotion_converts_copied_pr109_prose_handoff_to_strict_pass_target(
     monkeypatch.setenv("HERMES_PROFILE", "gm2")
     with kb.connect() as conn:
         shape = _shape(conn, handoff_reason=PR109_PROSE_HANDOFF)
+        _allow_historical_pr109_incident(monkeypatch, shape)
         author, _, child, *_ = shape
         receipt = _call(
             conn,
@@ -260,6 +276,7 @@ def test_repromotion_strict_target_rejects_drifted_pass_evidence_without_mutatio
     monkeypatch.setenv("HERMES_PROFILE", "gm2")
     with kb.connect() as conn:
         shape = _shape(conn, handoff_reason=PR109_PROSE_HANDOFF)
+        _allow_historical_pr109_incident(monkeypatch, shape)
         author, _, child, *_ = shape
         assert _call(
             conn,
@@ -308,6 +325,7 @@ def test_repromotion_strict_correction_drift_is_zero_mutation_at_pass(
     monkeypatch.setenv("HERMES_PROFILE", "gm2")
     with kb.connect() as conn:
         shape = _shape(conn, handoff_reason=PR109_PROSE_HANDOFF)
+        _allow_historical_pr109_incident(monkeypatch, shape)
         author, _, child, *_ = shape
         assert _call(
             conn,
@@ -378,6 +396,7 @@ def test_prose_recovery_rejects_wrong_repo_pr_or_base_without_mutation(
     monkeypatch.setenv("HERMES_PROFILE", "gm2")
     with kb.connect() as conn:
         shape = _shape(conn, handoff_reason=PR109_PROSE_HANDOFF)
+        _allow_historical_pr109_incident(monkeypatch, shape)
         before = "\n".join(conn.iterdump())
         assert _call(
             conn,
@@ -386,6 +405,77 @@ def test_prose_recovery_rejects_wrong_repo_pr_or_base_without_mutation(
             reason="PR109 strict PASS target recovery",
         ) is None
         assert "\n".join(conn.iterdump()) == before
+
+
+def test_prose_recovery_is_rejected_outside_frozen_historical_incident(
+    kanban_home, monkeypatch,
+):
+    monkeypatch.setenv("HERMES_PROFILE", "gm2")
+    with kb.connect() as conn:
+        shape = _shape(conn, handoff_reason=PR109_PROSE_HANDOFF)
+        before = "\n".join(conn.iterdump())
+        assert _call(
+            conn,
+            shape,
+            exact_candidate=PR109_CANDIDATE,
+            reason="must not generalize prose authority",
+        ) is None
+        assert "\n".join(conn.iterdump()) == before
+
+
+def test_repromotion_scopes_receipts_to_latest_audit_generation(
+    kanban_home, monkeypatch,
+):
+    monkeypatch.setenv("HERMES_PROFILE", "gm2")
+    with kb.connect() as conn:
+        shape = _shape(conn)
+        author, _, child, *_ = shape
+        first = _call(conn, shape)
+        assert first is not None
+
+        claimed = kb.claim_task(conn, child, claimer="host:next-auditor")
+        assert claimed is not None and claimed.current_run_id is not None
+        assert kb.block_task(
+            conn,
+            child,
+            reason="fresh exact-head audit needs one more supported recovery",
+            kind="dependency",
+            expected_run_id=claimed.current_run_id,
+        )
+        second_shape = (
+            shape[0], shape[1], shape[2], claimed.current_run_id,
+            shape[4], shape[5], shape[6],
+        )
+        second = _call(conn, second_shape)
+
+        assert second is not None
+        assert second.prior_review_run_id == claimed.current_run_id
+        assert second.receipt_sha256 != first.receipt_sha256
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? "
+            "AND kind='review_repromoted'", (author,),
+        ).fetchone()[0] == 2
+
+        final_claim = kb.claim_task(conn, child, claimer="host:final-auditor")
+        assert final_claim is not None and final_claim.current_run_id is not None
+        evidence = {
+            **CANDIDATE,
+            "github_review_id": 1,
+            "github_review_url": (
+                "https://github.com/kiddhu/aion-governance/pull/961"
+                "#pullrequestreview-1"
+            ),
+            "github_review_state": "APPROVED",
+        }
+        assert kb.record_review_verdict(
+            conn,
+            author,
+            review_task_id=child,
+            expected_review_run_id=final_claim.current_run_id,
+            verdict="pass",
+            reason="fresh exact-head PASS",
+            evidence=evidence,
+        )
 
 
 @pytest.mark.parametrize(
