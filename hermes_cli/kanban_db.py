@@ -280,7 +280,10 @@ FACTORY_HISTORICAL_PROSE_REPROMOTION_INCIDENT = {
         "ec758e25523d2a618744f315f33836f41ac1a44c "
         "(tree 4a0d87a9900c89a1f5431a402db4fe7bec6fa2e7, "
         "base edcc2d39258739cd0625366d91b20bac9a6a8096). "
-        "The ambiguous historical live-identity gap now fails closed."
+        "The ambiguous historical live-identity gap now fails closed inside the "
+        "terminal transaction with byte-equivalent state; deterministic RED, 753 "
+        "relevant tests, and all hosted CI checks pass.Same role-separated audit "
+        "child must issue a fresh commit-bound round-3 verdict."
     ),
 }
 FACTORY_CONTROLLED_NO_PRODUCT_CLOSEOUT_REASON = (

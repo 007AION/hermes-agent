@@ -49,7 +49,10 @@ PR109_PROSE_HANDOFF = (
     "ec758e25523d2a618744f315f33836f41ac1a44c "
     "(tree 4a0d87a9900c89a1f5431a402db4fe7bec6fa2e7, "
     "base edcc2d39258739cd0625366d91b20bac9a6a8096). "
-    "The ambiguous historical live-identity gap now fails closed."
+    "The ambiguous historical live-identity gap now fails closed inside the "
+    "terminal transaction with byte-equivalent state; deterministic RED, 753 "
+    "relevant tests, and all hosted CI checks pass.Same role-separated audit "
+    "child must issue a fresh commit-bound round-3 verdict."
 )
 
 
@@ -278,6 +281,75 @@ def test_repromotion_converts_copied_pr109_prose_handoff_to_strict_pass_target(
             reason="fresh exact-head PASS",
             evidence=evidence,
         )
+
+
+def test_frozen_pr109_incident_matches_unpatched_exact_live_tuple(
+    kanban_home, monkeypatch,
+):
+    """The immutable run4654 handoff matches without patching migration data."""
+    monkeypatch.setenv("HERMES_PROFILE", "gm2")
+    task_ids = iter(["t_1d9142bd", "t_d2afcef5", "t_exact_controller"])
+    monkeypatch.setattr(kb, "_new_task_id", lambda: next(task_ids))
+
+    with kb.connect() as conn:
+        conn.execute("DELETE FROM sqlite_sequence WHERE name='task_runs'")
+        conn.execute(
+            "INSERT INTO sqlite_sequence(name, seq) VALUES ('task_runs', 4653)"
+        )
+        author = kb.create_task(conn, title="author", assignee="agent007")
+        author_claim = kb.claim_task(conn, author, claimer="host:author")
+        assert author_claim is not None and author_claim.current_run_id == 4654
+        child = kb.create_task(
+            conn, title="audit", assignee="bafuxunan", parents=[author]
+        )
+        handoff = kb.request_review_handoff(
+            conn,
+            author,
+            expected_run_id=4654,
+            review_task_id=child,
+            reason=PR109_PROSE_HANDOFF,
+        )
+        assert handoff is not None
+        assert handoff.receipt_sha256 == (
+            "1725939ccc2beb18d9555d1d7dc4e9039f01415cc5525b9d126bbc87c9429587"
+        )
+        child_claim = kb.claim_task(conn, child, claimer="host:auditor")
+        assert child_claim is not None and child_claim.current_run_id == 4655
+        assert kb.block_task(
+            conn,
+            child,
+            reason="same-child re-promotion requires strict target recovery",
+            kind="dependency",
+            expected_run_id=4655,
+        )
+        controller = kb.create_task(conn, title="GM correction", assignee="gm2")
+        controller_claim = kb.claim_task(
+            conn, controller, claimer="gm2:controller"
+        )
+        assert controller_claim is not None
+        shape = (
+            author,
+            4654,
+            child,
+            4655,
+            handoff,
+            controller,
+            controller_claim.current_run_id,
+        )
+
+        receipt = _call(
+            conn,
+            shape,
+            exact_candidate=PR109_CANDIDATE,
+            reason="PR109 strict PASS target recovery",
+        )
+        assert receipt is not None
+        assert receipt.strict_handoff_reason is not None
+        assert json.loads(receipt.strict_handoff_reason) == {
+            "version": 1,
+            "candidate": PR109_CANDIDATE,
+            "summary": "PR109 strict PASS target recovery",
+        }
 
 
 @pytest.mark.parametrize("field", ["repository", "pr", "head", "tree", "base"])
