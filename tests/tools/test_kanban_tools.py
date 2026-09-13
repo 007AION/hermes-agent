@@ -306,10 +306,12 @@ def test_complete_happy_path(worker_env):
     d = json.loads(out)
     assert d["ok"] is True
     assert d["task_id"] == worker_env
-    # Verify via kernel
+
     from hermes_cli import kanban_db as kb
     conn = kb.connect()
     try:
+        task = kb.get_task(conn, worker_env)
+        assert task.status == "done"
         run = kb.latest_run(conn, worker_env)
         assert run.outcome == "completed"
         assert run.summary == "got the thing done"
@@ -317,6 +319,117 @@ def test_complete_happy_path(worker_env):
     finally:
         conn.close()
 
+
+def test_tools_create_and_complete_closed_successor_handoff(worker_env):
+    from tools import kanban_tools as kt
+
+    created = json.loads(kt._handle_create({
+        "title": "independent audit",
+        "assignee": "auditor",
+        "parents": [worker_env],
+        "logical_successor_key": "audit",
+    }))
+    assert created["ok"] is True
+    child = created["task_id"]
+
+    completed = json.loads(kt._handle_complete({
+        "summary": "candidate frozen",
+        "created_cards": [child],
+        "transition_handoff": {
+            "version": 1,
+            "required_successors": [{"key": "audit", "task_id": child}],
+        },
+    }))
+    assert completed["ok"] is True
+
+
+def test_tool_complete_accepts_explicit_zero_successor_handoff(worker_env):
+    from tools import kanban_tools as kt
+    from tools.registry import invalidate_check_fn_cache, registry
+    from toolsets import resolve_toolset
+
+    invalidate_check_fn_cache()
+    definitions = registry.get_definitions(
+        set(resolve_toolset("hermes-cli")), quiet=True,
+    )
+    schema = next(
+        tool for tool in definitions
+        if tool["function"]["name"] == "kanban_complete"
+    )
+    handoff_schema = schema["function"]["parameters"]["properties"][
+        "transition_handoff"
+    ]
+    assert handoff_schema["properties"]["required_successors"]["minItems"] == 0
+
+    completed = json.loads(kt._handle_complete({
+        "summary": "verified terminal leaf",
+        "transition_handoff": {"version": 1, "required_successors": []},
+    }))
+    assert completed["ok"] is True
+
+
+def test_tool_create_rejects_conflicting_successor_runtime_replay(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    request = {
+        "title": "independent audit",
+        "assignee": "auditor",
+        "parents": [worker_env],
+        "logical_successor_key": "audit",
+        "max_runtime_seconds": 60,
+    }
+    created = json.loads(kt._handle_create(request))
+    assert created["ok"] is True
+
+    conn = kb.connect()
+    try:
+        before = "\n".join(conn.iterdump())
+    finally:
+        conn.close()
+    conflict = json.loads(kt._handle_create({
+        **request,
+        "initial_status": "blocked",
+        "max_runtime_seconds": 600,
+        "goal_mode": True,
+        "goal_max_turns": 9,
+    }))
+    assert "conflicting logical successor replay" in conflict["error"]
+    conn = kb.connect()
+    try:
+        assert "\n".join(conn.iterdump()) == before
+        child = kb.get_task(conn, created["task_id"])
+        assert child is not None
+        assert child.status == "todo"
+        assert child.max_runtime_seconds == 60
+        assert child.goal_mode is False
+    finally:
+        conn.close()
+
+
+def test_tool_completion_rejects_unbound_successor_without_mutation(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        before = "\n".join(conn.iterdump())
+    finally:
+        conn.close()
+    result = json.loads(kt._handle_complete({
+        "summary": "must fail",
+        "transition_handoff": {
+            "version": 1,
+            "required_successors": [{"key": "audit", "task_id": "t_missing0000"}],
+        },
+    }))
+    assert "transition_handoff" in result["error"]
+    conn = kb.connect()
+    try:
+        assert "\n".join(conn.iterdump()) == before
+        assert kb.get_task(conn, worker_env).status == "running"
+    finally:
+        conn.close()
 
 def test_complete_metadata_round_trips_through_show(worker_env):
     """Structured completion metadata should be visible to downstream agents."""

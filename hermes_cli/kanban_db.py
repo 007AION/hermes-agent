@@ -262,6 +262,30 @@ FACTORY_REVIEW_MERGER_PROFILE = "merger"
 FACTORY_REVIEW_MERGER_ACTOR = "kiddhu"
 FACTORY_REVIEW_REPOSITORY = "kiddhu/hermes-agent"
 FACTORY_REVIEW_VERDICT_RECOVERY_CONTROLLER_PROFILES = frozenset({"gm", "gm2"})
+# One immutable pre-JSON incident may be adapted into a strict v2 correction.
+# This is migration data, not a reusable prose grammar or normal authority path.
+FACTORY_HISTORICAL_PROSE_REPROMOTION_INCIDENT = {
+    "author_task_id": "t_1d9142bd",
+    "author_run_id": 4654,
+    "review_task_id": "t_d2afcef5",
+    "prior_review_run_id": 4655,
+    "handoff_receipt_sha256": (
+        "1725939ccc2beb18d9555d1d7dc4e9039f01415cc5525b9d126bbc87c9429587"
+    ),
+    "repository": "kiddhu/hermes-agent",
+    "pr": 109,
+    "base": "edcc2d39258739cd0625366d91b20bac9a6a8096",
+    "handoff_reason": (
+        "Round-3 repair candidate PR #109 is frozen at exact head "
+        "ec758e25523d2a618744f315f33836f41ac1a44c "
+        "(tree 4a0d87a9900c89a1f5431a402db4fe7bec6fa2e7, "
+        "base edcc2d39258739cd0625366d91b20bac9a6a8096). "
+        "The ambiguous historical live-identity gap now fails closed inside the "
+        "terminal transaction with byte-equivalent state; deterministic RED, 753 "
+        "relevant tests, and all hosted CI checks pass.Same role-separated audit "
+        "child must issue a fresh commit-bound round-3 verdict."
+    ),
+}
 FACTORY_CONTROLLED_NO_PRODUCT_CLOSEOUT_REASON = (
     "MACHINE_CANARY_COMPLETE_NO_PRODUCT_PAYLOAD"
 )
@@ -1959,6 +1983,7 @@ class ReviewRepromotionReceipt:
     controller_run_id: int
     exact_candidate: dict[str, Any]
     receipt_sha256: str
+    strict_handoff_reason: Optional[str] = None
 
 
 class _ReviewHandoffConflict(Exception):
@@ -4451,6 +4476,7 @@ def create_task(
     strategic_directive: Optional[Any] = None,
     authorized_scope: Optional[Any] = None,
     canonical_incident: Optional[str] = None,
+    logical_successor_key: Optional[str] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -4596,27 +4622,24 @@ def create_task(
                 # ``<repo>/.worktrees/<task-id>`` dir keyed on the new task id.
                 project_repo = str(project_obj.primary_path)
 
-    parents = tuple(p for p in parents if p)
+    parents = tuple(dict.fromkeys(p for p in parents if p))
+    if logical_successor_key is not None:
+        logical_successor_key = str(logical_successor_key).strip()
+        if len(parents) != 1:
+            raise ValueError("logical_successor_key requires exactly one parent")
+        derived_idempotency_key = logical_successor_idempotency_key(
+            parents[0], logical_successor_key
+        )
+        if idempotency_key is not None and idempotency_key != derived_idempotency_key:
+            raise ValueError(
+                "idempotency_key conflicts with the derived logical successor identity"
+            )
+        idempotency_key = derived_idempotency_key
 
     # Reject deterministic profile/skill mismatches before they consume the
     # dispatcher's retry budget.
     skills_list = _normalize_task_skills(skills)
     _validate_assignee_skills(assignee, skills_list)
-
-    # Idempotency check — return the existing task instead of creating a
-    # duplicate. Done BEFORE entering write_txn to keep the fast path fast
-    # and to avoid holding a write lock during the lookup. Race is
-    # acceptable: two concurrent creators with the same key might both
-    # insert, at which point both rows exist but the next lookup stabilises.
-    if idempotency_key:
-        row = conn.execute(
-            "SELECT id FROM tasks WHERE idempotency_key = ? "
-            "AND status != 'archived' "
-            "ORDER BY created_at DESC LIMIT 1",
-            (idempotency_key,),
-        ).fetchone()
-        if row:
-            return row["id"]
 
     now = int(time.time())
 
@@ -4667,11 +4690,65 @@ def create_task(
         if board_default:
             workspace_path = str(board_default)
 
+    successor_contract = None
+    if logical_successor_key is not None:
+        successor_contract = _logical_successor_creation_contract(
+            title=title.strip(),
+            body=body,
+            assignee=assignee,
+            created_by=created_by,
+            workspace_kind=workspace_kind,
+            workspace_path=workspace_path,
+            branch_name=branch_name,
+            project_id=project_id,
+            tenant=tenant,
+            priority=int(priority),
+            parents=parents,
+            triage=bool(triage),
+            initial_status=initial_status,
+            max_runtime_seconds=max_runtime_seconds,
+            skills=skills_list,
+            max_retries=max_retries,
+            model_override=model_override,
+            provider_override=provider_override,
+            goal_mode=bool(goal_mode),
+            goal_max_turns=goal_max_turns,
+            session_id=session_id,
+            factory_build_gate=factory_gate,
+            factory_preflight_required=preflight_required,
+        )
+
     # Retry once on the extremely unlikely id collision.
     for attempt in range(2):
         task_id = _new_task_id()
         try:
             with write_txn(conn):
+                # Lookup and insert share one BEGIN IMMEDIATE lock. Concurrent
+                # retries therefore cannot both observe absence and create two
+                # live tasks for one logical identity.
+                if idempotency_key:
+                    existing = conn.execute(
+                        "SELECT * FROM tasks WHERE idempotency_key = ? "
+                        "AND status != 'archived' ORDER BY created_at DESC, id DESC",
+                        (idempotency_key,),
+                    ).fetchall()
+                    if len(existing) > 1:
+                        raise ValueError(
+                            f"ambiguous idempotency key {idempotency_key!r}: "
+                            "multiple live tasks already exist"
+                        )
+                    if existing:
+                        row = existing[0]
+                        if logical_successor_key is not None:
+                            actual_contract = _stored_logical_successor_contract(
+                                conn, row
+                            )
+                            if actual_contract != successor_contract:
+                                raise ValueError(
+                                    "conflicting logical successor replay for "
+                                    f"{parents[0]!r}/{logical_successor_key!r}"
+                                )
+                        return row["id"]
                 # Determine task status from parent status, unless the caller
                 # parks it directly in blocked for human-ops review or in
                 # triage for a specifier.
@@ -4766,24 +4843,27 @@ def create_task(
                         "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
                         (pid, task_id),
                     )
+                created_payload = {
+                    "assignee": assignee,
+                    "status": task_status,
+                    "parents": list(parents),
+                    "tenant": tenant,
+                    "workspace_kind": workspace_kind,
+                    "workspace_path": workspace_path,
+                    "branch_name": branch_name,
+                    "project_id": project_id,
+                    "skills": list(skills_list) if skills_list else None,
+                    "goal_mode": bool(goal_mode) or None,
+                    "model_override": model_override,
+                    "provider_override": provider_override,
+                }
+                if successor_contract is not None:
+                    created_payload["logical_successor_contract"] = successor_contract
                 _append_event(
                     conn,
                     task_id,
                     "created",
-                    {
-                        "assignee": assignee,
-                        "status": task_status,
-                        "parents": list(parents),
-                        "tenant": tenant,
-                        "workspace_kind": workspace_kind,
-                        "workspace_path": workspace_path,
-                        "branch_name": branch_name,
-                        "project_id": project_id,
-                        "skills": list(skills_list) if skills_list else None,
-                        "goal_mode": bool(goal_mode) or None,
-                        "model_override": model_override,
-                        "provider_override": provider_override,
-                    },
+                    created_payload,
                 )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
             return task_id
@@ -4793,6 +4873,94 @@ def create_task(
             # Retry with a fresh id.
             continue
     raise RuntimeError("unreachable")
+
+
+_LOGICAL_SUCCESSOR_KEY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,63}")
+
+
+def _logical_successor_creation_contract(**values: Any) -> dict[str, Any]:
+    """Return the closed v1 identity of a logical successor create request."""
+    contract = {"version": 1, **values}
+    contract["parents"] = list(contract["parents"])
+    contract["skills"] = (
+        list(contract["skills"]) if contract["skills"] is not None else None
+    )
+    for field in ("max_runtime_seconds", "max_retries", "goal_max_turns"):
+        if contract[field] is not None:
+            contract[field] = int(contract[field])
+    return contract
+
+
+def _stored_logical_successor_contract(
+    conn: sqlite3.Connection, row: sqlite3.Row,
+) -> dict[str, Any]:
+    """Read the immutable create contract, reconstructing pre-v1 rows safely."""
+    event = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id=? AND kind='created' "
+        "ORDER BY id ASC LIMIT 1",
+        (row["id"],),
+    ).fetchone()
+    payload: dict[str, Any] = {}
+    if event is not None and event["payload"]:
+        try:
+            decoded = json.loads(event["payload"])
+            if isinstance(decoded, dict):
+                payload = decoded
+        except (TypeError, json.JSONDecodeError):
+            pass
+    stored = payload.get("logical_successor_contract")
+    if isinstance(stored, dict):
+        return stored
+
+    # Compatibility for successors created by the immediately preceding
+    # implementation, which persisted the task but not its closed replay
+    # contract. Creation status (unlike tasks.status) is immutable in the
+    # event and distinguishes blocked/triage/inherited lifecycle requests.
+    created_status = payload.get("status")
+    raw_skills = row["skills"]
+    try:
+        stored_skills = json.loads(raw_skills) if raw_skills is not None else None
+    except (TypeError, json.JSONDecodeError):
+        stored_skills = None
+    return _logical_successor_creation_contract(
+        title=row["title"],
+        body=row["body"],
+        assignee=row["assignee"],
+        created_by=row["created_by"],
+        workspace_kind=row["workspace_kind"],
+        workspace_path=row["workspace_path"],
+        branch_name=row["branch_name"],
+        project_id=row["project_id"],
+        tenant=row["tenant"],
+        priority=int(row["priority"] or 0),
+        parents=tuple(parent_ids(conn, row["id"])),
+        triage=created_status == "triage",
+        initial_status="blocked" if created_status == "blocked" else "running",
+        max_runtime_seconds=row["max_runtime_seconds"],
+        skills=stored_skills,
+        max_retries=row["max_retries"],
+        model_override=row["model_override"],
+        provider_override=row["provider_override"],
+        goal_mode=bool(row["goal_mode"]),
+        goal_max_turns=row["goal_max_turns"],
+        session_id=row["session_id"],
+        factory_build_gate=int(row["factory_build_gate"] or 0),
+        factory_preflight_required=int(row["factory_preflight_required"] or 0),
+    )
+
+
+def logical_successor_idempotency_key(source_task_id: str, key: str) -> str:
+    """Return the deterministic v1 identity for one source obligation."""
+    source_task_id = str(source_task_id or "").strip()
+    key = str(key or "").strip()
+    if re.fullmatch(r"t_[0-9A-Za-z]+", source_task_id) is None:
+        raise ValueError("logical successor source must be a task id")
+    if _LOGICAL_SUCCESSOR_KEY_RE.fullmatch(key) is None:
+        raise ValueError(
+            "logical successor key must be 1..64 characters from "
+            "[A-Za-z0-9._:-] and start alphanumeric"
+        )
+    return f"kanban-successor:v1:{source_task_id}:{key}"
 
 
 def _find_missing_parents(conn: sqlite3.Connection, parents: Iterable[str]) -> list[str]:
@@ -9393,8 +9561,18 @@ def _repromote_blocked_review_child(
         return None
     exact_candidate = {key: exact_candidate[key] for key in sorted(exact_candidate)}
 
+    strict_handoff_reason = json.dumps(
+        {
+            "version": 1,
+            "candidate": exact_candidate,
+            "summary": correction_reason,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
     core_payload = {
-        "version": 1,
+        "version": 2,
         "author_task_id": author_task_id,
         "author_run_id": author_run_id,
         "review_task_id": review_task_id,
@@ -9405,6 +9583,7 @@ def _repromote_blocked_review_child(
         "controller_task_id": controller_task_id,
         "controller_run_id": controller_run_id,
         "exact_candidate": exact_candidate,
+        "strict_handoff_reason": strict_handoff_reason,
     }
     receipt_sha256 = hashlib.sha256(
         json.dumps(
@@ -9425,8 +9604,9 @@ def _repromote_blocked_review_child(
             return None
         prior_events = conn.execute(
             "SELECT id, run_id, payload FROM task_events "
-            "WHERE task_id = ? AND kind = 'review_repromoted' ORDER BY id",
-            (author_task_id,),
+            "WHERE task_id = ? AND kind = 'review_repromoted' AND run_id = ? "
+            "ORDER BY id",
+            (author_task_id, prior_review_run_id),
         ).fetchall()
         if prior_events:
             if len(prior_events) != 1:
@@ -9436,11 +9616,32 @@ def _repromote_blocked_review_child(
                 payload = json.loads(row["payload"] or "{}")
             except (TypeError, ValueError):
                 return None
-            if (
-                row["run_id"] != prior_review_run_id
-                or payload != {**core_payload, "receipt_sha256": receipt_sha256}
-            ):
+            if row["run_id"] != prior_review_run_id:
                 return None
+            if payload != {**core_payload, "receipt_sha256": receipt_sha256}:
+                # Keep immutable v1 receipts replayable. They predate strict
+                # PASS-target binding and therefore cannot authorize it.
+                legacy_core = {
+                    key: value
+                    for key, value in core_payload.items()
+                    if key != "strict_handoff_reason"
+                }
+                legacy_core["version"] = 1
+                legacy_hash = hashlib.sha256(
+                    json.dumps(
+                        legacy_core,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        ensure_ascii=False,
+                    ).encode("utf-8")
+                ).hexdigest()
+                if payload != {**legacy_core, "receipt_sha256": legacy_hash}:
+                    return None
+                return ReviewRepromotionReceipt(
+                    event_id=int(row["id"]),
+                    receipt_sha256=legacy_hash,
+                    **legacy_core,
+                )
             return ReviewRepromotionReceipt(
                 event_id=int(row["id"]),
                 receipt_sha256=receipt_sha256,
@@ -9499,27 +9700,27 @@ def _repromote_blocked_review_child(
             or handoff.receipt_sha256 != handoff_receipt_sha256
         ):
             return None
-        legacy_tuples = re.findall(
-            r"PR(?P<pr>[1-9][0-9]*) exact candidate (?P<head>[0-9a-fA-F]{40}) "
-            r"\(tree (?P<tree>[0-9a-fA-F]{40}), base (?P<base>[0-9a-fA-F]{40})\)",
-            handoff.reason,
-        )
         strict_target = _canonical_audit_target_from_handoff_reason(handoff.reason)
         strict_match = (
             strict_target is not None
             and strict_target.get("candidate") == exact_candidate
         )
-        legacy_match = (
-            len(legacy_tuples) == 1
-            and legacy_tuples[0] == (
-                str(exact_candidate["pr"]), exact_candidate["head"],
-                exact_candidate["tree"], exact_candidate["base"],
-            )
-            and f"https://github.com/{exact_candidate['repository']}/" in (
-                author["body"] or ""
-            )
+        # Historical migration only: one immutable PR109 prose handoff may
+        # bootstrap a strict correction. Every identity/run/receipt field is
+        # frozen so this cannot become a future prose authority family.
+        incident = FACTORY_HISTORICAL_PROSE_REPROMOTION_INCIDENT
+        historical_recovery_match = (
+            author_task_id == incident["author_task_id"]
+            and author_run_id == incident["author_run_id"]
+            and review_task_id == incident["review_task_id"]
+            and prior_review_run_id == incident["prior_review_run_id"]
+            and handoff_receipt_sha256 == incident["handoff_receipt_sha256"]
+            and handoff.reason == incident["handoff_reason"]
+            and exact_candidate["repository"] == incident["repository"]
+            and exact_candidate["pr"] == incident["pr"]
+            and exact_candidate["base"] == incident["base"]
         )
-        if not strict_match and not legacy_match:
+        if not strict_match and not historical_recovery_match:
             return None
 
         author_run = conn.execute(
@@ -9696,6 +9897,81 @@ def _canonical_audit_target_from_handoff_reason(reason: Any) -> Optional[dict[st
     }
 
 
+def _strict_audit_target_for_handoff(
+    conn: sqlite3.Connection,
+    author_task_id: str,
+    handoff: Optional[ReviewHandoffReceipt],
+    *,
+    review_run_id: int,
+) -> Optional[dict[str, Any]]:
+    """Resolve the strict target bound to the current audit generation.
+
+    Immutable prose handoffs cannot be rewritten. The GM/GM2 same-child
+    repromotion path therefore appends a hash-bound v2 receipt carrying the
+    canonical JSON that a fresh auditor run must match. Earlier generations
+    remain immutable but do not poison later recovery; duplicate/conflicting
+    receipts within the latest generation still fail closed.
+    """
+    if handoff is None or type(review_run_id) is not int or review_run_id <= 0:
+        return None
+    direct = _canonical_audit_target_from_handoff_reason(handoff.reason)
+    if direct is not None:
+        return direct
+    rows = conn.execute(
+        "SELECT id, run_id, payload FROM task_events WHERE task_id=? "
+        "AND kind='review_repromoted' AND id>? AND run_id<? "
+        "ORDER BY run_id DESC, id",
+        (author_task_id, handoff.event_id, review_run_id),
+    ).fetchall()
+    if not rows:
+        return None
+    latest_generation = rows[0]["run_id"]
+    rows = [row for row in rows if row["run_id"] == latest_generation]
+    if len(rows) != 1:
+        return None
+    row = rows[0]
+    try:
+        payload = json.loads(row["payload"] or "{}")
+        digest = payload.pop("receipt_sha256")
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return None
+    required = {
+        "version", "author_task_id", "author_run_id", "review_task_id",
+        "prior_review_run_id", "handoff_receipt_sha256", "correction_actor",
+        "correction_reason", "controller_task_id", "controller_run_id",
+        "exact_candidate", "strict_handoff_reason",
+    }
+    encoded = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    ).encode("utf-8")
+    target = _canonical_audit_target_from_handoff_reason(
+        payload.get("strict_handoff_reason")
+    )
+    if (
+        set(payload) != required
+        or payload.get("version") != 2
+        or payload.get("author_task_id") != author_task_id
+        or payload.get("author_run_id") != handoff.expected_run_id
+        or payload.get("review_task_id") != handoff.review_task_id
+        or payload.get("handoff_receipt_sha256") != handoff.receipt_sha256
+        or payload.get("correction_actor")
+        not in FACTORY_REVIEW_VERDICT_RECOVERY_CONTROLLER_PROFILES
+        or type(payload.get("controller_task_id")) is not str
+        or not payload["controller_task_id"].strip()
+        or type(payload.get("controller_run_id")) is not int
+        or type(payload.get("prior_review_run_id")) is not int
+        or row["run_id"] != payload.get("prior_review_run_id")
+        or type(digest) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        or hashlib.sha256(encoded).hexdigest() != digest
+        or target is None
+        or target.get("candidate") != payload.get("exact_candidate")
+        or target.get("summary") != payload.get("correction_reason")
+    ):
+        return None
+    return target
+
+
 def _recovery_audit_target_from_handoff_reason(reason: Any) -> Optional[dict[str, Any]]:
     """Resolve strict JSON or the one recovery-only pre-JSON grammar."""
     strict = _canonical_audit_target_from_handoff_reason(reason)
@@ -9793,9 +10069,8 @@ def _canonical_current_audit_outcome(
         (payload.get("review_handoff_event_id"), author_task_id),
     ).fetchone()
     handoff = _review_handoff_receipt_from_row(author_task_id, handoff_row) if handoff_row else None
-    target = (
-        _canonical_audit_target_from_handoff_reason(handoff.reason)
-        if handoff is not None else None
+    target = _strict_audit_target_for_handoff(
+        conn, author_task_id, handoff, review_run_id=int(row["run_id"]),
     )
     task = conn.execute(
         "SELECT status, assignee, current_run_id, factory_build_gate, "
@@ -10096,9 +10371,11 @@ def _record_review_verdict(
             if parent_ids(conn, review_task_id) != [task_id] or handoff is None:
                 return False
             receipt = _review_handoff_receipt_from_row(task_id, handoff)
-            target = (
-                _canonical_audit_target_from_handoff_reason(receipt.reason)
-                if receipt is not None else None
+            target = _strict_audit_target_for_handoff(
+                conn,
+                task_id,
+                receipt,
+                review_run_id=expected_review_run_id,
             )
             if not _audit_target_matches_evidence(target, normalized_evidence):
                 return False
@@ -12554,6 +12831,7 @@ def complete_task(
     metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
+    transition_handoff: Optional[dict] = None,
 ) -> bool:
     """Transition ``running|ready -> done`` and record ``result``.
 
@@ -12584,6 +12862,7 @@ def complete_task(
     and never blocks.
     """
     now = int(time.time())
+    canonical_handoff = _canonical_transition_handoff(transition_handoff)
 
     # Gate: verify created_cards BEFORE the main write txn. A rejected
     # completion still needs an auditable event, so we emit it in a
@@ -12714,6 +12993,9 @@ def complete_task(
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
+    if canonical_handoff is not None:
+        metadata = dict(metadata) if isinstance(metadata, dict) else {}
+        metadata["transition_handoff"] = canonical_handoff
     # --- Controller/manual completion (AION-RL2-CORE-01) ---
     # expected_run_id=None: controller terminalization of any non-terminal
     # status (triage, todo, scheduled, review, running, ready, blocked).
@@ -12741,6 +13023,9 @@ def complete_task(
     )
 
     with write_txn(conn):
+        _validate_prebound_transition_successors(
+            conn, task_id, canonical_handoff
+        )
         if _run_finalizer:
             # AION-889 I1+I2 (architecture A): the kernel-owned finalizer owns
             # the terminal write (running -> done) AND the receipt binding
@@ -12865,6 +13150,8 @@ def complete_task(
         }
         if verified_cards:
             completed_payload["verified_cards"] = verified_cards
+        if canonical_handoff is not None:
+            completed_payload["transition_handoff"] = canonical_handoff
         # Record prior_status when controller completed a non-running task
         # (AION-RL2-CORE-01). Worker-completed tasks have no prior_status
         # because they were already running.
@@ -12956,6 +13243,122 @@ def complete_task(
         summary=(summary if summary is not None else result),
     )
     return True
+
+
+# ---------------------------------------------------------------------------
+# Closed terminal-transition handoff contract
+# ---------------------------------------------------------------------------
+
+
+class TransitionHandoffError(ValueError):
+    """The v1 terminal handoff is malformed or loses a declared obligation."""
+
+
+def _canonical_transition_handoff(handoff: Optional[dict]) -> Optional[dict]:
+    """Validate and canonicalize the bounded, closed v1 handoff schema."""
+    if handoff is None:
+        return None
+    if not isinstance(handoff, dict) or set(handoff) != {
+        "version", "required_successors",
+    }:
+        raise TransitionHandoffError(
+            "transition_handoff must contain exactly version and required_successors"
+        )
+    if type(handoff["version"]) is not int or handoff["version"] != 1:
+        raise TransitionHandoffError("transition_handoff.version must be integer 1")
+    successors = handoff["required_successors"]
+    if not isinstance(successors, list) or len(successors) > 32:
+        raise TransitionHandoffError(
+            "required_successors must contain between 0 and 32 entries"
+        )
+    canonical: list[dict[str, str]] = []
+    seen_keys: set[str] = set()
+    seen_tasks: set[str] = set()
+    for item in successors:
+        if not isinstance(item, dict) or set(item) != {"key", "task_id"}:
+            raise TransitionHandoffError(
+                "each required successor must contain exactly key and task_id"
+            )
+        key = item["key"]
+        task_id = item["task_id"]
+        if type(key) is not str or _LOGICAL_SUCCESSOR_KEY_RE.fullmatch(key) is None:
+            raise TransitionHandoffError("invalid required successor key")
+        if type(task_id) is not str or re.fullmatch(r"t_[0-9A-Za-z]+", task_id) is None:
+            raise TransitionHandoffError("invalid required successor task_id")
+        if key in seen_keys or task_id in seen_tasks:
+            raise TransitionHandoffError(
+                "required successor keys and task ids must be unique"
+            )
+        seen_keys.add(key)
+        seen_tasks.add(task_id)
+        canonical.append({"key": key, "task_id": task_id})
+    canonical.sort(key=lambda item: item["key"])
+    return {"version": 1, "required_successors": canonical}
+
+
+def _validate_prebound_transition_successors(
+    conn: sqlite3.Connection,
+    source_task_id: str,
+    handoff: Optional[dict],
+) -> None:
+    """Conserve every known logical successor in the terminal CAS."""
+    prefix = f"kanban-successor:v1:{source_task_id}:"
+    archived_only = conn.execute(
+        "SELECT t.idempotency_key FROM tasks t "
+        "WHERE substr(t.idempotency_key, 1, ?) = ? "
+        "GROUP BY t.idempotency_key "
+        "HAVING SUM(CASE WHEN t.status!='archived' THEN 1 ELSE 0 END) = 0 "
+        "ORDER BY t.idempotency_key",
+        (len(prefix), prefix),
+    ).fetchall()
+    if archived_only:
+        raise TransitionHandoffError(
+            "archived logical successor history is not a successful disposition"
+        )
+    rows = conn.execute(
+        "SELECT t.id, t.idempotency_key, EXISTS("
+        "SELECT 1 FROM task_links l WHERE l.parent_id=? AND l.child_id=t.id"
+        ") AS is_direct_child "
+        "FROM tasks t WHERE substr(t.idempotency_key, 1, ?) = ? "
+        "AND t.status!='archived' ORDER BY t.idempotency_key, t.id",
+        (source_task_id, len(prefix), prefix),
+    ).fetchall()
+    known = [
+        {
+            "key": row["idempotency_key"][len(prefix):],
+            "task_id": row["id"],
+        }
+        for row in rows
+    ]
+    declared = handoff["required_successors"] if handoff is not None else []
+    if known != declared or any(not row["is_direct_child"] for row in rows):
+        raise TransitionHandoffError(
+            "terminal transition must declare every known logical successor exactly"
+        )
+
+    # Re-read each declared identity independently. This keeps the prior
+    # ambiguity check explicit and guards malformed historical identities.
+    for successor in declared:
+        expected_identity = logical_successor_idempotency_key(
+            source_task_id, successor["key"]
+        )
+        matches = conn.execute(
+            "SELECT t.id, EXISTS("
+            "SELECT 1 FROM task_links l WHERE l.parent_id=? AND l.child_id=t.id"
+            ") AS is_direct_child "
+            "FROM tasks t WHERE t.idempotency_key=? AND t.status!='archived' "
+            "ORDER BY t.id",
+            (source_task_id, expected_identity),
+        ).fetchall()
+        if (
+            len(matches) != 1
+            or matches[0]["id"] != successor["task_id"]
+            or not matches[0]["is_direct_child"]
+        ):
+            raise TransitionHandoffError(
+                "terminal transition would lose required successor "
+                f"{successor['key']!r}"
+            )
 
 
 # ---------------------------------------------------------------------------
