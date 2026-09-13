@@ -13166,21 +13166,23 @@ def _canonical_transition_handoff(handoff: Optional[dict]) -> Optional[dict]:
 def _validate_prebound_transition_successors(
     conn: sqlite3.Connection, source_task_id: str, handoff: dict,
 ) -> None:
-    """Prove every declared successor identity and edge before terminal CAS."""
+    """Prove every declared successor is the unique live identity before CAS."""
     for successor in handoff["required_successors"]:
         expected_identity = logical_successor_idempotency_key(
             source_task_id, successor["key"]
         )
-        row = conn.execute(
-            "SELECT t.status, t.idempotency_key FROM tasks t "
-            "JOIN task_links l ON l.parent_id=? AND l.child_id=t.id "
-            "WHERE t.id=?",
-            (source_task_id, successor["task_id"]),
-        ).fetchone()
+        rows = conn.execute(
+            "SELECT t.id, EXISTS("
+            "SELECT 1 FROM task_links l WHERE l.parent_id=? AND l.child_id=t.id"
+            ") AS is_direct_child "
+            "FROM tasks t WHERE t.idempotency_key=? AND t.status!='archived' "
+            "ORDER BY t.id",
+            (source_task_id, expected_identity),
+        ).fetchall()
         if (
-            row is None
-            or row["status"] == "archived"
-            or row["idempotency_key"] != expected_identity
+            len(rows) != 1
+            or rows[0]["id"] != successor["task_id"]
+            or not rows[0]["is_direct_child"]
         ):
             raise TransitionHandoffError(
                 "terminal transition would lose required successor "

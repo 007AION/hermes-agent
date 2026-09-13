@@ -6132,6 +6132,54 @@ def test_completion_handoff_conflicts_fail_closed_byte_equivalent(
         assert kb.get_task(conn, source).status == "ready"
 
 
+def test_completion_handoff_rejects_ambiguous_historical_successor_identity(
+    kanban_home,
+):
+    """A pre-fix duplicate identity cannot be hidden by declaring only one child."""
+    with kb.connect() as conn:
+        source = kb.create_task(conn, title="source", assignee="author")
+        declared = kb.create_task(
+            conn, title="audit", assignee="auditor", parents=[source],
+            logical_successor_key="audit",
+        )
+        historical_duplicate = kb.create_task(
+            conn, title="pre-fix duplicate", assignee="auditor", parents=[source],
+        )
+        identity = kb.logical_successor_idempotency_key(source, "audit")
+        # Equivalent historical fixture: old create_task races could persist two
+        # direct, non-archived rows with this same deterministic identity.
+        conn.execute(
+            "UPDATE tasks SET idempotency_key=? WHERE id=?",
+            (identity, historical_duplicate),
+        )
+        conn.commit()
+        before = "\n".join(conn.iterdump())
+
+        with pytest.raises(kb.TransitionHandoffError):
+            kb.complete_task(
+                conn,
+                source,
+                summary="must remain nonterminal",
+                transition_handoff={
+                    "version": 1,
+                    "required_successors": [
+                        {"key": "audit", "task_id": declared},
+                    ],
+                },
+            )
+
+        assert "\n".join(conn.iterdump()) == before
+        assert kb.get_task(conn, source).status == "ready"
+        live_matches = conn.execute(
+            "SELECT id FROM tasks WHERE idempotency_key=? AND status!='archived' "
+            "ORDER BY id",
+            (identity,),
+        ).fetchall()
+        assert [row["id"] for row in live_matches] == sorted(
+            [declared, historical_duplicate]
+        )
+
+
 @pytest.mark.parametrize("run_delta", [-1, 1])
 def test_request_review_handoff_rejects_stale_run_without_mutation(
     kanban_home, run_delta,
