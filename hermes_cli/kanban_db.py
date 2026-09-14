@@ -261,6 +261,10 @@ FACTORY_REVIEW_AUDITOR_ACTOR = "GemAION"
 FACTORY_REVIEW_MERGER_PROFILE = "merger"
 FACTORY_REVIEW_MERGER_ACTOR = "kiddhu"
 FACTORY_REVIEW_REPOSITORY = "kiddhu/hermes-agent"
+FACTORY_REVIEW_MERGER_AUTHOR_BLOCK_REASON = (
+    "merger_not_author: authoritative implementation identity required; "
+    "Native audit-owned canonical PASS is missing, ambiguous, or drifted"
+)
 FACTORY_REVIEW_VERDICT_RECOVERY_CONTROLLER_PROFILES = frozenset({"gm", "gm2"})
 # One immutable pre-JSON incident may be adapted into a strict v2 correction.
 # This is migration data, not a reusable prose grammar or normal authority path.
@@ -6908,7 +6912,15 @@ def recompute_ready(
                 continue
             if not _predecessor_process_exited(conn, task_id):
                 continue
-            if cur_status == "blocked" and _has_sticky_block(conn, task_id):
+            gate_c_binding = _canonical_final_accepted_gate_c_binding(conn, task_id)
+            if (
+                cur_status == "blocked"
+                and _has_sticky_block(conn, task_id)
+                and not (
+                    gate_c_binding is not None
+                    and _gate_c_identity_block_matches(conn, task_id)
+                )
+            ):
                 # Worker / operator asked for human review — do not
                 # silently auto-recover.  ``unblock_task`` is the only
                 # legitimate exit (it emits ``"unblocked"`` which flips
@@ -6962,7 +6974,13 @@ def recompute_ready(
                     )
                 if changed.rowcount != 1:
                     continue
-                _append_event(conn, task_id, "promoted", None)
+                promoted_payload = None
+                if gate_c_binding is not None:
+                    promoted_payload = {
+                        "source": "canonical_final_accepted_gate_c",
+                        **gate_c_binding,
+                    }
+                _append_event(conn, task_id, "promoted", promoted_payload)
                 promoted += 1
                 if promoted_ids is not None:
                     promoted_ids.append(task_id)
@@ -7159,9 +7177,157 @@ def _review_handoff_parent_satisfies_child(
     """Keep the terminal gate, plus one exact typed review-handoff edge."""
     if parent_status in ("done", "archived"):
         return True
+    if parent_status != "review":
+        return False
+    if _review_handoff_event_for_child(conn, parent_id, child_id) is not None:
+        return True
+    binding = _canonical_final_accepted_gate_c_binding(conn, child_id)
+    return binding is not None and binding["author_task_id"] == parent_id
+
+
+def _canonical_final_accepted_gate_c_binding(
+    conn: sqlite3.Connection,
+    child_id: str,
+) -> Optional[dict[str, Any]]:
+    """Bind one merger to its reviewed author without terminalizing the author.
+
+    A canonical audit may finish before the role-separated merger exists.  Its
+    immutable outcome is then correctly ``FINAL_ACCEPTED`` with no continuation,
+    while the author remains in ``review`` pending Gate C.  Requiring that author
+    to become terminal before its direct dependency can identify it creates a
+    lifecycle cycle.  Accept only the exact two-parent author+auditor topology and
+    the current audit-owned receipt; every ambiguous or stale variant stays gated.
+    """
+    child = conn.execute(
+        "SELECT assignee, current_run_id, claim_lock, claim_expires, worker_pid, "
+        "worker_starttime, fence_lineage, fence_disposition FROM tasks WHERE id=?",
+        (child_id,),
+    ).fetchone()
+    if (
+        child is None
+        or child["assignee"] != FACTORY_REVIEW_MERGER_PROFILE
+        or any(
+            child[field] is not None
+            for field in (
+                "current_run_id", "claim_lock", "claim_expires", "worker_pid",
+                "worker_starttime", "fence_lineage", "fence_disposition",
+            )
+        )
+    ):
+        return None
+    parents = conn.execute(
+        "SELECT parent.id, parent.status, parent.assignee FROM task_links edge "
+        "JOIN tasks parent ON parent.id=edge.parent_id "
+        "WHERE edge.child_id=? ORDER BY parent.id",
+        (child_id,),
+    ).fetchall()
+    if len(parents) != 2:
+        return None
+    author_rows = [
+        row for row in parents
+        if row["status"] == "review"
+        and row["assignee"] == FACTORY_REVIEW_AUTHOR_PROFILE
+    ]
+    if len(author_rows) != 1:
+        return None
+    author_task_id = str(author_rows[0]["id"])
+    present, receipt = _canonical_current_audit_outcome(conn, author_task_id)
+    if not present or receipt is None or receipt.get("authenticated") is not True:
+        return None
+    if (
+        receipt.get("verdict") != "PASS"
+        or receipt.get("author_profile") != FACTORY_REVIEW_AUTHOR_PROFILE
+        or receipt.get("auditor_profile") != FACTORY_REVIEW_AUDITOR_PROFILE
+    ):
+        return None
+    audit_task_id = receipt.get("auditor_task_id")
+    if not isinstance(audit_task_id, str) or {
+        str(row["id"]) for row in parents
+    } != {author_task_id, audit_task_id}:
+        return None
+    audit_parent = next(row for row in parents if row["id"] == audit_task_id)
+    if (
+        audit_parent["status"] not in {"done", "archived"}
+        or audit_parent["assignee"] != FACTORY_REVIEW_AUDITOR_PROFILE
+    ):
+        return None
+    try:
+        author_run_id = int(receipt["author_run_id"])
+        audit_run_id = int(receipt["auditor_run_id"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    latest_author = conn.execute(
+        "SELECT id FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1",
+        (author_task_id,),
+    ).fetchone()
+    latest_audit = conn.execute(
+        "SELECT id FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1",
+        (audit_task_id,),
+    ).fetchone()
+    active = conn.execute(
+        "SELECT 1 FROM task_runs WHERE task_id IN (?,?) "
+        "AND (status='running' OR ended_at IS NULL) LIMIT 1",
+        (author_task_id, audit_task_id),
+    ).fetchone()
+    if (
+        latest_author is None
+        or int(latest_author["id"]) != author_run_id
+        or latest_audit is None
+        or int(latest_audit["id"]) != audit_run_id
+        or active is not None
+    ):
+        return None
+    outcome_row = conn.execute(
+        "SELECT id, payload FROM task_events WHERE task_id=? AND run_id=? "
+        "AND kind='canonical_audit_outcome'",
+        (audit_task_id, audit_run_id),
+    ).fetchone()
+    if outcome_row is None:
+        return None
+    try:
+        outcome = json.loads(outcome_row["payload"] or "{}")
+    except (TypeError, ValueError):
+        return None
+    if (
+        outcome.get("disposition") != "FINAL_ACCEPTED"
+        or outcome.get("continuation_ids") != []
+        or outcome.get("author_task_id") != author_task_id
+        or outcome.get("author_run_id") != author_run_id
+        or outcome.get("audit_task_id") != audit_task_id
+        or outcome.get("audit_run_id") != audit_run_id
+        or outcome.get("envelope_sha256")
+        != receipt.get("subject_version_or_exact_hash")
+    ):
+        return None
+    return {
+        "author_task_id": author_task_id,
+        "author_run_id": author_run_id,
+        "audit_task_id": audit_task_id,
+        "audit_run_id": audit_run_id,
+        "canonical_audit_outcome_event_id": int(outcome_row["id"]),
+    }
+
+
+def _gate_c_identity_block_matches(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Permit automatic recovery only for the exact now-satisfied identity block."""
+    row = conn.execute(
+        "SELECT kind, payload FROM task_events WHERE task_id=? "
+        "AND kind IN ('blocked','unblocked') ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if row is None or row["kind"] != "blocked":
+        return False
+    try:
+        payload = json.loads(row["payload"] or "{}")
+    except (TypeError, ValueError):
+        return False
     return (
-        parent_status == "review"
-        and _review_handoff_event_for_child(conn, parent_id, child_id) is not None
+        isinstance(payload, dict)
+        and set(payload) == {"reason", "kind", "recurrences"}
+        and payload.get("reason") == FACTORY_REVIEW_MERGER_AUTHOR_BLOCK_REASON
+        and payload.get("kind") == "capability"
+        and type(payload.get("recurrences")) is int
+        and payload["recurrences"] > 0
     )
 
 
